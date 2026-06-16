@@ -426,6 +426,36 @@ def test_stop_job_returns_cancel_instruction(runtime_stack):
     assert after["assignment"] is None
 
 
+def test_failed_assignment_is_not_reissued_on_heartbeat(runtime_stack):
+    _cfg, store, _logger, _events, controller = runtime_stack
+    controller.startup()
+    store.upsert_node(NodeRecord(
+        node_id="node-0",
+        advertised_addr="10.0.0.1",
+        state="ready",
+        gpus=[GpuInfo(index=0)],
+    ))
+    result = controller.submit_job({
+        "script": "train.py",
+        "nnodes": 1,
+        "nproc_per_node": 1,
+        "framework": "placeholder",
+    })
+    assert result["success"] is True
+    job_id = result["job"]["job_id"]
+    assignment_id = result["assignments"][0]["assignment_id"]
+    assert store.ack_assignment(assignment_id, "node-0", 1, "running")
+
+    controller.report_job_outcome(job_id, success=False, summary="exit_code=1", node_id="node-0")
+    after_failed_job = controller.heartbeat(HeartbeatPayload(node_id="node-0", state="ready"))
+    assert after_failed_job["assignment"] is None
+
+    store.update_job_state(job_id, "running")
+    assert store.ack_assignment(assignment_id, "node-0", 1, "failed")
+    after_failed_assignment = controller.heartbeat(HeartbeatPayload(node_id="node-0", state="ready"))
+    assert after_failed_assignment["assignment"] is None
+
+
 def test_stale_node_detection(runtime_stack):
     _cfg, store, _logger, events, controller = runtime_stack
     controller.startup()
@@ -624,6 +654,66 @@ def test_node_agent_stop_job_terminates_active_process(runtime_stack):
         assert "job-stop" in agent._stopping_jobs
     finally:
         _ACTIVE_PROCS.pop("job-stop", None)
+
+
+def test_node_agent_marks_failed_assignment_terminal(runtime_stack, tmp_path):
+    cfg, _store, logger, _events, _controller = runtime_stack
+
+    class FakeProc:
+        def wait(self):
+            return 1
+
+    class FakeClient:
+        def __init__(self):
+            self.acks = []
+            self.outcomes = []
+
+        def ack_assignment(self, assignment_id, node_id, job_generation, state):
+            self.acks.append((assignment_id, node_id, job_generation, state))
+            return {"success": True}
+
+        def report_outcome(self, job_id, *, success, summary="", node_id=""):
+            self.outcomes.append((job_id, success, summary, node_id))
+            return {"success": True}
+
+    client = FakeClient()
+    agent = NodeAgent(cfg, _store, logger, client=client)
+    agent.cfg.node_id = "node-0"
+    agent._running_job_id = "job-fail"
+
+    stdout_path = tmp_path / "stdout.log"
+    stderr_path = tmp_path / "stderr.log"
+    stdout_path.write_text("", encoding="utf-8")
+    stderr_path.write_text("boom", encoding="utf-8")
+    run_id = logger.start_process(
+        job_id="job-fail",
+        node_id="node-0",
+        command=["python", "train.py"],
+        cwd=str(tmp_path),
+        env={},
+    )
+    assignment = RankAssignment(
+        assignment_id="asg-fail",
+        job_id="job-fail",
+        node_id="node-0",
+        node_rank=0,
+        nproc_per_node=1,
+        nnodes=1,
+        world_size=1,
+        master_addr="127.0.0.1",
+        master_port=29500,
+        master_epoch=1,
+        job_generation=1,
+    )
+    _ACTIVE_PROCS["job-fail"] = FakeProc()  # type: ignore[assignment]
+    try:
+        agent._watch_process(FakeProc(), assignment, run_id, stdout_path, stderr_path)
+    finally:
+        _ACTIVE_PROCS.pop("job-fail", None)
+
+    assert agent._running_job_id is None
+    assert client.acks == [("asg-fail", "node-0", 1, "failed")]
+    assert client.outcomes == [("job-fail", False, "exit_code=1", "node-0")]
 
 
 def test_gateway_dispatch_cluster_event_routes_modes():

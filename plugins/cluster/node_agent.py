@@ -341,6 +341,21 @@ class NodeAgent:
                 )
             return
         success = exit_code == 0
+        assignment_state = "succeeded" if success else "failed"
+        try:
+            self.client.ack_assignment(
+                assignment.assignment_id,
+                self.cfg.node_id,
+                assignment.job_generation,
+                assignment_state,
+            )
+        except Exception as exc:
+            self.logger.log_error(
+                error_type="assignment_ack",
+                message=str(exc),
+                job_id=assignment.job_id,
+                node_id=self.cfg.node_id,
+            )
         try:
             self.client.report_outcome(
                 assignment.job_id,

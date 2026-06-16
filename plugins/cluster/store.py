@@ -408,7 +408,13 @@ class MemoryClusterStore(ClusterStore):
     def get_assignment_for_node(self, node_id: str) -> Optional[RankAssignment]:
         with self._lock:
             for a in self._assignments.values():
-                if a.node_id == node_id and a.state in ("pending", "accepted", "running"):
+                job = self._jobs.get(a.job_id)
+                if (
+                    a.node_id == node_id
+                    and a.state in ("pending", "accepted", "running")
+                    and job is not None
+                    and job.state in ("assigning", "running")
+                ):
                     return self._attach_job_spec(a)
             return None
 
@@ -880,9 +886,12 @@ class PostgresClusterStore(ClusterStore):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT assignment_id FROM cluster_assignments
-                    WHERE node_id = %s AND state IN ('pending','accepted','running')
-                    ORDER BY assignment_id DESC LIMIT 1
+                    SELECT a.assignment_id FROM cluster_assignments a
+                    JOIN cluster_jobs j ON j.job_id = a.job_id
+                    WHERE a.node_id = %s
+                      AND a.state IN ('pending','accepted','running')
+                      AND j.state IN ('assigning','running')
+                    ORDER BY a.assignment_id DESC LIMIT 1
                     """,
                     (node_id,),
                 )
