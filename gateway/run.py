@@ -3558,6 +3558,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._enqueue_fifo(session_key, event, adapter)
 
+    def dispatch_cluster_event(
+        self,
+        *,
+        session_key: str,
+        text: str,
+        route_mode: str = "queue",
+    ) -> bool:
+        """Deliver an embedded-cluster event to a gateway session."""
+        if not session_key or not text:
+            return False
+        source = self._get_cached_session_source(session_key)
+        if source is None:
+            logger.warning("Dropping cluster event for unknown session %s", session_key)
+            return False
+
+        event = MessageEvent(text=text, source=source, internal=True)
+        running_agent = self._running_agents.get(session_key)
+        mode = (route_mode or "queue").lower()
+
+        if mode == "guide" and running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+            steer = getattr(running_agent, "steer", None)
+            if callable(steer):
+                try:
+                    return bool(steer(text))
+                except Exception as exc:
+                    logger.warning("cluster guide failed for session %s: %s", session_key, exc)
+
+        if mode == "interrupt" and running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+            interrupt = getattr(running_agent, "interrupt", None)
+            if callable(interrupt):
+                try:
+                    interrupt(text)
+                    return True
+                except Exception as exc:
+                    logger.warning("cluster interrupt failed for session %s: %s", session_key, exc)
+
+        if running_agent:
+            self._queue_or_replace_pending_event(session_key, event)
+            return True
+
+        loop = getattr(self, "_cluster_event_loop", None)
+        if loop is not None and loop.is_running():
+            try:
+                safe_schedule_threadsafe(self._handle_message(event), loop, logger=logger)
+                return True
+            except Exception as exc:
+                logger.warning("cluster queue scheduling failed for session %s: %s", session_key, exc)
+        return False
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
@@ -6228,6 +6277,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # (e.g. customer handover ingest) without triggering the pairing flow.
         if not is_internal:
             try:
+                self._cluster_event_loop = asyncio.get_running_loop()
                 from gpucloud_cli.plugins import invoke_hook as _invoke_hook
                 _hook_results = _invoke_hook(
                     "pre_gateway_dispatch",
@@ -14471,6 +14521,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return
             self._running_agents[session_key] = agent_holder[0]
+            try:
+                from plugins.cluster.runtime import configure_event_delivery, get_embedded_runtime
+
+                cluster_runtime = get_embedded_runtime()
+                if cluster_runtime is not None:
+                    configure_event_delivery(
+                        cluster_runtime,
+                        agent=agent_holder[0],
+                        session_key=session_key,
+                        queue_delivery=lambda text, cluster_event: self.dispatch_cluster_event(
+                            session_key=session_key,
+                            text=text,
+                            route_mode=getattr(cluster_event, "route_mode", "queue"),
+                        ),
+                    )
+            except Exception as exc:
+                logger.debug("cluster event delivery setup failed: %s", exc)
             if self._draining:
                 self._update_runtime_status("draining")
         

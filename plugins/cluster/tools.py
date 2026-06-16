@@ -38,15 +38,24 @@ def check_cluster_available() -> bool:
         return False
     if os.environ.get("GPUCLOUD_CLUSTER_FORCE", "").strip() in ("1", "true", "yes"):
         return True
-    # Tools available when plugin enabled and master URL reachable OR local master running
+    # Tools are available when plugin enabled and master URL is reachable OR
+    # a local/embedded master is running in this process.
     if _runtime.get("controller"):
         return True
+    if cfg.embedded_master:
+        try:
+            from plugins.cluster.runtime import start_embedded_master
+
+            if start_embedded_master() is not None:
+                return True
+        except Exception:
+            pass
     try:
         client = ClusterClient(cfg, timeout=2.0)
         client.health()
         return True
     except Exception:
-        return bool(cfg.master_url)
+        return False
 
 
 def _ok(data: Any) -> str:

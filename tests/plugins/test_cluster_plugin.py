@@ -6,6 +6,8 @@ import json
 import os
 import threading
 import time
+from collections import OrderedDict
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -15,6 +17,12 @@ from plugins.cluster.controller import ClusterController
 from plugins.cluster.events import ClusterEventBridge
 from plugins.cluster.cluster_logging import ClusterLogger
 from plugins.cluster.models import GpuInfo, HeartbeatPayload, JobSpec, NodeRecord, RankAssignment
+from plugins.cluster.runtime import (
+    ClusterRuntime,
+    configure_event_delivery,
+    start_embedded_master,
+    stop_embedded_master,
+)
 from plugins.cluster.server import ClusterHTTPServer
 from plugins.cluster.store import MemoryClusterStore
 from plugins.cluster.tools import (
@@ -31,6 +39,7 @@ from plugins.cluster.node_capabilities import (
     resolve_local_launch,
     select_nodes_for_job,
 )
+from plugins.cluster.node_agent import NodeAgent, _ACTIVE_PROCS
 
 
 @pytest.fixture(autouse=True)
@@ -43,6 +52,7 @@ def _cluster_env(tmp_path, monkeypatch):
     data_dir = tmp_path / "cluster-data"
     monkeypatch.setenv("GPUCLOUD_CLUSTER_DATA_DIR", str(data_dir))
     yield data_dir
+    stop_embedded_master()
 
 
 @pytest.fixture
@@ -71,8 +81,14 @@ def runtime_stack(tmp_path):
 def test_load_cluster_config_defaults():
     cfg = load_cluster_config({"enabled": True, "role": "worker"})
     assert cfg.enabled is True
+    assert cfg.embedded_master is False
     assert cfg.role == "worker"
     assert cfg.heartbeat_interval_sec == 5
+
+
+def test_load_cluster_config_embedded_master():
+    cfg = load_cluster_config({"enabled": True, "embedded_master": True})
+    assert cfg.embedded_master is True
 
 
 def test_resolve_role_auto_master_when_local():
@@ -370,6 +386,46 @@ def test_controller_submit_job_and_idempotency(runtime_stack):
     assert second["job"]["job_id"] == job_id
 
 
+def test_stop_job_returns_cancel_instruction(runtime_stack):
+    _cfg, store, _logger, _events, controller = runtime_stack
+    controller.startup()
+    store.upsert_node(NodeRecord(
+        node_id="node-0",
+        advertised_addr="10.0.0.1",
+        state="ready",
+        gpus=[GpuInfo(index=0)],
+    ))
+    result = controller.submit_job({
+        "script": "train.py",
+        "nnodes": 1,
+        "nproc_per_node": 1,
+        "framework": "placeholder",
+    })
+    assert result["success"] is True
+    job_id = result["job"]["job_id"]
+    assignment_id = result["assignments"][0]["assignment_id"]
+    assert store.ack_assignment(assignment_id, "node-0", 1, "running")
+
+    before = controller.heartbeat(HeartbeatPayload(
+        node_id="node-0",
+        state="busy",
+        running_job_id=job_id,
+    ))
+    assert before["cancel_job_ids"] == []
+
+    stopped = controller.stop_job(job_id)
+    assert stopped["success"] is True
+    assert stopped["assignments"] == [assignment_id]
+
+    after = controller.heartbeat(HeartbeatPayload(
+        node_id="node-0",
+        state="busy",
+        running_job_id=job_id,
+    ))
+    assert after["cancel_job_ids"] == [job_id]
+    assert after["assignment"] is None
+
+
 def test_stale_node_detection(runtime_stack):
     _cfg, store, _logger, events, controller = runtime_stack
     controller.startup()
@@ -399,6 +455,46 @@ def test_event_routing_record_vs_queue(runtime_stack):
     assert queued == []
     events.emit("job_failed", {"summary": "boom"}, job_id="job-1")
     assert len(queued) == 1
+
+
+def test_event_delivery_routes_to_agent(runtime_stack):
+    cfg, store, logger, events, controller = runtime_stack
+    cfg.event_routing = {
+        "default": "record",
+        "job_failed": "queue",
+        "node_lost": "guide",
+        "config_mismatch": "interrupt",
+    }
+    runtime = ClusterRuntime(cfg, store, logger, events, controller)
+    queued = []
+
+    class FakeAgent:
+        def __init__(self):
+            self.steered = []
+            self.interrupted = []
+
+        def steer(self, text):
+            self.steered.append(text)
+            return True
+
+        def interrupt(self, text):
+            self.interrupted.append(text)
+
+    agent = FakeAgent()
+    configure_event_delivery(
+        runtime,
+        agent=agent,
+        session_key="sess-1",
+        queue_delivery=lambda text, event: queued.append((text, event.event_type)),
+    )
+
+    events.emit("job_failed", {"summary": "boom"}, job_id="job-1")
+    events.emit("node_lost", {"summary": "lost"}, node_id="node-1")
+    events.emit("config_mismatch", {"summary": "bad config"}, node_id="node-1")
+
+    assert queued and queued[0][1] == "job_failed"
+    assert agent.steered and "node_lost" in agent.steered[0]
+    assert agent.interrupted and "config_mismatch" in agent.interrupted[0]
 
 
 def test_tool_handlers_local_controller(runtime_stack):
@@ -455,6 +551,33 @@ def test_http_server_health(runtime_stack, tmp_path):
     server.stop()
 
 
+def test_embedded_master_starts_once(tmp_path):
+    raw_cfg = {
+        "cluster": {
+            "enabled": True,
+            "embedded_master": True,
+            "role": "master",
+            "node_id": "embedded-master",
+            "master_url": "http://127.0.0.1:0",
+            "bind_host": "127.0.0.1",
+            "bind_port": 0,
+            "data_dir": str(tmp_path / "embedded-cluster"),
+            "heartbeat_interval_sec": 1,
+        }
+    }
+    with patch("gpucloud_cli.config.load_config", return_value=raw_cfg):
+        runtime = start_embedded_master(session_key="sess-embed")
+        assert runtime is not None
+        assert runtime.running is True
+        again = start_embedded_master(session_key="sess-embed")
+        assert again is runtime
+
+        import httpx
+        resp = httpx.get(f"http://127.0.0.1:{runtime.cfg.bind_port}/health", timeout=2.0)
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+
+
 def test_assignment_validation_rejects_wrong_node():
     from plugins.cluster.models import RankAssignment
     from plugins.cluster.training import validate_local_assignment
@@ -479,3 +602,75 @@ def test_assignment_validation_rejects_wrong_node():
         local_addrs=["127.0.0.1"],
     )
     assert result.ok is False
+
+
+def test_node_agent_stop_job_terminates_active_process(runtime_stack):
+    cfg, store, logger, _events, _controller = runtime_stack
+
+    class FakeProc:
+        def __init__(self):
+            self.terminated = False
+
+        def terminate(self):
+            self.terminated = True
+
+    proc = FakeProc()
+    _ACTIVE_PROCS["job-stop"] = proc  # type: ignore[assignment]
+    try:
+        agent = NodeAgent(cfg, store, logger)
+        agent._running_job_id = "job-stop"
+        agent._stop_job("job-stop")
+        assert proc.terminated is True
+        assert "job-stop" in agent._stopping_jobs
+    finally:
+        _ACTIVE_PROCS.pop("job-stop", None)
+
+
+def test_gateway_dispatch_cluster_event_routes_modes():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    source = SimpleNamespace(platform="test-platform")
+    runner._session_sources = OrderedDict({"sess-gw": source})
+    runner._running_agents = {}
+    runner.adapters = {
+        "test-platform": SimpleNamespace(_pending_messages={}),
+    }
+    runner._queued_events = {}
+
+    class FakeAgent:
+        def __init__(self):
+            self.steered = []
+            self.interrupted = []
+
+        def steer(self, text):
+            self.steered.append(text)
+            return True
+
+        def interrupt(self, text):
+            self.interrupted.append(text)
+
+    agent = FakeAgent()
+    runner._running_agents["sess-gw"] = agent
+
+    assert runner.dispatch_cluster_event(
+        session_key="sess-gw",
+        text="[cluster:node_lost] node lost",
+        route_mode="guide",
+    ) is True
+    assert agent.steered == ["[cluster:node_lost] node lost"]
+
+    assert runner.dispatch_cluster_event(
+        session_key="sess-gw",
+        text="[cluster:config_mismatch] bad config",
+        route_mode="interrupt",
+    ) is True
+    assert agent.interrupted == ["[cluster:config_mismatch] bad config"]
+
+    assert runner.dispatch_cluster_event(
+        session_key="sess-gw",
+        text="[cluster:job_failed] boom",
+        route_mode="queue",
+    ) is True
+    pending = runner.adapters["test-platform"]._pending_messages
+    assert pending["sess-gw"].text == "[cluster:job_failed] boom"

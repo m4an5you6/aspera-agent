@@ -83,6 +83,7 @@ class NodeAgent:
         self._stop = threading.Event()
         self._config_hash = compute_config_hash(cfg)
         self._running_job_id: Optional[str] = None
+        self._stopping_jobs: set[str] = set()
 
     def register(self) -> Dict[str, Any]:
         return self.client.register(
@@ -113,6 +114,8 @@ class NodeAgent:
         while not self._stop.wait(self.cfg.heartbeat_interval_sec):
             try:
                 resp = self.heartbeat_once()
+                for job_id in resp.get("cancel_job_ids") or []:
+                    self._stop_job(str(job_id))
                 assignment_raw = resp.get("assignment")
                 if assignment_raw and not self._running_job_id:
                     assignment = RankAssignment(**assignment_raw)
@@ -319,6 +322,24 @@ class NodeAgent:
         with _ACTIVE_LOCK:
             _ACTIVE_PROCS.pop(assignment.job_id, None)
         self._running_job_id = None
+        stopped = assignment.job_id in self._stopping_jobs
+        if stopped:
+            self._stopping_jobs.discard(assignment.job_id)
+            try:
+                self.client.ack_assignment(
+                    assignment.assignment_id,
+                    self.cfg.node_id,
+                    assignment.job_generation,
+                    "stopped",
+                )
+            except Exception as exc:
+                self.logger.log_error(
+                    error_type="report_outcome",
+                    message=str(exc),
+                    job_id=assignment.job_id,
+                    node_id=self.cfg.node_id,
+                )
+            return
         success = exit_code == 0
         try:
             self.client.report_outcome(
@@ -339,10 +360,24 @@ class NodeAgent:
         with _ACTIVE_LOCK:
             procs = list(_ACTIVE_PROCS.items())
         for job_id, proc in procs:
+            self._stopping_jobs.add(job_id)
             try:
                 proc.terminate()
             except OSError:
                 pass
+
+    def _stop_job(self, job_id: str) -> None:
+        with _ACTIVE_LOCK:
+            proc = _ACTIVE_PROCS.get(job_id)
+        if not proc:
+            if self._running_job_id == job_id:
+                self._running_job_id = None
+            return
+        self._stopping_jobs.add(job_id)
+        try:
+            proc.terminate()
+        except OSError:
+            pass
 
 
 def _agent_version() -> str:

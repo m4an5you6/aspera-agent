@@ -21,6 +21,7 @@ RouteMode = Literal["record", "queue", "guide", "interrupt", "execute_direct"]
 @dataclass
 class ClusterConfig:
     enabled: bool = False
+    embedded_master: bool = False
     role: ClusterRole = "auto"
     node_id: str = ""
     master_url: str = "http://127.0.0.1:8765"
@@ -88,6 +89,7 @@ def load_cluster_config(raw: Optional[Dict[str, Any]] = None) -> ClusterConfig:
 
     return ClusterConfig(
         enabled=bool(raw.get("enabled", False)),
+        embedded_master=bool(raw.get("embedded_master", False)),
         role=str(raw.get("role") or "auto"),  # type: ignore[arg-type]
         node_id=str(raw.get("node_id") or _default_node_id()),
         master_url=str(raw.get("master_url") or "http://127.0.0.1:8765").rstrip("/"),

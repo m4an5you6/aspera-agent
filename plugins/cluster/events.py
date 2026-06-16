@@ -80,7 +80,10 @@ class ClusterEventBridge:
 
         if mode == "guide":
             if self.callbacks.on_guide:
-                self.callbacks.on_guide(text)
+                if self.callbacks.on_guide(text):
+                    return
+                with self._lock:
+                    self._queued.append(event)
             else:
                 with self._lock:
                     self._queued.append(event)
@@ -88,7 +91,10 @@ class ClusterEventBridge:
 
         if mode == "interrupt":
             if self.callbacks.on_interrupt:
-                self.callbacks.on_interrupt(text)
+                if self.callbacks.on_interrupt(text):
+                    return
+                with self._lock:
+                    self._queued.append(event)
             else:
                 with self._lock:
                     self._queued.append(event)
@@ -114,6 +120,11 @@ class ClusterEventBridge:
             items = list(self._queued)
             self._queued.clear()
             return items
+
+    def requeue(self, event: ClusterEvent) -> None:
+        """Return an event to the in-memory delivery queue."""
+        with self._lock:
+            self._queued.append(event)
 
     def wire_gateway_agent(self, agent: Any) -> None:
         """Attach steer/interrupt callbacks to a running AIAgent instance."""

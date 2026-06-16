@@ -8,13 +8,10 @@ import sys
 
 from plugins.cluster.client import ClusterClient
 from plugins.cluster.config import load_cluster_config, resolve_role
-from plugins.cluster.controller import ClusterController
-from plugins.cluster.events import ClusterEventBridge
-from plugins.cluster.cluster_logging import ClusterLogger
 from plugins.cluster.node_agent import NodeAgent
+from plugins.cluster.runtime import build_runtime
 from plugins.cluster.server import ClusterHTTPServer
 from plugins.cluster.store import open_store
-from plugins.cluster.tools import set_runtime
 
 
 def register_cli(subparser: argparse.ArgumentParser) -> None:
@@ -45,16 +42,8 @@ def cluster_command(args: argparse.Namespace) -> int:
 
 
 def _build_runtime():
-    cfg = load_cluster_config()
-    cfg.enabled = True
-    cfg.data_dir.mkdir(parents=True, exist_ok=True)
-    store = open_store(cfg.database_url)
-    store.ensure_schema()
-    logger = ClusterLogger(cfg, store)
-    events = ClusterEventBridge(cfg, store)
-    controller = ClusterController(cfg, store, logger, events)
-    set_runtime(controller=controller, store=store, logger=logger, events=events)
-    return cfg, store, logger, events, controller
+    runtime = build_runtime(force_enabled=True)
+    return runtime.cfg, runtime.store, runtime.logger, runtime.events, runtime.controller
 
 
 def _cmd_serve() -> int:

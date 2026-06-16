@@ -96,10 +96,16 @@ class ClusterController:
             route_mode="record",
         )
         assignment = self.store.get_assignment_for_node(hb.node_id)
+        cancel_job_ids: List[str] = []
+        if hb.running_job_id:
+            running_job = self.store.get_job(str(hb.running_job_id))
+            if running_job and running_job.state in ("stopped", "cancelled"):
+                cancel_job_ids.append(running_job.job_id)
         return {
             "ok": True,
             "master_epoch": self._master_epoch,
             "assignment": assignment.to_dict() if assignment else None,
+            "cancel_job_ids": cancel_job_ids,
         }
 
     def status(self) -> Dict[str, Any]:
@@ -250,13 +256,28 @@ class ClusterController:
         if not job:
             return {"success": False, "error": "job not found"}
         self.store.update_job_state(job_id, "stopped")
+        stopped_assignments = []
+        for assignment in self.store.list_assignments_for_job(job_id):
+            if assignment.state in ("pending", "accepted", "running"):
+                if self.store.ack_assignment(
+                    assignment.assignment_id,
+                    assignment.node_id,
+                    assignment.job_generation,
+                    "stopping",
+                ):
+                    stopped_assignments.append(assignment.assignment_id)
         self.events.emit(
             "job_stopped",
-            {"job_id": job_id},
+            {"job_id": job_id, "assignments": stopped_assignments},
             job_id=job_id,
             route_mode="execute_direct",
         )
-        return {"success": True, "job_id": job_id, "state": "stopped"}
+        return {
+            "success": True,
+            "job_id": job_id,
+            "state": "stopped",
+            "assignments": stopped_assignments,
+        }
 
     def node_action(self, node_id: str, action: str) -> Dict[str, Any]:
         node = self.store.get_node(node_id)

@@ -2082,6 +2082,9 @@ DEFAULT_CONFIG = {
     # Opt in via ``plugins.enabled: [cluster]``.
     "cluster": {
         "enabled": False,
+        # Start the master HTTP control plane inside the Agent/Gateway process.
+        # Disabled by default to avoid unexpected port binding.
+        "embedded_master": False,
         # master | worker | auto — auto resolves from master_url + bind_port.
         "role": "auto",
         "node_id": "",
