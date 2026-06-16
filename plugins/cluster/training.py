@@ -157,6 +157,7 @@ def build_torchrun_command(
         f"--node_rank={assignment.node_rank}",
         f"--master_addr={assignment.master_addr}",
         f"--master_port={assignment.master_port}",
+        "--max_restarts=0",
         spec.script,
         *spec.script_args,
     ]
