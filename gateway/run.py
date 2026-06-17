@@ -9295,7 +9295,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         try:
             from gpucloud_cli.goals import GoalManager
-            from gpucloud_cli.autogoals import AutoGoalManager, DEFAULT_AUTOGOAL_MAX_TURNS
+            from gpucloud_cli.autogoals import AutoGoalManager, resolve_autogoal_budget
         except Exception as exc:
             logger.debug("goal continuation: goals module unavailable: %s", exc)
             return
@@ -9312,14 +9312,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 from gpucloud_cli.config import load_config
 
                 cfg = load_config() or {}
-                autogoals_cfg = cfg.get("autogoals") or {}
-                auto_max_turns = int(
-                    autogoals_cfg.get("max_turns", DEFAULT_AUTOGOAL_MAX_TURNS)
-                    or DEFAULT_AUTOGOAL_MAX_TURNS
-                )
+                auto_max_turns, segment_max_turns, max_segments = resolve_autogoal_budget(cfg)
             except Exception:
-                auto_max_turns = DEFAULT_AUTOGOAL_MAX_TURNS
-            mgr = AutoGoalManager(session_id=sid, default_max_turns=auto_max_turns)
+                auto_max_turns, segment_max_turns, max_segments = resolve_autogoal_budget({})
+            mgr = AutoGoalManager(
+                session_id=sid,
+                default_max_turns=auto_max_turns,
+                default_segment_max_turns=segment_max_turns,
+                default_max_segments=max_segments,
+            )
         if not mgr.is_active():
             return
 

@@ -809,7 +809,7 @@ DEFAULT_CONFIG = {
     # None/0 = unbounded.
     "max_concurrent_sessions": None,
     "agent": {
-        "max_turns": 90,
+        "max_turns": 100,
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has
@@ -1733,7 +1733,11 @@ DEFAULT_CONFIG = {
     # service automation often spans discovery, preflight, dry-run, launch,
     # monitoring, and repair.
     "autogoals": {
-        "max_turns": 200,
+        "max_turns": 2000,
+        "segment_max_turns": 100,
+        "max_segments": 20,
+        "summarize_between_segments": True,
+        "pause_on_segment_exhaustion": False,
     },
 
     # Skills — external skill directories for sharing skills across tools/agents.
@@ -1921,6 +1925,7 @@ DEFAULT_CONFIG = {
     # Approval mode for dangerous commands:
     #   manual — always prompt the user (default)
     #   smart  — use auxiliary LLM to auto-approve low-risk commands, prompt for high-risk
+    #   autonomous — no manual fallback; self-review rm -rf and review high-risk commands
     #   off    — skip all approval prompts (equivalent to --yolo)
     #
     # cron_mode — what to do when a cron job hits a dangerous command:
@@ -1930,6 +1935,25 @@ DEFAULT_CONFIG = {
         "mode": "manual",
         "timeout": 60,
         "cron_mode": "deny",
+        "autonomous": {
+            "self_review_patterns": [
+                "recursive delete",
+                "recursive delete (long flag)",
+                "delete in root path",
+                "xargs with rm",
+                "find -exec/-execdir rm",
+                "find -delete",
+            ],
+            "second_review_patterns": [
+                "overwrite project env/config file",
+                "in-place edit of GPUCLOUD config/env",
+                "force kill processes",
+                "kill process via pgrep expansion (self-termination)",
+                "stop/restart gpucloud gateway (kills running agents)",
+            ],
+            "safe_delete_roots": [],
+            "second_review_on_escalate": False,
+        },
         # When true, /reload-mcp asks the user to confirm before rebuilding
         # the MCP tool set for the active session.  Reloading invalidates
         # the provider prompt cache (tool schemas are baked into the system

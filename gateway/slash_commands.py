@@ -1528,7 +1528,7 @@ class GatewaySlashCommandsMixin:
         lower = args.lower()
 
         try:
-            from gpucloud_cli.autogoals import AutoGoalManager, DEFAULT_AUTOGOAL_MAX_TURNS
+            from gpucloud_cli.autogoals import AutoGoalManager, resolve_autogoal_budget
             from gpucloud_cli.config import load_config
         except Exception as exc:
             return f"AutoGoals unavailable: {exc}"
@@ -1543,15 +1543,16 @@ class GatewaySlashCommandsMixin:
 
         try:
             cfg = load_config() or {}
-            autogoals_cfg = cfg.get("autogoals") or {}
-            max_turns = int(
-                autogoals_cfg.get("max_turns", DEFAULT_AUTOGOAL_MAX_TURNS)
-                or DEFAULT_AUTOGOAL_MAX_TURNS
-            )
+            max_turns, segment_max_turns, max_segments = resolve_autogoal_budget(cfg)
         except Exception:
-            max_turns = DEFAULT_AUTOGOAL_MAX_TURNS
+            max_turns, segment_max_turns, max_segments = resolve_autogoal_budget({})
 
-        mgr = AutoGoalManager(session_id=sid, default_max_turns=max_turns)
+        mgr = AutoGoalManager(
+            session_id=sid,
+            default_max_turns=max_turns,
+            default_segment_max_turns=segment_max_turns,
+            default_max_segments=max_segments,
+        )
 
         if not args or lower == "status":
             return mgr.status_line()
@@ -1601,8 +1602,15 @@ class GatewaySlashCommandsMixin:
         warning = ""
         if state.config_warnings:
             warning = "\nConfig warnings: " + "; ".join(state.config_warnings)
+        if state.max_segments == 1:
+            budget_label = f"{state.max_turns}-turn budget"
+        else:
+            budget_label = (
+                f"{state.max_turns}-turn budget, "
+                f"{state.max_segments} segment(s) × {state.segment_max_turns} turns"
+            )
         return (
-            f"⊙ AutoGoal set ({state.max_turns}-turn budget): {state.goal}\n"
+            f"⊙ AutoGoal set ({budget_label}): {state.goal}\n"
             "AutoGoal is non-interactive: it will discover, self-audit, proceed if safe, "
             f"or block itself if unsafe.{warning}"
         )

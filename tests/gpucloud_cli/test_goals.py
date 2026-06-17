@@ -407,6 +407,88 @@ def test_autogoal_incomplete_gpucloud_yaml_warns_not_rejects(gpucloud_home, monk
     assert "Do not ask the user questions" in prompt
 
 
+def test_autogoal_segment_budget_summarizes_and_continues(gpucloud_home, monkeypatch):
+    from gpucloud_cli import autogoals
+    from gpucloud_cli.autogoals import AutoGoalManager
+
+    monkeypatch.setattr(
+        autogoals,
+        "judge_goal",
+        lambda *_args, **_kwargs: ("continue", "keep going", False),
+    )
+
+    mgr = AutoGoalManager(
+        session_id="autogoal-segments",
+        default_max_turns=4,
+        default_segment_max_turns=2,
+        default_max_segments=2,
+    )
+    mgr.set("train autonomously")
+
+    d1 = mgr.evaluate_after_turn("first step")
+    assert d1["should_continue"] is True
+
+    d2 = mgr.evaluate_after_turn("segment one useful summary")
+    assert d2["should_continue"] is True
+    assert "segment 1/2" in d2["message"]
+    assert "segment one useful summary" in d2["continuation_prompt"]
+
+    state = mgr.state
+    assert state is not None
+    assert state.status == "active"
+    assert state.segment_index == 2
+    assert state.segment_turns_used == 0
+    assert len(state.segment_summaries) == 1
+
+
+def test_autogoal_stops_after_max_segments(gpucloud_home, monkeypatch):
+    from gpucloud_cli import autogoals
+    from gpucloud_cli.autogoals import AutoGoalManager
+
+    monkeypatch.setattr(
+        autogoals,
+        "judge_goal",
+        lambda *_args, **_kwargs: ("continue", "keep going", False),
+    )
+
+    mgr = AutoGoalManager(
+        session_id="autogoal-max-segments",
+        default_max_turns=4,
+        default_segment_max_turns=2,
+        default_max_segments=2,
+    )
+    mgr.set("train autonomously")
+
+    mgr.evaluate_after_turn("one")
+    mgr.evaluate_after_turn("two")
+    mgr.evaluate_after_turn("three")
+    final = mgr.evaluate_after_turn("four")
+
+    assert final["should_continue"] is False
+    assert final["status"] == "paused"
+    assert "segment budget exhausted" in final["message"]
+    assert mgr.state is not None
+    assert mgr.state.segment_index == 2
+    assert len(mgr.state.segment_summaries) == 2
+
+
+def test_autogoal_budget_resolution_preserves_legacy_max_turns():
+    from gpucloud_cli.autogoals import resolve_autogoal_budget
+
+    assert resolve_autogoal_budget({"autogoals": {"max_turns": 77}}) == (77, 77, 1)
+
+
+def test_autogoal_budget_resolution_uses_segments_when_configured():
+    from gpucloud_cli.autogoals import resolve_autogoal_budget
+
+    assert resolve_autogoal_budget({
+        "autogoals": {
+            "segment_max_turns": 100,
+            "max_segments": 20,
+        }
+    }) == (2000, 100, 20)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Auto-pause on consecutive judge parse failures
 # ──────────────────────────────────────────────────────────────────────

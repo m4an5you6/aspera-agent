@@ -15,13 +15,15 @@ import os
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from gpucloud_cli.goals import DEFAULT_MAX_TURNS, judge_goal
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_AUTOGOAL_MAX_TURNS = 200
+DEFAULT_AUTOGOAL_SEGMENT_MAX_TURNS = 100
+DEFAULT_AUTOGOAL_MAX_SEGMENTS = 20
+DEFAULT_AUTOGOAL_MAX_TURNS = DEFAULT_AUTOGOAL_SEGMENT_MAX_TURNS * DEFAULT_AUTOGOAL_MAX_SEGMENTS
 
 AUTO_GOAL_KICKOFF_TEMPLATE = """[AutoGoal: non-interactive autonomous ML/service loop]
 Objective:
@@ -58,6 +60,9 @@ Objective:
 Last audit/judge reason:
 {reason}
 
+Segment context:
+{segment_context}
+
 Continue autonomously toward the objective. Do not ask the user questions, do
 not call clarify, and do not wait for confirmation. Inspect, infer, choose a
 conservative default, run self-audit, proceed if safe, or explicitly block with
@@ -82,6 +87,11 @@ class AutoGoalState:
     status: str = "active"  # active | paused | done | cleared | blocked
     turns_used: int = 0
     max_turns: int = DEFAULT_AUTOGOAL_MAX_TURNS
+    segment_index: int = 1
+    segment_turns_used: int = 0
+    segment_max_turns: int = DEFAULT_AUTOGOAL_SEGMENT_MAX_TURNS
+    max_segments: int = DEFAULT_AUTOGOAL_MAX_SEGMENTS
+    segment_summaries: List[Dict[str, Any]] = field(default_factory=list)
     created_at: float = 0.0
     last_turn_at: float = 0.0
     last_verdict: Optional[str] = None
@@ -102,6 +112,16 @@ class AutoGoalState:
             status=str(data.get("status") or "active"),
             turns_used=int(data.get("turns_used", 0) or 0),
             max_turns=int(data.get("max_turns", DEFAULT_AUTOGOAL_MAX_TURNS) or DEFAULT_AUTOGOAL_MAX_TURNS),
+            segment_index=int(data.get("segment_index", 1) or 1),
+            segment_turns_used=int(data.get("segment_turns_used", 0) or 0),
+            segment_max_turns=int(
+                data.get("segment_max_turns", data.get("max_turns", DEFAULT_AUTOGOAL_SEGMENT_MAX_TURNS))
+                or DEFAULT_AUTOGOAL_SEGMENT_MAX_TURNS
+            ),
+            max_segments=int(data.get("max_segments", 1) or 1),
+            segment_summaries=[
+                item for item in (data.get("segment_summaries") or []) if isinstance(item, dict)
+            ],
             created_at=float(data.get("created_at", 0.0) or 0.0),
             last_turn_at=float(data.get("last_turn_at", 0.0) or 0.0),
             last_verdict=data.get("last_verdict"),
@@ -229,12 +249,115 @@ def _looks_blocked(text: str) -> bool:
     return "auto_goal_blocked:" in lowered or "autogoal_blocked:" in lowered
 
 
+def resolve_autogoal_budget(config: Optional[Dict[str, Any]] = None) -> Tuple[int, int, int]:
+    """Resolve ``(total_turns, segment_turns, max_segments)`` from config.
+
+    Back-compat: an existing config that only sets ``autogoals.max_turns`` keeps
+    the old single-budget behavior. Segment mode turns on when either
+    ``segment_max_turns`` or ``max_segments`` is present.
+    """
+    if config is None:
+        try:
+            from gpucloud_cli.config import load_config
+
+            config = load_config() or {}
+        except Exception:
+            config = {}
+
+    autogoals_cfg = (config or {}).get("autogoals") or {}
+    if not isinstance(autogoals_cfg, dict):
+        autogoals_cfg = {}
+
+    has_segment_cfg = (
+        "segment_max_turns" in autogoals_cfg
+        or "max_segments" in autogoals_cfg
+    )
+    if has_segment_cfg:
+        try:
+            segment_turns = int(
+                autogoals_cfg.get("segment_max_turns", DEFAULT_AUTOGOAL_SEGMENT_MAX_TURNS)
+                or DEFAULT_AUTOGOAL_SEGMENT_MAX_TURNS
+            )
+        except (TypeError, ValueError):
+            segment_turns = DEFAULT_AUTOGOAL_SEGMENT_MAX_TURNS
+        try:
+            max_segments = int(
+                autogoals_cfg.get("max_segments", DEFAULT_AUTOGOAL_MAX_SEGMENTS)
+                or DEFAULT_AUTOGOAL_MAX_SEGMENTS
+            )
+        except (TypeError, ValueError):
+            max_segments = DEFAULT_AUTOGOAL_MAX_SEGMENTS
+        segment_turns = max(1, segment_turns)
+        max_segments = max(1, max_segments)
+        try:
+            total_turns = int(autogoals_cfg.get("max_turns") or (segment_turns * max_segments))
+        except (TypeError, ValueError):
+            total_turns = segment_turns * max_segments
+        return max(1, total_turns), segment_turns, max_segments
+
+    if "max_turns" in autogoals_cfg:
+        try:
+            total_turns = int(autogoals_cfg.get("max_turns") or DEFAULT_AUTOGOAL_MAX_TURNS)
+        except (TypeError, ValueError):
+            total_turns = DEFAULT_AUTOGOAL_MAX_TURNS
+        total_turns = max(1, total_turns)
+        return total_turns, total_turns, 1
+
+    return (
+        DEFAULT_AUTOGOAL_MAX_TURNS,
+        DEFAULT_AUTOGOAL_SEGMENT_MAX_TURNS,
+        DEFAULT_AUTOGOAL_MAX_SEGMENTS,
+    )
+
+
+def _summarize_segment(
+    *,
+    segment_index: int,
+    turns_used: int,
+    reason: str,
+    last_response: str,
+) -> Dict[str, Any]:
+    text = (last_response or "").strip()
+    if len(text) > 1800:
+        text = text[-1800:]
+    return {
+        "segment": segment_index,
+        "turns_used": turns_used,
+        "reason": reason or "continue",
+        "summary": text or "(no response text captured)",
+        "created_at": time.time(),
+    }
+
+
 class AutoGoalManager:
     """Per-session non-interactive autogoal state and continuation logic."""
 
-    def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_AUTOGOAL_MAX_TURNS):
+    def __init__(
+        self,
+        session_id: str,
+        *,
+        default_max_turns: Optional[int] = None,
+        default_segment_max_turns: Optional[int] = None,
+        default_max_segments: Optional[int] = None,
+    ):
         self.session_id = session_id
-        self.default_max_turns = int(default_max_turns or DEFAULT_AUTOGOAL_MAX_TURNS)
+        if default_segment_max_turns is None and default_max_segments is None:
+            if default_max_turns is None:
+                self.default_segment_max_turns = DEFAULT_AUTOGOAL_SEGMENT_MAX_TURNS
+                self.default_max_segments = DEFAULT_AUTOGOAL_MAX_SEGMENTS
+                self.default_max_turns = DEFAULT_AUTOGOAL_MAX_TURNS
+            else:
+                self.default_max_turns = int(default_max_turns or DEFAULT_AUTOGOAL_MAX_TURNS)
+                self.default_segment_max_turns = self.default_max_turns
+                self.default_max_segments = 1
+        else:
+            self.default_segment_max_turns = int(
+                default_segment_max_turns or DEFAULT_AUTOGOAL_SEGMENT_MAX_TURNS
+            )
+            self.default_max_segments = int(default_max_segments or DEFAULT_AUTOGOAL_MAX_SEGMENTS)
+            self.default_max_turns = int(
+                default_max_turns or (self.default_segment_max_turns * self.default_max_segments)
+            )
         self._state: Optional[AutoGoalState] = load_autogoal(session_id)
 
     @property
@@ -251,7 +374,11 @@ class AutoGoalManager:
         s = self._state
         if s is None or s.status == "cleared":
             return "No active autogoal. Set one with /autogoal <objective>."
-        turns = f"{s.turns_used}/{s.max_turns} turns"
+        turns = (
+            f"{s.turns_used}/{s.max_turns} turns, "
+            f"segment {s.segment_index}/{s.max_segments} "
+            f"({s.segment_turns_used}/{s.segment_max_turns})"
+        )
         warn = f", {len(s.config_warnings)} warning(s)" if s.config_warnings else ""
         if s.status == "active":
             return f"⊙ AutoGoal (active, {turns}{warn}): {s.goal}"
@@ -275,6 +402,11 @@ class AutoGoalManager:
             status="active",
             turns_used=0,
             max_turns=int(max_turns) if max_turns else self.default_max_turns,
+            segment_index=1,
+            segment_turns_used=0,
+            segment_max_turns=self.default_segment_max_turns,
+            max_segments=self.default_max_segments,
+            segment_summaries=[],
             created_at=time.time(),
             last_turn_at=0.0,
             config_path=config_path,
@@ -299,6 +431,9 @@ class AutoGoalManager:
         self._state.paused_reason = None
         if reset_budget:
             self._state.turns_used = 0
+            self._state.segment_index = 1
+            self._state.segment_turns_used = 0
+            self._state.segment_summaries = []
         save_autogoal(self.session_id, self._state)
         return self._state
 
@@ -323,9 +458,15 @@ class AutoGoalManager:
     def next_continuation_prompt(self, reason: str = "") -> Optional[str]:
         if not self._state or self._state.status != "active":
             return None
+        if self._state.segment_summaries:
+            recent = self._state.segment_summaries[-3:]
+            segment_context = json.dumps(recent, ensure_ascii=False, indent=2)
+        else:
+            segment_context = "No prior segment summaries."
         return AUTO_GOAL_CONTINUATION_TEMPLATE.format(
             goal=self._state.goal,
             reason=reason or self._state.last_reason or "continue",
+            segment_context=segment_context,
         )
 
     def evaluate_after_turn(self, last_response: str, *, user_initiated: bool = True) -> Dict[str, Any]:
@@ -341,6 +482,7 @@ class AutoGoalManager:
             }
 
         state.turns_used += 1
+        state.segment_turns_used += 1
         state.last_turn_at = time.time()
 
         if _looks_blocked(last_response):
@@ -374,6 +516,52 @@ class AutoGoalManager:
                 "message": f"✓ AutoGoal achieved: {reason}",
             }
 
+        if state.segment_turns_used >= state.segment_max_turns:
+            summary = _summarize_segment(
+                segment_index=state.segment_index,
+                turns_used=state.segment_turns_used,
+                reason=reason,
+                last_response=last_response,
+            )
+            state.segment_summaries.append(summary)
+            state.segment_summaries = state.segment_summaries[-state.max_segments:]
+
+            if state.segment_index >= state.max_segments:
+                state.status = "paused"
+                state.paused_reason = (
+                    f"segment budget exhausted ({state.segment_index}/{state.max_segments} segments, "
+                    f"{state.turns_used}/{state.max_turns} turns)"
+                )
+                save_autogoal(self.session_id, state)
+                return {
+                    "status": "paused",
+                    "should_continue": False,
+                    "continuation_prompt": None,
+                    "verdict": "continue",
+                    "reason": reason,
+                    "message": (
+                        f"⏸ AutoGoal paused — segment budget exhausted "
+                        f"({state.segment_index}/{state.max_segments} segments)."
+                    ),
+                }
+
+            completed_segment = state.segment_index
+            state.segment_index += 1
+            state.segment_turns_used = 0
+            state.last_reason = f"segment {completed_segment} completed; continue from summary"
+            save_autogoal(self.session_id, state)
+            return {
+                "status": "active",
+                "should_continue": True,
+                "continuation_prompt": self.next_continuation_prompt(state.last_reason),
+                "verdict": "continue",
+                "reason": state.last_reason,
+                "message": (
+                    f"↻ AutoGoal segment {completed_segment}/{state.max_segments} summarized; "
+                    f"continuing segment {state.segment_index}/{state.max_segments}."
+                ),
+            }
+
         if state.turns_used >= state.max_turns:
             state.status = "paused"
             state.paused_reason = f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
@@ -398,6 +586,9 @@ class AutoGoalManager:
             "verdict": "continue",
             "reason": reason,
             "message": (
-                f"↻ Continuing autogoal ({state.turns_used}/{state.max_turns}): {reason}"
+                f"↻ Continuing autogoal "
+                f"({state.turns_used}/{state.max_turns}, "
+                f"segment {state.segment_index}/{state.max_segments} "
+                f"{state.segment_turns_used}/{state.segment_max_turns}): {reason}"
             ),
         }

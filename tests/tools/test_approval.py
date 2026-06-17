@@ -2,6 +2,7 @@
 
 import ast
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -14,6 +15,7 @@ from tools.approval import (
     _get_approval_mode,
     _smart_approve,
     approve_session,
+    check_all_command_guards,
     detect_dangerous_command,
     is_approved,
     load_permanent,
@@ -44,6 +46,69 @@ class TestSmartApproval:
         assert mock_call.call_args.kwargs["task"] == "approval"
         assert mock_call.call_args.kwargs["temperature"] == 0
         assert mock_call.call_args.kwargs["max_tokens"] == 16
+
+
+class TestAutonomousApproval:
+    def _autonomous_env(self, monkeypatch):
+        monkeypatch.setenv("GPUCLOUD_INTERACTIVE", "1")
+        monkeypatch.delenv("GPUCLOUD_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("GPUCLOUD_EXEC_ASK", raising=False)
+        monkeypatch.delenv("GPUCLOUD_CRON_SESSION", raising=False)
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "autonomous")
+        monkeypatch.setitem(
+            sys.modules,
+            "tools.tirith_security",
+            SimpleNamespace(
+                check_command_security=lambda _cmd: {
+                    "action": "allow",
+                    "findings": [],
+                    "summary": "",
+                }
+            ),
+        )
+
+    def test_autonomous_approves_cluster_cleanup_after_review(self, monkeypatch):
+        self._autonomous_env(monkeypatch)
+        monkeypatch.setattr(approval_module, "_smart_approve", lambda *_args, **_kwargs: "approve")
+
+        result = check_all_command_guards("pkill -9 -f torch.distributed", "local")
+
+        assert result["approved"] is True
+        assert result.get("autonomous_approved") is True
+        assert result.get("smart_approved") is True
+
+    def test_autonomous_self_reviews_scoped_recursive_delete(self, monkeypatch):
+        self._autonomous_env(monkeypatch)
+
+        result = check_all_command_guards("rm -rf /tmp/gpucloud-safe-delete-test", "local")
+
+        assert result["approved"] is True
+        assert result.get("autonomous_approved") is True
+
+    def test_autonomous_keeps_hardline_rm_root_blocked(self, monkeypatch):
+        self._autonomous_env(monkeypatch)
+
+        result = check_all_command_guards("rm -rf /", "local")
+
+        assert result["approved"] is False
+        assert result.get("hardline") is True
+
+    def test_autonomous_smart_escalate_does_not_prompt_manually(self, monkeypatch):
+        self._autonomous_env(monkeypatch)
+        monkeypatch.setattr(approval_module, "_smart_approve", lambda *_args, **_kwargs: "escalate")
+        prompted = {"called": False}
+
+        def fake_prompt(*_args, **_kwargs):
+            prompted["called"] = True
+            return "once"
+
+        monkeypatch.setattr(approval_module, "prompt_dangerous_approval", fake_prompt)
+
+        result = check_all_command_guards("pkill -9 -f torch.distributed", "local")
+
+        assert result["approved"] is False
+        assert result.get("smart_escalated") is True
+        assert prompted["called"] is False
 
 
 class TestDetectDangerousRm:

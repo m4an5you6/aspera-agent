@@ -12,6 +12,7 @@ import contextvars
 import logging
 import os
 import re
+import shlex
 import sys
 import threading
 import time
@@ -961,7 +962,7 @@ def _get_approval_config() -> dict:
 
 
 def _get_approval_mode() -> str:
-    """Read the approval mode from config. Returns 'manual', 'smart', or 'off'."""
+    """Read the approval mode from config."""
     mode = _get_approval_config().get("mode", "manual")
     return _normalize_approval_mode(mode)
 
@@ -985,6 +986,299 @@ def _get_cron_approval_mode() -> str:
         return "deny"
     except Exception:
         return "deny"
+
+
+_DEFAULT_AUTONOMOUS_SELF_REVIEW_PATTERNS = {
+    "recursive delete",
+    "recursive delete (long flag)",
+    "delete in root path",
+    "xargs with rm",
+    "find -exec/-execdir rm",
+    "find -delete",
+}
+
+_DEFAULT_AUTONOMOUS_SECOND_REVIEW_PATTERNS = {
+    "overwrite project env/config file",
+    "in-place edit of GPUCLOUD config/env",
+    "in-place edit of GPUCLOUD config/env (long flag)",
+    "in-place edit of GPUCLOUD config/env (perl/ruby)",
+    "force kill processes",
+    "force kill processes (killall -KILL)",
+    "force kill processes (killall -s KILL)",
+    "kill processes by regex (killall -r)",
+    "kill process via pgrep expansion (self-termination)",
+    "kill process via backtick pgrep expansion (self-termination)",
+    "stop/restart gpucloud gateway (kills running agents)",
+    "gpucloud update (restarts gateway, kills running agents)",
+}
+
+
+def _as_bool(value: object, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return is_truthy_value(value)
+
+
+def _as_str_set(value: object, default: set[str]) -> set[str]:
+    if value is None:
+        return set(default)
+    if isinstance(value, str):
+        return {value}
+    if isinstance(value, (list, tuple, set)):
+        return {str(item) for item in value if str(item).strip()}
+    return set(default)
+
+
+def _get_autonomous_approval_config() -> dict:
+    """Return config for fully autonomous approval mode."""
+    cfg = _get_approval_config().get("autonomous", {})
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    safe_roots = cfg.get("safe_delete_roots")
+    if safe_roots is None:
+        safe_roots_list: list[str] = []
+    elif isinstance(safe_roots, str):
+        safe_roots_list = [safe_roots]
+    elif isinstance(safe_roots, (list, tuple, set)):
+        safe_roots_list = [str(item) for item in safe_roots if str(item).strip()]
+    else:
+        safe_roots_list = []
+
+    return {
+        "self_review_patterns": _as_str_set(
+            cfg.get("self_review_patterns"),
+            _DEFAULT_AUTONOMOUS_SELF_REVIEW_PATTERNS,
+        ),
+        "second_review_patterns": _as_str_set(
+            cfg.get("second_review_patterns"),
+            _DEFAULT_AUTONOMOUS_SECOND_REVIEW_PATTERNS,
+        ),
+        "safe_delete_roots": safe_roots_list,
+        "second_review_on_escalate": _as_bool(cfg.get("second_review_on_escalate"), False),
+    }
+
+
+def _configured_pattern_matches(pattern_key: str, configured: set[str]) -> bool:
+    aliases = _approval_key_aliases(pattern_key)
+    return any(alias in configured for alias in aliases)
+
+
+def _normalize_path_for_review(path: str, *, base: str) -> str:
+    if not os.path.isabs(path):
+        path = os.path.join(base, path)
+    return os.path.normpath(os.path.abspath(os.path.expanduser(path)))
+
+
+def _is_path_under(path: str, root: str) -> bool:
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:
+        return False
+
+
+def _extract_rm_targets(command: str) -> list[str]:
+    """Best-effort extraction of rm targets for autonomous self-review."""
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return []
+
+    targets: list[str] = []
+    stop_tokens = {";", "&&", "||", "|"}
+    for idx, token in enumerate(tokens):
+        if os.path.basename(token) != "rm":
+            continue
+        for candidate in tokens[idx + 1:]:
+            if candidate in stop_tokens:
+                break
+            if candidate == "--":
+                continue
+            if candidate.startswith("-"):
+                continue
+            targets.append(candidate)
+        break
+    return targets
+
+
+def _review_recursive_delete(command: str, autonomous_cfg: dict) -> tuple[bool, str]:
+    """Deterministic self-review for recoverable recursive deletes."""
+    targets = _extract_rm_targets(command)
+    if not targets:
+        return False, "recursive delete self-review could not identify a concrete rm target"
+
+    cwd = os.getcwd()
+    safe_roots = [cwd, "/tmp", "/var/tmp"]
+    safe_roots.extend(str(root) for root in autonomous_cfg.get("safe_delete_roots", []) if str(root).strip())
+    normalized_safe_roots = {
+        _normalize_path_for_review(root, base=cwd)
+        for root in safe_roots
+        if str(root).strip()
+    }
+
+    unsafe_reasons: list[str] = []
+    reviewed_targets: list[str] = []
+    root_like = {"/", "/*", ".", "./", "..", "../", "~", "$HOME", "${HOME}"}
+
+    for raw_target in targets:
+        target = raw_target.strip()
+        if not target:
+            unsafe_reasons.append("empty delete target")
+            continue
+        if target in root_like:
+            unsafe_reasons.append(f"target {target!r} is root/home/current-directory scoped")
+            continue
+        if "$" in target or "`" in target or "$(" in target:
+            unsafe_reasons.append(f"target {target!r} contains unresolved shell expansion")
+            continue
+        if any(ch in target for ch in "*?["):
+            unsafe_reasons.append(f"target {target!r} contains glob expansion")
+            continue
+
+        normalized = _normalize_path_for_review(target, base=cwd)
+        reviewed_targets.append(normalized)
+        if not any(_is_path_under(normalized, root) and normalized != root for root in normalized_safe_roots):
+            unsafe_reasons.append(
+                f"target {target!r} is outside configured safe delete roots "
+                f"({', '.join(sorted(normalized_safe_roots))})"
+            )
+
+    if unsafe_reasons:
+        return False, "; ".join(unsafe_reasons)
+    return True, f"recursive delete self-review approved scoped targets: {', '.join(reviewed_targets)}"
+
+
+def _second_review_approve(command: str, description: str) -> str:
+    """Optional second review for autonomous high-risk commands."""
+    try:
+        from agent.auxiliary_client import call_llm
+
+        prompt = f"""You are a second-pass security reviewer for an autonomous AI coding agent.
+
+The first approval reviewer escalated this command instead of approving it.
+
+Command:
+{command}
+
+Risk description:
+{description}
+
+Approve only when the command is necessary, scoped, and recoverable. Deny if it
+can damage user data, credentials, system configuration, active gateway/agent
+processes, or production services.
+
+Respond with exactly one word: APPROVE or DENY"""
+
+        response = call_llm(
+            task="approval_second_review",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=16,
+        )
+        answer = (response.choices[0].message.content or "").strip().upper()
+        return "approve" if answer == "APPROVE" else "deny"
+    except Exception as exc:
+        logger.debug("Autonomous second review failed (%s), denying", exc)
+        return "deny"
+
+
+def _autonomous_review_warnings(
+    command: str,
+    warnings: list[tuple[str, str, bool]],
+    *,
+    session_key: str,
+) -> dict:
+    """Policy-driven approval path with no manual fallback."""
+    autonomous_cfg = _get_autonomous_approval_config()
+    self_review_patterns = autonomous_cfg["self_review_patterns"]
+    second_review_patterns = autonomous_cfg["second_review_patterns"]
+    combined_desc = "; ".join(desc for _, desc, _ in warnings)
+
+    needs_delete_review = any(
+        _configured_pattern_matches(key, self_review_patterns)
+        for key, _desc, _is_tirith in warnings
+    )
+    if needs_delete_review:
+        ok, reason = _review_recursive_delete(command, autonomous_cfg)
+        if not ok:
+            logger.warning("Autonomous delete self-review denied: %s", reason)
+            return {
+                "approved": False,
+                "message": (
+                    f"BLOCKED by autonomous delete self-review: {reason}. "
+                    "Do NOT retry this command or attempt the same deletion via another tool."
+                ),
+                "autonomous_denied": True,
+                "pattern_key": warnings[0][0],
+                "description": combined_desc,
+                "outcome": "denied",
+                "user_consent": False,
+            }
+        logger.info("Autonomous delete self-review approved: %s", reason)
+
+    needs_second_review = any(
+        is_tirith or _configured_pattern_matches(key, second_review_patterns)
+        for key, _desc, is_tirith in warnings
+    )
+    if needs_second_review:
+        verdict = _smart_approve(command, combined_desc)
+        if verdict == "approve":
+            logger.info("Autonomous high-risk review approved: %s", command[:120])
+            return {
+                "approved": True,
+                "message": None,
+                "autonomous_approved": True,
+                "smart_approved": True,
+                "description": combined_desc,
+            }
+        if verdict == "deny":
+            logger.warning("Autonomous high-risk review denied: %s", combined_desc)
+            return {
+                "approved": False,
+                "message": (
+                    f"BLOCKED by autonomous high-risk review: {combined_desc}. "
+                    "The command was assessed as genuinely dangerous. Do NOT retry."
+                ),
+                "autonomous_denied": True,
+                "smart_denied": True,
+                "pattern_key": warnings[0][0],
+                "description": combined_desc,
+                "outcome": "denied",
+                "user_consent": False,
+            }
+        if autonomous_cfg.get("second_review_on_escalate"):
+            second_verdict = _second_review_approve(command, combined_desc)
+            if second_verdict == "approve":
+                logger.info("Autonomous second review approved: %s", command[:120])
+                return {
+                    "approved": True,
+                    "message": None,
+                    "autonomous_approved": True,
+                    "second_review_approved": True,
+                    "description": combined_desc,
+                }
+        logger.warning("Autonomous high-risk review escalated; blocking: %s", combined_desc)
+        return {
+            "approved": False,
+            "message": (
+                f"BLOCKED by autonomous high-risk review: {combined_desc}. "
+                "The review was uncertain and autonomous mode is configured to fail closed."
+            ),
+            "autonomous_denied": True,
+            "smart_escalated": True,
+            "pattern_key": warnings[0][0],
+            "description": combined_desc,
+            "outcome": "escalated",
+            "user_consent": False,
+        }
+
+    logger.info("Autonomous approval granted for warning(s): %s", combined_desc)
+    return {
+        "approved": True,
+        "message": None,
+        "autonomous_approved": True,
+        "description": combined_desc,
+    }
 
 
 def _smart_approve(command: str, description: str) -> str:
@@ -1062,9 +1356,10 @@ def check_dangerous_command(command: str, env_type: str,
         logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
         return _hardline_block_result(hardline_desc)
 
-    # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
-    # CLI --yolo remains process-scoped via the env var for local use.
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+    # --yolo or approvals.mode=off: bypass all approval prompts. Gateway
+    # /yolo is session-scoped; CLI --yolo remains process-scoped.
+    approval_mode = _get_approval_mode()
+    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
         return {"approved": True, "message": None}
 
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
@@ -1074,6 +1369,13 @@ def check_dangerous_command(command: str, env_type: str,
     session_key = get_current_session_key()
     if is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
+
+    if approval_mode == "autonomous":
+        return _autonomous_review_warnings(
+            command,
+            [(pattern_key, description, False)],
+            session_key=session_key,
+        )
 
     is_cli = env_var_enabled("GPUCLOUD_INTERACTIVE")
     is_gateway = _is_gateway_approval_context()
@@ -1375,7 +1677,10 @@ def check_all_command_guards(command: str, env_type: str,
     if not warnings:
         return {"approved": True, "message": None}
 
-    # --- Phase 2.5: Smart approval (auxiliary LLM risk assessment) ---
+    # --- Phase 2.5: Autonomous/smart approval (auxiliary LLM risk assessment) ---
+    if approval_mode == "autonomous":
+        return _autonomous_review_warnings(command, warnings, session_key=session_key)
+
     # When approvals.mode=smart, ask the aux LLM before prompting the user.
     # Inspired by OpenAI Codex's Smart Approvals guardian subagent
     # (openai/codex#13860).
@@ -1640,6 +1945,13 @@ def check_execute_code_guard(code: str, env_type: str) -> dict:
     # consulted, so every execute_code call re-prompts the user (#39275).
     if is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
+
+    if approval_mode == "autonomous":
+        return _autonomous_review_warnings(
+            command,
+            [(pattern_key, description, False)],
+            session_key=session_key,
+        )
 
     # Smart mode: ask the aux LLM about the whole script. An APPROVE here only
     # suppresses the redundant whole-script prompt; the per-call terminal()
