@@ -179,8 +179,19 @@ class NodeAgent:
             working_dir=str(spec_dict.get("working_dir") or assignment.working_dir),
             job_id=str(spec_dict.get("job_id") or assignment.job_id),
             idempotency_key=str(spec_dict.get("idempotency_key") or ""),
+            job_kind=str(spec_dict.get("job_kind") or (spec_dict.get("extra") or {}).get("job_kind") or "training"),
             extra=dict(spec_dict.get("extra") or {}),
         )
+
+        if spec.is_inference or str(spec.framework).lower() == "inference":
+            self.client.ack_assignment(
+                assignment.assignment_id,
+                self.cfg.node_id,
+                assignment.job_generation,
+                "accepted",
+            )
+            self._launch_inference(assignment, spec)
+            return
 
         resolved = resolve_local_launch(self.cfg, spec, assignment)
         resolved_validation = validate_resolved_launch(resolved)
@@ -226,6 +237,112 @@ class NodeAgent:
             "accepted",
         )
         self._launch_process(assignment)
+
+    def _launch_inference(self, assignment: RankAssignment, spec: JobSpec) -> None:
+        """Run ModelAdapter lifecycle for job_kind=inference (no torchrun)."""
+        # Ensure built-in adapters are registered even if plugin discovery skipped.
+        try:
+            import plugins.inference_adapters.hf_vllm  # noqa: F401
+        except Exception:
+            pass
+
+        from plugins.inference_adapters.registry import create_adapter
+        from plugins.inference_adapters.runtime import (
+            remember_adapter,
+            run_inference_lifecycle,
+            stop_job_adapter,
+        )
+
+        extra = spec.extra or {}
+        adapter_id = str(
+            extra.get("adapter_id")
+            or (extra.get("inference_spec") or {}).get("adapter_id")
+            or ""
+        ).strip()
+        try:
+            adapter = create_adapter(adapter_id) if adapter_id else None
+        except KeyError as exc:
+            self.logger.log_error(
+                error_type="inference_adapter",
+                message=str(exc),
+                job_id=assignment.job_id,
+                node_id=self.cfg.node_id,
+            )
+            self.client.ack_assignment(
+                assignment.assignment_id,
+                self.cfg.node_id,
+                assignment.job_generation,
+                "rejected",
+            )
+            try:
+                self.client.report_outcome(
+                    assignment.job_id,
+                    success=False,
+                    summary=str(exc),
+                    node_id=self.cfg.node_id,
+                    details={"phase": "validate", "adapter_id": adapter_id},
+                )
+            except Exception:
+                pass
+            return
+
+        self._running_job_id = assignment.job_id
+        if adapter is not None:
+            remember_adapter(assignment.job_id, adapter)
+        self.client.ack_assignment(
+            assignment.assignment_id,
+            self.cfg.node_id,
+            assignment.job_generation,
+            "running",
+        )
+
+        stop_requested = lambda: assignment.job_id in self._stopping_jobs
+
+        def _on_outcome(success: bool, summary: str, details: dict) -> None:
+            try:
+                self.client.ack_assignment(
+                    assignment.assignment_id,
+                    self.cfg.node_id,
+                    assignment.job_generation,
+                    "succeeded" if success else "failed",
+                )
+            except Exception as exc:
+                self.logger.log_error(
+                    error_type="assignment_ack",
+                    message=str(exc),
+                    job_id=assignment.job_id,
+                    node_id=self.cfg.node_id,
+                )
+            try:
+                self.client.report_outcome(
+                    assignment.job_id,
+                    success=success,
+                    summary=summary,
+                    node_id=self.cfg.node_id,
+                    details=details,
+                )
+            except Exception as exc:
+                self.logger.log_error(
+                    error_type="report_outcome",
+                    message=str(exc),
+                    job_id=assignment.job_id,
+                    node_id=self.cfg.node_id,
+                )
+
+        def _run() -> None:
+            try:
+                run_inference_lifecycle(
+                    job_spec=spec.to_dict(),
+                    on_outcome=_on_outcome,
+                    stop_flag=stop_requested,
+                    adapter=adapter,
+                )
+            finally:
+                stop_job_adapter(assignment.job_id)
+                self._running_job_id = None
+                self._stopping_jobs.discard(assignment.job_id)
+
+        threading.Thread(target=_run, daemon=True, name=f"inference-{assignment.job_id}").start()
 
     def _launch_process(self, assignment: RankAssignment) -> None:
         cwd = Path(assignment.working_dir).expanduser()
@@ -382,13 +499,22 @@ class NodeAgent:
                 pass
 
     def _stop_job(self, job_id: str) -> None:
+        self._stopping_jobs.add(job_id)
+        try:
+            from plugins.inference_adapters.runtime import stop_job_adapter
+
+            if stop_job_adapter(job_id):
+                if self._running_job_id == job_id:
+                    self._running_job_id = None
+                return
+        except Exception:
+            pass
         with _ACTIVE_LOCK:
             proc = _ACTIVE_PROCS.get(job_id)
         if not proc:
             if self._running_job_id == job_id:
                 self._running_job_id = None
             return
-        self._stopping_jobs.add(job_id)
         try:
             proc.terminate()
         except OSError:

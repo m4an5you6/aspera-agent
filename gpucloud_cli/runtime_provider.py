@@ -836,6 +836,7 @@ def _resolve_openrouter_runtime(
     if _is_openrouter_context:
         api_key_candidates = [
             explicit_api_key,
+            cfg_api_key,  # model.api_key in config.yaml (internal deployments)
             os.getenv("OPENROUTER_API_KEY"),
             os.getenv("OPENAI_API_KEY"),
         ]

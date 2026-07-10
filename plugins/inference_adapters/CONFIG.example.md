@@ -1,0 +1,49 @@
+"""
+# Inference adapters config (internal: secrets may live in config.yaml)
+
+Add to ~/.gpucloud/config.yaml when enabling deploy-after-confirm inference:
+
+```yaml
+model:
+  provider: openrouter   # or openai / custom
+  default: your-model
+  api_key: "sk-..."      # LLM key for agent bring-up (internal deployments)
+
+plugins:
+  enabled: [cluster, inference_adapters]
+
+cluster:
+  enabled: true
+  role: master   # or worker
+  embedded_master: true   # master nodes
+  embedded_worker: true   # worker nodes
+  master_url: http://<master>:8765
+  bind_host: 0.0.0.0
+  bind_port: 8765
+  secret: "shared-cluster-secret"   # env GPUCLOUD_CLUSTER_SECRET still wins if set
+
+inference_adapters:
+  enabled: true
+  default_adapter_id: hf_vllm
+  health_poll_seconds: 2
+  health_timeout_seconds: 600
+  serve_api_key_env: INFERENCE_API_KEY
+  serve_api_key: ""       # optional protect local vLLM HTTP
+  hf_token: ""            # optional private weight pull
+  status_callback_url: "" # optional thin API callback for deploy status projection
+```
+
+# Optional legacy .env (not required when keys are in config.yaml)
+
+```bash
+# Still supported if you prefer env over yaml:
+# OPENROUTER_API_KEY=...
+# GPUCLOUD_CLUSTER_SECRET=...
+# HF_TOKEN=...
+# INFERENCE_API_KEY=...
+```
+
+Use `plugins.inference_adapters.bootstrap.plan_deploy_bootstrap(...)` after
+deploy is requested to render per-node config.yaml (+ optional .env) and a
+remote start script. Assignment JSON must never carry plaintext keys.
+"""

@@ -118,6 +118,7 @@ class ClusterHTTPHandler(BaseHTTPRequestHandler):
                 success=bool(body.get("success")),
                 summary=str(body.get("summary") or ""),
                 node_id=str(body.get("node_id") or ""),
+                details=body.get("details") if isinstance(body.get("details"), dict) else None,
             )
             return 200, {"success": True}
 

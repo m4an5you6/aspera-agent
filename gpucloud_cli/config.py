@@ -2109,6 +2109,8 @@ DEFAULT_CONFIG = {
         # Start the master HTTP control plane inside the Agent/Gateway process.
         # Disabled by default to avoid unexpected port binding.
         "embedded_master": False,
+        # Start NodeAgent heartbeat loop inside the Agent/Gateway process (workers).
+        "embedded_worker": False,
         # master | worker | auto — auto resolves from master_url + bind_port.
         "role": "auto",
         "node_id": "",
@@ -2117,12 +2119,16 @@ DEFAULT_CONFIG = {
         "bind_port": 8765,
         # Env var name holding the shared HMAC/bearer secret (see OPTIONAL_ENV_VARS).
         "secret_env": "GPUCLOUD_CLUSTER_SECRET",
+        # Inline cluster secret for internal deployments (env wins when set).
+        "secret": "",
         "heartbeat_interval_sec": 5,
         "heartbeat_ttl_sec": 20,
         "data_dir": "",
         # Postgres URL for control-plane state. Empty → in-memory store (tests/dev).
         "database_url": "",
         "master_epoch": 0,
+        # Optional thin-API URL for inference deploy status projection.
+        "status_callback_url": "",
         # Gateway session key for queue/guide/interrupt event delivery.
         "event_session_key": "",
         "event_routing": {
@@ -2157,6 +2163,21 @@ DEFAULT_CONFIG = {
         "conda": {
             "envs": {},
         },
+    },
+
+    # Pluggable ModelAdapter runtime for cluster inference jobs.
+    "inference_adapters": {
+        "enabled": False,
+        "default_adapter_id": "hf_vllm",
+        "health_poll_seconds": 2,
+        "health_timeout_seconds": 600,
+        "serve_api_key_env": "INFERENCE_API_KEY",
+        # Inline serve key for internal deployments (env name above still works).
+        "serve_api_key": "",
+        # Optional HF token for private weight pulls (internal config.yaml).
+        "hf_token": "",
+        # Thin Inference API callback for deploy status projection (optional).
+        "status_callback_url": "",
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
@@ -2967,6 +2988,15 @@ OPTIONAL_ENV_VARS = {
             "cluster_job_status", "cluster_logs", "cluster_stop_job",
             "cluster_node_action",
         ],
+        "category": "tool",
+        "advanced": True,
+    },
+    "INFERENCE_API_KEY": {
+        "description": "Optional API key protecting locally served inference HTTP endpoints",
+        "prompt": "Inference endpoint API key",
+        "url": None,
+        "password": True,
+        "tools": ["inference_adapter_list"],
         "category": "tool",
         "advanced": True,
     },

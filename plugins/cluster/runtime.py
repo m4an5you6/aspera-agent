@@ -207,3 +207,57 @@ def stop_embedded_master() -> None:
     if runtime and runtime.server:
         runtime.server.stop()
 
+
+_embedded_worker_lock = threading.RLock()
+_embedded_worker_agent: Optional[Any] = None
+_embedded_worker_thread: Optional[threading.Thread] = None
+
+
+def start_embedded_worker() -> Optional[Any]:
+    """Start NodeAgent heartbeat loop in a daemon thread (symmetric to embedded_master)."""
+    global _embedded_worker_agent, _embedded_worker_thread
+
+    cfg = load_cluster_config()
+    if not cfg.enabled or not cfg.embedded_worker:
+        return None
+
+    with _embedded_worker_lock:
+        if _embedded_worker_agent is not None:
+            return _embedded_worker_agent
+
+        from plugins.cluster.node_agent import NodeAgent
+
+        runtime = build_runtime(force_enabled=True)
+        agent = NodeAgent(runtime.cfg, runtime.store, runtime.logger)
+        thread = threading.Thread(
+            target=agent.run_loop,
+            name=f"cluster-embedded-worker-{runtime.cfg.node_id}",
+            daemon=True,
+        )
+        thread.start()
+        _embedded_worker_agent = agent
+        _embedded_worker_thread = thread
+        _log.info(
+            "embedded cluster worker started node_id=%s master_url=%s",
+            runtime.cfg.node_id,
+            runtime.cfg.master_url,
+        )
+        return agent
+
+
+def get_embedded_worker() -> Optional[Any]:
+    with _embedded_worker_lock:
+        return _embedded_worker_agent
+
+
+def stop_embedded_worker() -> None:
+    global _embedded_worker_agent, _embedded_worker_thread
+    with _embedded_worker_lock:
+        agent = _embedded_worker_agent
+        _embedded_worker_agent = None
+        _embedded_worker_thread = None
+    if agent is not None:
+        try:
+            agent.stop()
+        except Exception:
+            _log.exception("error stopping embedded worker")

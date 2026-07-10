@@ -78,10 +78,15 @@ class JobSpec:
     working_dir: str = "."
     job_id: str = field(default_factory=lambda: new_id("job-"))
     idempotency_key: str = ""
+    job_kind: str = "training"  # training | inference
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+    @property
+    def is_inference(self) -> bool:
+        return str(self.job_kind or "").lower() == "inference"
 
 
 @dataclass

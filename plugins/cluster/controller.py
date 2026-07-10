@@ -140,30 +140,59 @@ class ClusterController:
         candidates = [n for n in self.store.list_nodes() if n.state in ("ready", "busy")]
         nnodes = int(norm["nnodes"])
         nproc = int(norm["nproc_per_node"])
+        job_kind = str(norm.get("job_kind") or "training")
+        rejections: List[str] = []
 
-        selected, rejections = select_nodes_for_job(
-            candidates,
-            req,
-            nnodes=nnodes,
-            nproc_per_node=nproc,
-            stale_ids=stale_ids,
-            metrics_by_node={
-                n.node_id: self.store.get_node_metrics(n.node_id) for n in candidates
-            },
-        )
-        if len(selected) < nnodes:
-            return {
-                "success": False,
-                "errors": [
-                    f"need {nnodes} eligible nodes matching job requirements, "
-                    f"have {len(selected)}",
-                    *rejections[:10],
-                ],
-            }
+        preferred_ids: List[str] = []
+        if job_kind == "inference":
+            inf = (norm.get("extra") or {}).get("inference_spec") or {}
+            preferred_ids = [str(x) for x in list((inf.get("gpus") or {}).get("node_ids") or [])]
+
+        if preferred_ids:
+            by_id = {n.node_id: n for n in candidates if n.node_id not in stale_ids}
+            selected = [by_id[i] for i in preferred_ids if i in by_id]
+            if len(selected) < nnodes:
+                return {
+                    "success": False,
+                    "errors": [
+                        f"requested node_ids {preferred_ids} but only "
+                        f"{len(selected)} eligible/registered",
+                    ],
+                }
+            selected = selected[:nnodes]
+        else:
+            selected, rejections = select_nodes_for_job(
+                candidates,
+                req,
+                nnodes=nnodes,
+                nproc_per_node=nproc,
+                stale_ids=stale_ids,
+                metrics_by_node={
+                    n.node_id: self.store.get_node_metrics(n.node_id) for n in candidates
+                },
+            )
+            if len(selected) < nnodes:
+                return {
+                    "success": False,
+                    "errors": [
+                        f"need {nnodes} eligible nodes matching job requirements, "
+                        f"have {len(selected)}",
+                        *rejections[:10],
+                    ],
+                }
 
         master_addr = parse_master_addr(self.cfg.master_url, selected[0].advertised_addr)
         master_port = pick_rendezvous_port(self.cfg)
         world_size = nnodes * nproc
+        if job_kind == "inference":
+            # Inference does not use torchrun rendezvous; keep fields for schema compatibility.
+            serve_port = (
+                (norm.get("extra") or {}).get("inference_spec") or {}
+            ).get("serve", {}).get("port")
+            try:
+                master_port = int(serve_port) if serve_port not in (None, "") else master_port
+            except (TypeError, ValueError):
+                pass
 
         spec = JobSpec(
             job_id=norm["job_id"],
@@ -175,6 +204,7 @@ class ClusterController:
             env=norm["env"],
             working_dir=norm["working_dir"],
             idempotency_key=norm["idempotency_key"],
+            job_kind=job_kind,
             extra=norm.get("extra") or {},
         )
 
@@ -322,14 +352,87 @@ class ClusterController:
         return self.store.ack_assignment(assignment_id, node_id, job_generation, state)
 
     def report_job_outcome(
-        self, job_id: str, *, success: bool, summary: str = "", node_id: str = ""
+        self,
+        job_id: str,
+        *,
+        success: bool,
+        summary: str = "",
+        node_id: str = "",
+        details: Optional[Dict[str, Any]] = None,
     ) -> None:
         state = "succeeded" if success else "failed"
         self.store.update_job_state(job_id, state, error_summary=summary if not success else "")
         event_type = "job_completed" if success else "job_failed"
+        payload: Dict[str, Any] = {"summary": summary or state, "job_id": job_id}
+        if details:
+            payload["details"] = details
         self.events.emit(
             event_type,
-            {"summary": summary or state, "job_id": job_id},
+            payload,
             job_id=job_id,
             node_id=node_id,
         )
+        # Project inference visit info to thin API / status callback when configured.
+        self._maybe_project_inference_status(job_id, success=success, summary=summary, details=details or {})
+
+    def _maybe_project_inference_status(
+        self,
+        job_id: str,
+        *,
+        success: bool,
+        summary: str,
+        details: Dict[str, Any],
+    ) -> None:
+        job = self.store.get_job(job_id)
+        if not job:
+            return
+        extra = job.spec.extra or {}
+        is_inference = (
+            str(getattr(job.spec, "job_kind", "") or "").lower() == "inference"
+            or str(extra.get("job_kind") or "").lower() == "inference"
+        )
+        if not is_inference:
+            return
+        callback = ""
+        if details.get("callback_url"):
+            callback = str(details["callback_url"])
+        if not callback:
+            callback = str(self.cfg.status_callback_url or "").strip()
+        if not callback:
+            try:
+                from gpucloud_cli.config import load_config
+
+                ia = load_config().get("inference_adapters") or {}
+                callback = str(ia.get("status_callback_url") or "").strip()
+            except Exception:
+                callback = ""
+        if not callback:
+            return
+        body = {
+            "job_id": job_id,
+            "success": success,
+            "summary": summary,
+            "status": "available" if success else "failed",
+            "visit_host": details.get("visit_host"),
+            "visit_port": details.get("visit_port"),
+            "protocol": details.get("protocol"),
+            "stream_path": details.get("stream_path"),
+            "adapter_id": details.get("adapter_id"),
+            "deploy_node_id": details.get("deploy_node_id"),
+            "details": details,
+        }
+        try:
+            import httpx
+
+            headers = {"Content-Type": "application/json"}
+            secret = self.cfg.secret
+            if secret:
+                headers["Authorization"] = f"Bearer {secret}"
+            with httpx.Client(timeout=15.0) as client:
+                client.post(callback, json=body, headers=headers)
+        except Exception as exc:
+            self.logger.log_error(
+                error_type="status_callback",
+                message=str(exc),
+                job_id=job_id,
+            )

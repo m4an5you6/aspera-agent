@@ -22,12 +22,15 @@ RouteMode = Literal["record", "queue", "guide", "interrupt", "execute_direct"]
 class ClusterConfig:
     enabled: bool = False
     embedded_master: bool = False
+    embedded_worker: bool = False
     role: ClusterRole = "auto"
     node_id: str = ""
     master_url: str = "http://127.0.0.1:8765"
     bind_host: str = "127.0.0.1"
     bind_port: int = 8765
     secret_env: str = "GPUCLOUD_CLUSTER_SECRET"
+    # Inline secret from config.yaml (internal deployments). Env wins when set.
+    secret_value: str = ""
     heartbeat_interval_sec: int = 5
     heartbeat_ttl_sec: int = 20
     data_dir: Path = field(default_factory=lambda: Path("/tmp/gpucloud-cluster"))
@@ -41,10 +44,15 @@ class ClusterConfig:
     node_paths: Dict[str, Any] = field(default_factory=dict)
     # Logical conda env name -> local prefix or python path.
     conda: Dict[str, Any] = field(default_factory=dict)
+    # Optional thin-API callback for deploy status projection (inference).
+    status_callback_url: str = ""
 
     @property
     def secret(self) -> str:
-        return os.environ.get(self.secret_env, "").strip()
+        return (
+            os.environ.get(self.secret_env, "").strip()
+            or str(self.secret_value or "").strip()
+        )
 
     @property
     def logs_dir(self) -> Path:
@@ -90,12 +98,14 @@ def load_cluster_config(raw: Optional[Dict[str, Any]] = None) -> ClusterConfig:
     return ClusterConfig(
         enabled=bool(raw.get("enabled", False)),
         embedded_master=bool(raw.get("embedded_master", False)),
+        embedded_worker=bool(raw.get("embedded_worker", False)),
         role=str(raw.get("role") or "auto"),  # type: ignore[arg-type]
         node_id=str(raw.get("node_id") or _default_node_id()),
         master_url=str(raw.get("master_url") or "http://127.0.0.1:8765").rstrip("/"),
         bind_host=str(raw.get("bind_host") or "127.0.0.1"),
         bind_port=int(raw["bind_port"]) if raw.get("bind_port") is not None else 8765,
         secret_env=str(raw.get("secret_env") or "GPUCLOUD_CLUSTER_SECRET"),
+        secret_value=str(raw.get("secret") or "").strip(),
         heartbeat_interval_sec=int(raw.get("heartbeat_interval_sec") or 5),
         heartbeat_ttl_sec=int(raw.get("heartbeat_ttl_sec") or 20),
         data_dir=path,
@@ -107,6 +117,7 @@ def load_cluster_config(raw: Optional[Dict[str, Any]] = None) -> ClusterConfig:
         training=dict(raw.get("training") or {}),
         node_paths=dict(raw.get("node_paths") or {}),
         conda=dict(raw.get("conda") or {}),
+        status_callback_url=str(raw.get("status_callback_url") or "").strip(),
     )
 
 

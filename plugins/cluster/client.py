@@ -89,10 +89,19 @@ class ClusterClient:
         })
 
     def report_outcome(
-        self, job_id: str, *, success: bool, summary: str = "", node_id: str = ""
+        self,
+        job_id: str,
+        *,
+        success: bool,
+        summary: str = "",
+        node_id: str = "",
+        details: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        return self._request("POST", f"/api/jobs/{job_id}/outcome", {
+        body: Dict[str, Any] = {
             "success": success,
             "summary": summary,
             "node_id": node_id,
-        })
+        }
+        if details:
+            body["details"] = details
+        return self._request("POST", f"/api/jobs/{job_id}/outcome", body)

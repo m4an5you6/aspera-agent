@@ -34,6 +34,16 @@ def validate_job_spec(raw: Dict[str, Any]) -> ValidationResult:
     errors: List[str] = []
     warnings: List[str] = []
 
+    from plugins.inference_adapters.spec import extract_job_kind, validate_inference_spec
+
+    job_kind = extract_job_kind(raw)
+    if job_kind == "inference":
+        inf_errors, normalized = validate_inference_spec(raw)
+        errors.extend(inf_errors)
+        return ValidationResult(
+            ok=not errors, errors=errors, warnings=warnings, normalized=normalized
+        )
+
     script = str(raw.get("script") or "").strip()
     if not script:
         errors.append("script is required")
@@ -63,6 +73,9 @@ def validate_job_spec(raw: Dict[str, Any]) -> ValidationResult:
     if not isinstance(extra, dict):
         errors.append("extra must be an object")
         extra = {}
+    else:
+        extra = dict(extra)
+    extra.setdefault("job_kind", "training")
 
     # Logical fields may appear at top level or inside extra.
     logical_keys = (
@@ -100,6 +113,7 @@ def validate_job_spec(raw: Dict[str, Any]) -> ValidationResult:
         "working_dir": working_dir,
         "job_id": str(raw.get("job_id") or new_id("job-")),
         "idempotency_key": str(raw.get("idempotency_key") or raw.get("request_id") or ""),
+        "job_kind": "training",
         "extra": extra,
     }
 

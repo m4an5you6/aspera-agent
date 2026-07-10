@@ -23,7 +23,7 @@ from plugins.cluster.tools import (
     handle_cluster_submit_job,
     handle_cluster_validate_config,
 )
-from plugins.cluster.runtime import start_embedded_master
+from plugins.cluster.runtime import start_embedded_master, start_embedded_worker
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +73,7 @@ def register(ctx) -> None:
             session_key=session_id,
             queue_delivery=_queue_to_cli,
         )
+        start_embedded_worker()
 
     def _pre_gateway_dispatch(event: Any = None, gateway: Any = None, session_store: Any = None, **_kwargs: Any) -> None:
         if event is None or gateway is None or session_store is None:
@@ -105,6 +106,7 @@ def register(ctx) -> None:
             session_key=session_key,
             queue_delivery=_queue_to_gateway,
         )
+        start_embedded_worker()
 
     ctx.register_hook("on_session_start", _on_session_start)
     ctx.register_hook("pre_gateway_dispatch", _pre_gateway_dispatch)

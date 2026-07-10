@@ -1,0 +1,6 @@
+name: inference_adapters
+version: 1.0.0
+description: "Pluggable ModelAdapter runtime for cluster inference jobs (hf_vllm reference)."
+author: GPUCLOUD
+provides_tools:
+  - inference_adapter_list

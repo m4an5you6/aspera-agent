@@ -767,7 +767,19 @@ class PostgresClusterStore(ClusterStore):
         spec_raw = data["spec"]
         if isinstance(spec_raw, str):
             spec_raw = json.loads(spec_raw)
-        spec = JobSpec(**spec_raw)
+        if not isinstance(spec_raw, dict):
+            spec_raw = {}
+        # Back-compat: older rows lack job_kind
+        spec_raw = dict(spec_raw)
+        spec_raw.setdefault("job_kind", (spec_raw.get("extra") or {}).get("job_kind") or "training")
+        # Drop unknown keys so JobSpec(**) stays forward/back compatible
+        allowed = {
+            "script", "script_args", "nnodes", "nproc_per_node", "framework",
+            "env", "working_dir", "job_id", "idempotency_key", "job_kind", "extra",
+        }
+        filtered = {k: v for k, v in spec_raw.items() if k in allowed}
+        filtered.setdefault("script", "")
+        spec = JobSpec(**filtered)
         return JobRecord(
             job_id=data["job_id"],
             spec=spec,

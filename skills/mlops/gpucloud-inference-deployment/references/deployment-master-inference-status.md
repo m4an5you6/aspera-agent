@@ -1,28 +1,11 @@
-# ComputingPlatform Deployment-master Inference Status
+# Agent-orchestrated inference status
 
-The `ComputingPlatform-Deployment-master.zip` inference runner is currently disabled.
+Prefer the thin API under ComputingPlatform-Inference:
 
-The source defines statuses as `disabled` and raises:
+- `POST /api/inference/agent/deploy` — after resources are confirmed; submits `job_kind=inference` to the cluster master.
+- `POST /api/inference/agent/status` — master callback projecting `available` / `failed` + visit fields into `inference_deploy_nodes`.
+- `GET /api/inference/agent/deploy/{deploy_node_id}` — poll deploy status.
 
-```text
-inference disabled: app.models.inference_artifact and app.models.inference_deployment are not installed
-```
+Do **not** treat legacy Deployment-master inference stubs as the control plane. Worker-local ModelAdapter (`hf_vllm` or a new adapter) plus cluster heartbeat is the supported path.
 
-Disabled functions include:
-
-- `prepare_inference_artifact_for_job`
-- `create_or_start_deployment`
-- `run_inference_deployment`
-- `spawn_inference_deployment_worker`
-- `stop_inference_deployment`
-- `refresh_inference_deployment`
-- vLLM runtime helpers
-
-## Consequence for GPUCLOUD
-
-Do not claim the one-click deployment backend already provides a working inference deployment API. For now:
-
-- Worker-local vLLM deployment is the reliable path.
-- Backend artifact export can be treated as a source of trained output metadata.
-- UI/backend status writeback needs a separate implemented endpoint or must read GPUCLOUD main worker endpoints.
-- If a user asks for deployment through the backend, first verify that inference models/routes are installed in the active backend.
+Platform backends should read `inference_deploy_nodes` or the GET endpoint — they should not poll GPU worker `/health` themselves.
