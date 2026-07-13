@@ -111,8 +111,14 @@ def test_bootstrap_templates_and_write(tmp_path):
         inference_api_key="inf",
         model_provider="openrouter",
         model_default="test-model",
+        node_id="master-a",
+        master_url="http://10.0.0.1:8765",
     )
     assert "embedded_master: true" in master
+    assert "embedded_worker: true" in master
+    assert "node_id: master-a" in master
+    assert "http://10.0.0.1:8765" in master
+    assert "master_url:" in master
     assert "api_key:" in master
     assert "sk-test" in master
     assert "secret:" in master
@@ -139,8 +145,12 @@ def test_bootstrap_templates_and_write(tmp_path):
     assert plan["master"]["role"] == "master"
     assert plan["workers"][0]["node_id"] == "w1"
     assert "api_key:" in plan["master"]["config_yaml"]
+    assert "embedded_worker: true" in plan["master"]["config_yaml"]
+    assert "node_id: m1" in plan["master"]["config_yaml"]
+    assert "master_url:" in plan["master"]["config_yaml"]
     assert "sk-test" in plan["master"]["script"]
     assert plan["master"]["dotenv"] == ""
+    assert any("embedded_worker" in n for n in plan["notes"])
 
 
 def test_bootstrap_optional_dotenv():
@@ -330,6 +340,46 @@ def test_start_embedded_worker_respects_flag(tmp_path, monkeypatch):
         ):
             agent = start_embedded_worker()
             assert agent is not None
+            stop_embedded_worker()
+
+
+def test_start_embedded_worker_on_master_role(tmp_path, monkeypatch):
+    """GPU master configs dual-enable: role=master + embedded_worker starts NodeAgent."""
+    monkeypatch.setenv("GPUCLOUD_HOME", str(tmp_path / ".gpucloud"))
+    monkeypatch.setenv("GPUCLOUD_CLUSTER_DATA_DIR", str(tmp_path / "cdata"))
+
+    with patch("plugins.cluster.runtime.load_cluster_config") as load_cfg, patch(
+        "plugins.cluster.runtime.build_runtime"
+    ) as build:
+        cfg = ClusterConfig(
+            enabled=True,
+            embedded_master=True,
+            embedded_worker=True,
+            role="master",
+            node_id="master-a",
+            master_url="http://127.0.0.1:8765",
+            data_dir=tmp_path / "cdata",
+        )
+        load_cfg.return_value = cfg
+        store = MemoryClusterStore()
+        store.ensure_schema()
+        logger = ClusterLogger(cfg, store)
+        events = ClusterEventBridge(cfg, store)
+        controller = ClusterController(cfg, store, logger, events)
+        from plugins.cluster.runtime import ClusterRuntime
+
+        build.return_value = ClusterRuntime(
+            cfg=cfg, store=store, logger=logger, events=events, controller=controller
+        )
+        with patch.object(
+            __import__("plugins.cluster.node_agent", fromlist=["NodeAgent"]).NodeAgent,
+            "run_loop",
+            lambda self: None,
+        ):
+            agent = start_embedded_worker()
+            assert agent is not None
+            assert agent.cfg.role == "master"
+            assert agent.cfg.node_id == "master-a"
             stop_embedded_worker()
 
 

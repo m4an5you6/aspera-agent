@@ -2109,7 +2109,10 @@ DEFAULT_CONFIG = {
         # Start the master HTTP control plane inside the Agent/Gateway process.
         # Disabled by default to avoid unexpected port binding.
         "embedded_master": False,
-        # Start NodeAgent heartbeat loop inside the Agent/Gateway process (workers).
+        # Start NodeAgent heartbeat loop inside the Agent/Gateway process.
+        # GPU masters that should receive inference assignments / ensure_runtime
+        # must set this true alongside embedded_master. Pure control-plane
+        # (no GPU) hosts can leave it false.
         "embedded_worker": False,
         # master | worker | auto — auto resolves from master_url + bind_port.
         "role": "auto",

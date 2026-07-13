@@ -15,8 +15,11 @@ plugins:
 cluster:
   enabled: true
   role: master   # or worker
-  embedded_master: true   # master nodes
-  embedded_worker: true   # worker nodes
+  # GPU master: enable both so this host schedules AND can serve / ensure_runtime.
+  # Pure control-plane (no GPU): embedded_master true, embedded_worker false.
+  embedded_master: true
+  embedded_worker: true
+  node_id: master-a          # required when embedded_worker is true
   master_url: http://<master>:8765
   bind_host: 0.0.0.0
   bind_port: 8765
@@ -54,4 +57,8 @@ deploy is requested to render per-node config.yaml (+ optional .env) and a
 remote start script. Assignment JSON must never carry plaintext keys.
 Master selects RuntimeScheme (tasks); workers execute/replan — see
 `skills/mlops/gpucloud-inference-deployment/references/runtime-scheme-contract.md`.
+
+Bootstrap master configs enable ``embedded_worker: true`` so the master host
+registers as a schedulable node (same ensure_runtime / serve path as workers).
+Control-plane-only masters may set ``embedded_worker: false`` after render.
 """

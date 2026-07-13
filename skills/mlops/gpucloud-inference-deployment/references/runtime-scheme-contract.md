@@ -7,7 +7,9 @@ Allowed projected states only: `bootstrapping → submitted → available | fail
 Platform **must**:
 
 1. Confirm job + GPUs, SSH bootstrap master/workers (`plan_deploy_bootstrap`).
-2. Wait until workers have heartbeated with `probe_version >= 1` (or retry submit on `capabilities_incomplete:`).
+   GPU masters render with `embedded_worker: true` so they register and can
+   receive ensure_runtime / serve assignments like other workers.
+2. Wait until nodes (including GPU master) have heartbeated with `probe_version >= 1` (or retry submit on `capabilities_incomplete:`).
 3. Submit coarse inference JSON (no package pins / install steps).
 4. Poll terminal status / accept status callback.
 

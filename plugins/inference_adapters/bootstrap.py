@@ -34,6 +34,8 @@ def render_master_config(
     *,
     bind_host: str = "0.0.0.0",
     bind_port: int = 8765,
+    node_id: str = "",
+    master_url: str = "",
     default_adapter_id: str = "hf_vllm",
     model_provider: str = "",
     model_default: str = "",
@@ -43,6 +45,13 @@ def render_master_config(
     hf_token: str = "",
     inference_api_key: str = "",
 ) -> str:
+    """Render master config.
+
+    GPU masters also enable ``embedded_worker`` so the same host registers as a
+    schedulable node, receives inference assignments, and runs ensure_runtime.
+    Pure control-plane (no GPU) fleets may still set ``embedded_worker: false``
+    by hand after render.
+    """
     provider = model_provider or "openrouter"
     model_lines = [
         "model:",
@@ -53,6 +62,11 @@ def render_master_config(
         model_lines.append(f"  base_url: {_yaml_scalar(model_base_url)}")
     if llm_api_key:
         model_lines.append(f"  api_key: {_yaml_scalar(llm_api_key)}")
+
+    resolved_master_url = (master_url or "").strip() or f"http://127.0.0.1:{int(bind_port)}"
+    node_line = ""
+    if str(node_id or "").strip():
+        node_line = f"\n              node_id: {_yaml_scalar(str(node_id).strip())}"
 
     cluster_extra = ""
     if cluster_secret:
@@ -77,9 +91,10 @@ def render_master_config(
               enabled: true
               role: master
               embedded_master: true
-              embedded_worker: false
+              embedded_worker: true
+              master_url: {_yaml_scalar(resolved_master_url)}
               bind_host: {bind_host}
-              bind_port: {bind_port}
+              bind_port: {bind_port}{node_line}
               heartbeat_interval_sec: 5
               heartbeat_ttl_sec: 20{cluster_extra}
 
@@ -296,7 +311,12 @@ def plan_deploy_bootstrap(
         hf_token=hf_token,
         inference_api_key=inference_api_key,
     )
-    master_cfg = render_master_config(bind_port=bind_port, **common_kw)
+    master_cfg = render_master_config(
+        bind_port=bind_port,
+        node_id=master_node_id,
+        master_url=master_url,
+        **common_kw,
+    )
     workers = []
     for nid in worker_node_ids:
         wcfg = render_worker_config(
@@ -336,5 +356,7 @@ def plan_deploy_bootstrap(
             "Call only after deploy is requested (not pre-pool).",
             "llm_api_key / cluster.secret are written into config.yaml (internal deployments).",
             "Never put api_key in assignment JSON.",
+            "Master enables embedded_worker so it can register, ensure_runtime, and serve like workers.",
+            "Control-plane-only masters (no GPU) may set embedded_worker: false after render.",
         ],
     }

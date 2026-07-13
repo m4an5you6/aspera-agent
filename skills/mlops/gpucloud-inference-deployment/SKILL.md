@@ -23,8 +23,9 @@ Use after training completes when the platform should expose a model through a *
 
 1. Confirm job, GPUs, weights, and the **LLM api_key for agent bring-up** first.
 2. **Deploy starts agent bring-up** — platform `POST /api/inference/agent/deploy` with `bootstrap=true` SSHs to nodes, writes `config.yaml` (`model.api_key`, `cluster.secret`), starts `gpucloud gateway`, then submits the inference job.
-3. Master selects a **RuntimeScheme** (`tasks[]` + mirror/constraints). Worker runs `validate → ensure_runtime → ensure_artifacts → start → health → outcome`. High-frequency **replan** stays on master/worker; platform only sees terminal status.
+3. Master selects a **RuntimeScheme** (`tasks[]` + mirror/constraints). Assigned nodes (including a GPU master with `embedded_worker: true`) run `validate → ensure_runtime → ensure_artifacts → start → health → outcome`. High-frequency **replan** stays on master/worker; platform only sees terminal status.
 4. Never put api keys or package pins in assignment JSON. Use `secrets_ref` env names only.
+5. Multi-node fleets: enable **both** `embedded_master` and `embedded_worker` on the GPU master so it heartbeats, can appear in `gpus.node_ids`, and deploys env like other workers. Pure control-plane masters (no GPU) keep `embedded_worker: false`.
 
 ## Flow
 
@@ -69,8 +70,10 @@ plugins:
 cluster:
   enabled: true
   role: master   # or worker
+  # GPU master: both true. Control-plane-only: embedded_worker false.
   embedded_master: true
   embedded_worker: true
+  node_id: master-a
   master_url: http://<master>:8765
   secret: "<shared-cluster-secret>"
 model:
