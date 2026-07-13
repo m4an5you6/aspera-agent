@@ -122,6 +122,20 @@ class ClusterHTTPHandler(BaseHTTPRequestHandler):
             )
             return 200, {"success": True}
 
+        if path.startswith("/api/jobs/") and path.endswith("/replan") and method == "POST":
+            job_id = path.split("/")[-2]
+            return 200, ctrl.handle_replan(
+                job_id,
+                failed_task_id=str(body.get("failed_task_id") or ""),
+                error=str(body.get("error") or ""),
+                facts=body.get("facts") if isinstance(body.get("facts"), dict) else {},
+                completed_task_ids=body.get("completed_task_ids")
+                if isinstance(body.get("completed_task_ids"), list)
+                else [],
+                stderr_tail=str(body.get("stderr_tail") or ""),
+                node_id=str(body.get("node_id") or ""),
+            )
+
         if path == "/api/nodes/register" and method == "POST":
             node = ctrl.register_node(
                 node_id=str(body.get("node_id") or ""),

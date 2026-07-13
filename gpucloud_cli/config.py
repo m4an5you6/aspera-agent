@@ -2170,7 +2170,7 @@ DEFAULT_CONFIG = {
         "enabled": False,
         "default_adapter_id": "hf_vllm",
         "health_poll_seconds": 2,
-        "health_timeout_seconds": 600,
+        "health_timeout_seconds": 300,
         "serve_api_key_env": "INFERENCE_API_KEY",
         # Inline serve key for internal deployments (env name above still works).
         "serve_api_key": "",
@@ -2178,6 +2178,15 @@ DEFAULT_CONFIG = {
         "hf_token": "",
         # Thin Inference API callback for deploy status projection (optional).
         "status_callback_url": "",
+        # High-frequency RuntimeScheme replan budgets (master/worker).
+        "max_replan_attempts": 16,
+        "max_replan_wall_seconds": 3600,
+        "ensure_runtime_timeout_seconds": 1800,
+        # Named pip mirror profiles (URLs). Master picks profile name on scheme.
+        "mirror_profiles": {},
+        # Optional override of built-in pin matrix / scheme templates (empty = built-in).
+        "runtime_matrix": [],
+        "runtime_schemes": [],
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

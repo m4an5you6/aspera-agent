@@ -105,3 +105,23 @@ class ClusterClient:
         if details:
             body["details"] = details
         return self._request("POST", f"/api/jobs/{job_id}/outcome", body)
+
+    def request_replan(
+        self,
+        job_id: str,
+        *,
+        failed_task_id: str = "",
+        error: str = "",
+        facts: Optional[Dict[str, Any]] = None,
+        completed_task_ids: Optional[list] = None,
+        stderr_tail: str = "",
+        node_id: str = "",
+    ) -> Dict[str, Any]:
+        return self._request("POST", f"/api/jobs/{job_id}/replan", {
+            "failed_task_id": failed_task_id,
+            "error": error,
+            "facts": facts or {},
+            "completed_task_ids": completed_task_ids or [],
+            "stderr_tail": stderr_tail,
+            "node_id": node_id,
+        })

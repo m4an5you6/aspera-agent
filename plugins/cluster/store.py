@@ -222,6 +222,9 @@ class ClusterStore(ABC):
     ) -> bool: ...
 
     @abstractmethod
+    def update_job_extra(self, job_id: str, extra: Dict[str, Any]) -> bool: ...
+
+    @abstractmethod
     def list_jobs(self, limit: int = 50) -> List[JobRecord]: ...
 
     @abstractmethod
@@ -394,6 +397,19 @@ class MemoryClusterStore(ClusterStore):
             job.updated_at = time.time()
             if error_summary:
                 job.error_summary = error_summary
+            return True
+
+    def update_job_extra(self, job_id: str, extra: Dict[str, Any]) -> bool:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return False
+            job.spec.extra = dict(extra or {})
+            job.updated_at = time.time()
+            # Keep assignment job_spec in sync so next heartbeat sees new scheme.
+            for a in self._assignments.values():
+                if a.job_id == job_id:
+                    a.job_spec = job.spec.to_dict()
             return True
 
     def list_jobs(self, limit: int = 50) -> List[JobRecord]:
@@ -833,6 +849,23 @@ class PostgresClusterStore(ClusterStore):
                         """,
                         (state, time.time(), error_summary, job_id),
                     )
+                return cur.rowcount > 0
+
+    def update_job_extra(self, job_id: str, extra: Dict[str, Any]) -> bool:
+        job = self.get_job(job_id)
+        if not job:
+            return False
+        job.spec.extra = dict(extra or {})
+        spec_json = json.dumps(job.spec.to_dict())
+        with self._tx() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE cluster_jobs SET spec=%s, updated_at=%s
+                    WHERE job_id=%s
+                    """,
+                    (spec_json, time.time(), job_id),
+                )
                 return cur.rowcount > 0
 
     def list_jobs(self, limit: int = 50) -> List[JobRecord]:

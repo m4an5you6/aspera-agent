@@ -28,6 +28,7 @@ from plugins.cluster.training import (
 )
 from plugins.cluster.node_capabilities import (
     LogicalJobRequirements,
+    probe_ready,
     select_nodes_for_job,
 )
 
@@ -194,6 +195,48 @@ class ClusterController:
             except (TypeError, ValueError):
                 pass
 
+            # Select RuntimeScheme (tasks-centric) from node capabilities + experience.
+            from plugins.inference_adapters.experience import get_experience_store
+            from plugins.inference_adapters.runtime_scheme import (
+                embed_scheme_in_job_extra,
+                select_initial_scheme,
+            )
+
+            exp = get_experience_store(self.cfg.data_dir)
+            schemes: List[Dict[str, Any]] = []
+            for node in selected:
+                caps = dict(node.capabilities or {})
+                if not caps:
+                    caps = self.store.get_node_metrics(node.node_id) or {}
+                if not probe_ready(caps):
+                    return {
+                        "success": False,
+                        "errors": [f"capabilities_incomplete:{node.node_id}"],
+                    }
+                adapter_id = str(
+                    ((norm.get("extra") or {}).get("adapter_id"))
+                    or ((norm.get("extra") or {}).get("inference_spec") or {}).get("adapter_id")
+                    or "hf_vllm"
+                )
+                scheme, scheme_errs = select_initial_scheme(
+                    caps, adapter_id=adapter_id, experience=exp
+                )
+                if scheme_errs or not scheme:
+                    return {"success": False, "errors": scheme_errs or ["no_scheme_match"]}
+                schemes.append(scheme)
+            matrix_ids = {str(s.get("matrix_id") or s.get("scheme_id")) for s in schemes}
+            if len(matrix_ids) > 1:
+                return {
+                    "success": False,
+                    "errors": ["heterogeneous_runtime:selected nodes need different schemes"],
+                }
+            extra = dict(norm.get("extra") or {})
+            extra = embed_scheme_in_job_extra(extra, schemes[0])
+            # Track replan budget bookkeeping on the job
+            extra["replan_attempts"] = 0
+            extra["attempted_scheme_ids"] = [str(schemes[0].get("scheme_id") or "")]
+            norm["extra"] = extra
+
         spec = JobSpec(
             job_id=norm["job_id"],
             script=norm["script"],
@@ -351,6 +394,145 @@ class ClusterController:
     ) -> bool:
         return self.store.ack_assignment(assignment_id, node_id, job_generation, state)
 
+    def handle_replan(
+        self,
+        job_id: str,
+        *,
+        failed_task_id: str = "",
+        error: str = "",
+        facts: Optional[Dict[str, Any]] = None,
+        completed_task_ids: Optional[List[str]] = None,
+        stderr_tail: str = "",
+        node_id: str = "",
+    ) -> Dict[str, Any]:
+        """Amend RuntimeScheme tasks for a running inference job (high-frequency replan)."""
+        from plugins.inference_adapters.experience import get_experience_store
+        from plugins.inference_adapters.runtime_scheme import (
+            amend_scheme_for_replan,
+            embed_scheme_in_job_extra,
+            get_replan_budget,
+        )
+
+        job = self.store.get_job(job_id)
+        if not job:
+            return {"success": False, "errors": ["job not found"]}
+        extra = dict(job.spec.extra or {})
+        is_inference = (
+            str(getattr(job.spec, "job_kind", "") or "").lower() == "inference"
+            or str(extra.get("job_kind") or "").lower() == "inference"
+        )
+        if not is_inference:
+            return {"success": False, "errors": ["not an inference job"]}
+
+        max_attempts, _wall = get_replan_budget()
+        attempts = int(extra.get("replan_attempts") or 0)
+        if attempts >= max_attempts:
+            self._record_experience(
+                job,
+                outcome="replan_exhausted",
+                facts=facts or {},
+                failed_task_id=failed_task_id,
+                error=error,
+            )
+            self.store.update_job_state(job_id, "failed", error_summary=f"replan_exhausted:{error}")
+            return {"success": False, "errors": [f"replan_exhausted:{error}"]}
+
+        current = extra.get("runtime_scheme") or (extra.get("inference_spec") or {}).get("runtime", {}).get(
+            "scheme"
+        )
+        if not isinstance(current, dict):
+            return {"success": False, "errors": ["no runtime_scheme on job"]}
+
+        exp = get_experience_store(self.cfg.data_dir)
+        # Record this failure attempt for sharing
+        exp.record(
+            facts=facts or {},
+            scheme_id=str(current.get("scheme_id") or ""),
+            tasks=list(current.get("tasks") or []),
+            outcome="fail",
+            failed_task_id=failed_task_id,
+            error=error,
+            mirror_profile=str(current.get("mirror_profile") or "default"),
+        )
+
+        attempted = list(extra.get("attempted_scheme_ids") or [])
+        new_scheme, errs = amend_scheme_for_replan(
+            current,
+            facts=facts or {},
+            failed_task_id=failed_task_id,
+            error=error,
+            experience=exp,
+            attempted_scheme_ids=attempted,
+        )
+        if errs or not new_scheme:
+            self._record_experience(
+                job,
+                outcome="replan_exhausted",
+                facts=facts or {},
+                failed_task_id=failed_task_id,
+                error="; ".join(errs or ["replan failed"]),
+            )
+            self.store.update_job_state(
+                job_id, "failed", error_summary="; ".join(errs or ["replan failed"])
+            )
+            return {"success": False, "errors": errs or ["replan failed"]}
+
+        attempts += 1
+        sid = str(new_scheme.get("scheme_id") or "")
+        if sid and sid not in attempted:
+            attempted.append(sid)
+        extra["replan_attempts"] = attempts
+        extra["attempted_scheme_ids"] = attempted
+        extra["last_replan"] = {
+            "failed_task_id": failed_task_id,
+            "error": error,
+            "completed_task_ids": list(completed_task_ids or []),
+            "stderr_tail": (stderr_tail or "")[-500:],
+            "node_id": node_id,
+        }
+        extra = embed_scheme_in_job_extra(extra, new_scheme)
+        self.store.update_job_extra(job_id, extra)
+        self.events.emit(
+            "job_replanned",
+            {
+                "job_id": job_id,
+                "replan_generation": new_scheme.get("replan_generation"),
+                "scheme_id": new_scheme.get("scheme_id"),
+                "failed_task_id": failed_task_id,
+            },
+            job_id=job_id,
+            node_id=node_id,
+        )
+        return {"success": True, "scheme": new_scheme, "replan_attempts": attempts}
+
+    def _record_experience(
+        self,
+        job: JobRecord,
+        *,
+        outcome: str,
+        facts: Dict[str, Any],
+        failed_task_id: str = "",
+        error: str = "",
+    ) -> None:
+        try:
+            from plugins.inference_adapters.experience import get_experience_store
+
+            extra = job.spec.extra or {}
+            scheme = extra.get("runtime_scheme") or {}
+            if not isinstance(scheme, dict):
+                return
+            get_experience_store(self.cfg.data_dir).record(
+                facts=facts,
+                scheme_id=str(scheme.get("scheme_id") or ""),
+                tasks=list(scheme.get("tasks") or []),
+                outcome=outcome,
+                failed_task_id=failed_task_id,
+                error=error,
+                mirror_profile=str(scheme.get("mirror_profile") or "default"),
+            )
+        except Exception:
+            pass
+
     def report_job_outcome(
         self,
         job_id: str,
@@ -372,6 +554,20 @@ class ClusterController:
             job_id=job_id,
             node_id=node_id,
         )
+        # Experience: record success with effective tasks
+        job = self.store.get_job(job_id)
+        if job and str(getattr(job.spec, "job_kind", "") or "").lower() == "inference":
+            facts = {}
+            if isinstance(details, dict):
+                needs = details.get("needs_replan") if isinstance(details.get("needs_replan"), dict) else {}
+                facts = dict(needs.get("facts") or details.get("facts") or {})
+            self._record_experience(
+                job,
+                outcome="success" if success else "fail",
+                facts=facts,
+                failed_task_id=str((details or {}).get("phase") or "") if not success else "",
+                error=summary if not success else "",
+            )
         # Project inference visit info to thin API / status callback when configured.
         self._maybe_project_inference_status(job_id, success=success, summary=summary, details=details or {})
 

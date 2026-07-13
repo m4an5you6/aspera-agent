@@ -26,11 +26,17 @@ inference_adapters:
   enabled: true
   default_adapter_id: hf_vllm
   health_poll_seconds: 2
-  health_timeout_seconds: 600
+  health_timeout_seconds: 300
   serve_api_key_env: INFERENCE_API_KEY
   serve_api_key: ""       # optional protect local vLLM HTTP
   hf_token: ""            # optional private weight pull
   status_callback_url: "" # optional thin API callback for deploy status projection
+  max_replan_attempts: 16
+  max_replan_wall_seconds: 3600
+  ensure_runtime_timeout_seconds: 1800
+  mirror_profiles: {}     # optional named pip indexes; empty uses built-in default
+  runtime_matrix: []      # optional pin matrix override; empty uses built-in
+  runtime_schemes: []     # optional scheme templates; empty uses built-in
 ```
 
 # Optional legacy .env (not required when keys are in config.yaml)
@@ -46,4 +52,6 @@ inference_adapters:
 Use `plugins.inference_adapters.bootstrap.plan_deploy_bootstrap(...)` after
 deploy is requested to render per-node config.yaml (+ optional .env) and a
 remote start script. Assignment JSON must never carry plaintext keys.
+Master selects RuntimeScheme (tasks); workers execute/replan — see
+`skills/mlops/gpucloud-inference-deployment/references/runtime-scheme-contract.md`.
 """

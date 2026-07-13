@@ -298,6 +298,27 @@ class NodeAgent:
 
         stop_requested = lambda: assignment.job_id in self._stopping_jobs
 
+        def _replan_callback(needs) -> dict:
+            resp = self.client.request_replan(
+                assignment.job_id,
+                failed_task_id=getattr(needs, "failed_task_id", "") or "",
+                error=getattr(needs, "error", "") or str(needs),
+                facts=getattr(needs, "facts", None) or {},
+                completed_task_ids=getattr(needs, "completed_task_ids", None) or [],
+                stderr_tail=getattr(needs, "stderr_tail", "") or "",
+                node_id=self.cfg.node_id,
+            )
+            if not resp.get("success") or not isinstance(resp.get("scheme"), dict):
+                from plugins.inference_adapters.task_runner import NeedsReplan
+
+                raise NeedsReplan(
+                    failed_task_id=getattr(needs, "failed_task_id", "") or "",
+                    error="; ".join(resp.get("errors") or [str(resp)]),
+                    facts=getattr(needs, "facts", None) or {},
+                    completed_task_ids=getattr(needs, "completed_task_ids", None) or [],
+                )
+            return resp["scheme"]
+
         def _on_outcome(success: bool, summary: str, details: dict) -> None:
             try:
                 self.client.ack_assignment(
@@ -336,6 +357,7 @@ class NodeAgent:
                     on_outcome=_on_outcome,
                     stop_flag=stop_requested,
                     adapter=adapter,
+                    replan_callback=_replan_callback,
                 )
             finally:
                 stop_job_adapter(assignment.job_id)

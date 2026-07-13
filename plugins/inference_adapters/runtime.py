@@ -1,4 +1,4 @@
-"""Fixed inference lifecycle runner: validate → ensure → start → health → outcome."""
+"""Fixed inference lifecycle runner: validate → ensure_runtime → ensure → start → health → outcome."""
 
 from __future__ import annotations
 
@@ -9,10 +9,12 @@ from typing import Any, Callable, Dict, Optional
 from plugins.inference_adapters.base import EndpointInfo, HealthState, ModelAdapter
 from plugins.inference_adapters.registry import create_adapter
 from plugins.inference_adapters.spec import extract_inference_spec
+from plugins.inference_adapters.task_runner import NeedsReplan
 
 _log = logging.getLogger(__name__)
 
 OutcomeCallback = Callable[[bool, str, Dict[str, Any]], None]
+ReplanCallback = Callable[[NeedsReplan], Dict[str, Any]]
 
 
 def _load_runtime_config() -> Dict[str, Any]:
@@ -26,26 +28,39 @@ def _load_runtime_config() -> Dict[str, Any]:
         return {}
 
 
+def _merge_inference_spec(job_spec: Dict[str, Any]) -> Dict[str, Any]:
+    inference_spec = extract_inference_spec(job_spec)
+    extra = job_spec.get("extra") if isinstance(job_spec.get("extra"), dict) else {}
+    if isinstance(extra.get("inference_spec"), dict):
+        inference_spec = extract_inference_spec({**extra["inference_spec"], **job_spec})
+    # Attach runtime.scheme from extra.runtime_scheme when missing
+    runtime = inference_spec.get("runtime") if isinstance(inference_spec.get("runtime"), dict) else {}
+    if not runtime.get("scheme") and isinstance(extra.get("runtime_scheme"), dict):
+        runtime = dict(runtime)
+        runtime["scheme"] = dict(extra["runtime_scheme"])
+        inference_spec["runtime"] = runtime
+    return inference_spec
+
+
 def run_inference_lifecycle(
     *,
     job_spec: Dict[str, Any],
     on_outcome: OutcomeCallback,
     stop_flag: Optional[Callable[[], bool]] = None,
     adapter: Optional[ModelAdapter] = None,
+    replan_callback: Optional[ReplanCallback] = None,
 ) -> Dict[str, Any]:
     """Execute the fixed adapter lifecycle and invoke on_outcome.
 
+    Phase order: validate → ensure_runtime → ensure_artifacts → start → health → outcome.
     ``on_outcome(success, summary, details)`` — details may include endpoint visit fields.
     """
     rt = _load_runtime_config()
     poll_s = float(rt.get("health_poll_seconds") or 2)
-    timeout_s = float(rt.get("health_timeout_seconds") or 600)
+    timeout_s = float(rt.get("health_timeout_seconds") or 300)
 
-    inference_spec = extract_inference_spec(job_spec)
-    # Prefer nested inference_spec from cluster JobSpec.extra
+    inference_spec = _merge_inference_spec(job_spec)
     extra = job_spec.get("extra") if isinstance(job_spec.get("extra"), dict) else {}
-    if isinstance(extra.get("inference_spec"), dict):
-        inference_spec = extract_inference_spec({**extra["inference_spec"], **job_spec})
 
     adapter_id = str(
         inference_spec.get("adapter_id")
@@ -68,6 +83,30 @@ def run_inference_lifecycle(
         msg = "; ".join(errors)
         on_outcome(False, msg, {"phase": "validate", "adapter_id": adapter_id})
         return {"success": False, "error": msg}
+
+    # Stash replan callback for adapters that support it (hf_vllm).
+    if replan_callback is not None:
+        inference_spec = dict(inference_spec)
+        inference_spec["_replan_callback"] = replan_callback
+        inference_spec["_stop_flag"] = stop_flag
+
+    try:
+        ad.ensure_runtime(inference_spec)
+    except NeedsReplan as needs:
+        on_outcome(
+            False,
+            needs.error,
+            {
+                "phase": "ensure_runtime",
+                "adapter_id": adapter_id,
+                "needs_replan": needs.to_dict(),
+            },
+        )
+        return {"success": False, "error": needs.error, "needs_replan": needs.to_dict()}
+    except Exception as exc:
+        _log.exception("ensure_runtime failed for %s", adapter_id)
+        on_outcome(False, str(exc), {"phase": "ensure_runtime", "adapter_id": adapter_id})
+        return {"success": False, "error": str(exc)}
 
     try:
         artifacts = ad.ensure_artifacts(inference_spec)
@@ -121,8 +160,6 @@ def run_inference_lifecycle(
             on_outcome(True, "inference ready", details)
             return {"success": True, "endpoint": endpoint.to_dict(), "details": details}
         if last == "dead":
-            # Keep polling until timeout unless process clearly dead repeatedly —
-            # adapters may report dead briefly during startup.
             pass
         time.sleep(max(0.2, poll_s))
 

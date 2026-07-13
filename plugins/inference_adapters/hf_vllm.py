@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.request import Request, urlopen
 
+from plugins.cluster.runtime_probe import resolve_inference_python
 from plugins.inference_adapters.base import ArtifactPaths, EndpointInfo, HealthState, ModelAdapter
 from plugins.inference_adapters.registry import register_adapter
 from plugins.inference_adapters.spec import resolve_secret_env
@@ -38,6 +39,7 @@ class HfVllmAdapter(ModelAdapter):
         self._proc: Optional[subprocess.Popen] = None
         self._endpoint: Optional[EndpointInfo] = None
         self._log_paths: Dict[str, Path] = {}
+        self._runtime_facts: Dict[str, Any] = {}
 
     def validate(self, spec: Dict[str, Any]) -> List[str]:
         errors: List[str] = []
@@ -62,6 +64,56 @@ class HfVllmAdapter(ModelAdapter):
             errors.append("gpus.tensor_parallel must be an integer")
         return errors
 
+    def ensure_runtime(self, spec: Dict[str, Any]) -> None:
+        """Run RuntimeScheme.tasks via task_runner (with optional replan callback)."""
+        from plugins.inference_adapters.runtime_scheme import get_replan_budget
+        from plugins.inference_adapters.task_runner import NeedsReplan, run_scheme_tasks
+
+        runtime = spec.get("runtime") if isinstance(spec.get("runtime"), dict) else {}
+        scheme = runtime.get("scheme") if isinstance(runtime.get("scheme"), dict) else None
+        if not scheme:
+            # No scheme embedded — nothing to install (legacy callers).
+            return
+
+        replan_cb = spec.get("_replan_callback")
+        stop_flag = spec.get("_stop_flag")
+        max_attempts, max_wall = get_replan_budget()
+
+        log_dir = Path(
+            os.environ.get("GPUCLOUD_INFERENCE_LOG_DIR")
+            or (Path(os.environ.get("GPUCLOUD_HOME", str(Path.home() / ".gpucloud"))) / "cluster" / "inference-logs")
+        )
+        job_id = str(spec.get("job_id") or "inference")
+        job_log_dir = log_dir / job_id
+
+        initial_facts = {
+            "python_executable": str(
+                (scheme.get("constraints") or {}).get("python_executable")
+                or resolve_inference_python()
+            ),
+        }
+
+        try:
+            result = run_scheme_tasks(
+                scheme,
+                initial_facts=initial_facts,
+                replan_callback=replan_cb if callable(replan_cb) else None,
+                stop_flag=stop_flag if callable(stop_flag) else None,
+                log_dir=job_log_dir,
+                max_replan_attempts=max_attempts,
+                max_replan_wall_seconds=max_wall,
+            )
+        except NeedsReplan:
+            raise
+        self._runtime_facts = dict(result.facts)
+        # Persist resolved python back onto spec runtime for start()
+        runtime = dict(runtime)
+        runtime["python_executable"] = str(
+            result.facts.get("python_executable") or initial_facts["python_executable"]
+        )
+        runtime["facts"] = dict(result.facts)
+        spec["runtime"] = runtime
+
     def ensure_artifacts(self, spec: Dict[str, Any]) -> ArtifactPaths:
         model = spec.get("model") if isinstance(spec.get("model"), dict) else {}
         local_path = Path(str(model.get("local_path") or "")).expanduser()
@@ -80,10 +132,20 @@ class HfVllmAdapter(ModelAdapter):
         port = int(serve.get("port") or 8000)
         tp = int(gpus.get("tensor_parallel") or 1)
         visible = gpus.get("visible_devices")
-        extra_args = list(serve.get("extra_args") or spec.get("adapter_options", {}).get("extra_args") or [])
+        runtime = spec.get("runtime") if isinstance(spec.get("runtime"), dict) else {}
+        scheme = runtime.get("scheme") if isinstance(runtime.get("scheme"), dict) else {}
+        scheme_extra = list((scheme.get("constraints") or {}).get("extra_args") or [])
+        extra_args = list(
+            serve.get("extra_args")
+            or spec.get("adapter_options", {}).get("extra_args")
+            or scheme_extra
+            or []
+        )
 
         env = os.environ.copy()
         env.update({str(k): str(v) for k, v in dict(spec.get("env") or {}).items()})
+        if isinstance(scheme.get("constraints"), dict) and isinstance(scheme["constraints"].get("env"), dict):
+            env.update({str(k): str(v) for k, v in scheme["constraints"]["env"].items()})
         if isinstance(visible, list) and visible:
             env["CUDA_VISIBLE_DEVICES"] = ",".join(str(x) for x in visible)
 
@@ -92,11 +154,16 @@ class HfVllmAdapter(ModelAdapter):
             secrets_ref.get("serve_api_key_env")
             or ""
         ).strip()
-        # Also honor config default name via env already present
         api_key = resolve_secret_env(api_key_env) if api_key_env else resolve_secret_env("INFERENCE_API_KEY")
 
+        python_exe = str(
+            runtime.get("python_executable")
+            or self._runtime_facts.get("python_executable")
+            or resolve_inference_python()
+        )
+
         cmd = [
-            env.get("VLLM_PYTHON") or env.get("INFERENCE_PYTHON") or "python",
+            python_exe,
             "-m",
             "vllm.entrypoints.openai.api_server",
             "--model",
@@ -109,7 +176,6 @@ class HfVllmAdapter(ModelAdapter):
             str(tp),
         ]
         if api_key:
-            # vLLM OpenAI server accepts --api-key on recent versions; also export for wrappers
             env["VLLM_API_KEY"] = api_key
             cmd.extend(["--api-key", api_key])
         cmd.extend(str(a) for a in extra_args)
@@ -134,7 +200,6 @@ class HfVllmAdapter(ModelAdapter):
             stderr=stderr_f,
             start_new_session=True,
         )
-        # Prefer advertised host for visit info when binding 0.0.0.0
         visit_host = os.environ.get("GPUCLOUD_CLUSTER_ADVERTISED_ADDR", "").strip()
         if not visit_host or host not in ("0.0.0.0", "::"):
             visit_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
@@ -164,7 +229,6 @@ class HfVllmAdapter(ModelAdapter):
                     return "ready"
                 return "degraded"
         except Exception:
-            # Startup window
             if self._proc is not None and self._proc.poll() is None:
                 return "degraded"
             return "dead"

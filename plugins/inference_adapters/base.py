@@ -45,6 +45,10 @@ class ModelAdapter(ABC):
     def validate(self, spec: Dict[str, Any]) -> List[str]:
         """Return validation errors (empty = ok). Must not start processes."""
 
+    def ensure_runtime(self, spec: Dict[str, Any]) -> None:
+        """Install/verify runtime per spec['runtime'].scheme tasks. Default: no-op."""
+        return None
+
     @abstractmethod
     def ensure_artifacts(self, spec: Dict[str, Any]) -> ArtifactPaths:
         """Prepare local loadable artifacts (pull/convert as needed)."""

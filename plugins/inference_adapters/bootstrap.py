@@ -87,7 +87,7 @@ def render_master_config(
               enabled: true
               default_adapter_id: {default_adapter_id}
               health_poll_seconds: 2
-              health_timeout_seconds: 600
+              health_timeout_seconds: 300
               serve_api_key_env: INFERENCE_API_KEY{ia_extra}
             """
         ).lstrip()
@@ -151,7 +151,7 @@ def render_worker_config(
               enabled: true
               default_adapter_id: {default_adapter_id}
               health_poll_seconds: 2
-              health_timeout_seconds: 600
+              health_timeout_seconds: 300
               serve_api_key_env: INFERENCE_API_KEY{ia_extra}
             """
         ).lstrip()

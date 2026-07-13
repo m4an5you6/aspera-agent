@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from plugins.cluster.config import ClusterConfig
 from plugins.cluster.models import GpuInfo, JobSpec, NodeRecord, RankAssignment, ValidationResult
+from plugins.cluster.runtime_probe import probe_python_stack, resolve_inference_python
 from plugins.cluster.training import build_torchrun_command
 
 
@@ -129,8 +132,60 @@ def resolve_python_executable(cfg: ClusterConfig, env_name: str = "") -> Tuple[s
     return default, errors
 
 
+def _probe_nvidia_driver() -> Tuple[str, int, int]:
+    """Return (driver_version, cuda_driver_major, cuda_driver_minor). Best-effort."""
+    driver = ""
+    major = 0
+    minor = 0
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            driver = proc.stdout.strip().splitlines()[0].strip()
+    except Exception:
+        pass
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        for line in (proc.stdout or "").splitlines():
+            if "CUDA Version" in line:
+                m = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", line)
+                if m:
+                    major = int(m.group(1))
+                    minor = int(m.group(2))
+                break
+    except Exception:
+        pass
+    if major == 0 and driver:
+        try:
+            drv_major = int(driver.split(".")[0])
+            if drv_major >= 525:
+                major = 12
+                minor = 0
+            elif drv_major >= 450:
+                major = 11
+                minor = 0
+        except (TypeError, ValueError, IndexError):
+            pass
+    return driver, major, minor
+
+
 def collect_local_metrics(cfg: ClusterConfig, gpus: Optional[List[GpuInfo]] = None) -> Dict[str, Any]:
-    """Build heartbeat metrics from local node config and runtime state."""
+    """Build heartbeat metrics from local node config and runtime state.
+
+    Includes progressive inference probe fields (probe_version >= 1) used by
+    master RuntimeScheme selection. Must never raise.
+    """
     node_paths = cfg.node_paths if hasattr(cfg, "node_paths") else {}
     conda_cfg = cfg.conda if hasattr(cfg, "conda") else {}
 
@@ -148,24 +203,47 @@ def collect_local_metrics(cfg: ClusterConfig, gpus: Optional[List[GpuInfo]] = No
 
     gpu_list = gpus or []
     gpu_count = len(gpu_list)
-    cuda_version = ""
-    try:
-        import torch
 
-        if torch.cuda.is_available():
-            cuda_version = str(getattr(torch.version, "cuda", "") or "")
-    except Exception:
-        pass
+    python_executable = resolve_inference_python()
+    nvidia_driver, cuda_driver_major, cuda_driver_minor = _probe_nvidia_driver()
+    stack = probe_python_stack(python_executable)
 
     return {
+        "probe_version": 1,
+        "probe_ok": bool(python_executable) and gpu_count >= 1,
+        "python_executable": python_executable,
+        "python_version": str(stack.get("python_version") or ""),
+        "nvidia_driver": nvidia_driver,
+        "cuda_driver_major": int(cuda_driver_major or 0),
+        "cuda_driver_minor": int(cuda_driver_minor or 0),
+        "torch_version": str(stack.get("torch_version") or ""),
+        "torch_cuda": str(stack.get("torch_cuda") or ""),
+        "torch_available": bool(stack.get("torch_available")),
+        "vllm_version": str(stack.get("vllm_version") or ""),
+        "vllm_available": bool(stack.get("vllm_available")),
         "conda_envs": sorted(conda_envs),
         "code_roots": sorted(str(k) for k in code_roots.keys()) if isinstance(code_roots, dict) else [],
         "data_roots": sorted(str(k) for k in data_roots.keys()) if isinstance(data_roots, dict) else [],
         "checkpoint_roots": sorted(str(k) for k in checkpoint_roots.keys()) if isinstance(checkpoint_roots, dict) else [],
         "scratch_free_gb": scratch_free,
         "gpu_count": gpu_count,
-        "cuda_version": cuda_version,
+        "cuda_version": str(stack.get("cuda_version") or ""),
     }
+
+
+def probe_ready(capabilities: Optional[Dict[str, Any]]) -> bool:
+    """True when heartbeat capabilities are sufficient for inference scheme selection."""
+    caps = capabilities if isinstance(capabilities, dict) else {}
+    try:
+        version = int(caps.get("probe_version") or 0)
+    except (TypeError, ValueError):
+        version = 0
+    python_executable = str(caps.get("python_executable") or "").strip()
+    try:
+        gpu_count = int(caps.get("gpu_count") or 0)
+    except (TypeError, ValueError):
+        gpu_count = 0
+    return version >= 1 and bool(python_executable) and gpu_count >= 1
 
 
 def _node_metrics(node: NodeRecord, metrics: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

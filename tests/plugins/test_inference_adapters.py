@@ -179,6 +179,9 @@ def test_load_cluster_config_embedded_worker(tmp_path, monkeypatch):
 
 
 def test_controller_submit_inference(tmp_path):
+    from plugins.inference_adapters.experience import reset_experience_store_for_tests
+
+    reset_experience_store_for_tests()
     cfg = ClusterConfig(
         enabled=True,
         role="master",
@@ -195,19 +198,36 @@ def test_controller_submit_inference(tmp_path):
     controller = ClusterController(cfg, store, logger, events)
     set_runtime(controller=controller, store=store, logger=logger, events=events)
 
+    caps = {
+        "probe_version": 1,
+        "probe_ok": True,
+        "python_executable": "/usr/bin/python3",
+        "python_version": "3.10.12",
+        "nvidia_driver": "535.0",
+        "cuda_driver_major": 12,
+        "cuda_driver_minor": 2,
+        "torch_available": False,
+        "vllm_available": False,
+        "gpu_count": 1,
+    }
     store.upsert_node(
         NodeRecord(
             node_id="gpu-node-03",
             advertised_addr="10.0.0.3",
             state="ready",
             gpus=[GpuInfo(index=0, name="GPU", memory_mb=24000)],
+            capabilities=dict(caps),
         )
     )
-    # Fresh heartbeat so node is not stale
     from plugins.cluster.models import HeartbeatPayload
 
     store.record_heartbeat(
-        HeartbeatPayload(node_id="gpu-node-03", state="ready", gpus=[GpuInfo(index=0)])
+        HeartbeatPayload(
+            node_id="gpu-node-03",
+            state="ready",
+            gpus=[GpuInfo(index=0)],
+            metrics=dict(caps),
+        )
     )
 
     result = controller.submit_job(
@@ -224,6 +244,12 @@ def test_controller_submit_inference(tmp_path):
     assert result["success"] is True
     assert result["job"]["spec"]["job_kind"] == "inference"
     assert result["assignments"][0]["node_id"] == "gpu-node-03"
+    extra = result["job"]["spec"]["extra"]
+    assert "runtime_scheme" in extra
+    scheme = extra["runtime_scheme"]
+    assert isinstance(scheme.get("tasks"), list) and scheme["tasks"]
+    assert "pip_packages" not in scheme  # no full BOM
+    assert extra["inference_spec"]["runtime"]["scheme"]["scheme_id"] == scheme["scheme_id"]
 
 
 def test_run_lifecycle_with_fake_adapter():
@@ -305,3 +331,320 @@ def test_start_embedded_worker_respects_flag(tmp_path, monkeypatch):
             agent = start_embedded_worker()
             assert agent is not None
             stop_embedded_worker()
+
+
+def _caps(**overrides):
+    base = {
+        "probe_version": 1,
+        "probe_ok": True,
+        "python_executable": "/usr/bin/python3",
+        "python_version": "3.10.12",
+        "nvidia_driver": "535.0",
+        "cuda_driver_major": 12,
+        "cuda_driver_minor": 2,
+        "torch_available": False,
+        "torch_version": "",
+        "vllm_available": False,
+        "vllm_version": "",
+        "gpu_count": 1,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_probe_ready_and_select_scheme():
+    from plugins.cluster.node_capabilities import probe_ready
+    from plugins.inference_adapters.experience import ExperienceStore, reset_experience_store_for_tests
+    from plugins.inference_adapters.runtime_scheme import select_initial_scheme
+
+    reset_experience_store_for_tests()
+    assert probe_ready(_caps()) is True
+    assert probe_ready({"probe_version": 1, "python_executable": "", "gpu_count": 1}) is False
+
+    scheme, errs = select_initial_scheme(_caps(), adapter_id="hf_vllm")
+    assert not errs
+    assert scheme and scheme["scheme_id"].startswith("hf_vllm.cu12")
+    assert isinstance(scheme["tasks"], list)
+
+    # already satisfied preferred
+    scheme2, errs2 = select_initial_scheme(
+        _caps(torch_available=True, vllm_available=True, vllm_version="0.6.6", torch_version="2.5.1"),
+        adapter_id="hf_vllm",
+    )
+    assert not errs2
+    assert "satisfied" in scheme2["reason"] or scheme2["scheme_id"]
+
+    bad, errs_bad = select_initial_scheme(_caps(cuda_driver_major=11), adapter_id="hf_vllm")
+    assert bad is None
+    assert any("no_scheme_match" in e for e in errs_bad)
+
+
+def test_task_runner_skips_ensure_when_available(monkeypatch):
+    from plugins.inference_adapters.runtime_scheme import instantiate_scheme, get_scheme_templates
+    from plugins.inference_adapters.task_runner import run_scheme_tasks
+
+    template = get_scheme_templates()[0]
+    scheme = instantiate_scheme(template, reason="test")
+    facts = {
+        "python_executable": "python3",
+        "torch_available": True,
+        "vllm_available": True,
+        "extras_missing": False,
+    }
+
+    # probe should refresh facts; stub probe to keep satisfied flags
+    import plugins.inference_adapters.task_runner as tr
+
+    def fake_probe(py, facts_dict):
+        facts_dict.update(
+            {
+                "torch_available": True,
+                "vllm_available": True,
+                "python_version": "3.10.12",
+                "extras_missing": False,
+            }
+        )
+
+    monkeypatch.setattr(tr, "_probe_into_facts", fake_probe)
+    pip_calls = []
+
+    def fake_pip(*a, **k):
+        pip_calls.append((a, k))
+        return True, ""
+
+    monkeypatch.setattr(tr, "_run_pip_install", fake_pip)
+    monkeypatch.setattr(tr, "_verify_imports", lambda *a, **k: (True, ""))
+
+    result = run_scheme_tasks(scheme, initial_facts=facts, max_replan_attempts=3)
+    assert "probe_stack" in result.completed_task_ids or "probe_stack" in result.skipped_task_ids
+    # ensure_* should be skipped because when=false
+    assert "ensure_torch" in result.skipped_task_ids
+    assert "ensure_vllm" in result.skipped_task_ids
+    assert pip_calls == []
+
+
+def test_task_runner_replan_callback(monkeypatch):
+    from plugins.inference_adapters.task_runner import NeedsReplan, run_scheme_tasks
+
+    scheme = {
+        "scheme_id": "s1",
+        "mirror_profile": "default",
+        "constraints": {"allow_install": True, "forbid_unpinned": True},
+        "replan_generation": 0,
+        "tasks": [
+            {"id": "ensure_vllm", "type": "ensure_package", "pin_ref": "matrix:missing/vllm", "when": "always"},
+            {"id": "verify_stack", "type": "verify", "imports": ["vllm"]},
+        ],
+    }
+
+    import plugins.inference_adapters.task_runner as tr
+
+    monkeypatch.setattr(tr, "_probe_into_facts", lambda *a, **k: None)
+
+    calls = {"n": 0}
+
+    def replan(needs: NeedsReplan):
+        calls["n"] += 1
+        assert needs.failed_task_id == "ensure_vllm"
+        return {
+            "scheme_id": "s2",
+            "mirror_profile": "default",
+            "constraints": {"allow_install": True},
+            "replan_generation": 1,
+            "tasks": [
+                {"id": "verify_stack", "type": "verify", "imports": ["vllm"]},
+            ],
+        }
+
+    monkeypatch.setattr(tr, "_verify_imports", lambda *a, **k: (True, ""))
+    result = run_scheme_tasks(
+        scheme,
+        initial_facts={"python_executable": "python3"},
+        replan_callback=replan,
+        max_replan_attempts=5,
+    )
+    assert calls["n"] == 1
+    assert "verify_stack" in result.completed_task_ids
+
+
+def test_experience_shared_across_lookups(tmp_path):
+    from plugins.inference_adapters.experience import ExperienceStore, facts_fingerprint
+
+    store = ExperienceStore(tmp_path / "exp.sqlite")
+    caps = _caps(torch_available=True, vllm_available=True, vllm_version="0.6.6")
+    tasks = [{"id": "verify_stack", "type": "verify", "imports": ["vllm"]}]
+    store.record(
+        facts=caps,
+        scheme_id="hf_vllm.cu12.py310",
+        tasks=tasks,
+        outcome="success",
+        mirror_profile="default",
+    )
+    hit = store.best_success(caps)
+    assert hit is not None
+    assert hit.scheme_id == "hf_vllm.cu12.py310"
+    assert hit.effective_tasks == tasks
+    assert facts_fingerprint(caps) == hit.facts_fingerprint
+
+    store.record(
+        facts=caps,
+        scheme_id="hf_vllm.cu12.py310",
+        tasks=tasks,
+        outcome="fail",
+        failed_task_id="ensure_vllm",
+        error="no matching distribution",
+    )
+    assert store.is_known_failure(
+        caps, scheme_id="hf_vllm.cu12.py310", failed_task_id="ensure_vllm", error="no matching distribution"
+    )
+
+
+def test_controller_capabilities_incomplete(tmp_path):
+    from plugins.inference_adapters.experience import reset_experience_store_for_tests
+
+    reset_experience_store_for_tests()
+    cfg = ClusterConfig(
+        enabled=True,
+        role="master",
+        node_id="master",
+        master_url="http://127.0.0.1:8765",
+        data_dir=tmp_path / "data",
+        heartbeat_ttl_sec=30,
+    )
+    cfg.data_dir.mkdir(parents=True, exist_ok=True)
+    store = MemoryClusterStore()
+    store.ensure_schema()
+    logger = ClusterLogger(cfg, store)
+    events = ClusterEventBridge(cfg, store)
+    controller = ClusterController(cfg, store, logger, events)
+
+    store.upsert_node(
+        NodeRecord(
+            node_id="gpu-node-03",
+            advertised_addr="10.0.0.3",
+            state="ready",
+            gpus=[GpuInfo(index=0)],
+            capabilities={},
+        )
+    )
+    from plugins.cluster.models import HeartbeatPayload
+
+    store.record_heartbeat(HeartbeatPayload(node_id="gpu-node-03", state="ready", gpus=[GpuInfo(index=0)]))
+
+    result = controller.submit_job(
+        {
+            "job_kind": "inference",
+            "adapter_id": "hf_vllm",
+            "model": {"local_path": "/data/model"},
+            "gpus": {"node_ids": ["gpu-node-03"]},
+            "nnodes": 1,
+            "nproc_per_node": 1,
+        }
+    )
+    assert result["success"] is False
+    assert any("capabilities_incomplete" in e for e in result["errors"])
+
+
+def test_controller_replan_and_experience(tmp_path):
+    from plugins.inference_adapters.experience import reset_experience_store_for_tests
+
+    reset_experience_store_for_tests()
+    cfg = ClusterConfig(
+        enabled=True,
+        role="master",
+        node_id="master",
+        master_url="http://127.0.0.1:8765",
+        data_dir=tmp_path / "data",
+        heartbeat_ttl_sec=30,
+    )
+    cfg.data_dir.mkdir(parents=True, exist_ok=True)
+    store = MemoryClusterStore()
+    store.ensure_schema()
+    logger = ClusterLogger(cfg, store)
+    events = ClusterEventBridge(cfg, store)
+    controller = ClusterController(cfg, store, logger, events)
+
+    caps = _caps()
+    store.upsert_node(
+        NodeRecord(
+            node_id="gpu-node-03",
+            advertised_addr="10.0.0.3",
+            state="ready",
+            gpus=[GpuInfo(index=0)],
+            capabilities=dict(caps),
+        )
+    )
+    from plugins.cluster.models import HeartbeatPayload
+
+    store.record_heartbeat(
+        HeartbeatPayload(node_id="gpu-node-03", state="ready", gpus=[GpuInfo(index=0)], metrics=dict(caps))
+    )
+
+    submitted = controller.submit_job(
+        {
+            "job_kind": "inference",
+            "adapter_id": "hf_vllm",
+            "model": {"local_path": "/data/model"},
+            "gpus": {"node_ids": ["gpu-node-03"]},
+            "nnodes": 1,
+            "nproc_per_node": 1,
+        }
+    )
+    assert submitted["success"]
+    job_id = submitted["job"]["job_id"]
+    gen0 = submitted["job"]["spec"]["extra"]["runtime_scheme"]["replan_generation"]
+
+    replanned = controller.handle_replan(
+        job_id,
+        failed_task_id="ensure_vllm",
+        error="no matching distribution found for vllm",
+        facts=caps,
+        completed_task_ids=["probe_stack"],
+        node_id="gpu-node-03",
+    )
+    assert replanned["success"] is True
+    assert replanned["scheme"]["replan_generation"] == gen0 + 1
+    assert store.get_job(job_id).spec.extra["replan_attempts"] == 1
+
+
+def test_lifecycle_ensure_runtime_fail_phase():
+    from plugins.inference_adapters.task_runner import NeedsReplan
+
+    class BoomAdapter(ModelAdapter):
+        adapter_id = "boom_rt"
+
+        def validate(self, spec):
+            return []
+
+        def ensure_runtime(self, spec):
+            raise NeedsReplan(failed_task_id="ensure_vllm", error="boom", facts={})
+
+        def ensure_artifacts(self, spec):
+            return ArtifactPaths(model_path="/tmp/m")
+
+        def start(self, spec, artifacts):
+            return EndpointInfo(host="127.0.0.1", port=9)
+
+        def health(self):
+            return "ready"
+
+        def stop(self):
+            return None
+
+    register_adapter(BoomAdapter)
+    outcomes = []
+
+    def on_outcome(ok, summary, details):
+        outcomes.append((ok, summary, details))
+
+    result = run_inference_lifecycle(
+        job_spec={
+            "job_kind": "inference",
+            "adapter_id": "boom_rt",
+            "extra": {"adapter_id": "boom_rt", "inference_spec": {"adapter_id": "boom_rt"}},
+        },
+        on_outcome=on_outcome,
+        adapter=BoomAdapter(),
+    )
+    assert result["success"] is False
+    assert outcomes[0][2]["phase"] == "ensure_runtime"

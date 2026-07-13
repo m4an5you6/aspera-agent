@@ -1,7 +1,7 @@
 ---
 name: gpucloud-inference-deployment
 description: Deploy via cluster ModelAdapter with JSON spec bootstrap.
-version: 1.1.0
+version: 1.2.0
 author: GPUCLOUD
 platforms: [linux]
 metadata:
@@ -23,8 +23,8 @@ Use after training completes when the platform should expose a model through a *
 
 1. Confirm job, GPUs, weights, and the **LLM api_key for agent bring-up** first.
 2. **Deploy starts agent bring-up** — platform `POST /api/inference/agent/deploy` with `bootstrap=true` SSHs to nodes, writes `config.yaml` (`model.api_key`, `cluster.secret`), starts `gpucloud gateway`, then submits the inference job.
-3. Inference execution is a **fixed code lifecycle** on the worker: `validate → ensure_artifacts → start → health → outcome`. Skills do **not** schedule processes.
-4. Never put api keys in assignment JSON. Use `secrets_ref` env names only (runtime may resolve from config.yaml for internal fleets).
+3. Master selects a **RuntimeScheme** (`tasks[]` + mirror/constraints). Worker runs `validate → ensure_runtime → ensure_artifacts → start → health → outcome`. High-frequency **replan** stays on master/worker; platform only sees terminal status.
+4. Never put api keys or package pins in assignment JSON. Use `secrets_ref` env names only.
 
 ## Flow
 
@@ -32,13 +32,15 @@ Use after training completes when the platform should expose a model through a *
 confirm resources
   → POST /api/inference/agent/deploy  (or cluster_submit_job job_kind=inference)
   → bootstrap nodes (config.yaml: model.api_key + cluster.secret)
-  → master assigns → worker ModelAdapter
+  → workers heartbeat capabilities
+  → master selects RuntimeScheme (experience + rules)
+  → worker task runner (replan as needed) → ModelAdapter start/health
   → status callback / DB available + visit_*
 ```
 
 Bootstrap helpers: `plugins.inference_adapters.bootstrap.plan_deploy_bootstrap`.
 
-## JSON Spec Shape
+## JSON Spec Shape (platform → master)
 
 ```json
 {
@@ -57,7 +59,7 @@ Bootstrap helpers: `plugins.inference_adapters.bootstrap.plan_deploy_bootstrap`.
 }
 ```
 
-Reference adapter `hf_vllm`: local HF directory → vLLM → `/health`. New models = new `adapter_id` implementation under `plugins/inference_adapters/`.
+Do **not** send vLLM/torch version pins or install scripts. Master fills `runtime_scheme`.
 
 ## Config (non-secret)
 
@@ -79,29 +81,29 @@ inference_adapters:
   enabled: true
   default_adapter_id: hf_vllm
   status_callback_url: http://<thin-api>/api/inference/agent/status
-  serve_api_key: ""   # optional
-  hf_token: ""        # optional
+  max_replan_attempts: 16
+  max_replan_wall_seconds: 3600
+  serve_api_key: ""
+  hf_token: ""
 ```
-
-## Secrets (config.yaml by default; `.env` still optional)
-
-- **Required in config:** `model.api_key` (or env `OPENROUTER_API_KEY` / `OPENAI_API_KEY`)
-- **Required in config:** `cluster.secret` (or env `GPUCLOUD_CLUSTER_SECRET`; env wins if both set)
-- Optional: `inference_adapters.hf_token`, `inference_adapters.serve_api_key`
 
 ## Thin API
 
 - `POST /api/inference/agent/deploy` — create deploy row + submit to master
 - `POST /api/inference/agent/status` — master projects ready/failed (Bearer cluster secret)
-- `GET /api/inference/agent/deploy/{id}` — poll status
+- `GET /api/inference/agent/deploy/{id}` — poll status (`bootstrapping|submitted|available|failed`)
 
 ## Troubleshooting
 
+- `capabilities_incomplete:<node>` — wait for worker heartbeat probe, retry submit.
+- `no_scheme_match:` — no built-in scheme for this CUDA/python; extend matrix/schemes.
+- `replan_exhausted:` — install/replan budget used up; check `inference-logs/` and experience failures.
 - `agent_llm_api_key_missing` — `model.api_key` / `.env` lacked LLM key before gateway start.
-- `unknown adapter_id` — enable `inference_adapters` plugin / import adapter module.
-- Health timeout — check inference logs under cluster `inference-logs/` and vLLM package compatibility (`references/vllm-runtime-and-model-readiness.md`).
+- Health timeout — see `references/vllm-runtime-and-model-readiness.md`.
 
 ## References
 
+- `references/runtime-scheme-contract.md`
 - `references/vllm-runtime-and-model-readiness.md`
+- `references/deployment-master-inference-status.md`
 - `plugins/inference_adapters/CONFIG.example.md`
