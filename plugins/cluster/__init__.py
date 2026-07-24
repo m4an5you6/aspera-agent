@@ -111,4 +111,16 @@ def register(ctx) -> None:
     ctx.register_hook("on_session_start", _on_session_start)
     ctx.register_hook("pre_gateway_dispatch", _pre_gateway_dispatch)
 
+    # Also boot when this process is already the gateway (plugin re-discovery).
+    # Primary boot path is gateway/run.py after discover_plugins(); this covers
+    # late loads while avoiding binding :8765 from short-lived CLI commands.
+    import os
+
+    if os.environ.get("_GPUCLOUD_GATEWAY") == "1":
+        try:
+            start_embedded_master()
+            start_embedded_worker()
+        except Exception:
+            logger.exception("embedded cluster auto-start failed")
+
     logger.info("cluster plugin registered (%d tools)", len(_TOOLS))

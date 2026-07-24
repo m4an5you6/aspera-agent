@@ -4692,6 +4692,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "plugin discovery failed at gateway startup", exc_info=True,
             )
 
+        # Headless / messaging-less gateways never hit on_session_start or
+        # pre_gateway_dispatch, so embedded cluster would never bind bind_port.
+        # Start from config at boot when embedded_master / embedded_worker are set.
+        try:
+            from plugins.cluster.runtime import start_embedded_master, start_embedded_worker
+
+            master = start_embedded_master()
+            worker = start_embedded_worker()
+            if master is not None:
+                logger.info(
+                    "embedded cluster master listening on %s:%s",
+                    master.cfg.bind_host,
+                    master.cfg.bind_port,
+                )
+            if worker is not None:
+                logger.info(
+                    "embedded cluster worker started node_id=%s",
+                    getattr(worker, "node_id", None)
+                    or getattr(getattr(worker, "cfg", None), "node_id", ""),
+                )
+        except Exception:
+            logger.warning(
+                "embedded cluster auto-start at gateway boot failed",
+                exc_info=True,
+            )
+
         # Register declarative shell hooks from cli-config.yaml.  Gateway
         # has no TTY, so consent has to come from one of the three opt-in
         # channels (--accept-hooks on launch, GPUCLOUD_ACCEPT_HOOKS env var,
