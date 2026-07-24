@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import select
+import signal
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -18,6 +21,13 @@ from plugins.inference_adapters.runtime_scheme import (
 )
 
 _log = logging.getLogger(__name__)
+
+# pip progress tokens that reset the idle timer (case-insensitive).
+_PIP_PROGRESS_RE = re.compile(
+    r"(downloading|download\s+\d|installing|building\s+wheel|writing|saved\s+|successfully\s+installed|"
+    r"collecting\s+|obtaining\s+|preparing\s+|using\s+cached|%\s*\||\d+\.\d+\s*(k|m|g)?b/s)",
+    re.IGNORECASE,
+)
 
 
 class NeedsReplan(Exception):
@@ -116,6 +126,35 @@ def _mirror_env_and_args(profile_name: str) -> tuple[Dict[str, str], List[str]]:
     return env, args
 
 
+def _kill_pip_process(proc: subprocess.Popen) -> None:
+    try:
+        if proc.poll() is not None:
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                proc.kill()
+            proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
+def _path_mtime(path: Optional[Path]) -> float:
+    if path is None:
+        return 0.0
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def _run_pip_install(
     python_executable: str,
     specs: List[str],
@@ -124,16 +163,26 @@ def _run_pip_install(
     mirror_profile: str = "default",
     timeout: float = 1800,
     log_path: Optional[Path] = None,
+    on_progress: Optional[Callable[[], None]] = None,
 ) -> tuple[bool, str]:
+    """Run pip install with idle (no-progress) timeout.
+
+    ``timeout`` is the max seconds without download/write/progress output —
+    not an absolute wall for the whole install. Any progress renews the idle timer.
+    """
     env = os.environ.copy()
     mirror_env, mirror_args = _mirror_env_and_args(mirror_profile)
     env.update(mirror_env)
+    # Encourage line-buffered progress from pip.
+    env.setdefault("PYTHONUNBUFFERED", "1")
     cmd = [
         python_executable,
         "-m",
         "pip",
         "install",
         "--disable-pip-version-check",
+        "--progress-bar",
+        "on",
         *mirror_args,
     ]
     for url in extra_index_urls or []:
@@ -141,30 +190,113 @@ def _run_pip_install(
             cmd.extend(["--extra-index-url", url])
     cmd.extend(specs)
     _log.info("pip install: %s", " ".join(cmd))
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-            env=env,
-        )
-    except subprocess.TimeoutExpired as exc:
-        return False, f"pip timeout after {timeout}s: {exc}"
-    except Exception as exc:
-        return False, str(exc)
 
-    combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    idle_limit = float(timeout or 1800)
+    log_fh = None
     if log_path is not None:
         try:
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(log_path, "ab") as fh:
-                fh.write(combined.encode("utf-8", errors="replace"))
+            log_fh = open(log_path, "ab")
         except Exception:
-            pass
+            log_fh = None
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=env,
+            start_new_session=True,
+        )
+    except Exception as exc:
+        if log_fh is not None:
+            log_fh.close()
+        return False, str(exc)
+
+    chunks: List[str] = []
+    last_progress = time.monotonic()
+    last_log_mtime = _path_mtime(log_path)
+    timed_out = False
+
+    def _note_progress(reason: str = "") -> None:
+        nonlocal last_progress
+        last_progress = time.monotonic()
+        if on_progress is not None:
+            try:
+                on_progress()
+            except Exception:
+                pass
+        if reason:
+            _log.debug("pip progress: %s", reason)
+
+    def _consume(data: str) -> None:
+        if not data:
+            return
+        chunks.append(data)
+        if log_fh is not None:
+            try:
+                log_fh.write(data.encode("utf-8", errors="replace"))
+                log_fh.flush()
+            except Exception:
+                pass
+        # Any new bytes count as activity; stronger tokens also renew.
+        _note_progress("stdout/stderr bytes")
+        if _PIP_PROGRESS_RE.search(data):
+            _note_progress("pip progress token")
+
+    try:
+        fds = [fd for fd in (proc.stdout, proc.stderr) if fd is not None]
+        while True:
+            if proc.poll() is not None:
+                # Drain remaining output.
+                for stream in fds:
+                    try:
+                        rest = stream.read()
+                    except Exception:
+                        rest = ""
+                    if rest:
+                        _consume(rest)
+                break
+
+            idle_for = time.monotonic() - last_progress
+            if idle_for > idle_limit:
+                timed_out = True
+                _kill_pip_process(proc)
+                break
+
+            ready, _, _ = select.select(fds, [], [], 1.0)
+            for stream in ready:
+                try:
+                    data = stream.readline()
+                except Exception:
+                    data = ""
+                if data:
+                    _consume(data)
+
+            # Optional: log file growth also counts as progress.
+            new_mtime = _path_mtime(log_path)
+            if new_mtime > last_log_mtime:
+                last_log_mtime = new_mtime
+                _note_progress("log mtime")
+    finally:
+        if log_fh is not None:
+            try:
+                log_fh.close()
+            except Exception:
+                pass
+
+    combined = "".join(chunks)
+    if timed_out:
+        tail = combined[-2000:] if combined else ""
+        msg = f"pip timeout after {int(idle_limit)}s (no progress)"
+        if tail:
+            msg = f"{msg}: {tail}"
+        return False, msg
+
     if proc.returncode != 0:
-        tail = combined[-2000:]
+        tail = combined[-2000:] if combined else ""
         return False, tail or f"pip exit {proc.returncode}"
     return True, ""
 
@@ -218,6 +350,8 @@ def run_scheme_tasks(
     """Execute scheme.tasks with optional synchronous replan callback.
 
     ``replan_callback(needs)`` must return a new scheme dict (or raise).
+    ``max_replan_wall_seconds`` is an idle / no-progress budget: task completion,
+    skips, successful replan, and pip download/write progress all renew it.
     """
     current = dict(scheme or {})
     facts: Dict[str, Any] = dict(initial_facts or {})
@@ -228,9 +362,13 @@ def run_scheme_tasks(
     completed: Set[str] = set()
     skipped: Set[str] = set()
     replan_count = 0
-    started = time.monotonic()
+    last_progress_at = time.monotonic()
     timeout = get_ensure_runtime_timeout()
     attempted_scheme_ids: List[str] = []
+
+    def _bump_progress() -> None:
+        nonlocal last_progress_at
+        last_progress_at = time.monotonic()
 
     while True:
         if stop_flag and stop_flag():
@@ -240,10 +378,10 @@ def run_scheme_tasks(
                 facts=facts,
                 completed_task_ids=sorted(completed),
             )
-        if time.monotonic() - started > max_replan_wall_seconds:
+        if time.monotonic() - last_progress_at > max_replan_wall_seconds:
             raise NeedsReplan(
                 failed_task_id="",
-                error="replan_exhausted:wall_clock",
+                error="replan_exhausted:no_progress_wall",
                 facts=facts,
                 completed_task_ids=sorted(completed),
             )
@@ -276,6 +414,7 @@ def run_scheme_tasks(
             if not _eval_when(when, facts):
                 skipped.add(tid)
                 progress = True
+                _bump_progress()
                 continue
 
             ttype = str(task.get("type") or "")
@@ -285,13 +424,18 @@ def run_scheme_tasks(
                     _probe_into_facts(py, facts)
                     completed.add(tid)
                     progress = True
+                    _bump_progress()
                 elif ttype == "ensure_package":
                     pin_ref = str(task.get("pin") or task.get("pin_ref") or "")
                     if task.get("pin") and not str(task.get("pin")).startswith("matrix:"):
                         # literal pin field
                         specs = [str(task["pin"])]
                         urls: List[str] = []
-                        err = None if "==" in specs[0] or "@" in specs[0] else f"forbid_unpinned:{specs[0]}"
+                        err = (
+                            None
+                            if "==" in specs[0] or "@" in specs[0]
+                            else f"forbid_unpinned:{specs[0]}"
+                        )
                     else:
                         specs, urls, err = resolve_pin_ref(pin_ref)
                     if err:
@@ -301,7 +445,11 @@ def run_scheme_tasks(
                             facts=facts,
                             completed_task_ids=sorted(completed),
                         )
-                    constraints = current.get("constraints") if isinstance(current.get("constraints"), dict) else {}
+                    constraints = (
+                        current.get("constraints")
+                        if isinstance(current.get("constraints"), dict)
+                        else {}
+                    )
                     if not constraints.get("allow_install", True):
                         raise NeedsReplan(
                             failed_task_id=tid,
@@ -319,6 +467,7 @@ def run_scheme_tasks(
                         mirror_profile=str(current.get("mirror_profile") or "default"),
                         timeout=timeout,
                         log_path=log_path,
+                        on_progress=_bump_progress,
                     )
                     if not ok:
                         raise NeedsReplan(
@@ -331,6 +480,7 @@ def run_scheme_tasks(
                     _probe_into_facts(py, facts)
                     completed.add(tid)
                     progress = True
+                    _bump_progress()
                 elif ttype == "ensure_package_set":
                     pin_ref = str(task.get("pin_ref") or "")
                     specs, urls, err = resolve_pin_ref(pin_ref)
@@ -351,6 +501,7 @@ def run_scheme_tasks(
                         mirror_profile=str(current.get("mirror_profile") or "default"),
                         timeout=timeout,
                         log_path=log_path,
+                        on_progress=_bump_progress,
                     )
                     if not ok:
                         raise NeedsReplan(
@@ -363,6 +514,7 @@ def run_scheme_tasks(
                     facts["extras_missing"] = False
                     completed.add(tid)
                     progress = True
+                    _bump_progress()
                 elif ttype == "verify":
                     imports = [str(x) for x in (task.get("imports") or [])]
                     ok, err_text = _verify_imports(py, imports)
@@ -376,6 +528,7 @@ def run_scheme_tasks(
                         )
                     completed.add(tid)
                     progress = True
+                    _bump_progress()
                 else:
                     raise NeedsReplan(
                         failed_task_id=tid,
@@ -408,6 +561,7 @@ def run_scheme_tasks(
                 # Allow re-evaluation of when conditions
                 skipped = {x for x in skipped if x != failed}
                 progress = True
+                _bump_progress()
                 break
 
         if not progress:

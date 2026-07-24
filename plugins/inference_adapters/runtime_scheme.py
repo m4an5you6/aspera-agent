@@ -6,7 +6,11 @@ import copy
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
-from plugins.inference_adapters.experience import ExperienceStore, classify_error
+from plugins.inference_adapters.experience import (
+    REPLANABLE_ERROR_CLASSES,
+    ExperienceStore,
+    classify_error,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -387,7 +391,7 @@ def amend_scheme_for_replan(
     gen = int(current.get("replan_generation") or 0) + 1
     err_class = classify_error(error, failed_task_id)
 
-    # 1) Experience success patch
+    # 1) Experience success patch (allowed for any failure class — reuse known-good scheme)
     if experience is not None:
         prior = experience.best_success(facts)
         if prior and prior.effective_tasks and prior.scheme_id not in attempted:
@@ -404,6 +408,10 @@ def amend_scheme_for_replan(
                     if prior.mirror_profile:
                         scheme["mirror_profile"] = prior.mirror_profile
                     return scheme, []
+
+    # Only classifiable install/import failures may switch template / matrix / extras.
+    if err_class not in REPLANABLE_ERROR_CLASSES:
+        return None, [f"replan_refused:{err_class}"]
 
     adapter = str(current.get("adapter_id") or "hf_vllm")
     templates = [
@@ -439,15 +447,18 @@ def amend_scheme_for_replan(
     patched["reason"] = f"replan_patch:{failed_task_id}:{err_class}"
     tasks = list(patched.get("tasks") or [])
 
-    # If ensure_vllm failed with no_wheel, try inserting ensure_extras before verify
-    # and/or switch pin to alternate matrix if available.
+    # Switch pin to alternate matrix when available (replanable classes only).
     alt_matrix = None
     cur_matrix = str(patched.get("matrix_id") or "")
     for mid in get_pin_matrix():
         if mid != cur_matrix:
             alt_matrix = mid
             break
-    if alt_matrix and failed_task_id in ("ensure_vllm", "ensure_torch", "verify_stack"):
+    if (
+        err_class in REPLANABLE_ERROR_CLASSES
+        and alt_matrix
+        and failed_task_id in ("ensure_vllm", "ensure_torch", "verify_stack")
+    ):
         patched["matrix_id"] = alt_matrix
         for t in tasks:
             pin_ref = str(t.get("pin_ref") or "")
@@ -458,8 +469,8 @@ def amend_scheme_for_replan(
         patched["reason"] = f"replan_switch_matrix:{alt_matrix}"
         return patched, []
 
-    # Insert ensure_extras if missing and verify/import failed
-    if err_class in ("import", "conflict", "other") and failed_task_id in (
+    # Insert ensure_extras if missing and verify/import/conflict failed
+    if err_class in ("import_failed", "conflict") and failed_task_id in (
         "verify_stack",
         "ensure_vllm",
     ):

@@ -60,14 +60,20 @@ def tasks_digest(tasks: Optional[List[Dict[str, Any]]]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
+REPLANABLE_ERROR_CLASSES = frozenset({"no_wheel", "conflict", "import_failed"})
+
+
 def classify_error(error: str = "", failed_task_id: str = "") -> str:
     text = f"{failed_task_id} {error}".lower()
+    # Timeout before broader tokens so "pip timeout after Ns" is not "other".
+    if "pip timeout" in text or "timeout after" in text:
+        return "timeout"
     if "no_wheel" in text or "no matching distribution" in text or "could not find a version" in text:
         return "no_wheel"
     if "conflict" in text or "resolutionimpossible" in text or "dependency" in text:
         return "conflict"
-    if "import" in text or "modulenotfound" in text:
-        return "import"
+    if "import_failed" in text or "modulenotfound" in text or "import " in text:
+        return "import_failed"
     if "constraint" in text or "no_scheme" in text or "incompatible" in text:
         return "constraint"
     if "pin_ref" in text or "unresolved" in text:

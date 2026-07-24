@@ -35,6 +35,8 @@ inference_adapters:
   hf_token: ""            # optional private weight pull
   status_callback_url: "" # optional thin API callback for deploy status projection
   max_replan_attempts: 16
+  # Idle / no-progress budgets (download/write progress renews them; not absolute wall clocks).
+  # Replan scheme/matrix switches only for no_wheel | conflict | import_failed.
   max_replan_wall_seconds: 3600
   ensure_runtime_timeout_seconds: 1800
   mirror_profiles: {}     # optional named pip indexes; empty uses built-in default
@@ -57,6 +59,12 @@ deploy is requested to render per-node config.yaml (+ optional .env) and a
 remote start script. Assignment JSON must never carry plaintext keys.
 Master selects RuntimeScheme (tasks); workers execute/replan — see
 `skills/mlops/gpucloud-inference-deployment/references/runtime-scheme-contract.md`.
+
+``ensure_runtime_timeout_seconds`` and ``max_replan_wall_seconds`` are **idle
+no-progress limits**: pip download/write output renews them. Absolute
+"kill after N seconds from start" is not used. Replan only amends scheme /
+matrix for ``no_wheel``, ``conflict``, and ``import_failed``; pip timeout
+classifies as ``timeout`` and is refused (no matrix switch).
 
 Bootstrap master configs enable ``embedded_worker: true`` so the master host
 registers as a schedulable node (same ensure_runtime / serve path as workers).

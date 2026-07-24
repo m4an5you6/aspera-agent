@@ -698,3 +698,279 @@ def test_lifecycle_ensure_runtime_fail_phase():
     )
     assert result["success"] is False
     assert outcomes[0][2]["phase"] == "ensure_runtime"
+
+
+def test_classify_error_timeout_and_import_failed():
+    from plugins.inference_adapters.experience import classify_error
+
+    assert classify_error("pip timeout after 1800s (no progress)") == "timeout"
+    assert classify_error("pip timeout after 30s: ...") == "timeout"
+    assert classify_error("import_failed:vllm:No module named 'vllm'") == "import_failed"
+    assert classify_error("ModuleNotFoundError: No module named 'torch'") == "import_failed"
+    assert classify_error("no matching distribution found for vllm") == "no_wheel"
+    assert classify_error("ResolutionImpossible") == "conflict"
+
+
+def test_amend_scheme_refuses_timeout_keeps_matrix():
+    from plugins.inference_adapters.runtime_scheme import amend_scheme_for_replan
+
+    current = {
+        "scheme_id": "hf_vllm.cu12.py310",
+        "matrix_id": "cu12-py310",
+        "adapter_id": "hf_vllm",
+        "replan_generation": 0,
+        "mirror_profile": "default",
+        "tasks": [
+            {
+                "id": "ensure_vllm",
+                "type": "ensure_package",
+                "pin_ref": "matrix:cu12-py310/vllm",
+                "when": "always",
+            }
+        ],
+    }
+    facts = {
+        "cuda_major": 12,
+        "python_version": "3.10.12",
+        "torch_available": False,
+        "vllm_available": False,
+    }
+    scheme, errs = amend_scheme_for_replan(
+        current,
+        facts=facts,
+        failed_task_id="ensure_vllm",
+        error="pip timeout after 1800s (no progress)",
+        attempted_scheme_ids=["hf_vllm.cu12.py310", "hf_vllm.cu12.py311"],
+    )
+    assert scheme is None
+    assert errs and errs[0].startswith("replan_refused:timeout")
+    assert current["matrix_id"] == "cu12-py310"
+
+
+def test_amend_scheme_no_wheel_can_switch_matrix():
+    from plugins.inference_adapters.runtime_scheme import (
+        amend_scheme_for_replan,
+        get_scheme_templates,
+    )
+
+    attempted = [str(t.get("scheme_id") or "") for t in get_scheme_templates()]
+    current = {
+        "scheme_id": attempted[0] if attempted else "hf_vllm.cu12.py310",
+        "matrix_id": "cu12-py310",
+        "adapter_id": "hf_vllm",
+        "replan_generation": 1,
+        "mirror_profile": "default",
+        "tasks": [
+            {
+                "id": "ensure_vllm",
+                "type": "ensure_package",
+                "pin_ref": "matrix:cu12-py310/vllm",
+                "when": "always",
+            }
+        ],
+    }
+    facts = {
+        "cuda_major": 12,
+        "python_version": "3.10.12",
+        "torch_available": True,
+        "vllm_available": False,
+    }
+    scheme, errs = amend_scheme_for_replan(
+        current,
+        facts=facts,
+        failed_task_id="ensure_vllm",
+        error="no matching distribution found for vllm==0.6.6",
+        attempted_scheme_ids=attempted,
+    )
+    assert not errs
+    assert scheme is not None
+    assert scheme["matrix_id"] != "cu12-py310"
+    assert "replan_switch_matrix" in str(scheme.get("reason") or "")
+
+
+def test_run_pip_install_idle_timeout_renewed_by_output(monkeypatch):
+    """Intermittent pip output renews idle timer; total elapsed may exceed idle."""
+    import plugins.inference_adapters.task_runner as tr
+
+    class FakeStream:
+        def __init__(self, lines):
+            self._lines = list(lines)
+            self._i = 0
+
+        def readline(self):
+            if self._i < len(self._lines):
+                line = self._lines[self._i]
+                self._i += 1
+                return line
+            return ""
+
+        def read(self):
+            rest = "".join(self._lines[self._i :])
+            self._i = len(self._lines)
+            return rest
+
+    class FakeProc:
+        def __init__(self):
+            self.pid = 12345
+            self.stdout = FakeStream(
+                [
+                    "Collecting torch\n",
+                    "Downloading torch-2.5.1.whl (100 MB)\n",
+                    "Installing collected packages: torch\n",
+                    "Successfully installed torch-2.5.1\n",
+                ]
+            )
+            self.stderr = FakeStream([])
+            self.returncode = 0
+            self._polls = 0
+
+        def poll(self):
+            self._polls += 1
+            # Stay alive until a few select loops have consumed lines.
+            if self._polls < 6:
+                return None
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+        def terminate(self):
+            self.returncode = -15
+
+        def kill(self):
+            self.returncode = -9
+
+    clock = {"t": 0.0}
+
+    def fake_monotonic():
+        return clock["t"]
+
+    def fake_select(r, w, x, timeout=0):
+        # Advance clock a bit each select, but less than idle if output arrives.
+        clock["t"] += 0.4
+        ready = []
+        for stream in r:
+            if isinstance(stream, FakeStream) and stream._i < len(stream._lines):
+                ready.append(stream)
+        return ready, [], []
+
+    monkeypatch.setattr(tr.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(tr.select, "select", fake_select)
+    monkeypatch.setattr(
+        tr.subprocess,
+        "Popen",
+        lambda *a, **k: FakeProc(),
+    )
+    monkeypatch.setattr(tr, "_kill_pip_process", lambda proc: None)
+    monkeypatch.setattr(tr, "_mirror_env_and_args", lambda *_a, **_k: ({}, []))
+
+    bumps = {"n": 0}
+
+    def on_progress():
+        bumps["n"] += 1
+
+    # Idle limit 1s; total simulated time will exceed 1s but progress renews.
+    ok, err = tr._run_pip_install(
+        "python3",
+        ["torch==2.5.1"],
+        timeout=1.0,
+        on_progress=on_progress,
+    )
+    assert ok is True
+    assert err == ""
+    assert bumps["n"] >= 1
+    assert clock["t"] > 1.0  # total elapsed exceeded idle, yet succeeded
+
+
+def test_run_scheme_tasks_no_progress_wall_renewed(monkeypatch):
+    """Wall is idle-based: progress bumps prevent no_progress_wall during slow work."""
+    from plugins.inference_adapters.task_runner import run_scheme_tasks
+    import plugins.inference_adapters.task_runner as tr
+
+    scheme = {
+        "scheme_id": "s1",
+        "mirror_profile": "default",
+        "constraints": {"allow_install": True},
+        "replan_generation": 0,
+        "tasks": [
+            {"id": "ensure_torch", "type": "ensure_package", "pin": "torch==2.5.1", "when": "always"},
+            {"id": "verify_stack", "type": "verify", "imports": ["torch"]},
+        ],
+    }
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(tr.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(tr, "_probe_into_facts", lambda *a, **k: None)
+    monkeypatch.setattr(tr, "_verify_imports", lambda *a, **k: (True, ""))
+
+    def slow_pip(*a, **k):
+        on_progress = k.get("on_progress")
+        # Simulate long install with intermittent progress beyond wall if absolute.
+        for _ in range(5):
+            clock["t"] += 0.5
+            if on_progress:
+                on_progress()
+        clock["t"] += 0.1
+        return True, ""
+
+    monkeypatch.setattr(tr, "_run_pip_install", slow_pip)
+
+    # Wall of 1.0s would fail if absolute from start (total ~2.6s), but renews.
+    result = run_scheme_tasks(
+        scheme,
+        initial_facts={"python_executable": "python3"},
+        max_replan_attempts=2,
+        max_replan_wall_seconds=1.0,
+    )
+    assert "ensure_torch" in result.completed_task_ids
+    assert "verify_stack" in result.completed_task_ids
+
+
+def test_run_scheme_tasks_idle_wall_fires_on_next_loop(monkeypatch):
+    """Idle wall trips at loop top after progress stops renewing."""
+    from plugins.inference_adapters.task_runner import NeedsReplan, run_scheme_tasks
+    import plugins.inference_adapters.task_runner as tr
+
+    scheme = {
+        "scheme_id": "s1",
+        "tasks": [
+            # Skipped when vllm already available → counts as progress once.
+            {
+                "id": "ensure_vllm",
+                "type": "ensure_package",
+                "pin": "vllm==0.6.6",
+                "when": "not facts.vllm_available",
+            },
+            # Never runnable → keeps the outer while alive after the skip.
+            {
+                "id": "blocked",
+                "type": "probe",
+                "when": "always",
+                "after": ["never_done"],
+            },
+        ],
+    }
+
+    # monotonic() call order:
+    # 1) init last_progress_at
+    # 2) wall check (iter 1)
+    # 3) bump on skip
+    # 4) wall check (iter 2) → idle exceeded
+    times = [0.0, 0.0, 0.0, 100.0, 100.0, 100.0]
+
+    def mono():
+        return times.pop(0) if times else 100.0
+
+    monkeypatch.setattr(tr.time, "monotonic", mono)
+    monkeypatch.setattr(tr, "_probe_into_facts", lambda *a, **k: None)
+
+    with pytest.raises(NeedsReplan) as ei:
+        run_scheme_tasks(
+            scheme,
+            initial_facts={
+                "python_executable": "python3",
+                "vllm_available": True,
+            },
+            max_replan_wall_seconds=1.0,
+        )
+    assert ei.value.error == "replan_exhausted:no_progress_wall"
