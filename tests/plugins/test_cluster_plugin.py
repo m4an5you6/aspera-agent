@@ -456,6 +456,45 @@ def test_failed_assignment_is_not_reissued_on_heartbeat(runtime_stack):
     assert after_failed_assignment["assignment"] is None
 
 
+def test_report_job_outcome_persists_outcome_details(runtime_stack):
+    _cfg, store, _logger, _events, controller = runtime_stack
+    controller.startup()
+    store.upsert_node(NodeRecord(
+        node_id="node-0",
+        advertised_addr="10.0.0.1",
+        state="ready",
+        gpus=[GpuInfo(index=0)],
+    ))
+    result = controller.submit_job({
+        "script": "train.py",
+        "nnodes": 1,
+        "nproc_per_node": 1,
+        "framework": "placeholder",
+    })
+    assert result["success"] is True, result
+    job_id = result["job"]["job_id"]
+    details = {
+        "visit_host": "10.0.20.188",
+        "visit_port": 8000,
+        "deploy_node_id": 99,
+        "adapter_id": "hf_vllm",
+    }
+    controller.report_job_outcome(
+        job_id,
+        success=True,
+        summary="ready",
+        node_id="node-0",
+        details=details,
+    )
+    job = store.get_job(job_id)
+    assert job is not None
+    assert job.state == "succeeded"
+    assert job.outcome_details.get("visit_host") == "10.0.20.188"
+    assert job.outcome_details.get("visit_port") == 8000
+    status = controller.job_status(job_id)
+    assert status["job"]["outcome_details"]["visit_port"] == 8000
+
+
 def test_stale_node_detection(runtime_stack):
     _cfg, store, _logger, events, controller = runtime_stack
     controller.startup()

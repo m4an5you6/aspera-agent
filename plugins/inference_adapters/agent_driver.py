@@ -287,10 +287,22 @@ def run_inference_agent(
     remember_adapter(job_id, ad)
     clear_reported_outcome(job_id)
 
+    # Match CLI AutoGoal: segment_max_turns × max_segments (default 100 × 20).
+    # ``max_iterations`` remains a back-compat alias for per-segment tool budget.
     try:
-        max_iterations = int(rt.get("max_iterations") or PROFILE_CLUSTER_INFERENCE.default_max_iterations)
+        segment_max_turns = int(
+            rt.get("segment_max_turns")
+            or rt.get("max_iterations")
+            or PROFILE_CLUSTER_INFERENCE.default_segment_max_turns
+        )
     except (TypeError, ValueError):
-        max_iterations = PROFILE_CLUSTER_INFERENCE.default_max_iterations
+        segment_max_turns = PROFILE_CLUSTER_INFERENCE.default_segment_max_turns
+    try:
+        max_segments = int(
+            rt.get("max_segments") or PROFILE_CLUSTER_INFERENCE.default_max_segments
+        )
+    except (TypeError, ValueError):
+        max_segments = PROFILE_CLUSTER_INFERENCE.default_max_segments
     try:
         inactivity_s = float(
             rt.get("agent_timeout_seconds") or PROFILE_CLUSTER_INFERENCE.default_inactivity_seconds
@@ -315,7 +327,8 @@ def run_inference_agent(
         completion=completion,
         stop_flag=stop_flag,
         inactivity_seconds=inactivity_s,
-        max_iterations=max_iterations,
+        segment_max_turns=segment_max_turns,
+        max_segments=max_segments,
         agent_factory=agent_factory,
         remember_agent=lambda _sid, agent: remember_inference_agent(job_id, agent),
         forget_agent=lambda _sid: forget_inference_agent(job_id),

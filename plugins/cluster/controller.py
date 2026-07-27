@@ -568,11 +568,17 @@ class ClusterController:
         details: Optional[Dict[str, Any]] = None,
     ) -> None:
         state = "succeeded" if success else "failed"
-        self.store.update_job_state(job_id, state, error_summary=summary if not success else "")
+        details_dict = dict(details or {})
+        self.store.update_job_state(
+            job_id,
+            state,
+            error_summary=summary if not success else "",
+            outcome_details=details_dict,
+        )
         event_type = "job_completed" if success else "job_failed"
         payload: Dict[str, Any] = {"summary": summary or state, "job_id": job_id}
-        if details:
-            payload["details"] = details
+        if details_dict:
+            payload["details"] = details_dict
         self.events.emit(
             event_type,
             payload,
@@ -583,77 +589,14 @@ class ClusterController:
         job = self.store.get_job(job_id)
         if job and str(getattr(job.spec, "job_kind", "") or "").lower() == "inference":
             facts = {}
-            if isinstance(details, dict):
-                needs = details.get("needs_replan") if isinstance(details.get("needs_replan"), dict) else {}
-                facts = dict(needs.get("facts") or details.get("facts") or {})
+            if details_dict:
+                needs = details_dict.get("needs_replan") if isinstance(details_dict.get("needs_replan"), dict) else {}
+                facts = dict(needs.get("facts") or details_dict.get("facts") or {})
             self._record_experience(
                 job,
                 outcome="success" if success else "fail",
                 facts=facts,
-                failed_task_id=str((details or {}).get("phase") or "") if not success else "",
+                failed_task_id=str(details_dict.get("phase") or "") if not success else "",
                 error=summary if not success else "",
             )
-        # Project inference visit info to thin API / status callback when configured.
-        self._maybe_project_inference_status(job_id, success=success, summary=summary, details=details or {})
-
-    def _maybe_project_inference_status(
-        self,
-        job_id: str,
-        *,
-        success: bool,
-        summary: str,
-        details: Dict[str, Any],
-    ) -> None:
-        job = self.store.get_job(job_id)
-        if not job:
-            return
-        extra = job.spec.extra or {}
-        is_inference = (
-            str(getattr(job.spec, "job_kind", "") or "").lower() == "inference"
-            or str(extra.get("job_kind") or "").lower() == "inference"
-        )
-        if not is_inference:
-            return
-        callback = ""
-        if details.get("callback_url"):
-            callback = str(details["callback_url"])
-        if not callback:
-            callback = str(self.cfg.status_callback_url or "").strip()
-        if not callback:
-            try:
-                from gpucloud_cli.config import load_config
-
-                ia = load_config().get("inference_adapters") or {}
-                callback = str(ia.get("status_callback_url") or "").strip()
-            except Exception:
-                callback = ""
-        if not callback:
-            return
-        body = {
-            "job_id": job_id,
-            "success": success,
-            "summary": summary,
-            "status": "available" if success else "failed",
-            "visit_host": details.get("visit_host"),
-            "visit_port": details.get("visit_port"),
-            "protocol": details.get("protocol"),
-            "stream_path": details.get("stream_path"),
-            "adapter_id": details.get("adapter_id"),
-            "deploy_node_id": details.get("deploy_node_id"),
-            "details": details,
-        }
-        try:
-            import httpx
-
-            headers = {"Content-Type": "application/json"}
-            secret = self.cfg.secret
-            if secret:
-                headers["Authorization"] = f"Bearer {secret}"
-            with httpx.Client(timeout=15.0) as client:
-                client.post(callback, json=body, headers=headers)
-        except Exception as exc:
-            self.logger.log_error(
-                error_type="status_callback",
-                message=str(exc),
-                job_id=job_id,
-            )
+        # Platform polls GET /api/jobs/{id} for outcome_details; no status POST.

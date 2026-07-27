@@ -2,17 +2,20 @@
 
 Session slash control stays in ``gpucloud_cli.autogoals.AutoGoalManager``.
 This module owns the non-interactive operating contract, profiles, completion
-policies, and a single-conversation run loop (stop + inactivity).
+policies, and a multi-segment run loop (per-segment tool budget × segments,
+stop + inactivity). Defaults match CLI AutoGoal: 100 × 20 = 2000 turns.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Optional, Protocol, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 _log = logging.getLogger(__name__)
 
@@ -20,6 +23,11 @@ AgentHook = Callable[[str, Any], None]
 InterruptHook = Callable[[str, str], bool]
 StopFlag = Callable[[], bool]
 AgentFactory = Callable[..., Any]
+
+# Match CLI AutoGoalManager defaults (segment_max_turns × max_segments).
+DEFAULT_SEGMENT_MAX_TURNS = 100
+DEFAULT_MAX_SEGMENTS = 20
+DEFAULT_MAX_TURNS = DEFAULT_SEGMENT_MAX_TURNS * DEFAULT_MAX_SEGMENTS
 
 # Shared non-interactive rules (used by /autogoal kickoff and headless hosts).
 AUTO_GOAL_OPERATING_CONTRACT = """\
@@ -92,7 +100,11 @@ class AutoGoalProfile:
     skip_context_files: bool = True
     quiet_mode: bool = True
     verbose_logging: bool = False
-    default_max_iterations: int = 90
+    # Per-segment AIAgent tool-call budget (CLI Autogoal "segment_max_turns").
+    default_segment_max_turns: int = DEFAULT_SEGMENT_MAX_TURNS
+    default_max_segments: int = DEFAULT_MAX_SEGMENTS
+    # Back-compat alias: same meaning as default_segment_max_turns.
+    default_max_iterations: int = DEFAULT_SEGMENT_MAX_TURNS
     default_inactivity_seconds: float = 1800.0
 
 
@@ -109,7 +121,9 @@ PROFILE_CLUSTER_INFERENCE = AutoGoalProfile(
     skip_context_files=False,
     quiet_mode=True,
     verbose_logging=True,
-    default_max_iterations=90,
+    default_segment_max_turns=DEFAULT_SEGMENT_MAX_TURNS,
+    default_max_segments=DEFAULT_MAX_SEGMENTS,
+    default_max_iterations=DEFAULT_SEGMENT_MAX_TURNS,
     default_inactivity_seconds=1800.0,
 )
 
@@ -122,9 +136,49 @@ PROFILE_SESSION = AutoGoalProfile(
     skip_context_files=False,
     quiet_mode=False,
     verbose_logging=False,
-    default_max_iterations=90,
+    default_segment_max_turns=DEFAULT_SEGMENT_MAX_TURNS,
+    default_max_segments=DEFAULT_MAX_SEGMENTS,
+    default_max_iterations=DEFAULT_SEGMENT_MAX_TURNS,
     default_inactivity_seconds=0.0,
 )
+
+
+def summarize_segment(
+    *,
+    segment_index: int,
+    turns_used: int,
+    reason: str,
+    last_response: str,
+) -> Dict[str, Any]:
+    """Compact prior-segment checkpoint for the next continuation prompt."""
+    text = (last_response or "").strip()
+    if len(text) > 1800:
+        text = text[-1800:]
+    return {
+        "segment": segment_index,
+        "turns_used": turns_used,
+        "reason": reason or "continue",
+        "summary": text or "(no response text captured)",
+        "created_at": time.time(),
+    }
+
+
+def format_continuation_prompt(
+    *,
+    goal: str,
+    reason: str,
+    segment_summaries: List[Dict[str, Any]],
+) -> str:
+    if segment_summaries:
+        recent = segment_summaries[-3:]
+        segment_context = json.dumps(recent, ensure_ascii=False, indent=2)
+    else:
+        segment_context = "No prior segment summaries."
+    return AUTO_GOAL_CONTINUATION_TEMPLATE.format(
+        goal=goal,
+        reason=reason or "continue",
+        segment_context=segment_context,
+    )
 
 
 @dataclass
@@ -170,6 +224,40 @@ class ContractCompletion:
     ]
     extract_json: Callable[[str], Optional[Dict[str, Any]]]
 
+    def _resolve_reported(self, conversation_result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        reported = self.pop_reported()
+        if reported is not None:
+            return reported
+        final_text = ""
+        if isinstance(conversation_result, dict):
+            final_text = str(conversation_result.get("final_response") or "")
+            if not final_text and conversation_result.get("error"):
+                final_text = str(conversation_result.get("error"))
+        return self.extract_json(final_text)
+
+    def try_complete(
+        self,
+        *,
+        conversation_result: Dict[str, Any],
+        defaults: Dict[str, Any],
+    ) -> Optional[AutoGoalRunResult]:
+        """Return a result when an explicit contract exists; else None to continue."""
+        reported = self._resolve_reported(conversation_result)
+        if not isinstance(reported, dict):
+            return None
+        success, summary, details = self.parse_contract(reported)
+        status = "done" if success else "failed"
+        if isinstance(details, dict) and str(details.get("phase") or "") == "cancelled":
+            status = "cancelled"
+        return AutoGoalRunResult(
+            success=success,
+            summary=summary,
+            details=details,
+            status=status,
+            error=None if success else summary,
+            conversation_result=conversation_result,
+        )
+
     def finalize(
         self,
         *,
@@ -178,14 +266,7 @@ class ContractCompletion:
         inactivity_seconds: float,
         defaults: Dict[str, Any],
     ) -> AutoGoalRunResult:
-        reported = self.pop_reported()
-        if reported is None:
-            final_text = ""
-            if isinstance(conversation_result, dict):
-                final_text = str(conversation_result.get("final_response") or "")
-                if not final_text and conversation_result.get("error"):
-                    final_text = str(conversation_result.get("error"))
-            reported = self.extract_json(final_text)
+        reported = self._resolve_reported(conversation_result)
 
         if inactivity_hit and not (isinstance(reported, dict) and reported.get("success")):
             summary = f"inference agent inactivity timeout after {int(inactivity_seconds)}s"
@@ -338,7 +419,15 @@ def resolve_headless_runtime_provider() -> Dict[str, Any]:
 
 
 class AutoGoalRuntime:
-    """Run one non-interactive agent conversation under an AutoGoal profile."""
+    """Run a multi-segment non-interactive agent loop under an AutoGoal profile.
+
+    Mirrors CLI AutoGoalManager: one agent for the whole run; each segment is
+    one ``run_conversation`` with ``max_iterations`` = ``segment_max_turns``
+    (default 100). When a segment ends without a completion contract, a summary
+    is captured and the same agent continues with a continuation prompt
+    (default ``max_segments`` = 20). No ``agent.close()`` between segments —
+    CLI does not close either; skill precipitation is optional, not required.
+    """
 
     def run(
         self,
@@ -350,6 +439,8 @@ class AutoGoalRuntime:
         stop_flag: Optional[StopFlag] = None,
         inactivity_seconds: Optional[float] = None,
         max_iterations: Optional[int] = None,
+        segment_max_turns: Optional[int] = None,
+        max_segments: Optional[int] = None,
         agent_factory: Optional[AgentFactory] = None,
         remember_agent: Optional[AgentHook] = None,
         forget_agent: Optional[Callable[[str], None]] = None,
@@ -366,15 +457,32 @@ class AutoGoalRuntime:
             else float(profile.default_inactivity_seconds)
         )
         try:
-            iters = int(max_iterations) if max_iterations is not None else int(profile.default_max_iterations)
+            if segment_max_turns is not None:
+                iters = int(segment_max_turns)
+            elif max_iterations is not None:
+                iters = int(max_iterations)
+            else:
+                iters = int(
+                    getattr(profile, "default_segment_max_turns", None)
+                    or profile.default_max_iterations
+                )
         except (TypeError, ValueError):
             iters = int(profile.default_max_iterations)
+        iters = max(1, iters)
+        try:
+            segments = (
+                int(max_segments)
+                if max_segments is not None
+                else int(getattr(profile, "default_max_segments", DEFAULT_MAX_SEGMENTS) or 1)
+            )
+        except (TypeError, ValueError):
+            segments = DEFAULT_MAX_SEGMENTS
+        segments = max(1, segments)
 
         prev_yolo = os.environ.get("GPUCLOUD_YOLO_MODE")
         os.environ["GPUCLOUD_YOLO_MODE"] = "1"
         os.environ.setdefault("GPUCLOUD_CRON_SESSION", "1")
 
-        agent = None
         try:
             if stop_flag and stop_flag():
                 summary = "cancelled before agent start"
@@ -391,8 +499,7 @@ class AutoGoalRuntime:
             model = _resolve_model_name(runtime, agent_model_hint)
             enabled = list(profile.enabled_toolsets)
             disabled = list(profile.disabled_toolsets)
-
-            factory_kwargs = dict(
+            factory_kwargs_base = dict(
                 model=model or runtime.get("model"),
                 api_key=runtime.get("api_key"),
                 base_url=runtime.get("base_url"),
@@ -408,75 +515,188 @@ class AutoGoalRuntime:
                 platform=profile.platform,
                 session_id=session_id,
             )
+            conv_task_id = task_id or session_id
+            segment_summaries: List[Dict[str, Any]] = []
+            last_result: Dict[str, Any] = {}
+            last_reason = "continue"
+            conversation_history: Optional[List[Dict[str, Any]]] = None
 
+            # Same agent for the whole run — matches CLI session agent reuse.
             if agent_factory is not None:
-                agent = agent_factory(**factory_kwargs)
+                agent = agent_factory(**factory_kwargs_base)
             else:
                 from run_agent import AIAgent
 
-                agent = AIAgent(**factory_kwargs)
+                agent = AIAgent(**factory_kwargs_base)
 
             if remember_agent is not None:
                 remember_agent(session_id, agent)
 
-            prompt = objective
-            conv_task_id = task_id or session_id
+            for segment_index in range(1, segments + 1):
+                if stop_flag and stop_flag():
+                    summary = "cancelled before segment start"
+                    details = {"phase": "cancelled", **defaults}
+                    return AutoGoalRunResult(
+                        success=False,
+                        summary=summary,
+                        details=details,
+                        status="cancelled",
+                        error=summary,
+                        conversation_result=last_result,
+                    )
 
-            def _run_conv() -> Dict[str, Any]:
-                return agent.run_conversation(user_message=prompt, task_id=conv_task_id)
+                if segment_index == 1:
+                    prompt = objective
+                else:
+                    prompt = format_continuation_prompt(
+                        goal=objective,
+                        reason=last_reason,
+                        segment_summaries=segment_summaries,
+                    )
 
-            result: Dict[str, Any] = {}
-            inactivity_hit = False
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(_run_conv)
-                while True:
-                    if stop_flag and stop_flag():
-                        if interrupt_agent is not None:
-                            interrupt_agent(session_id, "cancelled by stop flag")
-                        try:
-                            result = future.result(timeout=30)
-                        except Exception:
-                            result = {"final_response": "", "error": "cancelled"}
-                        summary = "cancelled during agent run"
-                        details = {"phase": "cancelled", **defaults}
-                        return AutoGoalRunResult(
-                            success=False,
-                            summary=summary,
-                            details=details,
-                            status="cancelled",
-                            error=summary,
-                            conversation_result=result,
-                        )
-                    try:
-                        result = future.result(timeout=2.0)
-                        break
-                    except FuturesTimeout:
-                        if inactivity_s <= 0:
-                            continue
-                        idle = 0.0
-                        if hasattr(agent, "get_activity_summary"):
-                            try:
-                                act = agent.get_activity_summary() or {}
-                                idle = float(act.get("seconds_since_activity") or 0.0)
-                            except Exception:
-                                idle = 0.0
-                        if idle >= inactivity_s:
-                            inactivity_hit = True
+                def _run_conv(
+                    a=agent,
+                    p=prompt,
+                    hist=conversation_history,
+                ) -> Dict[str, Any]:
+                    return a.run_conversation(
+                        user_message=p,
+                        task_id=conv_task_id,
+                        conversation_history=hist,
+                    )
+
+                result: Dict[str, Any] = {}
+                inactivity_hit = False
+                cancelled = False
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(_run_conv)
+                    while True:
+                        if stop_flag and stop_flag():
                             if interrupt_agent is not None:
-                                interrupt_agent(session_id, "autogoal inactivity timeout")
+                                interrupt_agent(session_id, "cancelled by stop flag")
                             try:
                                 result = future.result(timeout=30)
-                            except Exception as exc:
-                                result = {"final_response": "", "error": str(exc)}
+                            except Exception:
+                                result = {"final_response": "", "error": "cancelled"}
+                            cancelled = True
                             break
-                        continue
+                        try:
+                            result = future.result(timeout=2.0)
+                            break
+                        except FuturesTimeout:
+                            if inactivity_s <= 0:
+                                continue
+                            idle = 0.0
+                            if hasattr(agent, "get_activity_summary"):
+                                try:
+                                    act = agent.get_activity_summary() or {}
+                                    idle = float(act.get("seconds_since_activity") or 0.0)
+                                except Exception:
+                                    idle = 0.0
+                            if idle >= inactivity_s:
+                                inactivity_hit = True
+                                if interrupt_agent is not None:
+                                    interrupt_agent(session_id, "autogoal inactivity timeout")
+                                try:
+                                    result = future.result(timeout=30)
+                                except Exception as exc:
+                                    result = {"final_response": "", "error": str(exc)}
+                                break
+                            continue
 
-            return completion.finalize(
-                conversation_result=result if isinstance(result, dict) else {},
-                inactivity_hit=inactivity_hit,
+                last_result = result if isinstance(result, dict) else {}
+                final_text = str(last_result.get("final_response") or "")
+                msgs = last_result.get("messages")
+                if isinstance(msgs, list):
+                    conversation_history = msgs
+
+                if cancelled:
+                    summary = "cancelled during agent run"
+                    details = {"phase": "cancelled", **defaults}
+                    return AutoGoalRunResult(
+                        success=False,
+                        summary=summary,
+                        details=details,
+                        status="cancelled",
+                        error=summary,
+                        conversation_result=last_result,
+                    )
+
+                if inactivity_hit:
+                    return completion.finalize(
+                        conversation_result=last_result,
+                        inactivity_hit=True,
+                        inactivity_seconds=inactivity_s,
+                        defaults=defaults,
+                    )
+
+                if "AUTO_GOAL_BLOCKED:" in final_text:
+                    summary = "agent entered AUTO_GOAL_BLOCKED"
+                    return AutoGoalRunResult(
+                        success=False,
+                        summary=summary,
+                        details={**defaults, "phase": "blocked"},
+                        status="blocked",
+                        error=summary,
+                        conversation_result=last_result,
+                    )
+
+                early = None
+                if hasattr(completion, "try_complete"):
+                    try:
+                        early = completion.try_complete(
+                            conversation_result=last_result,
+                            defaults=defaults,
+                        )
+                    except Exception:
+                        _log.exception("autogoal try_complete failed session=%s", session_id)
+                        early = None
+                if early is not None:
+                    early.details.setdefault("segment_index", segment_index)
+                    early.details.setdefault("segments_used", segment_index)
+                    early.details.setdefault("max_segments", segments)
+                    return early
+
+                last_reason = (
+                    f"segment {segment_index}/{segments} ended without completion contract; "
+                    "continue from summary"
+                )
+                segment_summaries.append(
+                    summarize_segment(
+                        segment_index=segment_index,
+                        turns_used=iters,
+                        reason=last_reason,
+                        last_response=final_text,
+                    )
+                )
+                _log.info(
+                    "autogoal segment %s/%s summarized; continuing session=%s",
+                    segment_index,
+                    segments,
+                    session_id,
+                )
+                if segment_index >= segments:
+                    break
+
+            details_extra = {
+                "segment_index": segments,
+                "segments_used": len(segment_summaries),
+                "max_segments": segments,
+                "segment_max_turns": iters,
+            }
+            final = completion.finalize(
+                conversation_result=last_result,
+                inactivity_hit=False,
                 inactivity_seconds=inactivity_s,
-                defaults=defaults,
+                defaults={**defaults, **details_extra},
             )
+            if not final.success and not str(final.summary or "").strip():
+                final.summary = (
+                    f"autogoal segment budget exhausted "
+                    f"({segments}/{segments} segments × {iters} turns)"
+                )
+                final.error = final.summary
+            return final
         except Exception as exc:
             _log.exception("autogoal runtime failed for %s", session_id)
             summary = str(exc)
@@ -488,8 +708,13 @@ class AutoGoalRuntime:
                 error=summary,
             )
         finally:
+            # Match CLI: forget once at end of the run; never close() between
+            # segments (close can kill ProcessRegistry bg procs for the task).
             if forget_agent is not None:
-                forget_agent(session_id)
+                try:
+                    forget_agent(session_id)
+                except Exception:
+                    pass
             if prev_yolo is None:
                 os.environ.pop("GPUCLOUD_YOLO_MODE", None)
             else:

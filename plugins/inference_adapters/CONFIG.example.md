@@ -34,11 +34,17 @@ inference_adapters:
   health_poll_seconds: 2
   health_timeout_seconds: 300
   agent_timeout_seconds: 1800   # inactivity timeout for agent driver
-  max_iterations: 90
+  # Multi-segment AutoGoal budget (same shape as CLI /autogoal):
+  # each segment gets segment_max_turns tool-call iterations, then a summary
+  # continuation starts the next segment (same agent; skill_manage optional).
+  segment_max_turns: 100
+  max_segments: 20
+  # max_iterations: 100   # optional alias for segment_max_turns (back-compat)
   serve_api_key_env: INFERENCE_API_KEY
   serve_api_key: ""       # optional protect local vLLM HTTP
   hf_token: ""            # optional private weight pull
-  status_callback_url: "" # optional thin API callback for deploy status projection
+  status_callback_url: "" # deprecated — platform polls master job status instead
+
   # legacy_scheme only:
   max_replan_attempts: 16
   max_replan_wall_seconds: 3600

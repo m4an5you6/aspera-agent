@@ -68,15 +68,18 @@ def render_master_config(
     if str(node_id or "").strip():
         node_line = f"\n              node_id: {_yaml_scalar(str(node_id).strip())}"
 
+    # Indent must match sibling keys inside the dedent block below (14 spaces).
+    # Wrong indent (e.g. "  secret:") shrinks textwrap.dedent's common prefix and
+    # produces invalid YAML (secret at document root, over-indented children).
     cluster_extra = ""
     if cluster_secret:
-        cluster_extra = f"\n  secret: {_yaml_scalar(cluster_secret)}"
+        cluster_extra = f"\n              secret: {_yaml_scalar(cluster_secret)}"
 
     ia_extra_lines: List[str] = []
     if inference_api_key:
-        ia_extra_lines.append(f"  serve_api_key: {_yaml_scalar(inference_api_key)}")
+        ia_extra_lines.append(f"              serve_api_key: {_yaml_scalar(inference_api_key)}")
     if hf_token:
-        ia_extra_lines.append(f"  hf_token: {_yaml_scalar(hf_token)}")
+        ia_extra_lines.append(f"              hf_token: {_yaml_scalar(hf_token)}")
     ia_extra = ("\n" + "\n".join(ia_extra_lines)) if ia_extra_lines else ""
 
     return (
@@ -135,13 +138,13 @@ def render_worker_config(
 
     cluster_extra = ""
     if cluster_secret:
-        cluster_extra = f"\n  secret: {_yaml_scalar(cluster_secret)}"
+        cluster_extra = f"\n              secret: {_yaml_scalar(cluster_secret)}"
 
     ia_extra_lines: List[str] = []
     if inference_api_key:
-        ia_extra_lines.append(f"  serve_api_key: {_yaml_scalar(inference_api_key)}")
+        ia_extra_lines.append(f"              serve_api_key: {_yaml_scalar(inference_api_key)}")
     if hf_token:
-        ia_extra_lines.append(f"  hf_token: {_yaml_scalar(hf_token)}")
+        ia_extra_lines.append(f"              hf_token: {_yaml_scalar(hf_token)}")
     ia_extra = ("\n" + "\n".join(ia_extra_lines)) if ia_extra_lines else ""
 
     return (

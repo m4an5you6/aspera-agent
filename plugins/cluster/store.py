@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS cluster_jobs (
     created_at DOUBLE PRECISION NOT NULL,
     updated_at DOUBLE PRECISION NOT NULL,
     error_summary TEXT NOT NULL DEFAULT '',
+    outcome_details JSONB NOT NULL DEFAULT '{}',
     idempotency_key TEXT UNIQUE
 );
 
@@ -179,6 +180,18 @@ def _gpus_to_json(gpus: List[GpuInfo]) -> List[Dict[str, Any]]:
     return [g.to_dict() for g in gpus]
 
 
+def _json_dict(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    return {}
+
+
 class ClusterStore(ABC):
     @abstractmethod
     def ensure_schema(self) -> None: ...
@@ -218,7 +231,13 @@ class ClusterStore(ABC):
 
     @abstractmethod
     def update_job_state(
-        self, job_id: str, state: str, *, error_summary: str = "", expected_generation: Optional[int] = None
+        self,
+        job_id: str,
+        state: str,
+        *,
+        error_summary: str = "",
+        expected_generation: Optional[int] = None,
+        outcome_details: Optional[Dict[str, Any]] = None,
     ) -> bool: ...
 
     @abstractmethod
@@ -385,7 +404,13 @@ class MemoryClusterStore(ClusterStore):
             return self._jobs.get(jid) if jid else None
 
     def update_job_state(
-        self, job_id: str, state: str, *, error_summary: str = "", expected_generation: Optional[int] = None
+        self,
+        job_id: str,
+        state: str,
+        *,
+        error_summary: str = "",
+        expected_generation: Optional[int] = None,
+        outcome_details: Optional[Dict[str, Any]] = None,
     ) -> bool:
         with self._lock:
             job = self._jobs.get(job_id)
@@ -397,6 +422,8 @@ class MemoryClusterStore(ClusterStore):
             job.updated_at = time.time()
             if error_summary:
                 job.error_summary = error_summary
+            if outcome_details is not None:
+                job.outcome_details = dict(outcome_details)
             return True
 
     def update_job_extra(self, job_id: str, extra: Dict[str, Any]) -> bool:
@@ -597,6 +624,13 @@ class PostgresClusterStore(ClusterStore):
         conn = self._connect()
         with conn.cursor() as cur:
             cur.execute(SCHEMA_SQL)
+            # Backfill columns for fleets created before outcome_details existed.
+            cur.execute(
+                """
+                ALTER TABLE cluster_jobs
+                ADD COLUMN IF NOT EXISTS outcome_details JSONB NOT NULL DEFAULT '{}'
+                """
+            )
         conn.commit()
 
     def get_master_epoch(self) -> int:
@@ -748,14 +782,15 @@ class PostgresClusterStore(ClusterStore):
                     """
                     INSERT INTO cluster_jobs
                     (job_id, spec, state, master_epoch, job_generation, master_addr, master_port,
-                     created_at, updated_at, error_summary, idempotency_key)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     created_at, updated_at, error_summary, outcome_details, idempotency_key)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     """,
                     (
                         job.job_id, json.dumps(job.spec.to_dict()), job.state,
                         job.master_epoch, job.job_generation,
                         job.master_addr, job.master_port,
                         job.created_at, job.updated_at, job.error_summary,
+                        json.dumps(job.outcome_details or {}),
                         job.spec.idempotency_key or None,
                     ),
                 )
@@ -807,6 +842,7 @@ class PostgresClusterStore(ClusterStore):
             created_at=float(data["created_at"]),
             updated_at=float(data["updated_at"]),
             error_summary=data.get("error_summary") or "",
+            outcome_details=_json_dict(data.get("outcome_details")),
         )
 
     def get_job(self, job_id: str) -> Optional[JobRecord]:
@@ -829,11 +865,44 @@ class PostgresClusterStore(ClusterStore):
                 return self.get_job(row[0]) if row else None
 
     def update_job_state(
-        self, job_id: str, state: str, *, error_summary: str = "", expected_generation: Optional[int] = None
+        self,
+        job_id: str,
+        state: str,
+        *,
+        error_summary: str = "",
+        expected_generation: Optional[int] = None,
+        outcome_details: Optional[Dict[str, Any]] = None,
     ) -> bool:
         with self._tx() as conn:
             with conn.cursor() as cur:
-                if expected_generation is not None:
+                if outcome_details is not None:
+                    details_json = json.dumps(outcome_details)
+                    if expected_generation is not None:
+                        cur.execute(
+                            """
+                            UPDATE cluster_jobs
+                            SET state=%s, updated_at=%s, error_summary=%s, outcome_details=%s
+                            WHERE job_id=%s AND job_generation=%s
+                            """,
+                            (
+                                state,
+                                time.time(),
+                                error_summary,
+                                details_json,
+                                job_id,
+                                expected_generation,
+                            ),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            UPDATE cluster_jobs
+                            SET state=%s, updated_at=%s, error_summary=%s, outcome_details=%s
+                            WHERE job_id=%s
+                            """,
+                            (state, time.time(), error_summary, details_json, job_id),
+                        )
+                elif expected_generation is not None:
                     cur.execute(
                         """
                         UPDATE cluster_jobs SET state=%s, updated_at=%s, error_summary=%s

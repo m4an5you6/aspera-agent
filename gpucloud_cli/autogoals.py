@@ -23,6 +23,7 @@ from gpucloud_cli.autogoal_runtime import (
     AUTO_GOAL_KICKOFF_TEMPLATE,
     AUTO_GOAL_OPERATING_CONTRACT,
     format_kickoff_prompt,
+    summarize_segment,
 )
 from gpucloud_cli.goals import DEFAULT_MAX_TURNS, judge_goal
 
@@ -271,16 +272,12 @@ def _summarize_segment(
     reason: str,
     last_response: str,
 ) -> Dict[str, Any]:
-    text = (last_response or "").strip()
-    if len(text) > 1800:
-        text = text[-1800:]
-    return {
-        "segment": segment_index,
-        "turns_used": turns_used,
-        "reason": reason or "continue",
-        "summary": text or "(no response text captured)",
-        "created_at": time.time(),
-    }
+    return summarize_segment(
+        segment_index=segment_index,
+        turns_used=turns_used,
+        reason=reason,
+        last_response=last_response,
+    )
 
 
 class AutoGoalManager:

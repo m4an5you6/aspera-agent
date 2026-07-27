@@ -47,6 +47,9 @@ def test_cluster_inference_profile_keeps_context_files_skips_memory():
     assert PROFILE_CLUSTER_INFERENCE.skip_context_files is False
     assert PROFILE_CLUSTER_INFERENCE.skip_memory is True
     assert PROFILE_CLUSTER_INFERENCE.verbose_logging is True
+    assert PROFILE_CLUSTER_INFERENCE.default_segment_max_turns == 100
+    assert PROFILE_CLUSTER_INFERENCE.default_max_segments == 20
+    assert PROFILE_CLUSTER_INFERENCE.default_max_iterations == 100
 
 
 def test_wrap_objective_with_operating_contract():
@@ -54,6 +57,77 @@ def test_wrap_objective_with_operating_contract():
     assert "cluster_inference" in wrapped
     assert "do the thing" in wrapped
     assert "AUTO_GOAL_BLOCKED" in wrapped
+
+
+def test_runtime_multi_segment_continues_with_summary(monkeypatch, tmp_path):
+    monkeypatch.setenv("GPUCLOUD_HOME", str(tmp_path / ".gpucloud"))
+    (tmp_path / ".gpucloud").mkdir(parents=True, exist_ok=True)
+
+    calls = {"n": 0, "prompts": [], "agents": 0, "histories": []}
+    reported_box: Dict[str, Any] = {"payload": None}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            calls["agents"] += 1
+            assert kwargs.get("max_iterations") == 3
+
+        def run_conversation(self, user_message="", task_id=None, conversation_history=None):
+            calls["n"] += 1
+            calls["prompts"].append(user_message)
+            calls["histories"].append(conversation_history)
+            if calls["n"] == 1:
+                return {
+                    "final_response": "still installing vllm, not ready",
+                    "messages": [
+                        {"role": "user", "content": user_message},
+                        {"role": "assistant", "content": "still installing vllm, not ready"},
+                    ],
+                }
+            reported_box["payload"] = {
+                "success": True,
+                "summary": "ready after segment 2",
+                "details": {"phase": "ready", "visit_port": 8000},
+            }
+            return {"final_response": '{"success": true}'}
+
+        def interrupt(self, reason=""):
+            return None
+
+        def get_activity_summary(self):
+            return {"seconds_since_activity": 0.0}
+
+    result = AutoGoalRuntime().run(
+        objective="deploy inference",
+        profile=PROFILE_CLUSTER_INFERENCE,
+        session_id="sess-multi",
+        completion=ContractCompletion(
+            pop_reported=lambda: reported_box["payload"],
+            parse_contract=_parse_simple,
+            extract_json=_extract_json,
+        ),
+        agent_factory=FakeAgent,
+        runtime_provider={
+            "provider": "test",
+            "api_key": "k",
+            "base_url": "http://x",
+            "api_mode": "chat_completions",
+            "model": "m",
+        },
+        inactivity_seconds=1800,
+        segment_max_turns=3,
+        max_segments=5,
+    )
+
+    assert result.success is True
+    assert calls["n"] == 2
+    assert calls["agents"] == 1  # CLI-style: reuse one agent across segments
+    assert calls["histories"][0] is None
+    assert isinstance(calls["histories"][1], list)
+    assert "deploy inference" in calls["prompts"][0]
+    assert "[Continuing AutoGoal]" in calls["prompts"][1]
+    assert "still installing vllm" in calls["prompts"][1]
+    assert "skill_manage" not in calls["prompts"][1]
+    assert result.details.get("segment_index") == 2
 
 
 def test_runtime_contract_completion_success(monkeypatch, tmp_path):
@@ -70,7 +144,7 @@ def test_runtime_contract_completion_success(monkeypatch, tmp_path):
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_conversation(self, user_message="", task_id=None):
+        def run_conversation(self, user_message="", task_id=None, conversation_history=None):
             return {"final_response": "done"}
 
         def interrupt(self, reason=""):
@@ -123,7 +197,7 @@ def test_runtime_passes_verbose_logging_from_profile(monkeypatch, tmp_path):
         def __init__(self, **kwargs):
             captured.update(kwargs)
 
-        def run_conversation(self, user_message="", task_id=None):
+        def run_conversation(self, user_message="", task_id=None, conversation_history=None):
             return {"final_response": "done"}
 
         def interrupt(self, reason=""):
@@ -167,7 +241,7 @@ def test_runtime_stop_flag_before_start():
         def __init__(self, **kwargs):
             called["agent"] = True
 
-        def run_conversation(self, user_message="", task_id=None):
+        def run_conversation(self, user_message="", task_id=None, conversation_history=None):
             return {"final_response": ""}
 
     result = AutoGoalRuntime().run(
@@ -203,7 +277,7 @@ def test_runtime_inactivity_timeout():
         def __init__(self, **kwargs):
             pass
 
-        def run_conversation(self, user_message="", task_id=None):
+        def run_conversation(self, user_message="", task_id=None, conversation_history=None):
             import time
 
             time.sleep(5)

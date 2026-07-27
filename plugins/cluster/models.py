@@ -126,6 +126,8 @@ class JobRecord:
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
     error_summary: str = ""
+    # Inference outcome projection fields (visit_host/port/etc.) for platform pollers.
+    outcome_details: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
