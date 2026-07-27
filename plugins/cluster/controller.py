@@ -195,47 +195,72 @@ class ClusterController:
             except (TypeError, ValueError):
                 pass
 
-            # Select RuntimeScheme (tasks-centric) from node capabilities + experience.
+            # RuntimeScheme selection is only required for legacy_scheme driver.
+            from plugins.inference_adapters.agent_driver import get_inference_driver
             from plugins.inference_adapters.experience import get_experience_store
             from plugins.inference_adapters.runtime_scheme import (
                 embed_scheme_in_job_extra,
                 select_initial_scheme,
             )
 
-            exp = get_experience_store(self.cfg.data_dir)
-            schemes: List[Dict[str, Any]] = []
-            for node in selected:
-                caps = dict(node.capabilities or {})
-                if not caps:
-                    caps = self.store.get_node_metrics(node.node_id) or {}
-                if not probe_ready(caps):
+            driver = get_inference_driver()
+            if driver == "legacy_scheme":
+                exp = get_experience_store(self.cfg.data_dir)
+                schemes: List[Dict[str, Any]] = []
+                for node in selected:
+                    caps = dict(node.capabilities or {})
+                    if not caps:
+                        caps = self.store.get_node_metrics(node.node_id) or {}
+                    if not probe_ready(caps):
+                        return {
+                            "success": False,
+                            "errors": [f"capabilities_incomplete:{node.node_id}"],
+                        }
+                    adapter_id = str(
+                        ((norm.get("extra") or {}).get("adapter_id"))
+                        or ((norm.get("extra") or {}).get("inference_spec") or {}).get(
+                            "adapter_id"
+                        )
+                        or "hf_vllm"
+                    )
+                    scheme, scheme_errs = select_initial_scheme(
+                        caps, adapter_id=adapter_id, experience=exp
+                    )
+                    if scheme_errs or not scheme:
+                        return {
+                            "success": False,
+                            "errors": scheme_errs or ["no_scheme_match"],
+                        }
+                    schemes.append(scheme)
+                matrix_ids = {str(s.get("matrix_id") or s.get("scheme_id")) for s in schemes}
+                if len(matrix_ids) > 1:
                     return {
                         "success": False,
-                        "errors": [f"capabilities_incomplete:{node.node_id}"],
+                        "errors": [
+                            "heterogeneous_runtime:selected nodes need different schemes"
+                        ],
                     }
-                adapter_id = str(
-                    ((norm.get("extra") or {}).get("adapter_id"))
-                    or ((norm.get("extra") or {}).get("inference_spec") or {}).get("adapter_id")
-                    or "hf_vllm"
-                )
-                scheme, scheme_errs = select_initial_scheme(
-                    caps, adapter_id=adapter_id, experience=exp
-                )
-                if scheme_errs or not scheme:
-                    return {"success": False, "errors": scheme_errs or ["no_scheme_match"]}
-                schemes.append(scheme)
-            matrix_ids = {str(s.get("matrix_id") or s.get("scheme_id")) for s in schemes}
-            if len(matrix_ids) > 1:
-                return {
-                    "success": False,
-                    "errors": ["heterogeneous_runtime:selected nodes need different schemes"],
-                }
-            extra = dict(norm.get("extra") or {})
-            extra = embed_scheme_in_job_extra(extra, schemes[0])
-            # Track replan budget bookkeeping on the job
-            extra["replan_attempts"] = 0
-            extra["attempted_scheme_ids"] = [str(schemes[0].get("scheme_id") or "")]
-            norm["extra"] = extra
+                extra = dict(norm.get("extra") or {})
+                extra = embed_scheme_in_job_extra(extra, schemes[0])
+                extra["replan_attempts"] = 0
+                extra["attempted_scheme_ids"] = [str(schemes[0].get("scheme_id") or "")]
+                extra["inference_driver"] = "legacy_scheme"
+                norm["extra"] = extra
+            else:
+                # Agent driver: still require nodes to have completed capability probe
+                # so scheduling knows GPU/python presence; do not pin RuntimeScheme.
+                for node in selected:
+                    caps = dict(node.capabilities or {})
+                    if not caps:
+                        caps = self.store.get_node_metrics(node.node_id) or {}
+                    if not probe_ready(caps):
+                        return {
+                            "success": False,
+                            "errors": [f"capabilities_incomplete:{node.node_id}"],
+                        }
+                extra = dict(norm.get("extra") or {})
+                extra["inference_driver"] = "agent"
+                norm["extra"] = extra
 
         spec = JobSpec(
             job_id=norm["job_id"],

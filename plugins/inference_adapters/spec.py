@@ -61,6 +61,15 @@ def extract_inference_spec(raw: Dict[str, Any]) -> Dict[str, Any]:
         ),
         "deploy_node_id": base.get("deploy_node_id") or raw.get("deploy_node_id"),
         "callback_url": str(base.get("callback_url") or raw.get("callback_url") or ""),
+        "model_hint": str(
+            base.get("model_hint")
+            or raw.get("model_hint")
+            or (base.get("model") or {}).get("hint")
+            or ""
+        ),
+        "training_artifact_kind": str(
+            base.get("training_artifact_kind") or raw.get("training_artifact_kind") or ""
+        ),
     }
     # Convenience: top-level model.local_path aliases
     if not out["model"].get("local_path"):

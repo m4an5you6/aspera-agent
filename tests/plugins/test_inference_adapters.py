@@ -255,10 +255,83 @@ def test_controller_submit_inference(tmp_path):
     assert result["job"]["spec"]["job_kind"] == "inference"
     assert result["assignments"][0]["node_id"] == "gpu-node-03"
     extra = result["job"]["spec"]["extra"]
+    # Default driver=agent: no forced RuntimeScheme embed
+    assert extra.get("inference_driver") == "agent"
+    assert "runtime_scheme" not in extra
+    assert extra["inference_spec"]["model"]["local_path"] == "/data/model"
+
+
+def test_controller_submit_inference_legacy_scheme_embeds_runtime(tmp_path, monkeypatch):
+    monkeypatch.setenv("GPUCLOUD_HOME", str(tmp_path / ".gpucloud"))
+    monkeypatch.setattr(
+        "plugins.inference_adapters.agent_driver.get_inference_driver",
+        lambda: "legacy_scheme",
+    )
+    cfg = ClusterConfig(
+        enabled=True,
+        role="master",
+        node_id="master",
+        master_url="http://127.0.0.1:8765",
+        data_dir=tmp_path / "data",
+        heartbeat_ttl_sec=30,
+    )
+    cfg.data_dir.mkdir(parents=True, exist_ok=True)
+    store = MemoryClusterStore()
+    store.ensure_schema()
+    logger = ClusterLogger(cfg, store)
+    events = ClusterEventBridge(cfg, store)
+    controller = ClusterController(cfg, store, logger, events)
+    set_runtime(controller=controller, store=store, logger=logger, events=events)
+
+    caps = {
+        "probe_version": 1,
+        "probe_ok": True,
+        "python_executable": "/usr/bin/python3",
+        "python_version": "3.10.12",
+        "nvidia_driver": "535.0",
+        "cuda_driver_major": 12,
+        "cuda_driver_minor": 2,
+        "torch_available": False,
+        "vllm_available": False,
+        "gpu_count": 1,
+    }
+    store.upsert_node(
+        NodeRecord(
+            node_id="gpu-node-03",
+            advertised_addr="10.0.0.3",
+            state="ready",
+            gpus=[GpuInfo(index=0, name="GPU", memory_mb=24000)],
+            capabilities=dict(caps),
+        )
+    )
+    from plugins.cluster.models import HeartbeatPayload
+
+    store.record_heartbeat(
+        HeartbeatPayload(
+            node_id="gpu-node-03",
+            state="ready",
+            gpus=[GpuInfo(index=0)],
+            metrics=dict(caps),
+        )
+    )
+
+    result = controller.submit_job(
+        {
+            "job_kind": "inference",
+            "adapter_id": "hf_vllm",
+            "model": {"local_path": "/data/model"},
+            "gpus": {"node_ids": ["gpu-node-03"], "visible_devices": [0], "tensor_parallel": 1},
+            "serve": {"port": 8000},
+            "nnodes": 1,
+            "nproc_per_node": 1,
+        }
+    )
+    assert result["success"] is True
+    extra = result["job"]["spec"]["extra"]
+    assert extra.get("inference_driver") == "legacy_scheme"
     assert "runtime_scheme" in extra
     scheme = extra["runtime_scheme"]
     assert isinstance(scheme.get("tasks"), list) and scheme["tasks"]
-    assert "pip_packages" not in scheme  # no full BOM
     assert extra["inference_spec"]["runtime"]["scheme"]["scheme_id"] == scheme["scheme_id"]
 
 
@@ -595,10 +668,14 @@ def test_controller_capabilities_incomplete(tmp_path):
     assert any("capabilities_incomplete" in e for e in result["errors"])
 
 
-def test_controller_replan_and_experience(tmp_path):
+def test_controller_replan_and_experience(tmp_path, monkeypatch):
     from plugins.inference_adapters.experience import reset_experience_store_for_tests
 
     reset_experience_store_for_tests()
+    monkeypatch.setattr(
+        "plugins.inference_adapters.agent_driver.get_inference_driver",
+        lambda: "legacy_scheme",
+    )
     cfg = ClusterConfig(
         enabled=True,
         role="master",

@@ -7,7 +7,7 @@ Add to ~/.gpucloud/config.yaml when enabling deploy-after-confirm inference:
 model:
   provider: openrouter   # or openai / custom
   default: your-model
-  api_key: "sk-..."      # LLM key for agent bring-up (internal deployments)
+  api_key: "sk-..."      # LLM key for on-node inference agent (required for driver=agent)
 
 plugins:
   enabled: [cluster, inference_adapters]
@@ -15,7 +15,7 @@ plugins:
 cluster:
   enabled: true
   role: master   # or worker
-  # GPU master: enable both so this host schedules AND can serve / ensure_runtime.
+  # GPU master: enable both so this host schedules AND can serve.
   # Pure control-plane (no GPU): embedded_master true, embedded_worker false.
   embedded_master: true
   embedded_worker: true
@@ -27,16 +27,20 @@ cluster:
 
 inference_adapters:
   enabled: true
+  # agent (default): on-node AIAgent installs deps, prepares artifacts, starts vLLM until ready.
+  # legacy_scheme: fixed RuntimeScheme task runner (pin matrix + replan).
+  driver: agent
   default_adapter_id: hf_vllm
   health_poll_seconds: 2
   health_timeout_seconds: 300
+  agent_timeout_seconds: 1800   # inactivity timeout for agent driver
+  max_iterations: 90
   serve_api_key_env: INFERENCE_API_KEY
   serve_api_key: ""       # optional protect local vLLM HTTP
   hf_token: ""            # optional private weight pull
   status_callback_url: "" # optional thin API callback for deploy status projection
+  # legacy_scheme only:
   max_replan_attempts: 16
-  # Idle / no-progress budgets (download/write progress renews them; not absolute wall clocks).
-  # Replan scheme/matrix switches only for no_wheel | conflict | import_failed.
   max_replan_wall_seconds: 3600
   ensure_runtime_timeout_seconds: 1800
   mirror_profiles: {}     # optional named pip indexes; empty uses built-in default
@@ -57,16 +61,13 @@ inference_adapters:
 Use `plugins.inference_adapters.bootstrap.plan_deploy_bootstrap(...)` after
 deploy is requested to render per-node config.yaml (+ optional .env) and a
 remote start script. Assignment JSON must never carry plaintext keys.
-Master selects RuntimeScheme (tasks); workers execute/replan — see
-`skills/mlops/gpucloud-inference-deployment/references/runtime-scheme-contract.md`.
 
-``ensure_runtime_timeout_seconds`` and ``max_replan_wall_seconds`` are **idle
-no-progress limits**: pip download/write output renews them. Absolute
-"kill after N seconds from start" is not used. Replan only amends scheme /
-matrix for ``no_wheel``, ``conflict``, and ``import_failed``; pip timeout
-classifies as ``timeout`` and is refused (no matrix switch).
+With ``driver: agent`` (default), the assigned worker spawns an on-node AIAgent
+that chooses torch/vLLM for the model family, syncs/checks weights, starts
+serve via ``inference_start_vllm``, and reports ready. Fixed pin matrix is not
+required. Set ``driver: legacy_scheme`` to restore the old RuntimeScheme path.
 
 Bootstrap master configs enable ``embedded_worker: true`` so the master host
-registers as a schedulable node (same ensure_runtime / serve path as workers).
-Control-plane-only masters may set ``embedded_worker: false`` after render.
+registers as a schedulable node. Control-plane-only masters may set
+``embedded_worker: false`` after render.
 """

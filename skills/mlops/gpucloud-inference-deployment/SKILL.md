@@ -1,7 +1,7 @@
 ---
 name: gpucloud-inference-deployment
-description: Deploy via cluster ModelAdapter with JSON spec bootstrap.
-version: 1.2.0
+description: Deploy inference via on-node agent until vLLM is ready.
+version: 2.0.0
 author: GPUCLOUD
 platforms: [linux]
 metadata:
@@ -17,96 +17,96 @@ metadata:
 
 # GPUCLOUD Inference Deployment
 
-Use after training completes when the platform should expose a model through a **cluster ModelAdapter** (not Head SSH family pipelines).
+Use when a cluster inference assignment must expose a trained model through
+vLLM on **this GPU node**. An on-node LLM agent owns deps, artifacts, start,
+and health until ready (not a fixed pin matrix).
 
-## Core Rules
+## When to Use
 
-1. Confirm job, GPUs, weights, and the **LLM api_key for agent bring-up** first.
-2. **Deploy starts agent bring-up** — platform `POST /api/inference/agent/deploy` with `bootstrap=true` SSHs to nodes, writes `config.yaml` (`model.api_key`, `cluster.secret`), starts `gpucloud gateway`, then submits the inference job.
-3. Master selects a **RuntimeScheme** (`tasks[]` + mirror/constraints). Assigned nodes (including a GPU master with `embedded_worker: true`) run `validate → ensure_runtime → ensure_artifacts → start → health → outcome`. High-frequency **replan** stays on master/worker; platform only sees terminal status.
-4. Never put api keys or package pins in assignment JSON. Use `secrets_ref` env names only.
-5. Multi-node fleets: enable **both** `embedded_master` and `embedded_worker` on the GPU master so it heartbeats, can appear in `gpus.node_ids`, and deploys env like other workers. Pure control-plane masters (no GPU) keep `embedded_worker: false`.
+- Cluster worker received `job_kind=inference` and you are the deploy agent.
+- Platform called `POST /api/inference/agent/deploy` and bootstrap already
+  started `gpucloud gateway` on this host.
 
-## Flow
+## Prerequisites
 
-```text
-confirm resources
-  → POST /api/inference/agent/deploy  (or cluster_submit_job job_kind=inference)
-  → bootstrap nodes (config.yaml: model.api_key + cluster.secret)
-  → workers heartbeat capabilities
-  → master selects RuntimeScheme (experience + rules)
-  → worker task runner (replan as needed) → ModelAdapter start/health
-  → status callback / DB available + visit_*
-```
+- `model.api_key` in `~/.gpucloud/config.yaml` (agent LLM).
+- Tools: `terminal`, file tools, `inference_start_vllm`, `inference_health`,
+  `inference_report_ready`.
+- Assignment JSON includes `model.local_path`, `gpus`, `serve`, optional
+  `sources`, `model_hint`, `training_artifact_kind`.
 
-Bootstrap helpers: `plugins.inference_adapters.bootstrap.plan_deploy_bootstrap`.
+## How to Run
 
-## JSON Spec Shape (platform → master)
+Work until ready, then call `inference_report_ready`.
+
+## Quick Reference
+
+| Step | Action |
+|------|--------|
+| Probe | CUDA driver, Python, existing torch/vllm |
+| Model family | Read `config.json` / tokenizer / path; honor `model_hint` |
+| Install | Compatible torch + vLLM for that family (fix conflicts) |
+| Artifacts | Ensure HF-loadable dir; sync via `sources[]` if missing |
+| Serve | `inference_start_vllm` then poll `inference_health` |
+| Done | `inference_report_ready` with visit_* fields |
+
+## Procedure
+
+1. **Inspect environment** with `terminal`: `nvidia-smi`, `python3 -V`,
+   `python3 -c "import torch,vllm"` (may fail — that is OK).
+2. **Identify model family** from `model.local_path` (`config.json`
+   `model_type` / `architectures`), directory name, and optional
+   `model_hint` / `training_artifact_kind` (e.g. gpt2, qwen2.5, qwen3,
+   megatron export). Newer Qwen often needs newer vLLM than GPT-2.
+3. **Install stack**: pick torch CUDA wheel + vLLM versions that match the
+   model and driver. Prefer explicit `==` pins. On conflict or import
+   failure, uninstall/retry another combo. Pip mirrors from config are OK.
+   Historical reference only (not mandatory): cu12+py310 often used
+   `torch==2.5.1` + `vllm==0.6.6` for older models — do **not** force this
+   for Qwen3-class weights.
+4. **Artifacts**: if `local_path` missing or not HF-loadable (`config.json` +
+   weights), use `sources[]` to sync/convert. If still impossible, fail with
+   `phase=ensure_artifacts`.
+5. **Start**: call `inference_start_vllm` with `job_id`, `model_path`, and the
+   assignment `serve` / `gpus` / `secrets_ref`. Do not leave an unmanaged
+   background process if the tool works.
+6. **Health**: poll `inference_health` until `ready` (or timeout →
+   `phase=health_timeout`).
+7. **Report**: `inference_report_ready` with success contract (see below).
+
+## Outcome contract
 
 ```json
 {
-  "job_kind": "inference",
-  "adapter_id": "hf_vllm",
-  "spec_version": 1,
-  "model": { "local_path": "/data/models/job-123-hf" },
-  "gpus": {
-    "node_ids": ["gpu-node-03"],
-    "visible_devices": [0],
-    "tensor_parallel": 1
-  },
-  "serve": { "host": "0.0.0.0", "port": 8000 },
-  "secrets_ref": { "serve_api_key_env": "INFERENCE_API_KEY" },
-  "sources": []
+  "success": true,
+  "summary": "inference ready",
+  "details": {
+    "phase": "ready",
+    "adapter_id": "hf_vllm",
+    "visit_host": "<advertised host>",
+    "visit_port": 8000,
+    "protocol": "http://",
+    "stream_path": "/v1/chat/completions",
+    "health_path": "/health",
+    "deploy_node_id": 20,
+    "callback_url": "",
+    "model_path": "/path/to/model"
+  }
 }
 ```
 
-Do **not** send vLLM/torch version pins or install scripts. Master fills `runtime_scheme`.
+Failure: `success=false`, `details.phase` in
+`ensure_runtime|ensure_artifacts|start|health_timeout|cancelled|validate`.
 
-## Config (non-secret)
+## Pitfalls
 
-```yaml
-plugins:
-  enabled: [cluster, inference_adapters]
-cluster:
-  enabled: true
-  role: master   # or worker
-  # GPU master: both true. Control-plane-only: embedded_worker false.
-  embedded_master: true
-  embedded_worker: true
-  node_id: master-a
-  master_url: http://<master>:8765
-  secret: "<shared-cluster-secret>"
-model:
-  provider: openrouter
-  default: <model>
-  api_key: "<llm-api-key>"
-inference_adapters:
-  enabled: true
-  default_adapter_id: hf_vllm
-  status_callback_url: http://<thin-api>/api/inference/agent/status
-  max_replan_attempts: 16
-  max_replan_wall_seconds: 3600
-  serve_api_key: ""
-  hf_token: ""
-```
+- Fixed pin matrices cannot cover all model families — decide from evidence.
+- Disk space under `~/.cache/pip` can fill during large wheels.
+- Never put API keys in the outcome JSON.
+- Prefer managed start tool so cluster stop can kill the serve PID.
 
-## Thin API
+## Verification
 
-- `POST /api/inference/agent/deploy` — create deploy row + submit to master
-- `POST /api/inference/agent/status` — master projects ready/failed (Bearer cluster secret)
-- `GET /api/inference/agent/deploy/{id}` — poll status (`bootstrapping|submitted|available|failed`)
-
-## Troubleshooting
-
-- `capabilities_incomplete:<node>` — wait for worker heartbeat probe, retry submit.
-- `no_scheme_match:` — no built-in scheme for this CUDA/python; extend matrix/schemes.
-- `replan_exhausted:` — install/replan budget used up; check `inference-logs/` and experience failures.
-- `agent_llm_api_key_missing` — `model.api_key` / `.env` lacked LLM key before gateway start.
-- Health timeout — see `references/vllm-runtime-and-model-readiness.md`.
-
-## References
-
-- `references/runtime-scheme-contract.md`
-- `references/vllm-runtime-and-model-readiness.md`
-- `references/deployment-master-inference-status.md`
-- `plugins/inference_adapters/CONFIG.example.md`
+- `inference_health` → `ready`
+- `curl -sS http://127.0.0.1:<port>/health` succeeds
+- `inference_report_ready` returned `stored: true`

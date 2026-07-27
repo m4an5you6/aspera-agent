@@ -239,13 +239,18 @@ class NodeAgent:
         self._launch_process(assignment)
 
     def _launch_inference(self, assignment: RankAssignment, spec: JobSpec) -> None:
-        """Run ModelAdapter lifecycle for job_kind=inference (no torchrun)."""
+        """Run inference assignment: agent driver (default) or legacy scheme lifecycle."""
         # Ensure built-in adapters are registered even if plugin discovery skipped.
         try:
             import plugins.inference_adapters.hf_vllm  # noqa: F401
         except Exception:
             pass
 
+        from plugins.inference_adapters.agent_driver import (
+            get_inference_driver,
+            interrupt_inference_agent,
+            run_inference_agent,
+        )
         from plugins.inference_adapters.registry import create_adapter
         from plugins.inference_adapters.runtime import (
             remember_adapter,
@@ -297,6 +302,7 @@ class NodeAgent:
         )
 
         stop_requested = lambda: assignment.job_id in self._stopping_jobs
+        driver = get_inference_driver()
 
         def _replan_callback(needs) -> dict:
             resp = self.client.request_replan(
@@ -352,14 +358,23 @@ class NodeAgent:
 
         def _run() -> None:
             try:
-                run_inference_lifecycle(
-                    job_spec=spec.to_dict(),
-                    on_outcome=_on_outcome,
-                    stop_flag=stop_requested,
-                    adapter=adapter,
-                    replan_callback=_replan_callback,
-                )
+                if driver == "legacy_scheme":
+                    run_inference_lifecycle(
+                        job_spec=spec.to_dict(),
+                        on_outcome=_on_outcome,
+                        stop_flag=stop_requested,
+                        adapter=adapter,
+                        replan_callback=_replan_callback,
+                    )
+                else:
+                    run_inference_agent(
+                        job_spec=spec.to_dict(),
+                        on_outcome=_on_outcome,
+                        stop_flag=stop_requested,
+                        adapter=adapter,
+                    )
             finally:
+                interrupt_inference_agent(assignment.job_id, "inference thread exiting")
                 stop_job_adapter(assignment.job_id)
                 self._running_job_id = None
                 self._stopping_jobs.discard(assignment.job_id)
@@ -522,6 +537,12 @@ class NodeAgent:
 
     def _stop_job(self, job_id: str) -> None:
         self._stopping_jobs.add(job_id)
+        try:
+            from plugins.inference_adapters.agent_driver import interrupt_inference_agent
+
+            interrupt_inference_agent(job_id, "cluster stop requested")
+        except Exception:
+            pass
         try:
             from plugins.inference_adapters.runtime import stop_job_adapter
 
