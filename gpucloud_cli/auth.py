@@ -5944,6 +5944,24 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
     key_source = ""
     api_key, key_source = _resolve_api_key_provider_secret(provider_id, pconfig)
 
+    # Internal deployments often embed the key in config.yaml as model.api_key
+    # (no provider env var). Honour it when the configured provider matches.
+    if not api_key:
+        try:
+            from gpucloud_cli.config import load_config
+
+            model_cfg = load_config().get("model") or {}
+            if not isinstance(model_cfg, dict):
+                model_cfg = {}
+            cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+            if cfg_provider == provider_id:
+                cfg_key = str(model_cfg.get("api_key") or "").strip()
+                if has_usable_secret(cfg_key):
+                    api_key = cfg_key
+                    key_source = "model.api_key"
+        except Exception:
+            pass
+
     # No-auth LM Studio: substitute a placeholder so runtime / auxiliary_client
     # see the local server as configured. doctor still reports unconfigured
     # because get_api_key_provider_status uses the raw secret resolver.

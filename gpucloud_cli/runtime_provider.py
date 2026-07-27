@@ -1193,10 +1193,20 @@ def _resolve_explicit_runtime(
 
         api_key = explicit_api_key
         if not api_key:
+            cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+            if cfg_provider == provider:
+                cfg_key = str(model_cfg.get("api_key") or "").strip()
+                if has_usable_secret(cfg_key):
+                    api_key = cfg_key
+        if not api_key:
             creds = resolve_api_key_provider_credentials(provider)
             api_key = creds.get("api_key", "")
             if not base_url:
                 base_url = creds.get("base_url", "").rstrip("/")
+        if not base_url:
+            cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+            if cfg_provider == provider:
+                base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
 
         api_mode = "chat_completions"
         if provider == "copilot":
@@ -1625,22 +1635,29 @@ def resolve_runtime_provider(
             runtime["guardrail_config"] = guardrail_config
         return runtime
 
-    # API-key providers (z.ai/GLM, Kimi, MiniMax, MiniMax-CN)
+    # API-key providers (z.ai/GLM, Kimi, MiniMax, MiniMax-CN, Xiaomi, …)
     pconfig = PROVIDER_REGISTRY.get(provider)
     if pconfig and pconfig.auth_type == "api_key":
         creds = resolve_api_key_provider_credentials(provider)
-        # Honour model.base_url from config.yaml when the configured provider
-        # matches this provider — mirrors the Anthropic path above.  Without
-        # this, users who set model.base_url to e.g. api.minimaxi.com/anthropic
-        # (China endpoint) still get the hardcoded api.minimax.io default (#6039).
+        # Honour model.base_url / model.api_key from config.yaml when the
+        # configured provider matches — mirrors OpenRouter custom-endpoint
+        # and Anthropic paths. Internal deploys often put the key only in
+        # config.yaml (no XIAOMI_API_KEY / MINIMAX_API_KEY env var).
         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
         cfg_base_url = ""
+        cfg_api_key = ""
         if cfg_provider == provider:
             cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
+            cfg_api_key = str(model_cfg.get("api_key") or "").strip()
         base_url = cfg_base_url or creds.get("base_url", "").rstrip("/")
+        api_key = (
+            str(explicit_api_key or "").strip()
+            or (cfg_api_key if has_usable_secret(cfg_api_key) else "")
+            or str(creds.get("api_key") or "").strip()
+        )
         api_mode = "chat_completions"
         if provider == "copilot":
-            api_mode = _copilot_runtime_api_mode(model_cfg, creds.get("api_key", ""))
+            api_mode = _copilot_runtime_api_mode(model_cfg, api_key)
         elif provider == "xai":
             api_mode = "codex_responses"
         else:
@@ -1671,12 +1688,18 @@ def resolve_runtime_provider(
         # Strip trailing /v1 for OpenCode Anthropic models (see comment above).
         if api_mode == "anthropic_messages" and provider in {"opencode-zen", "opencode-go"}:
             base_url = re.sub(r"/v1/?$", "", base_url)
+        if str(explicit_api_key or "").strip() and api_key == str(explicit_api_key).strip():
+            key_source = "explicit"
+        elif cfg_api_key and api_key == cfg_api_key:
+            key_source = "model.api_key"
+        else:
+            key_source = creds.get("source", "env")
         return {
             "provider": provider,
             "api_mode": api_mode,
             "base_url": base_url,
-            "api_key": creds.get("api_key", ""),
-            "source": creds.get("source", "env"),
+            "api_key": api_key,
+            "source": key_source,
             "requested_provider": requested_provider,
         }
 

@@ -1262,6 +1262,52 @@ def test_minimax_config_base_url_ignored_for_different_provider(monkeypatch):
     assert resolved["base_url"] == "https://api.minimax.io/anthropic"
 
 
+def test_xiaomi_model_api_key_used_without_env(monkeypatch):
+    """Internal deploys put the key in model.api_key; env may be unset."""
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "xiaomi")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "xiaomi",
+            "default": "mimo-v2.5-pro",
+            "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+            "api_key": "sk-inline-xiaomi-key",
+        },
+    )
+    monkeypatch.setattr(rp, "load_pool", lambda provider: None)
+    monkeypatch.delenv("XIAOMI_API_KEY", raising=False)
+    monkeypatch.delenv("XIAOMI_BASE_URL", raising=False)
+
+    resolved = rp.resolve_runtime_provider(requested="xiaomi")
+
+    assert resolved["provider"] == "xiaomi"
+    assert resolved["api_key"] == "sk-inline-xiaomi-key"
+    assert resolved["base_url"] == "https://token-plan-cn.xiaomimimo.com/v1"
+    assert resolved["source"] == "model.api_key"
+
+
+def test_xiaomi_model_api_key_beats_env_when_provider_matches(monkeypatch):
+    """When model.provider matches, model.api_key wins (same as OpenRouter path)."""
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "xiaomi")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "xiaomi",
+            "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+            "api_key": "sk-from-config",
+        },
+    )
+    monkeypatch.setattr(rp, "load_pool", lambda provider: None)
+    monkeypatch.setenv("XIAOMI_API_KEY", "sk-from-env")
+    monkeypatch.delenv("XIAOMI_BASE_URL", raising=False)
+
+    resolved = rp.resolve_runtime_provider(requested="xiaomi")
+
+    assert resolved["api_key"] == "sk-from-config"
+    assert resolved["source"] == "model.api_key"
+
 def test_alibaba_default_coding_intl_endpoint_uses_chat_completions(monkeypatch):
     """Alibaba default coding-intl /v1 URL should use chat_completions mode."""
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "alibaba")

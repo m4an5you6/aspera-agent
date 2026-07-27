@@ -302,10 +302,38 @@ def run_inference_agent(
             format_runtime_provider_error,
         )
 
+        # Internal deploys write model.api_key into config.yaml (not always
+        # the provider env var). Pass them as explicit so AIAgent gets both
+        # api_key and base_url even if named-provider env vars are unset.
+        explicit_api_key = ""
+        explicit_base_url = ""
         try:
-            runtime = resolve_runtime_provider()
+            from gpucloud_cli.config import load_config
+
+            model_cfg = load_config().get("model") or {}
+            if isinstance(model_cfg, dict):
+                explicit_api_key = str(model_cfg.get("api_key") or "").strip()
+                explicit_base_url = str(model_cfg.get("base_url") or "").strip()
+        except Exception:
+            pass
+
+        try:
+            runtime = resolve_runtime_provider(
+                explicit_api_key=explicit_api_key or None,
+                explicit_base_url=explicit_base_url or None,
+            )
         except Exception as exc:
             msg = format_runtime_provider_error(exc)
+            on_outcome(False, msg, {"phase": "validate", **defaults})
+            return {"success": False, "error": msg}
+
+        if not str(runtime.get("api_key") or "").strip():
+            msg = (
+                "No LLM API key resolved for inference agent "
+                f"(provider={runtime.get('provider')!r}). "
+                "Set model.api_key in config.yaml or the provider env var "
+                "(e.g. XIAOMI_API_KEY)."
+            )
             on_outcome(False, msg, {"phase": "validate", **defaults})
             return {"success": False, "error": msg}
 
