@@ -46,6 +46,7 @@ def test_format_kickoff_includes_shared_contract():
 def test_cluster_inference_profile_keeps_context_files_skips_memory():
     assert PROFILE_CLUSTER_INFERENCE.skip_context_files is False
     assert PROFILE_CLUSTER_INFERENCE.skip_memory is True
+    assert PROFILE_CLUSTER_INFERENCE.verbose_logging is True
 
 
 def test_wrap_objective_with_operating_contract():
@@ -110,6 +111,53 @@ def test_runtime_contract_completion_success(monkeypatch, tmp_path):
         assert os.environ.get("GPUCLOUD_YOLO_MODE") is None
     else:
         assert os.environ.get("GPUCLOUD_YOLO_MODE") == prev
+
+
+def test_runtime_passes_verbose_logging_from_profile(monkeypatch, tmp_path):
+    monkeypatch.setenv("GPUCLOUD_HOME", str(tmp_path / ".gpucloud"))
+    (tmp_path / ".gpucloud").mkdir(parents=True, exist_ok=True)
+
+    captured = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run_conversation(self, user_message="", task_id=None):
+            return {"final_response": "done"}
+
+        def interrupt(self, reason=""):
+            return None
+
+        def get_activity_summary(self):
+            return {"seconds_since_activity": 0.0}
+
+    AutoGoalRuntime().run(
+        objective="obj",
+        profile=PROFILE_CLUSTER_INFERENCE,
+        session_id="sess-verbose",
+        completion=ContractCompletion(
+            pop_reported=lambda: {
+                "success": True,
+                "summary": "ok",
+                "details": {},
+            },
+            parse_contract=_parse_simple,
+            extract_json=_extract_json,
+        ),
+        agent_factory=FakeAgent,
+        runtime_provider={
+            "provider": "test",
+            "api_key": "k",
+            "base_url": "http://x",
+            "api_mode": "chat_completions",
+            "model": "m",
+        },
+        inactivity_seconds=1800,
+        max_iterations=10,
+    )
+
+    assert captured.get("verbose_logging") is True
 
 
 def test_runtime_stop_flag_before_start():

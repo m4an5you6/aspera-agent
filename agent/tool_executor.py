@@ -36,6 +36,10 @@ from agent.tool_dispatch_helpers import (
     _append_subdir_hint_to_multimodal,
     make_tool_result_message,
 )
+from agent.tool_logging import (
+    _log_tool_finish,
+    _log_tool_start,
+)
 from tools.terminal_tool import (
     get_active_env,
 )
@@ -490,6 +494,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # submit site below (GHSA-qg5c-hvr5-hjgr, #13617).
         start = time.time()
         try:
+            _log_tool_start(
+                function_name=function_name,
+                function_args=function_args,
+                verbose=bool(getattr(agent, "verbose_logging", False)),
+            )
             try:
                 result = agent._invoke_tool(
                     function_name,
@@ -524,10 +533,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
             duration = time.time() - start
             is_error, _ = _detect_tool_failure(function_name, result)
-            if is_error:
-                logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
-            else:
-                logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
+            _log_tool_finish(
+                function_name=function_name,
+                function_args=function_args,
+                function_result=result,
+                duration=duration,
+                is_error=is_error,
+                verbose=bool(getattr(agent, "verbose_logging", False)),
+            )
             results[index] = (function_name, function_args, result, duration, is_error, False, middleware_trace)
         finally:
             # Tear down worker-tid tracking.  Clear any interrupt bit we may
@@ -668,10 +681,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     failed=is_error,
                 )
 
-            if is_error:
-                _err_text = _multimodal_text_summary(function_result)
-                result_preview = _err_text[:200] if len(_err_text) > 200 else _err_text
-                logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
+            # Finish logging already happened in the worker (_run_tool).
 
             # Track file-mutation outcome for the turn-end verifier.
             # `blocked` calls never actually ran — don't let a guardrail
@@ -693,10 +703,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     )
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
-
-            if agent.verbose_logging:
-                logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
-                logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
 
         # Print cute message per tool
         if agent._should_emit_quiet_tool_messages():
@@ -927,6 +933,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 pass  # never block tool execution
 
         tool_start_time = time.time()
+        if not _execution_blocked:
+            _log_tool_start(
+                function_name=function_name,
+                function_args=function_args,
+                verbose=bool(getattr(agent, "verbose_logging", False)),
+            )
 
         if _block_msg is not None:
             # Tool blocked by plugin policy — return error without executing.
@@ -1253,18 +1265,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
             tool_duration = time.time() - tool_start_time
 
-        if isinstance(function_result, str):
-            result_preview = function_result if agent.verbose_logging else (
-                function_result[:200] if len(function_result) > 200 else function_result
-            )
-            _result_len = len(function_result)
-        else:
-            # Multimodal dict result (_multimodal=True) — not sliceable as string
-            result_preview = function_result
-            _result_len = len(str(function_result))
-
-        # Log tool errors to the persistent error log so [error] tags
-        # in the UI always have a corresponding detailed entry on disk.
+        # Detect tool failure before post-hook / guardrail observation append.
         _is_error_result, _ = _detect_tool_failure(function_name, function_result)
         # The agent-runtime tools above (todo, session_search, memory,
         # context-engine, memory-manager, clarify, delegate_task) are
@@ -1295,13 +1296,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 function_result,
                 failed=_is_error_result,
             )
-            result_preview = function_result if agent.verbose_logging else (
-                function_result[:200] if len(function_result) > 200 else function_result
-            )
-        if _is_error_result:
-            logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
-        else:
-            logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, _result_len)
+        _log_tool_finish(
+            function_name=function_name,
+            function_args=function_args,
+            function_result=function_result,
+            duration=tool_duration,
+            is_error=_is_error_result,
+            verbose=bool(getattr(agent, "verbose_logging", False)),
+        )
 
         # Track file-mutation outcome for the turn-end verifier.  See
         # the concurrent path for the rationale; both paths must feed
@@ -1327,11 +1329,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         agent._current_tool = None
         agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s)")
-
-        if agent.verbose_logging:
-            logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
-            _log_result = _multimodal_text_summary(function_result)
-            logging.debug(f"Tool result ({len(_log_result)} chars): {_log_result}")
 
         if not _execution_blocked and agent.tool_complete_callback:
             try:

@@ -91,6 +91,7 @@ class AutoGoalProfile:
     skip_memory: bool = True
     skip_context_files: bool = True
     quiet_mode: bool = True
+    verbose_logging: bool = False
     default_max_iterations: int = 90
     default_inactivity_seconds: float = 1800.0
 
@@ -103,9 +104,11 @@ PROFILE_CLUSTER_INFERENCE = AutoGoalProfile(
     # Job JSON + skill cover the deploy contract; still load cwd AGENTS.md /
     # .cursorrules / SOUL when present (node-local paths, mirrors, scratch).
     # Keep memory off — do not pull interactive chat USER.md / providers.
+    # verbose_logging so agent.log records terminal command + full tool results.
     skip_memory=True,
     skip_context_files=False,
     quiet_mode=True,
+    verbose_logging=True,
     default_max_iterations=90,
     default_inactivity_seconds=1800.0,
 )
@@ -118,6 +121,7 @@ PROFILE_SESSION = AutoGoalProfile(
     skip_memory=False,
     skip_context_files=False,
     quiet_mode=False,
+    verbose_logging=False,
     default_max_iterations=90,
     default_inactivity_seconds=0.0,
 )
@@ -397,6 +401,12 @@ class AutoGoalRuntime:
                 max_iterations=iters,
                 enabled_toolsets=enabled,
                 disabled_toolsets=disabled,
+                quiet_mode=profile.quiet_mode,
+                verbose_logging=bool(profile.verbose_logging),
+                skip_context_files=profile.skip_context_files,
+                skip_memory=profile.skip_memory,
+                platform=profile.platform,
+                session_id=session_id,
             )
 
             if agent_factory is not None:
@@ -404,15 +414,7 @@ class AutoGoalRuntime:
             else:
                 from run_agent import AIAgent
 
-                agent = AIAgent(
-                    **factory_kwargs,
-                    quiet_mode=profile.quiet_mode,
-                    verbose_logging=False,
-                    skip_context_files=profile.skip_context_files,
-                    skip_memory=profile.skip_memory,
-                    platform=profile.platform,
-                    session_id=session_id,
-                )
+                agent = AIAgent(**factory_kwargs)
 
             if remember_agent is not None:
                 remember_agent(session_id, agent)
