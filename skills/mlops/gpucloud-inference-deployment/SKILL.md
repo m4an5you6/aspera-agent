@@ -7,7 +7,7 @@ platforms: [linux]
 metadata:
   gpucloud:
     tags: [gpucloud, inference, deployment, vllm, cluster, model-adapter]
-    related_skills: [gpucloud-worker-setup, gpucloud-sft-training, serving-llms-vllm]
+    related_skills: [gpucloud-worker-setup, gpucloud-sft-training, gpucloud-megatron-weight-export, serving-llms-vllm]
     triggers:
       - deploy trained model
       - vllm from training
@@ -65,8 +65,10 @@ Work until ready, then call `inference_report_ready`.
    `torch==2.5.1` + `vllm==0.6.6` for older models — do **not** force this
    for Qwen3-class weights.
 4. **Artifacts**: if `local_path` missing or not HF-loadable (`config.json` +
-   weights), use `sources[]` to sync/convert. If still impossible, fail with
-   `phase=ensure_artifacts`.
+   weights), sync via `sources[]`. For `megatron_checkpoints` / `.distcp`,
+   follow skill `gpucloud-megatron-weight-export` (ModelOpt / SWIFT recipes
+   first; hand-rolled `load_distcp` only as last resort). If still impossible,
+   fail with `phase=ensure_artifacts`.
 5. **Start**: call `inference_start_vllm` with `job_id`, `model_path`, and the
    assignment `serve` / `gpus` / `secrets_ref`. Do not leave an unmanaged
    background process if the tool works.
@@ -104,6 +106,7 @@ Failure: `success=false`, `details.phase` in
 - Disk space under `~/.cache/pip` can fill during large wheels.
 - Never put API keys in the outcome JSON.
 - Prefer managed start tool so cluster stop can kill the serve PID.
+- Megatron raw checkpoints need `gpucloud-megatron-weight-export` before serve.
 
 ## Verification
 

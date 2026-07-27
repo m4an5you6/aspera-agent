@@ -190,7 +190,10 @@ def build_inference_agent_prompt(job_spec: Dict[str, Any], inference_spec: Dict[
     }
     return (
         "You are deploying inference on THIS GPU node until the service is ready.\n"
-        "Follow the skill `gpucloud-inference-deployment`.\n\n"
+        "Follow the skill `gpucloud-inference-deployment`.\n"
+        "For megatron_checkpoints / .distcp trees, follow "
+        "`gpucloud-megatron-weight-export` (ModelOpt/SWIFT recipes first; "
+        "hand-rolled load_distcp only as last resort).\n\n"
         "Job assignment JSON:\n"
         f"```json\n{json.dumps(compact, ensure_ascii=False, indent=2)}\n```\n\n"
         "Required work (in order):\n"
