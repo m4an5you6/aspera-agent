@@ -321,6 +321,48 @@ class TestSyncSkills:
         assert "old-skill" not in result.get("updated", [])
         assert (user_skill / "SKILL.md").read_text() == "# My custom version"
 
+    def test_force_overwrites_user_modified_bundled_skill(self, tmp_path):
+        """force=True replaces local edits for names that exist in bundled."""
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        user_skill = skills_dir / "old-skill"
+        user_skill.mkdir(parents=True)
+        (user_skill / "SKILL.md").write_text("# Old v1")
+        old_origin_hash = _dir_hash(user_skill)
+        manifest_file.write_text(f"old-skill:{old_origin_hash}\n")
+        (user_skill / "SKILL.md").write_text("# My custom version")
+
+        # Agent-created skill (unique name) must survive force sync.
+        agent_skill = skills_dir / "agent-summary-skill"
+        agent_skill.mkdir(parents=True)
+        (agent_skill / "SKILL.md").write_text("# agent owned\n")
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True, force=True)
+
+        assert "old-skill" in result["updated"]
+        assert "old-skill" in result.get("force_updated", [])
+        assert (user_skill / "SKILL.md").read_text() == "# Old"
+        assert (agent_skill / "SKILL.md").read_text() == "# agent owned\n"
+
+    def test_force_replaces_local_collision_without_manifest(self, tmp_path):
+        """force=True replaces a same-named local skill even with empty manifest."""
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        user_skill = skills_dir / "old-skill"
+        user_skill.mkdir(parents=True)
+        (user_skill / "SKILL.md").write_text("# stale local copy")
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True, force=True)
+
+        assert "old-skill" in result["updated"]
+        assert (user_skill / "SKILL.md").read_text() == "# Old"
+
     def test_unchanged_skill_not_updated(self, tmp_path):
         """Skill in sync (user == bundled == origin) = no action needed."""
         bundled = self._setup_bundled(tmp_path)

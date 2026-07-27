@@ -15710,10 +15710,16 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             )
             return False
 
-    # Sync bundled skills on gateway start (fast -- skips unchanged)
+    # Sync bundled skills on gateway start (fast -- skips unchanged).
+    # Cluster/bootstrap nodes may set GPUCLOUD_FORCE_BUNDLED_SKILLS_SYNC=1 so
+    # repo bundled skills replace stale local copies; agent-created skills with
+    # unique names are still never touched (sync only iterates bundled names).
     try:
         from tools.skills_sync import sync_skills
-        sync_skills(quiet=True)
+        _force_skills = str(
+            os.getenv("GPUCLOUD_FORCE_BUNDLED_SKILLS_SYNC", "") or ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        sync_skills(quiet=True, force=_force_skills)
     except Exception:
         pass
 

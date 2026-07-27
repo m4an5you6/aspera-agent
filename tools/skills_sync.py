@@ -451,9 +451,17 @@ def _backfill_optional_provenance(quiet: bool = False) -> List[str]:
     return backfilled
 
 
-def sync_skills(quiet: bool = False) -> dict:
+def sync_skills(quiet: bool = False, force: bool = False) -> dict:
     """
     Sync bundled skills into ~/.gpucloud/skills/ using the manifest.
+
+    Args:
+        quiet: Suppress progress prints.
+        force: When True, overwrite local copies of **bundled** skill names even
+            if they look user-modified or collided with a pre-existing directory.
+            Skills that exist only under ``~/.gpucloud/skills/`` (agent-created /
+            hub / custom names not present in the bundled tree) are never
+            touched — sync only iterates bundled names.
 
     Returns:
         dict with keys: copied (list), updated (list), skipped (int),
@@ -490,8 +498,36 @@ def sync_skills(quiet: bool = False) -> dict:
     copied = []
     updated = []
     user_modified = []
+    force_updated = []
     suppressed_skipped: List[str] = []
     skipped = 0
+
+    def _install_from_bundled(skill_name: str, skill_src: Path, dest: Path, bundled_hash: str) -> bool:
+        """Replace ``dest`` with ``skill_src``. Returns True on success."""
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            backup = dest.with_suffix(".bak") if dest.exists() else None
+            if backup is not None:
+                if backup.exists():
+                    _rmtree_writable(backup)
+                shutil.move(str(dest), str(backup))
+            try:
+                shutil.copytree(skill_src, dest)
+                manifest[skill_name] = bundled_hash
+                if backup is not None:
+                    try:
+                        _rmtree_writable(backup)
+                    except (OSError, IOError):
+                        logger.debug("Could not remove backup %s", backup, exc_info=True)
+                return True
+            except (OSError, IOError):
+                if backup is not None and backup.exists() and not dest.exists():
+                    shutil.move(str(backup), str(dest))
+                raise
+        except (OSError, IOError) as e:
+            if not quiet:
+                print(f"  ! Failed to install {skill_name}: {e}")
+            return False
 
     for skill_name, skill_src in bundled_skills:
         # Curator-pruned built-ins: do not re-seed. The suppression list
@@ -510,25 +546,29 @@ def sync_skills(quiet: bool = False) -> dict:
             # ── New skill — never offered before ──
             try:
                 if dest.exists():
-                    # User already has a skill with the same name — don't overwrite.
-                    # Only baseline in the manifest when the on-disk copy is
-                    # byte-identical to bundled (e.g. a reset that re-syncs, or
-                    # a coincidentally identical install); that case is harmless
-                    # to track. If the copy differs (custom skill, hub-installed,
-                    # or user-edited) skip the manifest write: recording
-                    # bundled_hash there would poison update detection by making
-                    # user_hash != origin_hash read as "user-modified" on every
-                    # subsequent sync, permanently blocking bundled updates.
-                    skipped += 1
                     if _dir_hash(dest) == bundled_hash:
+                        skipped += 1
                         manifest[skill_name] = bundled_hash
-                    elif not quiet:
-                        print(
-                            f"  ⚠ {skill_name}: bundled version shipped but you "
-                            f"already have a local skill by this name — yours "
-                            f"was kept. Run `gpucloud skills reset {skill_name}` "
-                            f"to replace it with the bundled version."
-                        )
+                    elif force:
+                        if _install_from_bundled(skill_name, skill_src, dest, bundled_hash):
+                            force_updated.append(skill_name)
+                            updated.append(skill_name)
+                            if not quiet:
+                                print(f"  ↑ {skill_name} (force-replaced local collision)")
+                    else:
+                        # User already has a skill with the same name — don't overwrite.
+                        # Only baseline in the manifest when the on-disk copy is
+                        # byte-identical to bundled (handled above). If the copy
+                        # differs, skip the manifest write: recording bundled_hash
+                        # would poison update detection as permanent user-modified.
+                        skipped += 1
+                        if not quiet:
+                            print(
+                                f"  ⚠ {skill_name}: bundled version shipped but you "
+                                f"already have a local skill by this name — yours "
+                                f"was kept. Run `gpucloud skills reset {skill_name}` "
+                                f"to replace it with the bundled version."
+                            )
                 else:
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copytree(skill_src, dest)
@@ -547,54 +587,54 @@ def sync_skills(quiet: bool = False) -> dict:
             user_hash = _dir_hash(dest)
 
             if not origin_hash:
-                # v1 migration: no origin hash recorded. Set baseline from
-                # user's current copy so future syncs can detect modifications.
-                manifest[skill_name] = user_hash
-                if user_hash == bundled_hash:
-                    skipped += 1  # already in sync
+                # v1 migration: no origin hash recorded.
+                if force and user_hash != bundled_hash:
+                    if _install_from_bundled(skill_name, skill_src, dest, bundled_hash):
+                        force_updated.append(skill_name)
+                        updated.append(skill_name)
+                        if not quiet:
+                            print(f"  ↑ {skill_name} (force-updated after v1 manifest)")
                 else:
-                    # Can't tell if user modified or bundled changed — be safe
+                    manifest[skill_name] = user_hash
                     skipped += 1
                 continue
 
             if user_hash != origin_hash:
                 # User modified this skill — don't overwrite their changes
-                user_modified.append(skill_name)
-                if not quiet:
-                    print(f"  ~ {skill_name} (user-modified, skipping)")
+                # unless force=True (cluster / bootstrap refresh of bundled pins).
+                if force:
+                    if user_hash == bundled_hash:
+                        manifest[skill_name] = bundled_hash
+                        skipped += 1
+                    elif _install_from_bundled(skill_name, skill_src, dest, bundled_hash):
+                        force_updated.append(skill_name)
+                        updated.append(skill_name)
+                        if not quiet:
+                            print(f"  ↑ {skill_name} (force-updated over local edits)")
+                else:
+                    user_modified.append(skill_name)
+                    if not quiet:
+                        print(f"  ~ {skill_name} (user-modified, skipping)")
                 continue
 
             # User copy matches origin — check if bundled has a newer version
             if bundled_hash != origin_hash:
-                try:
-                    # Move old copy to a backup so we can restore on failure
-                    backup = dest.with_suffix(".bak")
-                    shutil.move(str(dest), str(backup))
-                    try:
-                        shutil.copytree(skill_src, dest)
-                        manifest[skill_name] = bundled_hash
-                        updated.append(skill_name)
-                        if not quiet:
-                            print(f"  ↑ {skill_name} (updated)")
-                        # Remove backup after successful copy
-                        try:
-                            _rmtree_writable(backup)
-                        except (OSError, IOError):
-                            logger.debug("Could not remove backup %s", backup, exc_info=True)
-                    except (OSError, IOError):
-                        # Restore from backup
-                        if backup.exists() and not dest.exists():
-                            shutil.move(str(backup), str(dest))
-                        raise
-                except (OSError, IOError) as e:
+                if _install_from_bundled(skill_name, skill_src, dest, bundled_hash):
+                    updated.append(skill_name)
                     if not quiet:
-                        print(f"  ! Failed to update {skill_name}: {e}")
+                        print(f"  ↑ {skill_name} (updated)")
             else:
                 skipped += 1  # bundled unchanged, user unchanged
 
         else:
             # ── In manifest but not on disk — user deleted it ──
-            skipped += 1
+            if force:
+                if _install_from_bundled(skill_name, skill_src, dest, bundled_hash):
+                    copied.append(skill_name)
+                    if not quiet:
+                        print(f"  + {skill_name} (force-restored)")
+            else:
+                skipped += 1
 
     # Clean stale manifest entries (skills removed from bundled dir)
     cleaned = sorted(set(manifest.keys()) - bundled_names)
@@ -620,6 +660,7 @@ def sync_skills(quiet: bool = False) -> dict:
         "updated": updated,
         "skipped": skipped,
         "user_modified": user_modified,
+        "force_updated": force_updated,
         "cleaned": cleaned,
         "suppressed": suppressed_skipped,
         "total_bundled": len(bundled_skills),
