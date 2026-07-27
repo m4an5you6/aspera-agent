@@ -1,16 +1,19 @@
-"""Agent-driven inference prepare/serve/ready (replaces fixed RuntimeScheme lifecycle)."""
+"""Agent-driven inference prepare/serve/ready (thin host over AutoGoalRuntime)."""
 
 from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import threading
-import time
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FuturesTimeout
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
+
+from gpucloud_cli.autogoal_runtime import (
+    PROFILE_CLUSTER_INFERENCE,
+    AutoGoalRuntime,
+    ContractCompletion,
+    wrap_objective_with_operating_contract,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -233,7 +236,8 @@ def run_inference_agent(
 ) -> Dict[str, Any]:
     """Spawn an on-node AIAgent to prepare deps/artifacts and serve until ready.
 
-    ``agent_factory`` is optional (tests); when set it must return an object with
+    Thin host over ``AutoGoalRuntime`` + ``ContractCompletion``. ``agent_factory``
+    is optional (tests); when set it must return an object with
     ``run_conversation`` / optional ``interrupt`` / ``get_activity_summary``.
     """
     from plugins.inference_adapters.runtime import _merge_inference_spec, remember_adapter
@@ -280,218 +284,66 @@ def run_inference_agent(
     remember_adapter(job_id, ad)
     clear_reported_outcome(job_id)
 
-    # Non-interactive approvals for pip/shell
-    prev_yolo = os.environ.get("GPUCLOUD_YOLO_MODE")
-    os.environ["GPUCLOUD_YOLO_MODE"] = "1"
-    # Hint cron-like approval path if present
-    os.environ.setdefault("GPUCLOUD_CRON_SESSION", "1")
-
-    agent = None
     try:
-        if stop_flag and stop_flag():
-            success, summary, details = (
-                False,
-                "cancelled before agent start",
-                {"phase": "cancelled", **defaults},
-            )
-            on_outcome(success, summary, details)
-            return {"success": False, "error": summary}
-
-        from gpucloud_cli.runtime_provider import (
-            resolve_runtime_provider,
-            format_runtime_provider_error,
+        max_iterations = int(rt.get("max_iterations") or PROFILE_CLUSTER_INFERENCE.default_max_iterations)
+    except (TypeError, ValueError):
+        max_iterations = PROFILE_CLUSTER_INFERENCE.default_max_iterations
+    try:
+        inactivity_s = float(
+            rt.get("agent_timeout_seconds") or PROFILE_CLUSTER_INFERENCE.default_inactivity_seconds
         )
+    except (TypeError, ValueError):
+        inactivity_s = PROFILE_CLUSTER_INFERENCE.default_inactivity_seconds
 
-        # Internal deploys write model.api_key into config.yaml (not always
-        # the provider env var). Pass them as explicit so AIAgent gets both
-        # api_key and base_url even if named-provider env vars are unset.
-        explicit_api_key = ""
-        explicit_base_url = ""
-        try:
-            from gpucloud_cli.config import load_config
+    objective = wrap_objective_with_operating_contract(
+        build_inference_agent_prompt(job_spec, inference_spec),
+        host_label="cluster_inference",
+    )
+    completion = ContractCompletion(
+        pop_reported=lambda: pop_reported_outcome(job_id),
+        parse_contract=lambda payload: parse_outcome_contract(payload, defaults=defaults),
+        extract_json=_extract_json_object,
+    )
 
-            model_cfg = load_config().get("model") or {}
-            if isinstance(model_cfg, dict):
-                explicit_api_key = str(model_cfg.get("api_key") or "").strip()
-                explicit_base_url = str(model_cfg.get("base_url") or "").strip()
-        except Exception:
-            pass
+    run_result = AutoGoalRuntime().run(
+        objective=objective,
+        profile=PROFILE_CLUSTER_INFERENCE,
+        session_id=f"inference-{job_id}",
+        completion=completion,
+        stop_flag=stop_flag,
+        inactivity_seconds=inactivity_s,
+        max_iterations=max_iterations,
+        agent_factory=agent_factory,
+        remember_agent=lambda _sid, agent: remember_inference_agent(job_id, agent),
+        forget_agent=lambda _sid: forget_inference_agent(job_id),
+        interrupt_agent=lambda _sid, reason: interrupt_inference_agent(job_id, reason),
+        defaults=defaults,
+        agent_model_hint=str(rt.get("agent_model") or ""),
+        task_id=f"inference-{job_id}",
+    )
 
-        try:
-            runtime = resolve_runtime_provider(
-                explicit_api_key=explicit_api_key or None,
-                explicit_base_url=explicit_base_url or None,
-            )
-        except Exception as exc:
-            msg = format_runtime_provider_error(exc)
-            on_outcome(False, msg, {"phase": "validate", **defaults})
-            return {"success": False, "error": msg}
+    success = bool(run_result.success)
+    summary = str(run_result.summary or "")
+    details = dict(run_result.details or {})
 
-        if not str(runtime.get("api_key") or "").strip():
-            msg = (
-                "No LLM API key resolved for inference agent "
-                f"(provider={runtime.get('provider')!r}). "
-                "Set model.api_key in config.yaml or the provider env var "
-                "(e.g. XIAOMI_API_KEY)."
-            )
-            on_outcome(False, msg, {"phase": "validate", **defaults})
-            return {"success": False, "error": msg}
+    # Enrich visit fields from adapter endpoint when ready
+    if success and hasattr(ad, "_endpoint") and getattr(ad, "_endpoint", None) is not None:
+        ep = ad._endpoint  # noqa: SLF001 — adapter owns endpoint after start tool
+        details.setdefault("visit_host", ep.host)
+        details.setdefault("visit_port", ep.port)
+        details.setdefault("protocol", ep.protocol)
+        details.setdefault("stream_path", ep.stream_path)
+        details.setdefault("health_path", ep.health_path)
+        details.setdefault("endpoint", ep.to_dict())
 
-        try:
-            max_iterations = int(rt.get("max_iterations") or 90)
-        except (TypeError, ValueError):
-            max_iterations = 90
-        try:
-            inactivity_s = float(rt.get("agent_timeout_seconds") or 1800)
-        except (TypeError, ValueError):
-            inactivity_s = 1800.0
+    # Validate-phase provider errors should keep phase=validate when possible
+    if not success and details.get("phase") == "agent_error":
+        err = str(run_result.error or summary)
+        if "API key" in err or "runtime provider" in err.lower() or "No LLM" in err:
+            details["phase"] = "validate"
 
-        enabled_toolsets = [
-            "terminal",
-            "file",
-            "skills",
-            "web",
-            "inference_adapters",
-        ]
-        disabled_toolsets = [
-            "clarify",
-            "messaging",
-            "cronjob",
-            "delegation",
-        ]
-
-        model = str(
-            runtime.get("model")
-            or (load_inference_adapters_config().get("agent_model") or "")
-            or ""
-        )
-        # Prefer config model.default when runtime did not pin
-        if not model:
-            try:
-                from gpucloud_cli.config import load_config
-
-                model = str((load_config().get("model") or {}).get("default") or "")
-            except Exception:
-                model = ""
-
-        if agent_factory is not None:
-            agent = agent_factory(
-                model=model or runtime.get("model"),
-                api_key=runtime.get("api_key"),
-                base_url=runtime.get("base_url"),
-                provider=runtime.get("provider"),
-                api_mode=runtime.get("api_mode"),
-                max_iterations=max_iterations,
-                enabled_toolsets=enabled_toolsets,
-                disabled_toolsets=disabled_toolsets,
-            )
-        else:
-            from run_agent import AIAgent
-
-            agent = AIAgent(
-                model=model or runtime.get("model"),
-                api_key=runtime.get("api_key"),
-                base_url=runtime.get("base_url"),
-                provider=runtime.get("provider"),
-                api_mode=runtime.get("api_mode"),
-                max_iterations=max_iterations,
-                quiet_mode=True,
-                verbose_logging=False,
-                enabled_toolsets=enabled_toolsets,
-                disabled_toolsets=disabled_toolsets,
-                skip_context_files=True,
-                skip_memory=True,
-                platform="inference_worker",
-                session_id=f"inference-{job_id}",
-            )
-        remember_inference_agent(job_id, agent)
-
-        prompt = build_inference_agent_prompt(job_spec, inference_spec)
-
-        def _run_conv() -> Dict[str, Any]:
-            return agent.run_conversation(user_message=prompt, task_id=f"inference-{job_id}")
-
-        result: Dict[str, Any] = {}
-        inactivity_hit = False
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(_run_conv)
-            while True:
-                if stop_flag and stop_flag():
-                    interrupt_inference_agent(job_id, "cancelled by cluster stop")
-                    try:
-                        result = future.result(timeout=30)
-                    except Exception:
-                        result = {"final_response": "", "error": "cancelled"}
-                    success, summary, details = (
-                        False,
-                        "cancelled during agent run",
-                        {"phase": "cancelled", **defaults},
-                    )
-                    on_outcome(success, summary, details)
-                    return {"success": False, "error": summary}
-                try:
-                    result = future.result(timeout=2.0)
-                    break
-                except FuturesTimeout:
-                    if inactivity_s <= 0:
-                        continue
-                    idle = 0.0
-                    if hasattr(agent, "get_activity_summary"):
-                        try:
-                            act = agent.get_activity_summary() or {}
-                            idle = float(act.get("seconds_since_activity") or 0.0)
-                        except Exception:
-                            idle = 0.0
-                    if idle >= inactivity_s:
-                        inactivity_hit = True
-                        interrupt_inference_agent(job_id, "inference agent inactivity timeout")
-                        try:
-                            result = future.result(timeout=30)
-                        except Exception as exc:
-                            result = {"final_response": "", "error": str(exc)}
-                        break
-                    continue
-
-        if inactivity_hit and not pop_reported_outcome(job_id):
-            # Will re-pop below; store a synthetic if needed
-            pass
-
-        reported = pop_reported_outcome(job_id)
-        if reported is None:
-            final_text = ""
-            if isinstance(result, dict):
-                final_text = str(result.get("final_response") or "")
-                if not final_text and result.get("error"):
-                    final_text = str(result.get("error"))
-            reported = _extract_json_object(final_text)
-
-        if inactivity_hit and not (isinstance(reported, dict) and reported.get("success")):
-            success, summary, details = (
-                False,
-                f"inference agent inactivity timeout after {int(inactivity_s)}s",
-                {"phase": "agent_error", **defaults},
-            )
-        else:
-            success, summary, details = parse_outcome_contract(reported, defaults=defaults)
-            # Enrich visit fields from adapter endpoint when ready
-            if success and hasattr(ad, "_endpoint") and getattr(ad, "_endpoint", None) is not None:
-                ep = ad._endpoint  # noqa: SLF001 — adapter owns endpoint after start tool
-                details.setdefault("visit_host", ep.host)
-                details.setdefault("visit_port", ep.port)
-                details.setdefault("protocol", ep.protocol)
-                details.setdefault("stream_path", ep.stream_path)
-                details.setdefault("health_path", ep.health_path)
-                details.setdefault("endpoint", ep.to_dict())
-
-        on_outcome(success, summary, details)
-        return {"success": success, "summary": summary, "details": details}
-    except Exception as exc:
-        _log.exception("inference agent failed for %s", job_id)
-        on_outcome(False, str(exc), {"phase": "agent_error", **defaults})
-        return {"success": False, "error": str(exc)}
-    finally:
-        forget_inference_agent(job_id)
-        if prev_yolo is None:
-            os.environ.pop("GPUCLOUD_YOLO_MODE", None)
-        else:
-            os.environ["GPUCLOUD_YOLO_MODE"] = prev_yolo
+    on_outcome(success, summary, details)
+    out: Dict[str, Any] = {"success": success, "summary": summary, "details": details}
+    if not success:
+        out["error"] = str(run_result.error or summary)
+    return out

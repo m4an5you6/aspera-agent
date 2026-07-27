@@ -17,6 +17,13 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from gpucloud_cli.autogoal_runtime import (
+    AUTO_GOAL_CONTINUATION_TEMPLATE,
+    AUTO_GOAL_JUDGE_GOAL_TEMPLATE,
+    AUTO_GOAL_KICKOFF_TEMPLATE,
+    AUTO_GOAL_OPERATING_CONTRACT,
+    format_kickoff_prompt,
+)
 from gpucloud_cli.goals import DEFAULT_MAX_TURNS, judge_goal
 
 logger = logging.getLogger(__name__)
@@ -24,59 +31,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_AUTOGOAL_SEGMENT_MAX_TURNS = 100
 DEFAULT_AUTOGOAL_MAX_SEGMENTS = 20
 DEFAULT_AUTOGOAL_MAX_TURNS = DEFAULT_AUTOGOAL_SEGMENT_MAX_TURNS * DEFAULT_AUTOGOAL_MAX_SEGMENTS
-
-AUTO_GOAL_KICKOFF_TEMPLATE = """[AutoGoal: non-interactive autonomous ML/service loop]
-Objective:
-{goal}
-
-Operating contract:
-- You are running under /autogoal, not /goal. This is an autonomous training,
-  inference, or deployment service loop for multi-GPU, multi-node, and multi-IP
-  scenarios.
-- Do not ask the user questions. Do not call clarify. Do not wait for user
-  confirmation. Consume only the initial objective and continue autonomously.
-- If information is missing, inspect the host/repo/config, probe available
-  infrastructure, or choose conservative defaults and record your rationale.
-- Before starting training, inference, deployment, or any high-risk remote
-  action, write an internal `decision_record` in your response covering:
-  inputs, assumptions, risks, rollback/stop plan, and why proceeding is safe.
-- If you cannot safely proceed after self-audit, enter a blocked state by
-  explicitly writing `AUTO_GOAL_BLOCKED:` followed by the reason and next safe
-  action. Do not ask the user to decide.
-- Prefer dry-run, preflight, health checks, reversible steps, and clear logs.
-
-Optional gpucloud.yaml context:
-{config_context}
-
-Start by discovering the current repo, runtime, cluster/GPU/SSH state, conda
-or venv environments, data/checkpoint/scratch paths, and any existing training
-or deployment configuration. Then make the next concrete autonomous step.
-"""
-
-AUTO_GOAL_CONTINUATION_TEMPLATE = """[Continuing AutoGoal]
-Objective:
-{goal}
-
-Last audit/judge reason:
-{reason}
-
-Segment context:
-{segment_context}
-
-Continue autonomously toward the objective. Do not ask the user questions, do
-not call clarify, and do not wait for confirmation. Inspect, infer, choose a
-conservative default, run self-audit, proceed if safe, or explicitly block with
-`AUTO_GOAL_BLOCKED:` if no safe path remains.
-"""
-
-AUTO_GOAL_JUDGE_GOAL_TEMPLATE = """Autonomous /autogoal objective:
-{goal}
-
-Completion criteria:
-- The training, inference, or deployment objective is complete; OR
-- The agent explicitly entered AUTO_GOAL_BLOCKED with a concrete safety reason.
-
-The agent must not ask the user questions or wait for confirmation."""
 
 
 @dataclass
@@ -450,8 +404,8 @@ class AutoGoalManager:
             self._state.config_path = config_path
             self._state.config_warnings = warnings
             save_autogoal(self.session_id, self._state)
-        return AUTO_GOAL_KICKOFF_TEMPLATE.format(
-            goal=self._state.goal if self._state else "",
+        return format_kickoff_prompt(
+            self._state.goal if self._state else "",
             config_context=config_context,
         )
 
