@@ -1,7 +1,7 @@
 ---
 name: gpucloud-inference-deployment
 description: Deploy inference via on-node agent until vLLM is ready.
-version: 2.0.0
+version: 2.1.0
 author: GPUCLOUD
 platforms: [linux]
 metadata:
@@ -45,7 +45,7 @@ Work until ready, then call `inference_report_ready`.
 |------|--------|
 | Probe | CUDA driver, Python, existing torch/vllm |
 | Model family | Read `config.json` / tokenizer / path; honor `model_hint` |
-| Install | Compatible torch + vLLM for that family (fix conflicts) |
+| Install | torch + vLLM via **pip mirrors first** (see below) |
 | Artifacts | Ensure HF-loadable dir; sync via `sources[]` if missing |
 | Serve | `inference_start_vllm` then poll `inference_health` |
 | Done | `inference_report_ready` with visit_* fields |
@@ -60,8 +60,25 @@ Work until ready, then call `inference_report_ready`.
    megatron export). Newer Qwen often needs newer vLLM than GPT-2.
 3. **Install stack**: pick torch CUDA wheel + vLLM versions that match the
    model and driver. Prefer explicit `==` pins. On conflict or import
-   failure, uninstall/retry another combo. Pip mirrors from config are OK.
-   Historical reference only (not mandatory): cu12+py310 often used
+   failure, uninstall/retry another combo.
+   **Prefer pip mirrors** for every `pip install` / `pip download` of
+   torch/vLLM (and large deps). Do **not** default to bare PyPI — wheels
+   are hundreds of MB and official source is often too slow on GPU nodes.
+   Priority order:
+   1. Aliyun: `https://mirrors.aliyun.com/pypi/simple/`
+      (`--trusted-host mirrors.aliyun.com`)
+   2. Tsinghua: `https://pypi.tuna.tsinghua.edu.cn/simple`
+      (`--trusted-host pypi.tuna.tsinghua.edu.cn`)
+   3. Only if both fail: config/`INFERENCE_PIP_INDEX_URL` / official PyPI.
+   Example (use the target venv `python`/`pip` when present):
+   ```bash
+   ~/.cache/gpu_platform/inference_venvs/cu124/bin/pip install "vllm==<pin>" \
+     -i https://mirrors.aliyun.com/pypi/simple/ \
+     --trusted-host mirrors.aliyun.com
+   ```
+   If Aliyun stalls, retry the same pin on Tsinghua. Avoid `| tail` on long
+   installs so progress stays visible; use `terminal(background=true)` and
+   poll. Historical reference only (not mandatory): cu12+py310 often used
    `torch==2.5.1` + `vllm==0.6.6` for older models — do **not** force this
    for Qwen3-class weights.
 4. **Artifacts**: if `local_path` missing or not HF-loadable (`config.json` +
@@ -103,7 +120,10 @@ Failure: `success=false`, `details.phase` in
 ## Pitfalls
 
 - Fixed pin matrices cannot cover all model families — decide from evidence.
-- Disk space under `~/.cache/pip` can fill during large wheels.
+- Bare `pip install vllm` without `-i` mirror is a common stall; use Aliyun
+  then Tsinghua before falling back.
+- Disk space under `~/.cache/pip` / `/tmp/pip-unpack-*` can fill during large
+  wheels — clean failed partial downloads when retrying.
 - Never put API keys in the outcome JSON.
 - Prefer managed start tool so cluster stop can kill the serve PID.
 - Megatron raw checkpoints need `gpucloud-megatron-weight-export` before serve.
