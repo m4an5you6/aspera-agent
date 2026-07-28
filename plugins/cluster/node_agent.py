@@ -255,7 +255,6 @@ class NodeAgent:
         from plugins.inference_adapters.runtime import (
             remember_adapter,
             run_inference_lifecycle,
-            stop_job_adapter,
         )
 
         extra = spec.extra or {}
@@ -374,8 +373,10 @@ class NodeAgent:
                         adapter=adapter,
                     )
             finally:
+                # End the deploy agent only. Keep the serve process (e.g. vLLM)
+                # running after ready so clients can keep using visit_host/port.
+                # Explicit cluster cancel still calls stop_job_adapter via _stop_job.
                 interrupt_inference_agent(assignment.job_id, "inference thread exiting")
-                stop_job_adapter(assignment.job_id)
                 self._running_job_id = None
                 self._stopping_jobs.discard(assignment.job_id)
 
