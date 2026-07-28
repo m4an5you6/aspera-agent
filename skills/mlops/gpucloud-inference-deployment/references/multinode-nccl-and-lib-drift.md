@@ -92,12 +92,15 @@ keep restarting vLLM.
 - `trust_remote_code` must appear on the real vLLM CLI (`--trust-remote-code`);
   putting it only in unstructured `adapter_options` may be ignored.
 
-## Fallback
+## When NCCL still fails
 
 If NCCL smoke fails after aligning `libnccl` (or IB is unavailable and Socket
-NCCL remains broken), **stop burning turns on TP=N across nodes**. Prefer:
+NCCL remains broken), **stop restarting multi-node vLLM in a loop**.
 
-1. Single-node serve with TP equal to local GPUs, or
-2. Report `phase=start` with a clear NCCL/`libnccl` diagnostic
+1. Re-check `strings` on `libnccl.so.2` on every rank; reinstall the matching
+   cu12 NCCL wheel if needed; re-verify Ray worker `printenv | grep NCCL`.
+2. If still broken: report `phase=start` with the NCCL/`libnccl` diagnostic
+   (include both nodes' NCCL version strings and the smoke error).
 
+Do **not** silently degrade the job to single-node TP=1.
 Do not claim “nodes cannot communicate” when Gloo/Ray already succeed.

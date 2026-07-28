@@ -1,7 +1,7 @@
 ---
 name: gpucloud-inference-deployment
 description: Deploy inference via on-node agent until vLLM is ready.
-version: 2.5.0
+version: 2.5.1
 author: GPUCLOUD
 platforms: [linux]
 metadata:
@@ -113,8 +113,8 @@ When `nnodes > 1` (assignment has `ray.enabled` and global
   can lie after a cu130 drift — verify with `strings` on the `.so`.
 - **NCCL smoke before vLLM**: prove cross-node Gloo, then NCCL CUDA allreduce.
   If NCCL fails with `driver … insufficient` / `unhandled cuda error` while
-  ping/SSH/Ray/`gloo` work, fix `libnccl` (or fall back) — do **not** keep
-  restarting `inference_start_vllm`.
+  ping/SSH/Ray/`gloo` work, fix `libnccl` on every rank — do **not** keep
+  restarting `inference_start_vllm`, and do **not** degrade to single-node TP.
 - Put `NCCL_*` / `GLOO_SOCKET_IFNAME` into the **ray worker process** env
   (`ray start` / `ray join`), not only the API server shell.
 - **rank>0**: compat chain verified → `inference_ray_join` to
@@ -125,9 +125,11 @@ When `nnodes > 1` (assignment has `ray.enabled` and global
   NCCL smoke OK → `inference_start_vllm` with global TP + `ray.enabled` →
   health → `phase=ready` with reachable `visit_host`. Never start two
   independent TP=1 servers.
-- **Fallback**: if NCCL smoke still fails after aligning libs, serve single-node
-  TP=local GPUs or fail `phase=start` with the NCCL/`libnccl` diagnostic.
-  Do not burn a full turn budget on repeated TP=N restarts.
+- **If NCCL smoke fails** after aligning `libnccl` / worker env: stop
+  restarting `inference_start_vllm` in a loop; fix the stack (same
+  `libnccl.so.2` + process-env on every rank) or fail `phase=start` with the
+  NCCL/`libnccl` diagnostic. Do **not** silently switch the assignment to
+  single-node TP=1.
 
 ## Procedure
 

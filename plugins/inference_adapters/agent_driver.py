@@ -208,9 +208,14 @@ def build_inference_agent_prompt(job_spec: Dict[str, Any], inference_spec: Dict[
         "After runtime/artifacts are ready:\n"
         "1) `inference_ray_start` with ray.head_port and local_visible_devices\n"
         "2) `inference_cluster_wait_workers` until peers are worker_ready\n"
-        "3) `inference_start_vllm` with global tensor_parallel, local visible_devices, "
+        "3) Align libnccl across ranks + NCCL smoke (see skill "
+        "`multinode-nccl-and-lib-drift`); only then\n"
+        "4) `inference_start_vllm` with global tensor_parallel, local visible_devices, "
         "and ray={enabled:true, address/head_port}\n"
-        "4) health then `inference_report_ready` phase=ready with reachable visit_host\n"
+        "5) health then `inference_report_ready` phase=ready with reachable visit_host\n"
+        "HARD: if NCCL/cross-node serve fails, fix libnccl/env or fail "
+        "phase=start with that diagnostic. Do NOT degrade to single-node TP "
+        "and do NOT loop-restart inference_start_vllm.\n"
         if nnodes > 1 and node_rank == 0
         else (
             "You are a worker rank (rank>0) on a multi-node inference job.\n"
@@ -218,6 +223,8 @@ def build_inference_agent_prompt(job_spec: Dict[str, Any], inference_spec: Dict[
             "After runtime/artifacts are ready:\n"
             "1) `inference_ray_join` to ray head address (head advertised_addr:head_port)\n"
             "2) `inference_report_ready` with success=true and details.phase=worker_ready\n"
+            "HARD: keep the same torch/vLLM/libnccl stack as rank0; do not "
+            "start a local TP=1 server as a fallback.\n"
             if nnodes > 1
             else ""
         )
