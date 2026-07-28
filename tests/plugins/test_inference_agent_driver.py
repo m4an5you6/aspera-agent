@@ -85,6 +85,7 @@ def test_build_inference_agent_prompt_includes_hints():
     )
     assert "qwen2.5" in prompt
     assert "inference_report_ready" in prompt
+    assert "inference_ensure_runtime" in prompt
     assert "job-1" in prompt
 
 

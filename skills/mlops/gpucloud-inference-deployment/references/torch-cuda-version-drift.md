@@ -26,6 +26,18 @@ the driver cannot run.
   can float onto incompatible torch CUDA tags (record them in
   `rejected_alternatives` on the compat chain).
 
+## Related: libnccl drift on multi-node
+
+An unpinned / ranged vLLM install can also replace
+`site-packages/nvidia/nccl/lib/libnccl.so.2` with a **cuda13** NCCL (e.g.
+`2.28.9+cuda13.0`) while `pip show nvidia-nccl-cu12` still claims an older
+version. Cross-node NCCL then fails with
+`CUDA driver version is insufficient for CUDA runtime version` even when
+single-GPU `torch.cuda` works and Gloo/Ray succeed.
+
+Always verify the `.so` with `strings` on **every** rank before multi-node
+TP. Details: `references/multinode-nccl-and-lib-drift.md`.
+
 ## Compat chain
 
 Before any torch/vLLM pip, call `inference_ensure_runtime` with a full

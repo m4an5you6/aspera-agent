@@ -1,18 +1,19 @@
 ---
 name: gpucloud-inference-deployment
 description: Deploy inference via on-node agent until vLLM is ready.
-version: 2.4.0
+version: 2.5.0
 author: GPUCLOUD
 platforms: [linux]
 metadata:
   gpucloud:
-    tags: [gpucloud, inference, deployment, vllm, cluster, model-adapter]
+    tags: [gpucloud, inference, deployment, vllm, cluster, model-adapter, nccl]
     related_skills: [gpucloud-worker-setup, gpucloud-sft-training, gpucloud-megatron-weight-export, serving-llms-vllm]
     triggers:
       - deploy trained model
       - vllm from training
       - gpucloud inference deployment
       - adapter_id hf_vllm
+      - nccl unhandled cuda error
 ---
 
 # GPUCLOUD Inference Deployment
@@ -40,6 +41,7 @@ enforce a full compatibility-chain decision before install and before serve.
   `node_rank` / `nnodes` / `local_visible_devices` / `ray`.
 - Read before install: `references/vllm-runtime-and-model-readiness.md` and
   `references/torch-cuda-version-drift.md`.
+- Multi-node TP: also read `references/multinode-nccl-and-lib-drift.md`.
 
 ## How to Run
 
@@ -54,6 +56,8 @@ Work until ready, then call `inference_report_ready`.
 | Install | Exact `==` pins into that venv via **pip mirrors** (torch before vllm) |
 | Verify | CUDA smoke in venv → `inference_ensure_runtime` (`verified`) |
 | Artifacts | Ensure HF-loadable dir; sync via `sources[]` if missing |
+| Multi-node align | Same torch/vLLM/**libnccl** on all ranks (`strings` on `.so`, not only `pip show`) |
+| NCCL smoke | Gloo then NCCL allreduce across ranks **before** vLLM TP>1 |
 | Multi-node | rank0: ray head → wait workers → vLLM TP=global + ray; worker: ray join → `worker_ready` |
 | Serve | `inference_start_vllm` with that venv's `python_executable` (rank0 only when nnodes>1) |
 | Done | rank0: `phase=ready` + reachable visit_host; worker: `phase=worker_ready` |
@@ -103,13 +107,27 @@ When `nnodes > 1` (assignment has `ray.enabled` and global
 `gpus.tensor_parallel` = total GPUs):
 
 - Use **local** `local_visible_devices` / `gpus.visible_devices` for this node only.
+- **Align stacks across ranks** before Ray/serve: same exact torch/vLLM pins
+  and the same `libnccl.so.2` version string (see
+  `references/multinode-nccl-and-lib-drift.md`). `pip show nvidia-nccl-cu12`
+  can lie after a cu130 drift — verify with `strings` on the `.so`.
+- **NCCL smoke before vLLM**: prove cross-node Gloo, then NCCL CUDA allreduce.
+  If NCCL fails with `driver … insufficient` / `unhandled cuda error` while
+  ping/SSH/Ray/`gloo` work, fix `libnccl` (or fall back) — do **not** keep
+  restarting `inference_start_vllm`.
+- Put `NCCL_*` / `GLOO_SOCKET_IFNAME` into the **ray worker process** env
+  (`ray start` / `ray join`), not only the API server shell.
 - **rank>0**: compat chain verified → `inference_ray_join` to
   `$GPUCLOUD_CLUSTER_ADVERTISED_ADDR` of head or master addr + `ray.head_port`
   → `inference_report_ready` with `phase=worker_ready` (no API server).
 - **rank0**: compat chain verified → `inference_ray_start` →
-  `inference_cluster_wait_workers` (must succeed) → `inference_start_vllm`
-  with global TP + `ray.enabled` → health → `phase=ready` with reachable
-  `visit_host`. Never start two independent TP=1 servers.
+  `inference_cluster_wait_workers` (must succeed; use `http://…` master URL) →
+  NCCL smoke OK → `inference_start_vllm` with global TP + `ray.enabled` →
+  health → `phase=ready` with reachable `visit_host`. Never start two
+  independent TP=1 servers.
+- **Fallback**: if NCCL smoke still fails after aligning libs, serve single-node
+  TP=local GPUs or fail `phase=start` with the NCCL/`libnccl` diagnostic.
+  Do not burn a full turn budget on repeated TP=N restarts.
 
 ## Procedure
 
@@ -156,7 +174,9 @@ When `nnodes > 1` (assignment has `ray.enabled` and global
    first; hand-rolled `load_distcp` only as last resort). If still impossible,
    fail with `phase=ensure_artifacts`.
 7. **Start**: single-node — `inference_start_vllm` with local devices.
-   Multi-node — follow **Multi-node Ray TP** (rank0 waits for workers).
+   Multi-node — follow **Multi-node Ray TP** (align `libnccl`, NCCL smoke,
+   then rank0 waits for workers and starts TP). Pass
+   `--trust-remote-code` for custom Qwen configs when required.
 8. **Health**: poll `inference_health` until `ready` (or timeout →
    `phase=health_timeout`). Local `curl http://127.0.0.1:<port>/health` is
    fine for probing only (rank0).
@@ -202,8 +222,14 @@ Failure: `success=false`, `details.phase` in
   the venv `bin/pip`.
 - Bare `pip install vllm` without `-i` mirror is a common stall; use Aliyun
   then Tsinghua before falling back.
-- `vllm>=…` after a cu124 torch pin can upgrade torch to cu130 — see
-  `references/torch-cuda-version-drift.md`.
+- `vllm>=…` after a cu124 torch pin can upgrade torch **and** replace
+  `libnccl.so.2` with a cuda13 build — see
+  `references/torch-cuda-version-drift.md` and
+  `references/multinode-nccl-and-lib-drift.md`.
+- Multi-node: Ray/SSH OK + NCCL fail usually means **`libnccl` / driver
+  mismatch**, not “no connectivity.” Check `strings` on both nodes.
+- Multi-node: never run independent TP=1 API servers on each node; rank0 must
+  wait for `worker_ready` before `phase=ready`.
 - Disk space under `~/.cache/pip` / `/tmp/pip-unpack-*` can fill during large
   wheels — clean failed partial downloads when retrying.
 - Never put API keys in the outcome JSON.
@@ -211,13 +237,12 @@ Failure: `success=false`, `details.phase` in
   as the client endpoint; use the advertised / public host instead.
 - Prefer managed start tool so cluster stop can kill the serve PID.
 - Megatron raw checkpoints need `gpucloud-megatron-weight-export` before serve.
-- Multi-node: never run independent TP=1 API servers on each node; rank0 must
-  wait for `worker_ready` before `phase=ready`.
 
 ## Verification
 
 - `inference_ensure_runtime` reached `status=verified` for this `job_id`
 - Chosen venv `python` imports torch + vLLM; CUDA smoke prints `CUDA_OK`
+- Multi-node: `strings` on `libnccl.so.2` matches across ranks; NCCL smoke OK
 - `inference_health` → `ready`
 - `curl -sS http://127.0.0.1:<port>/health` succeeds (local probe only)
 - `inference_report_ready` `visit_host` is reachable from outside the node
