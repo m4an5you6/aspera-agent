@@ -66,3 +66,11 @@ If health fails, return:
 - host and port
 - package versions when available
 - which `python_executable` was used
+
+## Visit host (report, not bind)
+
+Serve may bind `0.0.0.0`; local health may use `127.0.0.1`. For
+`inference_report_ready` / outcome `visit_host`, always use a
+client-reachable address (`$GPUCLOUD_CLUSTER_ADVERTISED_ADDR`, public /
+outer IP, or cluster `advertised_addr`). Never ship `127.0.0.1` /
+`localhost` as `visit_host`.
