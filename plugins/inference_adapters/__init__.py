@@ -14,11 +14,17 @@ def register(ctx) -> None:
     # Import side-effect: register built-in adapters
     from plugins.inference_adapters import hf_vllm as _hf_vllm  # noqa: F401
     from plugins.inference_adapters.agent_tools import (
+        INFERENCE_CLUSTER_WAIT_WORKERS_SCHEMA,
         INFERENCE_HEALTH_SCHEMA,
+        INFERENCE_RAY_JOIN_SCHEMA,
+        INFERENCE_RAY_START_SCHEMA,
         INFERENCE_REPORT_READY_SCHEMA,
         INFERENCE_START_VLLM_SCHEMA,
         INFERENCE_STOP_SCHEMA,
+        handle_inference_cluster_wait_workers,
         handle_inference_health,
+        handle_inference_ray_join,
+        handle_inference_ray_start,
         handle_inference_report_ready,
         handle_inference_start_vllm,
         handle_inference_stop,
@@ -41,6 +47,14 @@ def register(ctx) -> None:
     )
     for name, schema, handler, emoji in (
         ("inference_start_vllm", INFERENCE_START_VLLM_SCHEMA, handle_inference_start_vllm, "🚀"),
+        ("inference_ray_start", INFERENCE_RAY_START_SCHEMA, handle_inference_ray_start, "🟠"),
+        ("inference_ray_join", INFERENCE_RAY_JOIN_SCHEMA, handle_inference_ray_join, "🔗"),
+        (
+            "inference_cluster_wait_workers",
+            INFERENCE_CLUSTER_WAIT_WORKERS_SCHEMA,
+            handle_inference_cluster_wait_workers,
+            "⏳",
+        ),
         ("inference_health", INFERENCE_HEALTH_SCHEMA, handle_inference_health, "❤️"),
         ("inference_stop", INFERENCE_STOP_SCHEMA, handle_inference_stop, "🛑"),
         (

@@ -1051,3 +1051,173 @@ def test_run_scheme_tasks_idle_wall_fires_on_next_loop(monkeypatch):
             max_replan_wall_seconds=1.0,
         )
     assert ei.value.error == "replan_exhausted:no_progress_wall"
+
+
+def test_controller_multinode_placements_and_outcome_gating(tmp_path, monkeypatch):
+    monkeypatch.setenv("GPUCLOUD_HOME", str(tmp_path / ".gpucloud"))
+    cfg = ClusterConfig(
+        enabled=True,
+        role="master",
+        node_id="master",
+        master_url="http://127.0.0.1:8765",
+        data_dir=tmp_path / "data",
+        heartbeat_ttl_sec=30,
+    )
+    cfg.data_dir.mkdir(parents=True, exist_ok=True)
+    store = MemoryClusterStore()
+    store.ensure_schema()
+    logger = ClusterLogger(cfg, store)
+    events = ClusterEventBridge(cfg, store)
+    controller = ClusterController(cfg, store, logger, events)
+    set_runtime(controller=controller, store=store, logger=logger, events=events)
+
+    caps = {
+        "probe_version": 1,
+        "probe_ok": True,
+        "python_executable": "/usr/bin/python3",
+        "python_version": "3.10.12",
+        "nvidia_driver": "535.0",
+        "cuda_driver_major": 12,
+        "cuda_driver_minor": 2,
+        "torch_available": True,
+        "vllm_available": True,
+        "gpu_count": 1,
+    }
+    for nid, addr in (("node5", "10.0.21.105"), ("node1", "10.0.20.185")):
+        store.upsert_node(
+            NodeRecord(
+                node_id=nid,
+                advertised_addr=addr,
+                state="ready",
+                gpus=[GpuInfo(index=0, name="GPU", memory_mb=24000)],
+                capabilities=dict(caps),
+            )
+        )
+        from plugins.cluster.models import HeartbeatPayload
+
+        store.record_heartbeat(
+            HeartbeatPayload(
+                node_id=nid,
+                state="ready",
+                gpus=[GpuInfo(index=0)],
+                metrics=dict(caps),
+            )
+        )
+
+    result = controller.submit_job(
+        {
+            "job_kind": "inference",
+            "adapter_id": "hf_vllm",
+            "model": {"local_path": "/data/model"},
+            "nnodes": 2,
+            "nproc_per_node": 1,
+            "gpus": {
+                "node_ids": ["node5", "node1"],
+                "tensor_parallel": 2,
+                "visible_devices": [0],
+                "placements": [
+                    {"node_id": "node5", "visible_devices": [0]},
+                    {"node_id": "node1", "visible_devices": [0]},
+                ],
+            },
+            "ray": {"enabled": True, "head_node_id": "node5", "head_port": 6413},
+            "serve": {"port": 8000},
+        }
+    )
+    assert result["success"] is True
+    asgs = sorted(result["assignments"], key=lambda a: a["node_rank"])
+    assert len(asgs) == 2
+    assert asgs[0]["node_id"] == "node5"
+    assert asgs[0]["gpus"] == [0]
+    assert asgs[1]["node_id"] == "node1"
+    assert asgs[0]["job_spec"]["extra"]["inference_spec"]["node_rank"] == 0
+    assert asgs[1]["job_spec"]["extra"]["inference_spec"]["local_visible_devices"] == [0]
+    assert asgs[0]["job_spec"]["extra"]["inference_spec"]["ray"]["enabled"] is True
+
+    job_id = result["job"]["job_id"]
+    # Rank0 ready before workers → rejected
+    early = controller.report_job_outcome(
+        job_id,
+        success=True,
+        summary="too early",
+        node_id="node5",
+        details={"phase": "ready", "visit_host": "10.0.21.105", "visit_port": 8000},
+    )
+    assert early.get("accepted") is False
+    assert early.get("error") == "workers_not_ready"
+    assert store.get_job(job_id).state == "running"
+
+    worker = controller.report_job_outcome(
+        job_id,
+        success=True,
+        summary="worker ok",
+        node_id="node1",
+        details={"phase": "worker_ready"},
+    )
+    assert worker.get("accepted") is True
+    assert worker.get("phase") == "worker_ready"
+    assert store.get_job(job_id).state == "running"
+    w_asg = [a for a in store.list_assignments_for_job(job_id) if a.node_id == "node1"][0]
+    assert w_asg.state == "worker_ready"
+
+    ready = controller.report_job_outcome(
+        job_id,
+        success=True,
+        summary="ready",
+        node_id="node5",
+        details={"phase": "ready", "visit_host": "10.0.21.105", "visit_port": 8000},
+    )
+    assert ready.get("accepted") is True
+    assert store.get_job(job_id).state == "succeeded"
+
+
+def test_hf_vllm_start_ray_and_adapter_options(tmp_path, monkeypatch):
+    monkeypatch.setenv("GPUCLOUD_HOME", str(tmp_path / ".gpucloud"))
+    monkeypatch.setenv("GPUCLOUD_CLUSTER_ADVERTISED_ADDR", "10.0.21.105")
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text('{"model_type":"gpt2"}')
+    (model / "pytorch_model.bin").write_bytes(b"x")
+
+    ad = HfVllmAdapter()
+    captured = {}
+
+    class _Proc:
+        pid = 4242
+
+        def poll(self):
+            return None
+
+    def fake_popen(cmd, env=None, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(env or {})
+        return _Proc()
+
+    monkeypatch.setattr("plugins.inference_adapters.hf_vllm.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        "plugins.inference_adapters.hf_vllm.resolve_inference_python",
+        lambda: "python3",
+    )
+
+    endpoint = ad.start(
+        {
+            "job_id": "job-ray",
+            "serve": {"host": "0.0.0.0", "port": 8000},
+            "gpus": {"tensor_parallel": 2, "visible_devices": [0]},
+            "ray": {"enabled": True, "head_port": 6413},
+            "adapter_options": {
+                "trust_remote_code": True,
+                "max_model_len": 4096,
+                "gpu_memory_utilization": 0.9,
+            },
+        },
+        ArtifactPaths(model_path=str(model)),
+    )
+    cmd = " ".join(captured["cmd"])
+    assert "--tensor-parallel-size 2" in cmd
+    assert "--distributed-executor-backend ray" in cmd
+    assert "--trust-remote-code" in cmd
+    assert "--max-model-len 4096" in cmd
+    assert captured["env"].get("CUDA_VISIBLE_DEVICES") == "0"
+    assert captured["env"].get("RAY_ADDRESS") == "10.0.21.105:6413"
+    assert endpoint.port == 8000

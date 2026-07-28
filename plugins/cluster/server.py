@@ -113,14 +113,14 @@ class ClusterHTTPHandler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/jobs/") and path.endswith("/outcome") and method == "POST":
             job_id = path.split("/")[-2]
-            ctrl.report_job_outcome(
+            result = ctrl.report_job_outcome(
                 job_id,
                 success=bool(body.get("success")),
                 summary=str(body.get("summary") or ""),
                 node_id=str(body.get("node_id") or ""),
                 details=body.get("details") if isinstance(body.get("details"), dict) else None,
             )
-            return 200, {"success": True}
+            return 200, result if isinstance(result, dict) else {"success": True}
 
         if path.startswith("/api/jobs/") and path.endswith("/replan") and method == "POST":
             job_id = path.split("/")[-2]

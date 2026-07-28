@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict
 
@@ -43,6 +44,10 @@ def handle_inference_start_vllm(args: dict, **kwargs: Any) -> str:
     secrets_ref = args.get("secrets_ref") if isinstance(args.get("secrets_ref"), dict) else {}
     env = args.get("env") if isinstance(args.get("env"), dict) else {}
     python_executable = str(args.get("python_executable") or "").strip()
+    ray = args.get("ray") if isinstance(args.get("ray"), dict) else {}
+    adapter_options = (
+        args.get("adapter_options") if isinstance(args.get("adapter_options"), dict) else {}
+    )
 
     spec: Dict[str, Any] = {
         "job_id": job_id,
@@ -52,9 +57,8 @@ def handle_inference_start_vllm(args: dict, **kwargs: Any) -> str:
         "gpus": gpus,
         "secrets_ref": secrets_ref,
         "env": {str(k): str(v) for k, v in env.items()},
-        "adapter_options": args.get("adapter_options")
-        if isinstance(args.get("adapter_options"), dict)
-        else {},
+        "adapter_options": adapter_options,
+        "ray": ray,
         "runtime": {},
     }
     if python_executable:
@@ -86,6 +90,85 @@ def handle_inference_start_vllm(args: dict, **kwargs: Any) -> str:
     except Exception as exc:
         _log.exception("inference_start_vllm failed job=%s", job_id)
         return json.dumps({"success": False, "error": str(exc), "phase": "start"})
+
+
+def handle_inference_ray_start(args: dict, **kwargs: Any) -> str:
+    from plugins.inference_adapters.ray_runtime import start_ray_head
+
+    port = int(args.get("port") or args.get("head_port") or 6379)
+    num_gpus = int(args.get("num_gpus") or 1)
+    devices = args.get("visible_devices") or args.get("cuda_visible_devices")
+    if isinstance(devices, list):
+        devices = [int(x) for x in devices]
+    else:
+        devices = None
+    try:
+        result = start_ray_head(
+            port=port,
+            num_gpus=num_gpus,
+            node_ip=str(args.get("node_ip") or "").strip(),
+            python_executable=str(args.get("python_executable") or "").strip(),
+            cuda_visible_devices=devices,
+        )
+        return json.dumps(result)
+    except Exception as exc:
+        _log.exception("inference_ray_start failed")
+        return json.dumps({"success": False, "error": str(exc)})
+
+
+def handle_inference_ray_join(args: dict, **kwargs: Any) -> str:
+    from plugins.inference_adapters.ray_runtime import join_ray_worker
+
+    address = str(args.get("address") or "").strip()
+    if not address:
+        return json.dumps({"success": False, "error": "address required (host:port)"})
+    num_gpus = int(args.get("num_gpus") or 1)
+    devices = args.get("visible_devices") or args.get("cuda_visible_devices")
+    if isinstance(devices, list):
+        devices = [int(x) for x in devices]
+    else:
+        devices = None
+    try:
+        result = join_ray_worker(
+            address=address,
+            num_gpus=num_gpus,
+            node_ip=str(args.get("node_ip") or "").strip(),
+            python_executable=str(args.get("python_executable") or "").strip(),
+            cuda_visible_devices=devices,
+        )
+        return json.dumps(result)
+    except Exception as exc:
+        _log.exception("inference_ray_join failed")
+        return json.dumps({"success": False, "error": str(exc)})
+
+
+def handle_inference_cluster_wait_workers(args: dict, **kwargs: Any) -> str:
+    from plugins.inference_adapters.ray_runtime import wait_workers_ready
+
+    job_id = str(args.get("job_id") or "").strip()
+    master_url = str(args.get("master_url") or os.environ.get("GPUCLOUD_CLUSTER_MASTER_URL") or "").strip()
+    if not job_id:
+        return json.dumps({"success": False, "error": "job_id required"})
+    if not master_url:
+        # Common on-node default when this node is the cluster master.
+        master_url = "http://127.0.0.1:8765"
+    secret = str(
+        args.get("cluster_secret")
+        or os.environ.get("GPUCLOUD_CLUSTER_SECRET")
+        or ""
+    ).strip()
+    try:
+        result = wait_workers_ready(
+            master_url=master_url,
+            job_id=job_id,
+            secret=secret,
+            timeout_seconds=float(args.get("timeout_seconds") or 600),
+            poll_seconds=float(args.get("poll_seconds") or 3),
+        )
+        return json.dumps(result)
+    except Exception as exc:
+        _log.exception("inference_cluster_wait_workers failed")
+        return json.dumps({"success": False, "error": str(exc)})
 
 
 def handle_inference_health(args: dict, **kwargs: Any) -> str:
@@ -146,7 +229,8 @@ INFERENCE_START_VLLM_SCHEMA = {
     "name": "inference_start_vllm",
     "description": (
         "Start OpenAI-compatible vLLM serve for a job using the managed HfVllmAdapter "
-        "(tracks PID/logs for cancel). Prefer this over raw terminal background serves."
+        "(tracks PID/logs for cancel). Prefer this over raw terminal background serves. "
+        "For multi-node TP, pass ray={enabled:true,address:host:port} and global tensor_parallel."
     ),
     "parameters": {
         "type": "object",
@@ -156,12 +240,64 @@ INFERENCE_START_VLLM_SCHEMA = {
             "adapter_id": {"type": "string", "default": "hf_vllm"},
             "serve": {"type": "object"},
             "gpus": {"type": "object"},
+            "ray": {"type": "object"},
             "secrets_ref": {"type": "object"},
             "env": {"type": "object"},
             "adapter_options": {"type": "object"},
             "python_executable": {"type": "string"},
         },
         "required": ["job_id", "model_path"],
+    },
+}
+
+INFERENCE_RAY_START_SCHEMA = {
+    "name": "inference_ray_start",
+    "description": "Start Ray head on this node (rank0) before multi-node vLLM.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "port": {"type": "integer"},
+            "head_port": {"type": "integer"},
+            "num_gpus": {"type": "integer"},
+            "visible_devices": {"type": "array", "items": {"type": "integer"}},
+            "node_ip": {"type": "string"},
+            "python_executable": {"type": "string"},
+        },
+        "required": [],
+    },
+}
+
+INFERENCE_RAY_JOIN_SCHEMA = {
+    "name": "inference_ray_join",
+    "description": "Join Ray worker on this node (rank>0) to the head address.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "address": {"type": "string", "description": "Ray head host:port"},
+            "num_gpus": {"type": "integer"},
+            "visible_devices": {"type": "array", "items": {"type": "integer"}},
+            "node_ip": {"type": "string"},
+            "python_executable": {"type": "string"},
+        },
+        "required": ["address"],
+    },
+}
+
+INFERENCE_CLUSTER_WAIT_WORKERS_SCHEMA = {
+    "name": "inference_cluster_wait_workers",
+    "description": (
+        "Rank0 only: poll cluster master until all peer assignments report "
+        "phase/state worker_ready before starting multi-node vLLM."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "job_id": {"type": "string"},
+            "master_url": {"type": "string"},
+            "timeout_seconds": {"type": "number"},
+            "poll_seconds": {"type": "number"},
+        },
+        "required": ["job_id"],
     },
 }
 
@@ -189,7 +325,8 @@ INFERENCE_REPORT_READY_SCHEMA = {
     "name": "inference_report_ready",
     "description": (
         "Report the final inference outcome contract to the cluster worker "
-        "(success/failure + visit_host/port). Call this when ready or when giving up."
+        "(success/failure + visit_host/port). Rank0 uses phase=ready; "
+        "workers use phase=worker_ready (no visit_host)."
     ),
     "parameters": {
         "type": "object",

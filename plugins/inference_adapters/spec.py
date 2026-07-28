@@ -70,6 +70,7 @@ def extract_inference_spec(raw: Dict[str, Any]) -> Dict[str, Any]:
         "training_artifact_kind": str(
             base.get("training_artifact_kind") or raw.get("training_artifact_kind") or ""
         ),
+        "ray": dict(base.get("ray") or raw.get("ray") or {}),
     }
     # Convenience: top-level model.local_path aliases
     if not out["model"].get("local_path"):
@@ -93,8 +94,17 @@ def validate_inference_spec(raw: Dict[str, Any]) -> tuple[List[str], Dict[str, A
         errors.append("adapter_id is required for job_kind=inference")
 
     nnodes = int(raw.get("nnodes") or spec.get("gpus", {}).get("nnodes") or 1)
+    placements = spec.get("gpus", {}).get("placements") or []
+    placement_nproc = 0
+    if isinstance(placements, list) and placements:
+        for p in placements:
+            if isinstance(p, dict):
+                placement_nproc = max(
+                    placement_nproc, len(p.get("visible_devices") or []) or 1
+                )
     nproc = int(
         raw.get("nproc_per_node")
+        or placement_nproc
         or len(spec.get("gpus", {}).get("visible_devices") or [])
         or spec.get("gpus", {}).get("tensor_parallel")
         or 1

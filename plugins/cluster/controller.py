@@ -298,8 +298,38 @@ class ClusterController:
         )
 
         assignments: List[RankAssignment] = []
+        inf_spec = (norm.get("extra") or {}).get("inference_spec") or {}
+        placements_by_node: Dict[str, List[int]] = {}
+        if job_kind == "inference":
+            for p in list((inf_spec.get("gpus") or {}).get("placements") or []):
+                if not isinstance(p, dict):
+                    continue
+                nid = str(p.get("node_id") or "").strip()
+                if not nid:
+                    continue
+                devices = [int(x) for x in (p.get("visible_devices") or [])]
+                if devices:
+                    placements_by_node[nid] = devices
+
         for rank, node in enumerate(selected):
-            gpu_ids = [g.index for g in node.gpus[:nproc]] or list(range(nproc))
+            if node.node_id in placements_by_node:
+                gpu_ids = list(placements_by_node[node.node_id])
+            else:
+                gpu_ids = [g.index for g in node.gpus[:nproc]] or list(range(nproc))
+            # Per-rank job_spec copy with local visible devices for agent prompt.
+            job_spec_dict = spec.to_dict()
+            if job_kind == "inference":
+                extra_copy = dict(job_spec_dict.get("extra") or {})
+                inf_copy = dict(extra_copy.get("inference_spec") or {})
+                gpus_copy = dict(inf_copy.get("gpus") or {})
+                gpus_copy["visible_devices"] = list(gpu_ids)
+                gpus_copy["local_visible_devices"] = list(gpu_ids)
+                inf_copy["gpus"] = gpus_copy
+                inf_copy["node_rank"] = rank
+                inf_copy["nnodes"] = nnodes
+                inf_copy["local_visible_devices"] = list(gpu_ids)
+                extra_copy["inference_spec"] = inf_copy
+                job_spec_dict["extra"] = extra_copy
             partial = RankAssignment(
                 assignment_id=new_id("asg-"),
                 job_id=job.job_id,
@@ -314,7 +344,7 @@ class ClusterController:
                 job_generation=job.job_generation,
                 gpus=gpu_ids,
                 working_dir=spec.working_dir,
-                job_spec=spec.to_dict(),
+                job_spec=job_spec_dict,
             )
             # Launch command is built on the worker after local path/env resolution.
             partial.launch_command = []
@@ -566,15 +596,105 @@ class ClusterController:
         summary: str = "",
         node_id: str = "",
         details: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        state = "succeeded" if success else "failed"
+    ) -> Dict[str, Any]:
         details_dict = dict(details or {})
+        phase = str(details_dict.get("phase") or "").strip().lower()
+        job = self.store.get_job(job_id)
+        assignments = self.store.list_assignments_for_job(job_id)
+        reporter = next((a for a in assignments if a.node_id == node_id), None)
+        is_inference = bool(
+            job
+            and (
+                str(getattr(job.spec, "job_kind", "") or "").lower() == "inference"
+                or str((getattr(job.spec, "extra", None) or {}).get("job_kind") or "").lower()
+                == "inference"
+            )
+        )
+
+        if is_inference and success:
+            # Non-rank0 "ready" → coerce to worker_ready (do not finish the job).
+            if reporter is not None and int(reporter.node_rank) != 0 and phase in ("", "ready"):
+                phase = "worker_ready"
+                details_dict["phase"] = "worker_ready"
+
+            if phase == "worker_ready":
+                if reporter is not None:
+                    self.store.ack_assignment(
+                        reporter.assignment_id,
+                        reporter.node_id,
+                        reporter.job_generation,
+                        "worker_ready",
+                    )
+                # Keep job running; expose partial outcome for polling tools.
+                self.store.update_job_state(
+                    job_id,
+                    "running",
+                    outcome_details={
+                        **(job.outcome_details if job else {}),
+                        "worker_reports": {
+                            **((job.outcome_details if job else {}).get("worker_reports") or {}),
+                            node_id: details_dict,
+                        },
+                    },
+                )
+                self.events.emit(
+                    "inference_worker_ready",
+                    {"summary": summary or "worker_ready", "job_id": job_id, "details": details_dict},
+                    job_id=job_id,
+                    node_id=node_id,
+                )
+                return {
+                    "success": True,
+                    "accepted": True,
+                    "phase": "worker_ready",
+                    "job_state": "running",
+                }
+
+            if phase == "ready":
+                if reporter is not None and int(reporter.node_rank) != 0:
+                    return {
+                        "success": False,
+                        "accepted": False,
+                        "error": "only rank0 may report phase=ready",
+                        "phase": phase,
+                    }
+                peers = [a for a in assignments if int(a.node_rank) != 0]
+                pending = [
+                    a.node_id
+                    for a in peers
+                    if a.state not in ("worker_ready", "succeeded")
+                ]
+                if peers and pending:
+                    return {
+                        "success": False,
+                        "accepted": False,
+                        "error": "workers_not_ready",
+                        "pending_nodes": pending,
+                        "phase": "ready",
+                        "job_state": "running",
+                    }
+                if reporter is not None:
+                    self.store.ack_assignment(
+                        reporter.assignment_id,
+                        reporter.node_id,
+                        reporter.job_generation,
+                        "succeeded",
+                    )
+
+        state = "succeeded" if success else "failed"
         self.store.update_job_state(
             job_id,
             state,
             error_summary=summary if not success else "",
             outcome_details=details_dict,
         )
+        if not success and reporter is not None:
+            self.store.ack_assignment(
+                reporter.assignment_id,
+                reporter.node_id,
+                reporter.job_generation,
+                "failed",
+            )
         event_type = "job_completed" if success else "job_failed"
         payload: Dict[str, Any] = {"summary": summary or state, "job_id": job_id}
         if details_dict:
@@ -599,4 +719,9 @@ class ClusterController:
                 failed_task_id=str(details_dict.get("phase") or "") if not success else "",
                 error=summary if not success else "",
             )
-        # Platform polls GET /api/jobs/{id} for outcome_details; no status POST.
+        return {
+            "success": True,
+            "accepted": True,
+            "phase": phase or ("ready" if success else "failed"),
+            "job_state": state,
+        }

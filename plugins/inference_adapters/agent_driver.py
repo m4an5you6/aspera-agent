@@ -31,6 +31,7 @@ _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IG
 _READY_PHASES = frozenset(
     {
         "ready",
+        "worker_ready",
         "ensure_runtime",
         "ensure_artifacts",
         "start",
@@ -170,6 +171,14 @@ def parse_outcome_contract(
 
 def build_inference_agent_prompt(job_spec: Dict[str, Any], inference_spec: Dict[str, Any]) -> str:
     """User prompt: job context + mandatory outcome contract."""
+    node_rank = int(inference_spec.get("node_rank") or 0)
+    nnodes = int(inference_spec.get("nnodes") or job_spec.get("nnodes") or 1)
+    local_devices = (
+        inference_spec.get("local_visible_devices")
+        or (inference_spec.get("gpus") or {}).get("local_visible_devices")
+        or (inference_spec.get("gpus") or {}).get("visible_devices")
+        or []
+    )
     compact = {
         "job_id": inference_spec.get("job_id"),
         "adapter_id": inference_spec.get("adapter_id") or "hf_vllm",
@@ -187,24 +196,50 @@ def build_inference_agent_prompt(job_spec: Dict[str, Any], inference_spec: Dict[
         "callback_url": inference_spec.get("callback_url") or "",
         "env": inference_spec.get("env") or {},
         "working_dir": inference_spec.get("working_dir") or ".",
+        "node_rank": node_rank,
+        "nnodes": nnodes,
+        "local_visible_devices": local_devices,
+        "ray": inference_spec.get("ray") or {},
+        "tensor_parallel": (inference_spec.get("gpus") or {}).get("tensor_parallel"),
     }
+    role_block = (
+        "You are rank0 (serve head) on a multi-node inference job.\n"
+        "After runtime/artifacts are ready:\n"
+        "1) `inference_ray_start` with ray.head_port and local_visible_devices\n"
+        "2) `inference_cluster_wait_workers` until peers are worker_ready\n"
+        "3) `inference_start_vllm` with global tensor_parallel, local visible_devices, "
+        "and ray={enabled:true, address/head_port}\n"
+        "4) health then `inference_report_ready` phase=ready with reachable visit_host\n"
+        if nnodes > 1 and node_rank == 0
+        else (
+            "You are a worker rank (rank>0) on a multi-node inference job.\n"
+            "Do NOT start the OpenAI API server and do NOT report visit_host.\n"
+            "After runtime/artifacts are ready:\n"
+            "1) `inference_ray_join` to ray head address (head advertised_addr:head_port)\n"
+            "2) `inference_report_ready` with success=true and details.phase=worker_ready\n"
+            if nnodes > 1
+            else ""
+        )
+    )
     return (
         "You are deploying inference on THIS GPU node until the service is ready.\n"
         "Follow the skill `gpucloud-inference-deployment`.\n"
         "For megatron_checkpoints / .distcp trees, follow "
         "`gpucloud-megatron-weight-export` (ModelOpt/SWIFT recipes first; "
         "hand-rolled load_distcp only as last resort).\n\n"
+        f"{role_block}\n"
         "Job assignment JSON:\n"
         f"```json\n{json.dumps(compact, ensure_ascii=False, indent=2)}\n```\n\n"
         "Required work (in order):\n"
         "1. Inspect CUDA/Python and the model directory (config.json / names) to infer model family.\n"
-        "2. Install a compatible torch + vLLM stack for that model (trial-and-error OK; fix conflicts).\n"
+        "2. Install a compatible torch + vLLM (+ ray when nnodes>1) stack for that model "
+        "into the inference venv (trial-and-error OK; fix conflicts).\n"
         "3. Ensure artifacts: if local_path missing or not HF-loadable, sync/convert using sources[]; else fail clearly.\n"
-        "4. Start serving with tools `inference_start_vllm` then poll `inference_health` until ready "
-        "(do not invent your own long-lived serve process unless the tool fails).\n"
+        "4. Follow the role steps above for Ray/serve (single-node: "
+        "`inference_start_vllm` then `inference_health`).\n"
         "5. Call `inference_report_ready` with the success contract (preferred), "
         "or end with a single JSON object matching the contract.\n\n"
-        "Success contract shape:\n"
+        "Success contract shape (rank0 ready):\n"
         "```json\n"
         "{\n"
         '  "success": true,\n'
@@ -223,6 +258,7 @@ def build_inference_agent_prompt(job_spec: Dict[str, Any], inference_spec: Dict[
         "  }\n"
         "}\n"
         "```\n"
+        "Worker contract: success=true, details.phase=worker_ready (no visit_host).\n"
         "On failure set success=false and details.phase to one of "
         "ensure_runtime|ensure_artifacts|start|health_timeout|cancelled|validate.\n"
         "Never put API keys into the contract JSON.\n"

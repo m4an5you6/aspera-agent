@@ -131,16 +131,25 @@ class HfVllmAdapter(ModelAdapter):
         host = str(serve.get("host") or "0.0.0.0")
         port = int(serve.get("port") or 8000)
         tp = int(gpus.get("tensor_parallel") or 1)
-        visible = gpus.get("visible_devices")
+        visible = gpus.get("local_visible_devices") or gpus.get("visible_devices")
         runtime = spec.get("runtime") if isinstance(spec.get("runtime"), dict) else {}
         scheme = runtime.get("scheme") if isinstance(runtime.get("scheme"), dict) else {}
         scheme_extra = list((scheme.get("constraints") or {}).get("extra_args") or [])
+        adapter_options = (
+            spec.get("adapter_options") if isinstance(spec.get("adapter_options"), dict) else {}
+        )
         extra_args = list(
             serve.get("extra_args")
-            or spec.get("adapter_options", {}).get("extra_args")
+            or adapter_options.get("extra_args")
             or scheme_extra
             or []
         )
+        ray = spec.get("ray") if isinstance(spec.get("ray"), dict) else {}
+        use_ray = bool(ray.get("enabled")) or str(
+            ray.get("distributed_executor_backend")
+            or adapter_options.get("distributed_executor_backend")
+            or ""
+        ).lower() == "ray"
 
         env = os.environ.copy()
         env.update({str(k): str(v) for k, v in dict(spec.get("env") or {}).items()})
@@ -175,6 +184,43 @@ class HfVllmAdapter(ModelAdapter):
             "--tensor-parallel-size",
             str(tp),
         ]
+        if use_ray:
+            cmd.extend(["--distributed-executor-backend", "ray"])
+            ray_addr = str(ray.get("address") or env.get("RAY_ADDRESS") or "").strip()
+            if not ray_addr:
+                head_port = ray.get("head_port") or ray.get("port")
+                head_host = (
+                    os.environ.get("GPUCLOUD_CLUSTER_ADVERTISED_ADDR", "").strip()
+                    or os.environ.get("MASTER_ADDR", "").strip()
+                    or "127.0.0.1"
+                )
+                if head_port is not None:
+                    ray_addr = f"{head_host}:{int(head_port)}"
+            if ray_addr:
+                env["RAY_ADDRESS"] = ray_addr
+
+        extra_joined = " ".join(str(a) for a in extra_args)
+        if adapter_options.get("trust_remote_code") and "--trust-remote-code" not in extra_joined:
+            cmd.append("--trust-remote-code")
+        if adapter_options.get("max_model_len") is not None and "--max-model-len" not in extra_joined:
+            cmd.extend(["--max-model-len", str(int(adapter_options["max_model_len"]))])
+        if (
+            adapter_options.get("gpu_memory_utilization") is not None
+            and "--gpu-memory-utilization" not in extra_joined
+        ):
+            cmd.extend(
+                [
+                    "--gpu-memory-utilization",
+                    str(float(adapter_options["gpu_memory_utilization"])),
+                ]
+            )
+        if adapter_options.get("cpu_offload_gb") is not None and "--cpu-offload-gb" not in extra_joined:
+            cmd.extend(["--cpu-offload-gb", str(float(adapter_options["cpu_offload_gb"]))])
+        if adapter_options.get("enable_lora") and "--enable-lora" not in extra_joined:
+            cmd.append("--enable-lora")
+        if adapter_options.get("max_lora_rank") is not None and "--max-lora-rank" not in extra_joined:
+            cmd.extend(["--max-lora-rank", str(int(adapter_options["max_lora_rank"]))])
+
         if api_key:
             env["VLLM_API_KEY"] = api_key
             cmd.extend(["--api-key", api_key])

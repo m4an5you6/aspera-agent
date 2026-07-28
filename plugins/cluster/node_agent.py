@@ -325,12 +325,16 @@ class NodeAgent:
             return resp["scheme"]
 
         def _on_outcome(success: bool, summary: str, details: dict) -> None:
+            phase = str((details or {}).get("phase") or "").strip().lower()
+            ack_state = "succeeded" if success else "failed"
+            if success and phase == "worker_ready":
+                ack_state = "worker_ready"
             try:
                 self.client.ack_assignment(
                     assignment.assignment_id,
                     self.cfg.node_id,
                     assignment.job_generation,
-                    "succeeded" if success else "failed",
+                    ack_state,
                 )
             except Exception as exc:
                 self.logger.log_error(
@@ -340,13 +344,28 @@ class NodeAgent:
                     node_id=self.cfg.node_id,
                 )
             try:
-                self.client.report_outcome(
+                resp = self.client.report_outcome(
                     assignment.job_id,
                     success=success,
                     summary=summary,
                     node_id=self.cfg.node_id,
                     details=details,
                 )
+                # Rank0 ready rejected until workers join — keep assignment running.
+                if (
+                    isinstance(resp, dict)
+                    and resp.get("accepted") is False
+                    and str(resp.get("error") or "") == "workers_not_ready"
+                ):
+                    try:
+                        self.client.ack_assignment(
+                            assignment.assignment_id,
+                            self.cfg.node_id,
+                            assignment.job_generation,
+                            "running",
+                        )
+                    except Exception:
+                        pass
             except Exception as exc:
                 self.logger.log_error(
                     error_type="report_outcome",
