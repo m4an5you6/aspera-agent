@@ -33,6 +33,10 @@ def _merge_inference_spec(job_spec: Dict[str, Any]) -> Dict[str, Any]:
     extra = job_spec.get("extra") if isinstance(job_spec.get("extra"), dict) else {}
     if isinstance(extra.get("inference_spec"), dict):
         inference_spec = extract_inference_spec({**extra["inference_spec"], **job_spec})
+        # Preserve role/placement fields even if a nested extract path drops them.
+        for key in ("node_rank", "nnodes", "local_visible_devices"):
+            if inference_spec.get(key) is None and extra["inference_spec"].get(key) is not None:
+                inference_spec[key] = extra["inference_spec"][key]
     # Attach runtime.scheme from extra.runtime_scheme when missing
     runtime = inference_spec.get("runtime") if isinstance(inference_spec.get("runtime"), dict) else {}
     if not runtime.get("scheme") and isinstance(extra.get("runtime_scheme"), dict):

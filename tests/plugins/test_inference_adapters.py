@@ -1174,6 +1174,12 @@ def test_controller_multinode_placements_and_outcome_gating(tmp_path, monkeypatc
 def test_hf_vllm_start_ray_and_adapter_options(tmp_path, monkeypatch):
     monkeypatch.setenv("GPUCLOUD_HOME", str(tmp_path / ".gpucloud"))
     monkeypatch.setenv("GPUCLOUD_CLUSTER_ADVERTISED_ADDR", "10.0.21.105")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    py = tmp_path / ".cache/gpu_platform/inference_venvs/cu124/bin/python"
+    py.parent.mkdir(parents=True)
+    py.write_text("#!/bin/sh\n")
+    py.chmod(0o755)
+
     model = tmp_path / "model"
     model.mkdir()
     (model / "config.json").write_text('{"model_type":"gpt2"}')
@@ -1194,10 +1200,6 @@ def test_hf_vllm_start_ray_and_adapter_options(tmp_path, monkeypatch):
         return _Proc()
 
     monkeypatch.setattr("plugins.inference_adapters.hf_vllm.subprocess.Popen", fake_popen)
-    monkeypatch.setattr(
-        "plugins.inference_adapters.hf_vllm.resolve_inference_python",
-        lambda: "python3",
-    )
 
     endpoint = ad.start(
         {
@@ -1205,6 +1207,7 @@ def test_hf_vllm_start_ray_and_adapter_options(tmp_path, monkeypatch):
             "serve": {"host": "0.0.0.0", "port": 8000},
             "gpus": {"tensor_parallel": 2, "visible_devices": [0]},
             "ray": {"enabled": True, "head_port": 6413},
+            "runtime": {"python_executable": str(py)},
             "adapter_options": {
                 "trust_remote_code": True,
                 "max_model_len": 4096,
@@ -1214,6 +1217,7 @@ def test_hf_vllm_start_ray_and_adapter_options(tmp_path, monkeypatch):
         ArtifactPaths(model_path=str(model)),
     )
     cmd = " ".join(captured["cmd"])
+    assert captured["cmd"][0] == str(py)
     assert "--tensor-parallel-size 2" in cmd
     assert "--distributed-executor-backend ray" in cmd
     assert "--trust-remote-code" in cmd

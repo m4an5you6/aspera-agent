@@ -10,10 +10,20 @@ from typing import Any, Dict
 
 from plugins.inference_adapters.agent_driver import store_reported_outcome
 from plugins.inference_adapters.base import ArtifactPaths
+from plugins.inference_adapters.inference_venv import (
+    InferenceVenvError,
+    check_role_tool_allowed,
+    resolve_serve_python,
+)
 from plugins.inference_adapters.registry import create_adapter
 from plugins.inference_adapters.runtime import _RUNNING, remember_adapter
 
 _log = logging.getLogger(__name__)
+
+_PYTHON_HINT = (
+    "Must be under ~/.cache/gpu_platform/inference_venvs/<tag>/bin/python "
+    "(swift_venv is rejected for Ray/vLLM serve)."
+)
 
 
 def _job_adapter(job_id: str, adapter_id: str = "hf_vllm"):
@@ -26,8 +36,22 @@ def _job_adapter(job_id: str, adapter_id: str = "hf_vllm"):
     return ad
 
 
+def _role_gate(tool_name: str) -> str | None:
+    ok, err = check_role_tool_allowed(tool_name)
+    if ok:
+        return None
+    return json.dumps({"success": False, "error": err, "phase": "role_gate"})
+
+
+def _serve_python(args: dict) -> str:
+    return resolve_serve_python(str(args.get("python_executable") or "").strip())
+
+
 def handle_inference_start_vllm(args: dict, **kwargs: Any) -> str:
     """Start vLLM via HfVllmAdapter and remember the process for this job_id."""
+    gated = _role_gate("inference_start_vllm")
+    if gated:
+        return gated
     job_id = str(args.get("job_id") or "").strip()
     model_path = str(args.get("model_path") or "").strip()
     adapter_id = str(args.get("adapter_id") or "hf_vllm").strip() or "hf_vllm"
@@ -43,11 +67,15 @@ def handle_inference_start_vllm(args: dict, **kwargs: Any) -> str:
     gpus = args.get("gpus") if isinstance(args.get("gpus"), dict) else {}
     secrets_ref = args.get("secrets_ref") if isinstance(args.get("secrets_ref"), dict) else {}
     env = args.get("env") if isinstance(args.get("env"), dict) else {}
-    python_executable = str(args.get("python_executable") or "").strip()
     ray = args.get("ray") if isinstance(args.get("ray"), dict) else {}
     adapter_options = (
         args.get("adapter_options") if isinstance(args.get("adapter_options"), dict) else {}
     )
+
+    try:
+        python_executable = _serve_python(args)
+    except InferenceVenvError as exc:
+        return json.dumps({"success": False, "error": str(exc), "phase": "venv_gate"})
 
     spec: Dict[str, Any] = {
         "job_id": job_id,
@@ -59,10 +87,8 @@ def handle_inference_start_vllm(args: dict, **kwargs: Any) -> str:
         "env": {str(k): str(v) for k, v in env.items()},
         "adapter_options": adapter_options,
         "ray": ray,
-        "runtime": {},
+        "runtime": {"python_executable": python_executable},
     }
-    if python_executable:
-        spec["runtime"]["python_executable"] = python_executable
 
     try:
         ad = _job_adapter(job_id, adapter_id)
@@ -85,6 +111,7 @@ def handle_inference_start_vllm(args: dict, **kwargs: Any) -> str:
                 "model_path": str(path.resolve()),
                 "pid": (endpoint.extra or {}).get("pid"),
                 "logs": (endpoint.extra or {}).get("logs"),
+                "python_executable": python_executable,
             }
         )
     except Exception as exc:
@@ -95,6 +122,9 @@ def handle_inference_start_vllm(args: dict, **kwargs: Any) -> str:
 def handle_inference_ray_start(args: dict, **kwargs: Any) -> str:
     from plugins.inference_adapters.ray_runtime import start_ray_head
 
+    gated = _role_gate("inference_ray_start")
+    if gated:
+        return gated
     port = int(args.get("port") or args.get("head_port") or 6379)
     num_gpus = int(args.get("num_gpus") or 1)
     devices = args.get("visible_devices") or args.get("cuda_visible_devices")
@@ -103,14 +133,18 @@ def handle_inference_ray_start(args: dict, **kwargs: Any) -> str:
     else:
         devices = None
     try:
+        python_executable = _serve_python(args)
         result = start_ray_head(
             port=port,
             num_gpus=num_gpus,
             node_ip=str(args.get("node_ip") or "").strip(),
-            python_executable=str(args.get("python_executable") or "").strip(),
+            python_executable=python_executable,
             cuda_visible_devices=devices,
         )
+        result["python_executable"] = python_executable
         return json.dumps(result)
+    except InferenceVenvError as exc:
+        return json.dumps({"success": False, "error": str(exc), "phase": "venv_gate"})
     except Exception as exc:
         _log.exception("inference_ray_start failed")
         return json.dumps({"success": False, "error": str(exc)})
@@ -119,6 +153,9 @@ def handle_inference_ray_start(args: dict, **kwargs: Any) -> str:
 def handle_inference_ray_join(args: dict, **kwargs: Any) -> str:
     from plugins.inference_adapters.ray_runtime import join_ray_worker
 
+    gated = _role_gate("inference_ray_join")
+    if gated:
+        return gated
     address = str(args.get("address") or "").strip()
     if not address:
         return json.dumps({"success": False, "error": "address required (host:port)"})
@@ -129,14 +166,18 @@ def handle_inference_ray_join(args: dict, **kwargs: Any) -> str:
     else:
         devices = None
     try:
+        python_executable = _serve_python(args)
         result = join_ray_worker(
             address=address,
             num_gpus=num_gpus,
             node_ip=str(args.get("node_ip") or "").strip(),
-            python_executable=str(args.get("python_executable") or "").strip(),
+            python_executable=python_executable,
             cuda_visible_devices=devices,
         )
+        result["python_executable"] = python_executable
         return json.dumps(result)
+    except InferenceVenvError as exc:
+        return json.dumps({"success": False, "error": str(exc), "phase": "venv_gate"})
     except Exception as exc:
         _log.exception("inference_ray_join failed")
         return json.dumps({"success": False, "error": str(exc)})
@@ -145,6 +186,9 @@ def handle_inference_ray_join(args: dict, **kwargs: Any) -> str:
 def handle_inference_cluster_wait_workers(args: dict, **kwargs: Any) -> str:
     from plugins.inference_adapters.ray_runtime import wait_workers_ready
 
+    gated = _role_gate("inference_cluster_wait_workers")
+    if gated:
+        return gated
     job_id = str(args.get("job_id") or "").strip()
     master_url = str(args.get("master_url") or os.environ.get("GPUCLOUD_CLUSTER_MASTER_URL") or "").strip()
     if not job_id:
@@ -230,7 +274,8 @@ INFERENCE_START_VLLM_SCHEMA = {
     "description": (
         "Start OpenAI-compatible vLLM serve for a job using the managed HfVllmAdapter "
         "(tracks PID/logs for cancel). Prefer this over raw terminal background serves. "
-        "For multi-node TP, pass ray={enabled:true,address:host:port} and global tensor_parallel."
+        "For multi-node TP, pass ray={enabled:true,address:host:port} and global tensor_parallel. "
+        "Rank>0 must not call this. python_executable must be inference_venvs (not swift_venv)."
     ),
     "parameters": {
         "type": "object",
@@ -244,7 +289,7 @@ INFERENCE_START_VLLM_SCHEMA = {
             "secrets_ref": {"type": "object"},
             "env": {"type": "object"},
             "adapter_options": {"type": "object"},
-            "python_executable": {"type": "string"},
+            "python_executable": {"type": "string", "description": _PYTHON_HINT},
         },
         "required": ["job_id", "model_path"],
     },
@@ -252,7 +297,10 @@ INFERENCE_START_VLLM_SCHEMA = {
 
 INFERENCE_RAY_START_SCHEMA = {
     "name": "inference_ray_start",
-    "description": "Start Ray head on this node (rank0) before multi-node vLLM.",
+    "description": (
+        "Start Ray head on this node (rank0 only) before multi-node vLLM. "
+        "Rank>0 must use inference_ray_join. python_executable must be inference_venvs."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
@@ -261,7 +309,7 @@ INFERENCE_RAY_START_SCHEMA = {
             "num_gpus": {"type": "integer"},
             "visible_devices": {"type": "array", "items": {"type": "integer"}},
             "node_ip": {"type": "string"},
-            "python_executable": {"type": "string"},
+            "python_executable": {"type": "string", "description": _PYTHON_HINT},
         },
         "required": [],
     },
@@ -269,7 +317,10 @@ INFERENCE_RAY_START_SCHEMA = {
 
 INFERENCE_RAY_JOIN_SCHEMA = {
     "name": "inference_ray_join",
-    "description": "Join Ray worker on this node (rank>0) to the head address.",
+    "description": (
+        "Join Ray worker on this node (rank>0 only) to the head address. "
+        "Rank0 must use inference_ray_start. python_executable must be inference_venvs."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
@@ -277,7 +328,7 @@ INFERENCE_RAY_JOIN_SCHEMA = {
             "num_gpus": {"type": "integer"},
             "visible_devices": {"type": "array", "items": {"type": "integer"}},
             "node_ip": {"type": "string"},
-            "python_executable": {"type": "string"},
+            "python_executable": {"type": "string", "description": _PYTHON_HINT},
         },
         "required": ["address"],
     },

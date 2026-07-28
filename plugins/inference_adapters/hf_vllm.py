@@ -11,10 +11,18 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.request import Request, urlopen
 
-from plugins.cluster.runtime_probe import resolve_inference_python
 from plugins.inference_adapters.base import ArtifactPaths, EndpointInfo, HealthState, ModelAdapter
+from plugins.inference_adapters.inference_venv import resolve_serve_python
 from plugins.inference_adapters.registry import register_adapter
 from plugins.inference_adapters.spec import resolve_secret_env
+
+
+def _serve_python_from_spec(spec: Dict[str, Any], facts: Dict[str, Any]) -> str:
+    runtime = spec.get("runtime") if isinstance(spec.get("runtime"), dict) else {}
+    requested = str(
+        runtime.get("python_executable") or facts.get("python_executable") or ""
+    ).strip()
+    return resolve_serve_python(requested)
 
 _log = logging.getLogger(__name__)
 
@@ -86,12 +94,10 @@ class HfVllmAdapter(ModelAdapter):
         job_id = str(spec.get("job_id") or "inference")
         job_log_dir = log_dir / job_id
 
-        initial_facts = {
-            "python_executable": str(
-                (scheme.get("constraints") or {}).get("python_executable")
-                or resolve_inference_python()
-            ),
-        }
+        constrained = str(
+            (scheme.get("constraints") or {}).get("python_executable") or ""
+        ).strip()
+        initial_facts = {"python_executable": resolve_serve_python(constrained)}
 
         try:
             result = run_scheme_tasks(
@@ -165,11 +171,7 @@ class HfVllmAdapter(ModelAdapter):
         ).strip()
         api_key = resolve_secret_env(api_key_env) if api_key_env else resolve_secret_env("INFERENCE_API_KEY")
 
-        python_exe = str(
-            runtime.get("python_executable")
-            or self._runtime_facts.get("python_executable")
-            or resolve_inference_python()
-        )
+        python_exe = _serve_python_from_spec(spec, self._runtime_facts or {})
 
         cmd = [
             python_exe,

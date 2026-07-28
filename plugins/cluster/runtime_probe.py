@@ -36,11 +36,19 @@ _PROBE_SCRIPT = (
 
 
 def resolve_inference_python() -> str:
-    """Prefer INFERENCE_PYTHON / VLLM_PYTHON when present, else sys.executable."""
+    """Prefer inference_venvs / INFERENCE_PYTHON; never prefer swift_venv."""
+    from plugins.inference_adapters.inference_venv import (
+        is_swift_python,
+        list_inference_venv_pythons,
+    )
+
     for key in ("INFERENCE_PYTHON", "VLLM_PYTHON"):
         candidate = str(os.environ.get(key) or "").strip()
-        if candidate and Path(candidate).exists():
+        if candidate and Path(candidate).exists() and not is_swift_python(candidate):
             return candidate
+    found = list_inference_venv_pythons()
+    if found:
+        return found[0]
     return sys.executable or "python3"
 
 

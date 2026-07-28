@@ -375,6 +375,20 @@ class NodeAgent:
                 )
 
         def _run() -> None:
+            # Role gates in inference tools read these (single inference job per node).
+            os.environ["GPUCLOUD_INFERENCE_NODE_RANK"] = str(assignment.node_rank)
+            os.environ["GPUCLOUD_INFERENCE_NNODES"] = str(assignment.nnodes)
+            os.environ["NODE_RANK"] = str(assignment.node_rank)
+            os.environ["NNODES"] = str(assignment.nnodes)
+            # Ensure per-rank fields survive JobSpec.round-trip into the agent prompt.
+            extra_mut = dict(spec.extra or {})
+            inf_mut = dict(extra_mut.get("inference_spec") or {})
+            inf_mut["node_rank"] = int(assignment.node_rank)
+            inf_mut["nnodes"] = int(assignment.nnodes)
+            if assignment.gpus and not inf_mut.get("local_visible_devices"):
+                inf_mut["local_visible_devices"] = list(assignment.gpus)
+            extra_mut["inference_spec"] = inf_mut
+            spec.extra = extra_mut
             try:
                 if driver == "legacy_scheme":
                     run_inference_lifecycle(

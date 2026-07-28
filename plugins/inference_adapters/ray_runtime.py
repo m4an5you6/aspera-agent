@@ -14,22 +14,9 @@ _log = logging.getLogger(__name__)
 
 
 def _resolve_python(python_executable: str = "") -> str:
-    candidates = [
-        (python_executable or "").strip(),
-        os.environ.get("INFERENCE_PYTHON", "").strip(),
-        os.environ.get("VLLM_PYTHON", "").strip(),
-        str(Path.home() / ".cache/gpu_platform/inference_venvs/cu124/bin/python"),
-        str(Path.home() / ".cache/gpu_platform/inference_venvs/cu128/bin/python"),
-        str(Path.home() / ".cache/gpu_platform/swift_venv/bin/python"),
-        "python3",
-    ]
-    for c in candidates:
-        if not c:
-            continue
-        p = Path(c).expanduser()
-        if c == "python3" or p.exists():
-            return str(p) if p.exists() else c
-    return "python3"
+    from plugins.inference_adapters.inference_venv import resolve_serve_python
+
+    return resolve_serve_python(python_executable)
 
 
 def _ray_bin(python_executable: str = "") -> str:

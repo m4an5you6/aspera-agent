@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import threading
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -233,7 +234,8 @@ def build_inference_agent_prompt(job_spec: Dict[str, Any], inference_spec: Dict[
         "Required work (in order):\n"
         "1. Inspect CUDA/Python and the model directory (config.json / names) to infer model family.\n"
         "2. Install a compatible torch + vLLM (+ ray when nnodes>1) stack for that model "
-        "into the inference venv (trial-and-error OK; fix conflicts).\n"
+        "into ~/.cache/gpu_platform/inference_venvs/<tag>/ ONLY "
+        "(never use swift_venv for Ray/vLLM serve; export via terminal+swift is OK).\n"
         "3. Ensure artifacts: if local_path missing or not HF-loadable, sync/convert using sources[]; else fail clearly.\n"
         "4. Follow the role steps above for Ray/serve (single-node: "
         "`inference_start_vllm` then `inference_health`).\n"
@@ -322,6 +324,32 @@ def run_inference_agent(
 
     remember_adapter(job_id, ad)
     clear_reported_outcome(job_id)
+
+    # Pin rank/nnodes for tool role gates (workers must not call ray_start / start_vllm).
+    try:
+        node_rank = int(
+            inference_spec.get("node_rank")
+            if inference_spec.get("node_rank") is not None
+            else (extra.get("inference_spec") or {}).get("node_rank")
+            or 0
+        )
+    except (TypeError, ValueError):
+        node_rank = 0
+    try:
+        nnodes = int(
+            inference_spec.get("nnodes")
+            or job_spec.get("nnodes")
+            or (extra.get("inference_spec") or {}).get("nnodes")
+            or 1
+        )
+    except (TypeError, ValueError):
+        nnodes = 1
+    inference_spec["node_rank"] = node_rank
+    inference_spec["nnodes"] = nnodes
+    os.environ["GPUCLOUD_INFERENCE_NODE_RANK"] = str(node_rank)
+    os.environ["GPUCLOUD_INFERENCE_NNODES"] = str(nnodes)
+    os.environ.setdefault("NODE_RANK", str(node_rank))
+    os.environ.setdefault("NNODES", str(nnodes))
 
     # Match CLI AutoGoal: segment_max_turns × max_segments (default 100 × 20).
     # ``max_iterations`` remains a back-compat alias for per-segment tool budget.

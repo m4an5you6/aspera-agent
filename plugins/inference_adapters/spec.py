@@ -72,6 +72,27 @@ def extract_inference_spec(raw: Dict[str, Any]) -> Dict[str, Any]:
         ),
         "ray": dict(base.get("ray") or raw.get("ray") or {}),
     }
+    # Multi-node role fields (set per-assignment by the cluster controller).
+    if base.get("node_rank") is not None:
+        try:
+            out["node_rank"] = int(base["node_rank"])
+        except (TypeError, ValueError):
+            out["node_rank"] = base["node_rank"]
+    elif raw.get("node_rank") is not None:
+        try:
+            out["node_rank"] = int(raw["node_rank"])
+        except (TypeError, ValueError):
+            out["node_rank"] = raw["node_rank"]
+    if base.get("nnodes") is not None:
+        try:
+            out["nnodes"] = int(base["nnodes"])
+        except (TypeError, ValueError):
+            out["nnodes"] = base["nnodes"]
+    local_devices = base.get("local_visible_devices")
+    if local_devices is None:
+        local_devices = (base.get("gpus") or {}).get("local_visible_devices")
+    if isinstance(local_devices, list):
+        out["local_visible_devices"] = list(local_devices)
     # Convenience: top-level model.local_path aliases
     if not out["model"].get("local_path"):
         for key in ("model_path", "local_path"):
