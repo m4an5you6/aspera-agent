@@ -101,7 +101,7 @@ def test_runtime_multi_segment_continues_with_summary(monkeypatch, tmp_path):
         profile=PROFILE_CLUSTER_INFERENCE,
         session_id="sess-multi",
         completion=ContractCompletion(
-            pop_reported=lambda: reported_box["payload"],
+            pop_reported=lambda: reported_box.pop("payload", None),
             parse_contract=_parse_simple,
             extract_json=_extract_json,
         ),
@@ -127,6 +127,128 @@ def test_runtime_multi_segment_continues_with_summary(monkeypatch, tmp_path):
     assert "[Continuing AutoGoal]" in calls["prompts"][1]
     assert "still installing vllm" in calls["prompts"][1]
     assert "skill_manage" not in calls["prompts"][1]
+    assert result.details.get("segment_index") == 2
+
+
+def test_try_complete_ignores_scraped_failure_json():
+    """Prose + failure JSON after a segment must NOT end AutoGoal early."""
+    completion = ContractCompletion(
+        pop_reported=lambda: None,
+        parse_contract=_parse_simple,
+        extract_json=_extract_json,
+    )
+    early = completion.try_complete(
+        conversation_result={
+            "final_response": (
+                "Engine core failed again.\n"
+                '{"success": false, "summary": "vllm failed", '
+                '"details": {"phase": "start"}}'
+            )
+        },
+        defaults={},
+    )
+    assert early is None
+
+
+def test_try_complete_accepts_scraped_terminal_success_json():
+    completion = ContractCompletion(
+        pop_reported=lambda: None,
+        parse_contract=_parse_simple,
+        extract_json=_extract_json,
+    )
+    early = completion.try_complete(
+        conversation_result={
+            "final_response": (
+                '{"success": true, "summary": "ok", '
+                '"details": {"phase": "ready", "visit_port": 8000}}'
+            )
+        },
+        defaults={},
+    )
+    assert early is not None
+    assert early.success is True
+    assert early.status == "done"
+
+
+def test_try_complete_tool_reported_failure_stops():
+    completion = ContractCompletion(
+        pop_reported=lambda: {
+            "success": False,
+            "summary": "gave up",
+            "details": {"phase": "start"},
+        },
+        parse_contract=_parse_simple,
+        extract_json=_extract_json,
+    )
+    early = completion.try_complete(
+        conversation_result={"final_response": "still working"},
+        defaults={},
+    )
+    assert early is not None
+    assert early.success is False
+    assert early.status == "failed"
+
+
+def test_runtime_scraped_failure_json_continues_to_next_segment(monkeypatch, tmp_path):
+    """Regression: max-iterations final text with failure JSON used to stop at segment 1."""
+    monkeypatch.setenv("GPUCLOUD_HOME", str(tmp_path / ".gpucloud"))
+    (tmp_path / ".gpucloud").mkdir(parents=True, exist_ok=True)
+
+    calls = {"n": 0}
+    reported_box: Dict[str, Any] = {"payload": None}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            pass
+
+        def run_conversation(self, user_message="", task_id=None, conversation_history=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {
+                    "final_response": (
+                        "torch_c_dlpack_ext ABI mismatch.\n"
+                        '{"success": false, "summary": "engine failed", '
+                        '"details": {"phase": "start"}}'
+                    ),
+                    "messages": [{"role": "assistant", "content": "seg1"}],
+                }
+            reported_box["payload"] = {
+                "success": True,
+                "summary": "ready",
+                "details": {"phase": "ready", "visit_port": 8000},
+            }
+            return {"final_response": "done", "messages": [{"role": "assistant", "content": "seg2"}]}
+
+        def interrupt(self, reason=""):
+            return None
+
+        def get_activity_summary(self):
+            return {"seconds_since_activity": 0.0}
+
+    result = AutoGoalRuntime().run(
+        objective="deploy",
+        profile=PROFILE_CLUSTER_INFERENCE,
+        session_id="sess-fail-json",
+        completion=ContractCompletion(
+            pop_reported=lambda: reported_box.pop("payload", None),
+            parse_contract=_parse_simple,
+            extract_json=_extract_json,
+        ),
+        agent_factory=FakeAgent,
+        runtime_provider={
+            "provider": "test",
+            "api_key": "k",
+            "base_url": "http://x",
+            "api_mode": "chat_completions",
+            "model": "m",
+        },
+        inactivity_seconds=1800,
+        segment_max_turns=3,
+        max_segments=5,
+    )
+
+    assert calls["n"] == 2
+    assert result.success is True
     assert result.details.get("segment_index") == 2
 
 

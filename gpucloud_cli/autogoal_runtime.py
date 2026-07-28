@@ -214,9 +214,19 @@ class CompletionPolicy(Protocol):
         ...
 
 
+# Phases that mean the inference/deploy objective actually finished successfully.
+_TERMINAL_SUCCESS_PHASES = frozenset({"ready", "worker_ready"})
+
+
 @dataclass
 class ContractCompletion:
-    """Prefer an explicit reported payload; else parse final response JSON."""
+    """Prefer an explicit reported payload; else parse final response JSON.
+
+    Mid-run ``try_complete`` is intentionally stricter than ``finalize``:
+    scraped failure JSON in a long segment reply must NOT end AutoGoal early
+    (that previously burned only the first 100-turn segment). Explicit tool
+    reports and terminal success contracts still stop immediately.
+    """
 
     pop_reported: Callable[[], Optional[Dict[str, Any]]]
     parse_contract: Callable[
@@ -224,16 +234,29 @@ class ContractCompletion:
     ]
     extract_json: Callable[[str], Optional[Dict[str, Any]]]
 
+    @staticmethod
+    def _final_text(conversation_result: Dict[str, Any]) -> str:
+        if not isinstance(conversation_result, dict):
+            return ""
+        final_text = str(conversation_result.get("final_response") or "")
+        if not final_text and conversation_result.get("error"):
+            final_text = str(conversation_result.get("error"))
+        return final_text
+
+    @staticmethod
+    def is_terminal_success_contract(payload: Optional[Dict[str, Any]]) -> bool:
+        """True only for success contracts with ready / worker_ready phase."""
+        if not isinstance(payload, dict) or not payload.get("success"):
+            return False
+        details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+        phase = str(details.get("phase") or "ready").strip()
+        return phase in _TERMINAL_SUCCESS_PHASES
+
     def _resolve_reported(self, conversation_result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         reported = self.pop_reported()
         if reported is not None:
             return reported
-        final_text = ""
-        if isinstance(conversation_result, dict):
-            final_text = str(conversation_result.get("final_response") or "")
-            if not final_text and conversation_result.get("error"):
-                final_text = str(conversation_result.get("error"))
-        return self.extract_json(final_text)
+        return self.extract_json(self._final_text(conversation_result))
 
     def try_complete(
         self,
@@ -241,8 +264,21 @@ class ContractCompletion:
         conversation_result: Dict[str, Any],
         defaults: Dict[str, Any],
     ) -> Optional[AutoGoalRunResult]:
-        """Return a result when an explicit contract exists; else None to continue."""
-        reported = self._resolve_reported(conversation_result)
+        """Return a result when a *terminal* contract exists; else None to continue.
+
+        - Tool-reported payloads (``pop_reported``) always complete the run
+          (success or intentional failure).
+        - JSON scraped from the final assistant text only completes early on
+          **terminal success** (``ready`` / ``worker_ready``). Failure-shaped
+          JSON in prose is ignored so multi-segment AutoGoal can continue.
+        """
+        reported = self.pop_reported()
+        from_tool = isinstance(reported, dict)
+        if not from_tool:
+            scraped = self.extract_json(self._final_text(conversation_result))
+            if not self.is_terminal_success_contract(scraped):
+                return None
+            reported = scraped
         if not isinstance(reported, dict):
             return None
         success, summary, details = self.parse_contract(reported)
