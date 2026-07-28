@@ -1,7 +1,7 @@
 ---
 name: gpucloud-inference-deployment
 description: Deploy inference via on-node agent until vLLM is ready.
-version: 2.5.2
+version: 2.5.3
 author: GPUCLOUD
 platforms: [linux]
 metadata:
@@ -117,12 +117,17 @@ When `nnodes > 1` (assignment has `ray.enabled` and global
   restarting `inference_start_vllm`, and do **not** degrade to single-node TP.
 - Put `NCCL_*` / `GLOO_SOCKET_IFNAME` into the **ray worker process** env
   (`ray start` / `ray join`), not only the API server shell.
-- **rank>0**: compat chain verified → `inference_ray_join` to
+- **rank>0**: compat chain verified → confirm **base HF** readable (LoRA
+  adapters not required on worker) → `inference_ray_join` to
   `$GPUCLOUD_CLUSTER_ADVERTISED_ADDR` of head or master addr + `ray.head_port`
   → `inference_report_ready` with `phase=worker_ready` (no API server).
-- **rank0**: compat chain verified → `inference_ray_start` →
+  **Forbidden on worker:** megatron/swift LoRA export, `merged_model`, failing
+  `ensure_artifacts` only because `hf_lora_*` is missing locally.
+- **rank0**: compat chain verified → own LoRA reuse/export (`hf_lora_*`) →
+  `inference_ray_start` →
   `inference_cluster_wait_workers` (must succeed; use `http://…` master URL) →
-  NCCL smoke OK → `inference_start_vllm` with global TP + `ray.enabled` →
+  NCCL smoke OK → `inference_start_vllm` with global TP + `ray.enabled` +
+  base path + `enable_lora` →
   health → `phase=ready` with reachable `visit_host`. Never start two
   independent TP=1 servers.
 - **If NCCL smoke fails** after aligning `libnccl` / worker env: stop
@@ -170,24 +175,21 @@ When `nnodes > 1` (assignment has `ray.enabled` and global
    Avoid `| tail` on long installs; use `terminal(background=true)` and poll.
 5. **Verify**: run `smoke_cmd` in the venv, then
    `inference_ensure_runtime` with `status=verified` (same chain / pins).
-6. **Artifacts**: if `local_path` missing or not HF-loadable (`config.json` +
-   weights), sync via `sources[]`. For `megatron_checkpoints` /
-   `swift_output` / `.distcp`, follow `gpucloud-megatron-weight-export`.
-   - **Qwen LoRA / `swift_output`**: endpoint is `hf_lora_*/` adapters, **not**
-     a full-weight `merged_model`. Prefer SWIFT `--merge_lora false`.
-   - If `{job_dir}/hf_lora_*/` already has `adapter_config.json` +
-     `adapter_model.safetensors`, **skip export/merge**; serve base HF from
-     `args.json` with `adapter_options.enable_lora=true` and
-     `max_lora_rank` ≥ training rank.
-   - **HARD**: never hand-merge LoRA into base safetensors for MoE; if SWIFT
-     fails on MoE → `phase=ensure_artifacts` (do not invent `merge_step*.py`).
-   Hand-rolled `load_distcp` only as last resort for **non-MoE**. If still
-   impossible, fail with `phase=ensure_artifacts`.
+6. **Artifacts** (role-aware on multi-node):
+   - **rank0 / single-node**: if `local_path` missing or not HF-loadable,
+     sync via `sources[]` / follow `gpucloud-megatron-weight-export`.
+     Qwen LoRA / `swift_output` → `hf_lora_*/` adapters (**not**
+     `merged_model`); reuse existing `hf_lora_*`; SWIFT `--merge_lora false`.
+     MoE + SWIFT fail → `phase=ensure_artifacts` (no hand-merge).
+   - **rank>0**: do **not** export LoRA. Confirm base HF readable for TP
+     shards; missing local `hf_lora_*` is OK (loaded on rank0). Only sync a
+     full model tree if the **base** path is absent — never fail solely for
+     missing adapters.
 7. **Start**: single-node — `inference_start_vllm` with local devices.
    Multi-node — follow **Multi-node Ray TP** (align `libnccl`, NCCL smoke,
    then rank0 waits for workers and starts TP). Pass
    `--trust-remote-code` for custom Qwen configs when required.
-   For LoRA: `model.local_path` / serve path = **base HF**; set
+   For LoRA (rank0): serve path = **base HF**; set
    `adapter_options.enable_lora` (+ `max_lora_rank`); load the adapter via
    vLLM LoRA (do not replace base with a merged tree).
 8. **Health**: poll `inference_health` until `ready` (or timeout →
@@ -251,7 +253,8 @@ Failure: `success=false`, `details.phase` in
 - Prefer managed start tool so cluster stop can kill the serve PID.
 - Megatron / `swift_output` raw checkpoints need
   `gpucloud-megatron-weight-export` before serve.
-- Qwen LoRA: existing `hf_lora_*` → reuse; never build `merged_model/`.
+- Qwen LoRA: existing `hf_lora_*` → reuse on rank0; never build `merged_model/`.
+- Multi-node worker: no LoRA export; missing local `hf_lora_*` is OK.
 
 ## Verification
 

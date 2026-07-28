@@ -205,13 +205,19 @@ def build_inference_agent_prompt(job_spec: Dict[str, Any], inference_spec: Dict[
     }
     role_block = (
         "You are rank0 (serve head) on a multi-node inference job.\n"
+        "Artifact ownership (Qwen LoRA / swift_output):\n"
+        "- YOU own export/reuse of hf_lora_*. Workers do not.\n"
+        "- Need local: base HF (from args.json) + hf_lora_*/adapters.\n"
+        "- If hf_lora_* already present → reuse; else SWIFT export "
+        "--merge_lora false on THIS node only. Never full merged_model.\n"
         "After runtime/artifacts are ready:\n"
         "1) `inference_ray_start` with ray.head_port and local_visible_devices\n"
         "2) `inference_cluster_wait_workers` until peers are worker_ready\n"
         "3) Align libnccl across ranks + NCCL smoke (see skill "
         "`multinode-nccl-and-lib-drift`); only then\n"
         "4) `inference_start_vllm` with global tensor_parallel, local visible_devices, "
-        "and ray={enabled:true, address/head_port}\n"
+        "ray={enabled:true,...}, model_path=BASE HF, adapter_options.enable_lora=true "
+        "(max_lora_rank >= training rank)\n"
         "5) health then `inference_report_ready` phase=ready with reachable visit_host\n"
         "HARD: if NCCL/cross-node serve fails, fix libnccl/env or fail "
         "phase=start with that diagnostic. Do NOT degrade to single-node TP "
@@ -220,13 +226,35 @@ def build_inference_agent_prompt(job_spec: Dict[str, Any], inference_spec: Dict[
         else (
             "You are a worker rank (rank>0) on a multi-node inference job.\n"
             "Do NOT start the OpenAI API server and do NOT report visit_host.\n"
-            "After runtime/artifacts are ready:\n"
+            "Artifact rules (Qwen LoRA / Ray TP) — read carefully:\n"
+            "- You do NOT need hf_lora_* locally. LoRA is loaded on rank0 only.\n"
+            "- You only need: matching torch/vLLM/ray/libnccl + readable BASE HF "
+            "weights (same path family as args.json / ModelScope cache).\n"
+            "- FORBIDDEN on worker: megatron/swift export, merge_model, inventing "
+            "hf_lora_*, reporting ensure_artifacts failure just because LoRA is "
+            "missing on THIS node.\n"
+            "- Do NOT sync hf_lora from sources unless rank0 requires a full HF "
+            "tree that is absent here (base path missing). Missing adapter "
+            "files alone is OK.\n"
+            "After runtime is verified:\n"
             "1) `inference_ray_join` to ray head address (head advertised_addr:head_port)\n"
             "2) `inference_report_ready` with success=true and details.phase=worker_ready\n"
             "HARD: keep the same torch/vLLM/libnccl stack as rank0; do not "
             "start a local TP=1 server as a fallback.\n"
             if nnodes > 1
             else ""
+        )
+    )
+    artifact_step = (
+        "4. Artifacts (role-aware): rank0 — if local_path not HF-loadable, "
+        "reuse/export hf_lora_* on THIS node (megatron-weight-export); "
+        "rank>0 — do NOT export LoRA; confirm base HF readable, then Ray join. "
+        "Missing worker-local hf_lora_* is NOT ensure_artifacts failure.\n"
+        if nnodes > 1
+        else (
+            "4. Ensure artifacts: if local_path missing or not HF-loadable, sync/convert "
+            "using sources[] + megatron-weight-export (LoRA path for swift_output; "
+            "reuse hf_lora_* when present); else fail clearly.\n"
         )
     )
     return (
@@ -237,13 +265,15 @@ def build_inference_agent_prompt(job_spec: Dict[str, Any], inference_spec: Dict[
         "hand-rolled load_distcp only as last resort for non-MoE).\n\n"
         "HARD — Qwen LoRA / swift_output artifacts:\n"
         "- Goal is hf_lora_*/adapter_*.safetensors + base HF, NOT a full-weight "
-        "merged_model. Use SWIFT megatron export with --merge_lora false.\n"
-        "- If job_dir already has hf_lora_*/ with adapter_config.json + "
+        "merged_model. SWIFT megatron export uses --merge_lora false.\n"
+        "- Multi-node: only rank0 may export/reuse LoRA and start vLLM with "
+        "enable_lora. rank>0 must NOT export; missing local hf_lora_* is OK.\n"
+        "- On rank0, if job_dir already has hf_lora_*/ with adapter_config.json + "
         "adapter_model.safetensors, SKIP export/merge; serve base from "
         "args.json model path with adapter_options.enable_lora=true and "
         "max_lora_rank >= training lora_rank.\n"
         "- Never invent merge_step*.py / PeftModel.merge_and_unload / dumping "
-        "35B+ merged safetensors. MoE + SWIFT fail → phase=ensure_artifacts.\n\n"
+        "35B+ merged safetensors. MoE + SWIFT fail on rank0 → phase=ensure_artifacts.\n\n"
         "HARD REQUIREMENT — compatibility chain (no operator pins injected):\n"
         "Before ANY torch/vLLM pip install, probe nvidia-smi + model family, "
         "read skill references `vllm-runtime-and-model-readiness` and "
@@ -252,8 +282,9 @@ def build_inference_agent_prompt(job_spec: Dict[str, Any], inference_spec: Dict[
         "(driver, model_family, venv_python under inference_venvs, exact "
         "pins.torch/pins.vllm as pkg==version, install_order torch-before-vllm, "
         "pip_index China mirror, rationale, rejected_alternatives, smoke_cmd). "
-        "Reject >= ranges and bare package names. After pip + CUDA smoke, call "
-        "`inference_ensure_runtime` again with status=verified. "
+        "Reject >= ranges and bare package names. "
+        "After planned: if venv already has exact pins, skip reinstall — run "
+        "smoke_cmd then ensure_runtime(verified). Do not re-download matching torch. "
         "`inference_ray_start` / `inference_ray_join` / `inference_start_vllm` "
         "are blocked until verified for this job_id. "
         "You choose the exact versions; do not wait for operator-supplied pins.\n\n"
@@ -264,13 +295,12 @@ def build_inference_agent_prompt(job_spec: Dict[str, Any], inference_spec: Dict[
         "1. Inspect CUDA/Python and the model directory (config.json / names) to infer model family.\n"
         "2. Call `inference_ensure_runtime` (planned) with the full compat_chain, "
         "then install exact torch + vLLM (+ ray when nnodes>1) pins into "
-        "~/.cache/gpu_platform/inference_venvs/<tag>/ ONLY using pip_index "
+        "~/.cache/gpu_platform/inference_venvs/<tag>/ ONLY if pins are missing "
         "(Aliyun → Tsinghua; never default bare official PyPI). "
-        "Never use swift_venv for Ray/vLLM serve; export via terminal+swift is OK.\n"
+        "Never use swift_venv for Ray/vLLM serve; export via terminal+swift is OK "
+        "(rank0 only for LoRA).\n"
         "3. CUDA smoke → `inference_ensure_runtime` (verified).\n"
-        "4. Ensure artifacts: if local_path missing or not HF-loadable, sync/convert "
-        "using sources[] + megatron-weight-export (LoRA path for swift_output; "
-        "reuse hf_lora_* when present); else fail clearly.\n"
+        f"{artifact_step}"
         "5. Follow the role steps above for Ray/serve (single-node: "
         "`inference_start_vllm` then `inference_health`).\n"
         "6. Call `inference_report_ready` with the success contract (preferred), "
@@ -299,6 +329,7 @@ def build_inference_agent_prompt(job_spec: Dict[str, Any], inference_spec: Dict[
         "ensure_runtime|ensure_artifacts|start|health_timeout|cancelled|validate.\n"
         "Never put API keys into the contract JSON.\n"
     )
+
 
 
 def run_inference_agent(
