@@ -10,6 +10,12 @@ from typing import Any, Dict
 
 from plugins.inference_adapters.agent_driver import store_reported_outcome
 from plugins.inference_adapters.base import ArtifactPaths
+from plugins.inference_adapters.compat_chain import (
+    require_verified_compat,
+    run_compat_smoke,
+    store_compat_chain,
+    validate_compat_chain,
+)
 from plugins.inference_adapters.inference_venv import (
     InferenceVenvError,
     check_role_tool_allowed,
@@ -47,6 +53,77 @@ def _serve_python(args: dict) -> str:
     return resolve_serve_python(str(args.get("python_executable") or "").strip())
 
 
+def _compat_gate(job_id: str, python_executable: str) -> str | None:
+    ok, err = require_verified_compat(job_id, python_executable=python_executable)
+    if ok:
+        return None
+    return json.dumps({"success": False, "error": err, "phase": "compat_gate"})
+
+
+def handle_inference_ensure_runtime(args: dict, **kwargs: Any) -> str:
+    """Validate/store full compat_chain; verified runs CUDA smoke in venv."""
+    job_id = str(args.get("job_id") or "").strip()
+    if not job_id:
+        return json.dumps({"success": False, "error": "job_id required", "phase": "compat_gate"})
+    status = str(args.get("status") or "planned").strip().lower() or "planned"
+    chain_in = args.get("compat_chain")
+    if chain_in is None and isinstance(args.get("chain"), dict):
+        chain_in = args.get("chain")
+
+    normalized, errors = validate_compat_chain(chain_in, status=status)
+    if errors or not normalized:
+        return json.dumps(
+            {
+                "success": False,
+                "error": "; ".join(errors) or "invalid compat_chain",
+                "errors": errors,
+                "phase": "compat_gate",
+            }
+        )
+
+    if status == "verified":
+        ok, smoke_out = run_compat_smoke(
+            venv_python=str(normalized["venv_python"]),
+            smoke_cmd=str(normalized.get("smoke_cmd") or ""),
+        )
+        if not ok:
+            normalized["status"] = "planned"
+            store_compat_chain(job_id, normalized)
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"CUDA smoke failed: {smoke_out}",
+                    "status": "planned",
+                    "stored": True,
+                    "fingerprint": normalized.get("fingerprint"),
+                    "smoke_output": smoke_out,
+                    "phase": "compat_gate",
+                    "compat_chain": normalized,
+                }
+            )
+        normalized["status"] = "verified"
+        normalized["smoke_output"] = smoke_out
+    else:
+        normalized["status"] = "planned"
+
+    store_compat_chain(job_id, normalized)
+    return json.dumps(
+        {
+            "success": True,
+            "stored": True,
+            "status": normalized["status"],
+            "fingerprint": normalized.get("fingerprint"),
+            "compat_chain": normalized,
+            "hint": (
+                "Next: pip install exact pins with -i pip_index (torch before vllm), "
+                "then call inference_ensure_runtime status=verified after CUDA smoke."
+                if normalized["status"] == "planned"
+                else "Compat chain verified; Ray / inference_start_vllm unlocked for this job."
+            ),
+        }
+    )
+
+
 def handle_inference_start_vllm(args: dict, **kwargs: Any) -> str:
     """Start vLLM via HfVllmAdapter and remember the process for this job_id."""
     gated = _role_gate("inference_start_vllm")
@@ -76,6 +153,10 @@ def handle_inference_start_vllm(args: dict, **kwargs: Any) -> str:
         python_executable = _serve_python(args)
     except InferenceVenvError as exc:
         return json.dumps({"success": False, "error": str(exc), "phase": "venv_gate"})
+
+    blocked = _compat_gate(job_id, python_executable)
+    if blocked:
+        return blocked
 
     spec: Dict[str, Any] = {
         "job_id": job_id,
@@ -125,6 +206,7 @@ def handle_inference_ray_start(args: dict, **kwargs: Any) -> str:
     gated = _role_gate("inference_ray_start")
     if gated:
         return gated
+    job_id = str(args.get("job_id") or "").strip()
     port = int(args.get("port") or args.get("head_port") or 6379)
     num_gpus = int(args.get("num_gpus") or 1)
     devices = args.get("visible_devices") or args.get("cuda_visible_devices")
@@ -134,6 +216,20 @@ def handle_inference_ray_start(args: dict, **kwargs: Any) -> str:
         devices = None
     try:
         python_executable = _serve_python(args)
+        if job_id:
+            blocked = _compat_gate(job_id, python_executable)
+            if blocked:
+                return blocked
+        else:
+            # Multi-node rank0 should pass job_id; without it still require any
+            # verified chain is insufficient — demand job_id for gate clarity.
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "job_id required for compat_gate (inference_ensure_runtime)",
+                    "phase": "compat_gate",
+                }
+            )
         result = start_ray_head(
             port=port,
             num_gpus=num_gpus,
@@ -156,6 +252,7 @@ def handle_inference_ray_join(args: dict, **kwargs: Any) -> str:
     gated = _role_gate("inference_ray_join")
     if gated:
         return gated
+    job_id = str(args.get("job_id") or "").strip()
     address = str(args.get("address") or "").strip()
     if not address:
         return json.dumps({"success": False, "error": "address required (host:port)"})
@@ -167,6 +264,17 @@ def handle_inference_ray_join(args: dict, **kwargs: Any) -> str:
         devices = None
     try:
         python_executable = _serve_python(args)
+        if not job_id:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "job_id required for compat_gate (inference_ensure_runtime)",
+                    "phase": "compat_gate",
+                }
+            )
+        blocked = _compat_gate(job_id, python_executable)
+        if blocked:
+            return blocked
         result = join_ray_worker(
             address=address,
             num_gpus=num_gpus,
@@ -269,11 +377,56 @@ def handle_inference_report_ready(args: dict, **kwargs: Any) -> str:
     return json.dumps({"success": True, "stored": True, "outcome": payload})
 
 
+INFERENCE_ENSURE_RUNTIME_SCHEMA = {
+    "name": "inference_ensure_runtime",
+    "description": (
+        "Record a full compatibility-chain decision before installing torch/vLLM "
+        "or starting Ray/serve. status=planned after deliberation; status=verified "
+        "after pip + CUDA smoke. Exact == pins only; pip_index must be a China mirror."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "job_id": {"type": "string"},
+            "status": {
+                "type": "string",
+                "enum": ["planned", "verified"],
+                "description": "planned before pip; verified after CUDA smoke",
+            },
+            "compat_chain": {
+                "type": "object",
+                "description": (
+                    "Full chain: driver, model_family, venv_python, pins "
+                    "(torch/vllm exact ==), install_order, pip_index, rationale, "
+                    "rejected_alternatives, smoke_cmd"
+                ),
+                "properties": {
+                    "driver": {"type": "object"},
+                    "model_family": {"type": "string"},
+                    "venv_python": {"type": "string"},
+                    "pins": {"type": "object"},
+                    "install_order": {"type": "array", "items": {"type": "string"}},
+                    "pip_index": {"type": "string"},
+                    "pip_extra_index": {"type": "string"},
+                    "rationale": {"type": "string"},
+                    "rejected_alternatives": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "smoke_cmd": {"type": "string"},
+                },
+            },
+        },
+        "required": ["job_id", "compat_chain"],
+    },
+}
+
 INFERENCE_START_VLLM_SCHEMA = {
     "name": "inference_start_vllm",
     "description": (
         "Start OpenAI-compatible vLLM serve for a job using the managed HfVllmAdapter "
         "(tracks PID/logs for cancel). Prefer this over raw terminal background serves. "
+        "Requires inference_ensure_runtime status=verified for job_id first. "
         "For multi-node TP, pass ray={enabled:true,address:host:port} and global tensor_parallel. "
         "Rank>0 must not call this. python_executable must be inference_venvs (not swift_venv)."
     ),
@@ -299,11 +452,13 @@ INFERENCE_RAY_START_SCHEMA = {
     "name": "inference_ray_start",
     "description": (
         "Start Ray head on this node (rank0 only) before multi-node vLLM. "
+        "Requires inference_ensure_runtime status=verified for job_id. "
         "Rank>0 must use inference_ray_join. python_executable must be inference_venvs."
     ),
     "parameters": {
         "type": "object",
         "properties": {
+            "job_id": {"type": "string"},
             "port": {"type": "integer"},
             "head_port": {"type": "integer"},
             "num_gpus": {"type": "integer"},
@@ -311,7 +466,7 @@ INFERENCE_RAY_START_SCHEMA = {
             "node_ip": {"type": "string"},
             "python_executable": {"type": "string", "description": _PYTHON_HINT},
         },
-        "required": [],
+        "required": ["job_id"],
     },
 }
 
@@ -319,18 +474,20 @@ INFERENCE_RAY_JOIN_SCHEMA = {
     "name": "inference_ray_join",
     "description": (
         "Join Ray worker on this node (rank>0 only) to the head address. "
+        "Requires inference_ensure_runtime status=verified for job_id. "
         "Rank0 must use inference_ray_start. python_executable must be inference_venvs."
     ),
     "parameters": {
         "type": "object",
         "properties": {
+            "job_id": {"type": "string"},
             "address": {"type": "string", "description": "Ray head host:port"},
             "num_gpus": {"type": "integer"},
             "visible_devices": {"type": "array", "items": {"type": "integer"}},
             "node_ip": {"type": "string"},
             "python_executable": {"type": "string", "description": _PYTHON_HINT},
         },
-        "required": ["address"],
+        "required": ["job_id", "address"],
     },
 }
 

@@ -228,18 +228,34 @@ def build_inference_agent_prompt(job_spec: Dict[str, Any], inference_spec: Dict[
         "For megatron_checkpoints / .distcp trees, follow "
         "`gpucloud-megatron-weight-export` (ModelOpt/SWIFT recipes first; "
         "hand-rolled load_distcp only as last resort).\n\n"
+        "HARD REQUIREMENT — compatibility chain (no operator pins injected):\n"
+        "Before ANY torch/vLLM pip install, probe nvidia-smi + model family, "
+        "read skill references `vllm-runtime-and-model-readiness` and "
+        "`torch-cuda-version-drift`, then call `inference_ensure_runtime` with "
+        "status=planned and a FULL compat_chain "
+        "(driver, model_family, venv_python under inference_venvs, exact "
+        "pins.torch/pins.vllm as pkg==version, install_order torch-before-vllm, "
+        "pip_index China mirror, rationale, rejected_alternatives, smoke_cmd). "
+        "Reject >= ranges and bare package names. After pip + CUDA smoke, call "
+        "`inference_ensure_runtime` again with status=verified. "
+        "`inference_ray_start` / `inference_ray_join` / `inference_start_vllm` "
+        "are blocked until verified for this job_id. "
+        "You choose the exact versions; do not wait for operator-supplied pins.\n\n"
         f"{role_block}\n"
         "Job assignment JSON:\n"
         f"```json\n{json.dumps(compact, ensure_ascii=False, indent=2)}\n```\n\n"
         "Required work (in order):\n"
         "1. Inspect CUDA/Python and the model directory (config.json / names) to infer model family.\n"
-        "2. Install a compatible torch + vLLM (+ ray when nnodes>1) stack for that model "
-        "into ~/.cache/gpu_platform/inference_venvs/<tag>/ ONLY "
-        "(never use swift_venv for Ray/vLLM serve; export via terminal+swift is OK).\n"
-        "3. Ensure artifacts: if local_path missing or not HF-loadable, sync/convert using sources[]; else fail clearly.\n"
-        "4. Follow the role steps above for Ray/serve (single-node: "
+        "2. Call `inference_ensure_runtime` (planned) with the full compat_chain, "
+        "then install exact torch + vLLM (+ ray when nnodes>1) pins into "
+        "~/.cache/gpu_platform/inference_venvs/<tag>/ ONLY using pip_index "
+        "(Aliyun → Tsinghua; never default bare official PyPI). "
+        "Never use swift_venv for Ray/vLLM serve; export via terminal+swift is OK.\n"
+        "3. CUDA smoke → `inference_ensure_runtime` (verified).\n"
+        "4. Ensure artifacts: if local_path missing or not HF-loadable, sync/convert using sources[]; else fail clearly.\n"
+        "5. Follow the role steps above for Ray/serve (single-node: "
         "`inference_start_vllm` then `inference_health`).\n"
-        "5. Call `inference_report_ready` with the success contract (preferred), "
+        "6. Call `inference_report_ready` with the success contract (preferred), "
         "or end with a single JSON object matching the contract.\n\n"
         "Success contract shape (rank0 ready):\n"
         "```json\n"
@@ -324,6 +340,9 @@ def run_inference_agent(
 
     remember_adapter(job_id, ad)
     clear_reported_outcome(job_id)
+    from plugins.inference_adapters.compat_chain import clear_compat_chain
+
+    clear_compat_chain(job_id)
 
     # Pin rank/nnodes for tool role gates (workers must not call ray_start / start_vllm).
     try:

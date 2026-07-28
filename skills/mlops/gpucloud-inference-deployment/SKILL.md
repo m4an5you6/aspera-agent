@@ -1,7 +1,7 @@
 ---
 name: gpucloud-inference-deployment
 description: Deploy inference via on-node agent until vLLM is ready.
-version: 2.3.0
+version: 2.4.0
 author: GPUCLOUD
 platforms: [linux]
 metadata:
@@ -19,7 +19,8 @@ metadata:
 
 Use when a cluster inference assignment must expose a trained model through
 vLLM on **this GPU node**. An on-node LLM agent owns deps, artifacts, start,
-and health until ready (not a fixed pin matrix).
+and health until ready (not a fixed pin matrix). You choose exact pins; tools
+enforce a full compatibility-chain decision before install and before serve.
 
 ## When to Use
 
@@ -30,12 +31,15 @@ and health until ready (not a fixed pin matrix).
 ## Prerequisites
 
 - `model.api_key` in `~/.gpucloud/config.yaml` (agent LLM).
-- Tools: `terminal`, file tools, `inference_start_vllm`, `inference_health`,
-  `inference_report_ready`; multi-node also `inference_ray_start`,
-  `inference_ray_join`, `inference_cluster_wait_workers`.
+- Tools: `terminal`, file tools, `inference_ensure_runtime`,
+  `inference_start_vllm`, `inference_health`, `inference_report_ready`;
+  multi-node also `inference_ray_start`, `inference_ray_join`,
+  `inference_cluster_wait_workers`.
 - Assignment JSON includes `model.local_path`, `gpus`, `serve`, optional
   `sources`, `model_hint`, `training_artifact_kind`, and for multi-node
   `node_rank` / `nnodes` / `local_visible_devices` / `ray`.
+- Read before install: `references/vllm-runtime-and-model-readiness.md` and
+  `references/torch-cuda-version-drift.md`.
 
 ## How to Run
 
@@ -45,9 +49,10 @@ Work until ready, then call `inference_report_ready`.
 
 | Step | Action |
 |------|--------|
-| Probe | In the inference **venv** (not system `python3`): torch/vLLM(+ray) + `nvidia-smi` |
-| Model family | Read `config.json` / tokenizer / path; honor `model_hint` |
-| Install | Into that same venv via **pip mirrors first** (see below) |
+| Probe | In the inference **venv** (not system `python3`): `nvidia-smi` + model family |
+| Compat chain | **Before any torch/vLLM pip**: write full chain → `inference_ensure_runtime` (`planned`) |
+| Install | Exact `==` pins into that venv via **pip mirrors** (torch before vllm) |
+| Verify | CUDA smoke in venv → `inference_ensure_runtime` (`verified`) |
 | Artifacts | Ensure HF-loadable dir; sync via `sources[]` if missing |
 | Multi-node | rank0: ray head → wait workers → vLLM TP=global + ray; worker: ray join → `worker_ready` |
 | Serve | `inference_start_vllm` with that venv's `python_executable` (rank0 only when nnodes>1) |
@@ -62,9 +67,35 @@ bare `pip` are not the source of truth.
 2. Else use (or create) `~/.cache/gpu_platform/inference_venvs/<tag>/`
    (e.g. `cu124`) — probe `bin/python`, install with `bin/pip`.
 3. Pass the chosen `bin/python` as `python_executable` to
-   `inference_start_vllm` / Ray tools.
+   `inference_ensure_runtime`, `inference_start_vllm`, and Ray tools.
 
 Details: `references/vllm-runtime-and-model-readiness.md`.
+
+## Compatibility chain (mandatory)
+
+**Any torch/vLLM pip install is forbidden until** you have called
+`inference_ensure_runtime` with `status=planned` and a complete
+`compat_chain`. **Ray / `inference_start_vllm` refuse** until a second call
+with `status=verified` (after pip + CUDA smoke) for the same `job_id`.
+
+Required `compat_chain` fields (align with the tool schema):
+
+| Field | Meaning |
+|-------|---------|
+| `driver` | `nvidia_smi_cuda` / `driver_version` from probe |
+| `model_family` | e.g. qwen3.6_moe from config / hint |
+| `venv_python` | Absolute path under `inference_venvs` |
+| `pins` | Exact `pkg==version` for **torch** and **vllm** (optional transformers/ray). Reject `>=`, bare names |
+| `install_order` | Ordered list; torch before vllm |
+| `pip_index` | China mirror URL (Aliyun preferred, else Tsinghua). Not official PyPI by default |
+| `pip_extra_index` | Optional; PyTorch CUDA wheel index only when needed |
+| `rationale` | Short narrative: driver CUDA → torch cu tag → vllm pin → why not latest; mirror choice |
+| `rejected_alternatives` | ≥1 concrete reject (e.g. `vllm>=0.8.0` pulls torch cu130) |
+| `smoke_cmd` | One-liner CUDA smoke planned after install |
+
+Flow: probe → write chain → `ensure_runtime(planned)` → pip exact pins with
+`-i <pip_index> --trusted-host …` → smoke → `ensure_runtime(verified)` →
+Ray/serve.
 
 ## Multi-node Ray TP
 
@@ -72,10 +103,10 @@ When `nnodes > 1` (assignment has `ray.enabled` and global
 `gpus.tensor_parallel` = total GPUs):
 
 - Use **local** `local_visible_devices` / `gpus.visible_devices` for this node only.
-- **rank>0**: install stack → `inference_ray_join` to
+- **rank>0**: compat chain verified → `inference_ray_join` to
   `$GPUCLOUD_CLUSTER_ADVERTISED_ADDR` of head or master addr + `ray.head_port`
   → `inference_report_ready` with `phase=worker_ready` (no API server).
-- **rank0**: install stack → `inference_ray_start` →
+- **rank0**: compat chain verified → `inference_ray_start` →
   `inference_cluster_wait_workers` (must succeed) → `inference_start_vllm`
   with global TP + `ray.enabled` → health → `phase=ready` with reachable
   `visit_host`. Never start two independent TP=1 servers.
@@ -89,42 +120,47 @@ When `nnodes > 1` (assignment has `ray.enabled` and global
    `model_type` / `architectures`), directory name, and optional
    `model_hint` / `training_artifact_kind` (e.g. gpt2, qwen2.5, qwen3,
    megatron export). Newer Qwen often needs newer vLLM than GPT-2.
-3. **Install stack** (only if the venv lacks a usable torch/vLLM): pick
-   torch CUDA wheel + vLLM versions that match the model and driver.
-   Prefer explicit `==` pins. On conflict or import failure,
-   uninstall/retry another combo **in the same venv**.
-   For `nnodes>1` also install `ray` into the same venv.
-   **Prefer pip mirrors** for every `pip install` / `pip download` of
-   torch/vLLM (and large deps). Do **not** default to bare PyPI — wheels
-   are hundreds of MB and official source is often too slow on GPU nodes.
-   Priority order:
+3. **Compat chain** — read `references/torch-cuda-version-drift.md`, choose
+   exact pins, call `inference_ensure_runtime` (`planned`). Do **not** skip
+   this before pip.
+4. **Install stack** (only if the venv lacks a usable torch/vLLM): follow
+   `install_order` with exact `==` pins from the chain. **Never** use
+   `vllm>=…` or unpinned `vllm` after torch is pinned — that is the drift
+   failure mode. For `nnodes>1` also pin/install `ray` into the same venv.
+   **Default pip index is a China mirror** (not official PyPI):
    1. Aliyun: `https://mirrors.aliyun.com/pypi/simple/`
       (`--trusted-host mirrors.aliyun.com`)
    2. Tsinghua: `https://pypi.tuna.tsinghua.edu.cn/simple`
       (`--trusted-host pypi.tuna.tsinghua.edu.cn`)
-   3. Only if both fail: config/`INFERENCE_PIP_INDEX_URL` / official PyPI.
+   3. Only if both fail: document `mirrors failed` in rationale and
+      re-`ensure_runtime`, then official PyPI / config index.
+   Torch CUDA wheels may add `--extra-index-url https://download.pytorch.org/whl/cuXXX`
+   — that does **not** replace the main mirror for vLLM.
    Example:
    ```bash
-   ~/.cache/gpu_platform/inference_venvs/<tag>/bin/pip install "vllm==<pin>" \
+   PIP="$HOME/.cache/gpu_platform/inference_venvs/<tag>/bin/pip"
+   $PIP install "torch==2.5.1+cu124" \
+     -i https://mirrors.aliyun.com/pypi/simple/ \
+     --trusted-host mirrors.aliyun.com \
+     --extra-index-url https://download.pytorch.org/whl/cu124
+   $PIP install "vllm==<exact-pin>" \
      -i https://mirrors.aliyun.com/pypi/simple/ \
      --trusted-host mirrors.aliyun.com
    ```
-   If Aliyun stalls, retry the same pin on Tsinghua. Avoid `| tail` on long
-   installs so progress stays visible; use `terminal(background=true)` and
-   poll. Historical reference only (not mandatory): cu12+py310 often used
-   `torch==2.5.1` + `vllm==0.6.6` for older models — do **not** force this
-   for Qwen3-class weights.
-4. **Artifacts**: if `local_path` missing or not HF-loadable (`config.json` +
+   Avoid `| tail` on long installs; use `terminal(background=true)` and poll.
+5. **Verify**: run `smoke_cmd` in the venv, then
+   `inference_ensure_runtime` with `status=verified` (same chain / pins).
+6. **Artifacts**: if `local_path` missing or not HF-loadable (`config.json` +
    weights), sync via `sources[]`. For `megatron_checkpoints` / `.distcp`,
    follow skill `gpucloud-megatron-weight-export` (ModelOpt / SWIFT recipes
    first; hand-rolled `load_distcp` only as last resort). If still impossible,
    fail with `phase=ensure_artifacts`.
-5. **Start**: single-node — `inference_start_vllm` with local devices.
+7. **Start**: single-node — `inference_start_vllm` with local devices.
    Multi-node — follow **Multi-node Ray TP** (rank0 waits for workers).
-6. **Health**: poll `inference_health` until `ready` (or timeout →
+8. **Health**: poll `inference_health` until `ready` (or timeout →
    `phase=health_timeout`). Local `curl http://127.0.0.1:<port>/health` is
    fine for probing only (rank0).
-7. **Report**: `inference_report_ready` with success contract (see below).
+9. **Report**: `inference_report_ready` with success contract (see below).
    **`visit_host` must be a client-reachable address**, not loopback (rank0).
    Prefer in order: `$GPUCLOUD_CLUSTER_ADVERTISED_ADDR` → node public /
    outer IP (e.g. `gpu_nodes.host` / `hostname -I` non-private) →
@@ -158,13 +194,16 @@ Failure: `success=false`, `details.phase` in
 
 ## Pitfalls
 
-- Fixed pin matrices cannot cover all model families — decide from evidence.
+- Fixed pin matrices cannot cover all model families — decide from evidence,
+  but always record the decision via `inference_ensure_runtime`.
 - Do not treat a failed system `python3 -c "import vllm"` as “no vLLM”;
   check the inference venv first.
 - Bare `pip` / `~/.local` installs miss the serve interpreter — always use
   the venv `bin/pip`.
 - Bare `pip install vllm` without `-i` mirror is a common stall; use Aliyun
   then Tsinghua before falling back.
+- `vllm>=…` after a cu124 torch pin can upgrade torch to cu130 — see
+  `references/torch-cuda-version-drift.md`.
 - Disk space under `~/.cache/pip` / `/tmp/pip-unpack-*` can fill during large
   wheels — clean failed partial downloads when retrying.
 - Never put API keys in the outcome JSON.
@@ -177,7 +216,8 @@ Failure: `success=false`, `details.phase` in
 
 ## Verification
 
-- Chosen venv `python` imports torch + vLLM
+- `inference_ensure_runtime` reached `status=verified` for this `job_id`
+- Chosen venv `python` imports torch + vLLM; CUDA smoke prints `CUDA_OK`
 - `inference_health` → `ready`
 - `curl -sS http://127.0.0.1:<port>/health` succeeds (local probe only)
 - `inference_report_ready` `visit_host` is reachable from outside the node
