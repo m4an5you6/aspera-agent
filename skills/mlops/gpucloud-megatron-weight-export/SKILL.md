@@ -1,16 +1,17 @@
 ---
 name: gpucloud-megatron-weight-export
 description: Export Megatron checkpoints to HF via proven recipes.
-version: 1.1.0
+version: 1.2.0
 author: GPUCLOUD
 platforms: [linux]
 metadata:
   gpucloud:
-    tags: [gpucloud, megatron, export, conversion, hf, inference, distcp]
+    tags: [gpucloud, megatron, export, conversion, hf, inference, distcp, lora]
     related_skills: [gpucloud-inference-deployment, gpucloud-sft-training]
     category: mlops
     triggers:
       - megatron_checkpoints
+      - swift_output
       - export megatron to hf
       - convert distcp
       - ModelOpt export
@@ -25,9 +26,11 @@ directory on **this** GPU node. Follow the recipe order yourself with
 
 ## When to Use
 
-- `training_artifact_kind=megatron_checkpoints`, or path has
-  `megatron_checkpoints` / `iter_*` / `*.distcp`.
+- `training_artifact_kind` is `megatron_checkpoints` **or** `swift_output`, or
+  path has `megatron_checkpoints` / `swift_output` / `iter_*` / `*.distcp`.
 - Weights are local (after `sources[]` sync) but not HF-loadable.
+- **`swift_output` with Qwen + LoRA** is the same family as megatron LoRA
+  export — do **not** invent a full-weight `merged_model`.
 
 ## Prerequisites
 
@@ -42,33 +45,48 @@ directory on **this** GPU node. Follow the recipe order yourself with
 ## How to Run
 
 1. Classify family → pick recipe.
-2. Run primary tool; on failure try the next step in that recipe.
-3. Verify HF/LoRA markers → use that dir as serve `model_path`.
+2. **Reuse gate**: if `{job_dir}/hf_lora_*/` already has
+   `adapter_config.json` + `adapter_model.safetensors`, skip export; serve
+   base + adapter.
+3. Run primary tool; on failure try the next step in that recipe.
+4. Verify HF/LoRA markers → serve (LoRA: base path + enable_lora).
 
 ## Quick Reference
 
 | Family | Primary | Then | Last |
 |--------|---------|------|------|
 | GPT-2 full weights | Megatron-LM **ModelOpt** export | Native GPT-2 distcp→HF (repo-style) | Minimal custom `load_distcp` |
-| Qwen LoRA megatron | **SWIFT** `megatron export` (`--to_hf`, `--merge_lora false`) | Manual LoRA convert (non-MoE only) | Minimal custom `load_distcp` (non-MoE) |
-| Already HF | Skip export | — | — |
+| Qwen LoRA (`swift_output` / megatron) | **SWIFT** `megatron export` (`--to_hf`, `--merge_lora false`) | Manual LoRA convert (**non-MoE only**) | Minimal custom `load_distcp` (**non-MoE only**) |
+| Already HF / existing `hf_lora_*` | Skip export | — | — |
+
+**HARD — Qwen LoRA / MoE:** never write a full-weight `merged_model` / never
+`merge_lora true` / never hand-merge LoRA into base safetensors. Endpoint is
+`hf_lora_*` adapters only. If SWIFT fails on MoE → `phase=ensure_artifacts`.
 
 ## Procedure
 
 ### 1. Confirm inputs
 
-Under `.../megatron_checkpoints/`:
+Under `.../megatron_checkpoints/` or `.../swift_output/` (checkpoint often
+under `swift_output/checkpoint-*/iter_*`):
 
 - Resolve iter: `latest_checkpointed_iteration.txt` or newest `iter_*`
 - Need `.metadata` + all shards listed therein (`__*_*`.distcp)
-- Read `args.json` for base/tokenizer / architecture clues
+- Read `args.json` / `sft_args.json` for base model, `tuner_type=lora`, MoE
 
 Incomplete shards → sync from `sources[]` first; do not convert a partial tree.
+
+### 1b. Reuse existing LoRA (do this first)
+
+If any `{job_dir}/hf_lora_*/` already contains both adapter files, **do not
+re-export and do not merge**. Use that adapter with the base HF path from
+`args.json` (`model` / ModelScope snapshot).
 
 ### 2. Route by family
 
 - **gpt2**: full HF under `{job_dir}/output/`
-- **qwen***: LoRA adapter under `{job_dir}/hf_lora_{iter}/` (vLLM: base + adapter)
+- **qwen*** + LoRA / `swift_output`: LoRA under `{job_dir}/hf_lora_{iter}/`
+  (vLLM: **base + adapter**, `enable_lora`, `max_lora_rank` ≥ training rank)
 - Unknown: inspect `args.json` / `model_hint`; if unclear, fail
   `phase=ensure_artifacts` briefly (do not guess MoE manual convert)
 
@@ -141,14 +159,17 @@ Then `inference_start_vllm` / health / `inference_report_ready`.
 
 ## Pitfalls
 
-- Raw `.distcp` is not vLLM-loadable.
+- Raw `.distcp` / bare `swift_output` is not vLLM-loadable.
 - Prefer ModelOpt / SWIFT over inventing parsers; custom `load_distcp` is
   **last resort** and should mirror proven GPT-2 / LoRA mapping, not random
   tensor dumps.
 - GPT-2 Conv1D layout mistakes → shape errors at load time.
 - Qwen MoE: if SWIFT fails, stop (manual fallback unsupported).
+- **Do not** “fix” a stuck export by merging LoRA into a full 35B+ HF tree
+  (`merged_model/`, `merge_step*.py`, loading base + `PeftModel.merge_and_unload`).
+  That burns hours/disk and is out of contract for LoRA jobs.
 - Huge convert logs blow context — keep status + final paths only.
-- Watch disk; export size ≈ checkpoint scale.
+- Watch disk; adapter export is small; full merge is not.
 
 ## Verification
 

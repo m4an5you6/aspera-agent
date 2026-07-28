@@ -1,7 +1,7 @@
 ---
 name: gpucloud-inference-deployment
 description: Deploy inference via on-node agent until vLLM is ready.
-version: 2.5.1
+version: 2.5.2
 author: GPUCLOUD
 platforms: [linux]
 metadata:
@@ -171,14 +171,25 @@ When `nnodes > 1` (assignment has `ray.enabled` and global
 5. **Verify**: run `smoke_cmd` in the venv, then
    `inference_ensure_runtime` with `status=verified` (same chain / pins).
 6. **Artifacts**: if `local_path` missing or not HF-loadable (`config.json` +
-   weights), sync via `sources[]`. For `megatron_checkpoints` / `.distcp`,
-   follow skill `gpucloud-megatron-weight-export` (ModelOpt / SWIFT recipes
-   first; hand-rolled `load_distcp` only as last resort). If still impossible,
-   fail with `phase=ensure_artifacts`.
+   weights), sync via `sources[]`. For `megatron_checkpoints` /
+   `swift_output` / `.distcp`, follow `gpucloud-megatron-weight-export`.
+   - **Qwen LoRA / `swift_output`**: endpoint is `hf_lora_*/` adapters, **not**
+     a full-weight `merged_model`. Prefer SWIFT `--merge_lora false`.
+   - If `{job_dir}/hf_lora_*/` already has `adapter_config.json` +
+     `adapter_model.safetensors`, **skip export/merge**; serve base HF from
+     `args.json` with `adapter_options.enable_lora=true` and
+     `max_lora_rank` ≥ training rank.
+   - **HARD**: never hand-merge LoRA into base safetensors for MoE; if SWIFT
+     fails on MoE → `phase=ensure_artifacts` (do not invent `merge_step*.py`).
+   Hand-rolled `load_distcp` only as last resort for **non-MoE**. If still
+   impossible, fail with `phase=ensure_artifacts`.
 7. **Start**: single-node — `inference_start_vllm` with local devices.
    Multi-node — follow **Multi-node Ray TP** (align `libnccl`, NCCL smoke,
    then rank0 waits for workers and starts TP). Pass
    `--trust-remote-code` for custom Qwen configs when required.
+   For LoRA: `model.local_path` / serve path = **base HF**; set
+   `adapter_options.enable_lora` (+ `max_lora_rank`); load the adapter via
+   vLLM LoRA (do not replace base with a merged tree).
 8. **Health**: poll `inference_health` until `ready` (or timeout →
    `phase=health_timeout`). Local `curl http://127.0.0.1:<port>/health` is
    fine for probing only (rank0).
@@ -238,7 +249,9 @@ Failure: `success=false`, `details.phase` in
 - Never report `visit_host=127.0.0.1` / `localhost` — platforms store that
   as the client endpoint; use the advertised / public host instead.
 - Prefer managed start tool so cluster stop can kill the serve PID.
-- Megatron raw checkpoints need `gpucloud-megatron-weight-export` before serve.
+- Megatron / `swift_output` raw checkpoints need
+  `gpucloud-megatron-weight-export` before serve.
+- Qwen LoRA: existing `hf_lora_*` → reuse; never build `merged_model/`.
 
 ## Verification
 
