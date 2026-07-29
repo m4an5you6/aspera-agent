@@ -1,30 +1,49 @@
 # Torch / CUDA Version Drift
 
-Lesson from deploy failures where torch was pinned to the driver CUDA tag,
-then an unpinned or ranged vLLM install replaced torch with a newer CUDA build
-the driver cannot run.
+Lesson from deploy failures where torch was pinned to one CUDA wheel tag,
+then an **unpinned or ranged** vLLM install replaced torch with a different
+CUDA build — or where agents mixed a new vLLM binary with an old torch via
+`--no-deps`.
 
-## Failure pattern
+## Failure pattern A — accidental resolver drift
 
 1. `nvidia-smi` reports CUDA **12.4** (driver capability).
 2. Agent installs `torch==2.5.1+cu124` into `inference_venvs/cu124` — smoke OK.
 3. Agent then runs `pip install "vllm>=0.8.0"` (or bare `vllm` / loose range).
 4. Resolver pulls a recent vLLM that **depends on** `torch` built for **cu128/cu130**.
-5. Pip upgrades/replaces the pinned torch. CUDA smoke fails
-   (`CUDA error` / incompatible runtime vs driver).
-6. Ray / serve never starts; turns are spent on downgrade loops.
+5. Pip upgrades/replaces the pinned torch without a planned cu-tag change.
+6. CUDA smoke / NCCL fails (or serve never starts); turns are spent on
+   downgrade loops.
+
+## Failure pattern B — intentional arch upgrade done wrong
+
+1. Arch floor needs vLLM ≥0.17 → wheel expects `torch==2.10.0` (cu126/cu128).
+2. Agent keeps `torch 2.5.1+cu124` and installs `vllm==0.17` with `--no-deps`.
+3. Shallow `import vllm` may look fine; deep import / registry hits
+   `undefined symbol` in `_C.abi3.so` (ABI mismatch).
+4. Agent then claims “driver cannot run CUDA 12.8” without ever installing
+   cu128 torch or seeing `insufficient driver` / PTX errors.
+
+Correct path when arch forces a newer torch: **new venv tag**, exact
+`torch==…+cuXXX` from `download.pytorch.org/whl/cuXXX`, CUDA smoke, then
+exact `vllm==…`. See `vllm-torch-version-index.md` (arch wins over preferred
+cu124 match; prove with smoke — do not pre-BLOCK).
 
 ## Rules
 
-- After choosing torch CUDA tag from the **driver**, pin **exact** versions:
+- After choosing the **planned** torch CUDA tag (preferred match **or**
+  intentional upgrade for arch), pin **exact** versions:
   `torch==…+cuXXX`, `vllm==…` (never `>=`, never bare package names).
 - Install / confirm **torch first**, then **vLLM**. Re-run CUDA smoke after
   each install that can touch torch.
 - Prefer China PyPI mirrors for the main index; use
   `download.pytorch.org/whl/cuXXX` only as `--extra-index-url` for CUDA wheels.
-- Do not assume “newer vLLM = better” for a given driver. Reject ranges that
-  can float onto incompatible torch CUDA tags (record them in
-  `rejected_alternatives` on the compat chain).
+- Do **not** use `--no-deps` to paste a newer vLLM onto an older torch.
+- Accidental drift (unpinned vLLM swapping cu tags) is forbidden. Intentional
+  cu-tag upgrade for arch is allowed and must be written in `compat_chain`
+  rationale + `rejected_alternatives`.
+- Do not assume “newer vLLM = better” for a given driver. Reject **ranges**;
+  do not reject an exact cu128 plan solely because `nvidia-smi` prints 12.4.
 
 ## Related: libnccl drift on multi-node
 
@@ -44,7 +63,5 @@ Before any torch/vLLM pip, call `inference_ensure_runtime` with a full
 `compat_chain` (`status=planned`). After install + smoke, call again with
 `status=verified`. Ray and `inference_start_vllm` refuse work until verified.
 
-Pin choice: arch floor ∩ driver CUDA tag — see
+Pin choice: arch floor first, then preferred or intentional cu tag — see
 `references/vllm-torch-version-index.md`.
-
-See skill procedure and `inference_ensure_runtime` schema for required fields.

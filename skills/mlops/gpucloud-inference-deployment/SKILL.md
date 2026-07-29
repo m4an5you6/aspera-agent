@@ -1,7 +1,7 @@
 ---
 name: gpucloud-inference-deployment
 description: Deploy inference via on-node agent until vLLM is ready.
-version: 2.6.0
+version: 2.6.1
 author: GPUCLOUD
 platforms: [linux]
 metadata:
@@ -40,7 +40,7 @@ enforce a full compatibility-chain decision before install and before serve.
   `sources`, `model_hint`, `training_artifact_kind`, and for multi-node
   `node_rank` / `nnodes` / `local_visible_devices` / `ray`.
 - Read before install: `references/vllm-torch-version-index.md` (arch → min
-  vLLM, driver → torch cu tag, pin decision order),
+  vLLM, preferred vs intentional cu tag, smoke-before-BLOCK),
   `references/vllm-runtime-and-model-readiness.md`, and
   `references/torch-cuda-version-drift.md`.
 - Multi-node TP: also read `references/multinode-nccl-and-lib-drift.md`.
@@ -54,7 +54,7 @@ Work until ready, then call `inference_report_ready`.
 | Step | Action |
 |------|--------|
 | Probe | In the inference **venv** (not system `python3`): `nvidia-smi` + `config.json` arch |
-| Version pick | Arch min vLLM ∩ driver cu tag → exact pins (`vllm-torch-version-index`) |
+| Version pick | Arch min vLLM first; preferred cu tag or intentional newer cu + smoke |
 | Compat chain | **Before any torch/vLLM pip**: write full chain → `inference_ensure_runtime` (`planned`) |
 | Install | Exact `==` pins into that venv via **pip mirrors** (torch before vllm) |
 | Verify | CUDA smoke in venv → `inference_ensure_runtime` (`verified`) |
@@ -96,8 +96,8 @@ Required `compat_chain` fields (align with the tool schema):
 | `install_order` | Ordered list; torch before vllm |
 | `pip_index` | China mirror URL (Aliyun preferred, else Tsinghua). Not official PyPI by default |
 | `pip_extra_index` | Optional; PyTorch CUDA wheel index only when needed |
-| `rationale` | Short narrative: driver CUDA → torch cu tag → vllm pin → why not latest; mirror choice |
-| `rejected_alternatives` | ≥1 concrete reject (e.g. `vllm>=0.8.0` pulls torch cu130) |
+| `rationale` | Arch floor → torch cu tag (preferred or intentional upgrade) → vllm pin; mirror |
+| `rejected_alternatives` | ≥1 concrete reject (e.g. unpinned `vllm>=…` drift; `--no-deps` ABI mix) |
 | `smoke_cmd` | One-liner CUDA smoke planned after install |
 
 Flow: probe → write chain → `ensure_runtime(planned)` → pip exact pins with
@@ -152,14 +152,18 @@ When `nnodes > 1` (assignment has `ray.enabled` and global
    Transformers fallback / `--trust-remote-code` alone is not a valid plan for
    large MoE (e.g. Qwen3.6 / `qwen3_5_moe` needs vLLM ≥ 0.17 native).
 3. **Compat chain** — follow the decision order in
-   `references/vllm-torch-version-index.md` (arch floor ∩ driver cu tag →
-   exact pins), read `references/torch-cuda-version-drift.md`, then call
+   `references/vllm-torch-version-index.md` (**arch floor first**; preferred
+   cu tag when possible; if the chosen vLLM requires a newer torch/cu tag,
+   plan an **intentional** dedicated venv + exact torch pin — do **not**
+   pre-BLOCK on `nvidia-smi` CUDA 12.4 alone, and do **not** `--no-deps`
+   mix ABI). Read `references/torch-cuda-version-drift.md`, then call
    `inference_ensure_runtime` (`planned`). Do **not** skip this before pip.
    Multi-node: every rank must plan the **same** `torch==` / `vllm==` pins.
 4. **Install stack** (only if the venv lacks a usable torch/vLLM): follow
    `install_order` with exact `==` pins from the chain. **Never** use
-   `vllm>=…` or unpinned `vllm` after torch is pinned — that is the drift
-   failure mode. For `nnodes>1` also pin/install `ray` into the same venv.
+   `vllm>=…` or unpinned `vllm` after torch is pinned — that is the
+   *accidental* drift failure mode. For `nnodes>1` also pin/install `ray`
+   into the same venv.
    **Default pip index is a China mirror** (not official PyPI):
    1. Aliyun: `https://mirrors.aliyun.com/pypi/simple/`
       (`--trusted-host mirrors.aliyun.com`)
@@ -169,14 +173,26 @@ When `nnodes > 1` (assignment has `ray.enabled` and global
       re-`ensure_runtime`, then official PyPI / config index.
    Torch CUDA wheels may add `--extra-index-url https://download.pytorch.org/whl/cuXXX`
    — that does **not** replace the main mirror for vLLM.
-   Example:
+   Example (preferred cu124 when arch allows):
    ```bash
-   PIP="$HOME/.cache/gpu_platform/inference_venvs/<tag>/bin/pip"
+   PIP="$HOME/.cache/gpu_platform/inference_venvs/cu124/bin/pip"
    $PIP install "torch==2.5.1+cu124" \
      -i https://mirrors.aliyun.com/pypi/simple/ \
      --trusted-host mirrors.aliyun.com \
      --extra-index-url https://download.pytorch.org/whl/cu124
    $PIP install "vllm==<exact-pin>" \
+     -i https://mirrors.aliyun.com/pypi/simple/ \
+     --trusted-host mirrors.aliyun.com
+   ```
+   Example (arch needs vLLM≥0.17 / torch 2.10 — intentional cu128):
+   ```bash
+   PIP="$HOME/.cache/gpu_platform/inference_venvs/cu128/bin/pip"
+   $PIP install "torch==2.10.0" "torchvision==0.25.0" "torchaudio==2.10.0" \
+     -i https://mirrors.aliyun.com/pypi/simple/ \
+     --trusted-host mirrors.aliyun.com \
+     --extra-index-url https://download.pytorch.org/whl/cu128
+   # CUDA smoke in this venv MUST pass before vLLM
+   $PIP install "vllm==0.17.0" \
      -i https://mirrors.aliyun.com/pypi/simple/ \
      --trusted-host mirrors.aliyun.com
    ```
@@ -265,10 +281,12 @@ Failure: `success=false`, `details.phase` in
   `quantization=bitsandbytes` + `load_format=bitsandbytes` (or the same via
   `extra_args`) and confirm the serve log — unknown keys used to be dropped
   silently by older adapters.
-- `vllm>=…` after a cu124 torch pin can upgrade torch **and** replace
-  `libnccl.so.2` with a cuda13 build — see
+- `vllm>=…` after a cu124 torch pin can **accidentally** upgrade torch **and**
+  replace `libnccl.so.2` with a cuda13 build — see
   `references/torch-cuda-version-drift.md` and
-  `references/multinode-nccl-and-lib-drift.md`.
+  `references/multinode-nccl-and-lib-drift.md`. Intentional cu128 for arch
+  (exact pins + dedicated venv + smoke) is allowed; `--no-deps` ABI mixing
+  and pre-BLOCK “driver cannot run 12.8” without smoke are not.
 - Multi-node: Ray/SSH OK + NCCL fail usually means **`libnccl` / driver
   mismatch**, not “no connectivity.” Check `strings` on both nodes.
 - Multi-node: never run independent TP=1 API servers on each node; rank0 must

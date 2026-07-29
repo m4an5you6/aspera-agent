@@ -49,11 +49,12 @@ def _valid_chain(inference_py: Path, **overrides):
         "pip_index": "https://mirrors.aliyun.com/pypi/simple/",
         "pip_extra_index": "https://download.pytorch.org/whl/cu124",
         "rationale": (
-            "Driver CUDA 12.4 → torch cu124 pin; vllm 0.6.6 matches that torch; "
-            "reject latest/ranges that float to cu130; Aliyun as pip_index."
+            "Arch allows older vLLM; prefer CUDA 12.4 → torch cu124 pin; "
+            "vllm 0.6.6 matches that torch; reject unpinned ranges that "
+            "accidentally float torch; Aliyun as pip_index."
         ),
         "rejected_alternatives": [
-            "vllm>=0.8.0 pulls torch with cu130 incompatible with driver 12.4"
+            "vllm>=0.8.0 unpinned — accidental torch cu-tag drift / NCCL replace"
         ],
         "smoke_cmd": (
             f"{inference_py} -c \"import torch; t=torch.zeros(1).cuda(); "
