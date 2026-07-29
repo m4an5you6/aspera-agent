@@ -428,7 +428,9 @@ INFERENCE_START_VLLM_SCHEMA = {
         "(tracks PID/logs for cancel). Prefer this over raw terminal background serves. "
         "Requires inference_ensure_runtime status=verified for job_id first. "
         "For multi-node TP, pass ray={enabled:true,address:host:port} and global tensor_parallel. "
-        "Rank>0 must not call this. python_executable must be inference_venvs (not swift_venv)."
+        "Rank>0 must not call this. python_executable must be inference_venvs (not swift_venv). "
+        "Honor assignment adapter_options (quantization/load_format/dtype/extra_args) from the "
+        "platform precision field; verify serve logs after start."
     ),
     "parameters": {
         "type": "object",
@@ -441,7 +443,18 @@ INFERENCE_START_VLLM_SCHEMA = {
             "ray": {"type": "object"},
             "secrets_ref": {"type": "object"},
             "env": {"type": "object"},
-            "adapter_options": {"type": "object"},
+            "adapter_options": {
+                "type": "object",
+                "description": (
+                    "vLLM options forwarded by hf_vllm: trust_remote_code, max_model_len, "
+                    "gpu_memory_utilization, cpu_offload_gb, enable_lora, max_lora_rank, "
+                    "dtype, quantization, load_format, enforce_eager, lora_modules, "
+                    "extra_args (list of raw CLI tokens for anything else). "
+                    "For 4-bit BitsAndBytes use quantization=bitsandbytes and "
+                    "load_format=bitsandbytes (or the same via extra_args). "
+                    "Bit width must be explicit — do not pass a vague bitsandbytes-only note."
+                ),
+            },
             "python_executable": {"type": "string", "description": _PYTHON_HINT},
         },
         "required": ["job_id", "model_path"],

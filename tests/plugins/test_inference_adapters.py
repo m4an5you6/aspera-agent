@@ -1225,3 +1225,103 @@ def test_hf_vllm_start_ray_and_adapter_options(tmp_path, monkeypatch):
     assert captured["env"].get("CUDA_VISIBLE_DEVICES") == "0"
     assert captured["env"].get("RAY_ADDRESS") == "10.0.21.105:6413"
     assert endpoint.port == 8000
+
+
+def test_hf_vllm_start_forwards_quantization_and_lora_modules(tmp_path, monkeypatch):
+    monkeypatch.setenv("GPUCLOUD_HOME", str(tmp_path / ".gpucloud"))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    py = tmp_path / ".cache/gpu_platform/inference_venvs/cu124/bin/python"
+    py.parent.mkdir(parents=True)
+    py.write_text("#!/bin/sh\n")
+    py.chmod(0o755)
+
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text('{"model_type":"qwen3_5_moe"}')
+
+    ad = HfVllmAdapter()
+    captured: dict = {}
+
+    class _Proc:
+        pid = 99
+
+        def poll(self):
+            return None
+
+    def fake_popen(cmd, env=None, **kwargs):
+        captured["cmd"] = list(cmd)
+        return _Proc()
+
+    monkeypatch.setattr("plugins.inference_adapters.hf_vllm.subprocess.Popen", fake_popen)
+
+    ad.start(
+        {
+            "job_id": "job-bnb",
+            "serve": {"host": "0.0.0.0", "port": 8000},
+            "gpus": {"tensor_parallel": 2, "visible_devices": [0]},
+            "runtime": {"python_executable": str(py)},
+            "adapter_options": {
+                "quantization": "bitsandbytes",
+                "load_format": "bitsandbytes",
+                "dtype": "float16",
+                "enforce_eager": True,
+                "enable_lora": True,
+                "max_lora_rank": 8,
+                "lora_modules": "qwen-lora=/tmp/hf_lora_100",
+            },
+        },
+        ArtifactPaths(model_path=str(model)),
+    )
+    cmd = captured["cmd"]
+    assert "--quantization" in cmd and cmd[cmd.index("--quantization") + 1] == "bitsandbytes"
+    assert "--load-format" in cmd and cmd[cmd.index("--load-format") + 1] == "bitsandbytes"
+    assert "--dtype" in cmd and cmd[cmd.index("--dtype") + 1] == "float16"
+    assert "--enforce-eager" in cmd
+    assert "--enable-lora" in cmd
+    assert "--lora-modules" in cmd
+    assert cmd[cmd.index("--lora-modules") + 1] == "qwen-lora=/tmp/hf_lora_100"
+
+
+def test_hf_vllm_start_extra_args_skip_duplicate_quantization(tmp_path, monkeypatch):
+    monkeypatch.setenv("GPUCLOUD_HOME", str(tmp_path / ".gpucloud"))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    py = tmp_path / ".cache/gpu_platform/inference_venvs/cu124/bin/python"
+    py.parent.mkdir(parents=True)
+    py.write_text("#!/bin/sh\n")
+    py.chmod(0o755)
+
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+
+    ad = HfVllmAdapter()
+    captured: dict = {}
+
+    class _Proc:
+        pid = 100
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(
+        "plugins.inference_adapters.hf_vllm.subprocess.Popen",
+        lambda cmd, env=None, **kwargs: captured.update(cmd=list(cmd)) or _Proc(),
+    )
+
+    ad.start(
+        {
+            "job_id": "job-dup",
+            "serve": {"port": 8000},
+            "gpus": {"tensor_parallel": 1},
+            "runtime": {"python_executable": str(py)},
+            "adapter_options": {
+                "quantization": "bitsandbytes",
+                "extra_args": ["--quantization", "awq"],
+            },
+        },
+        ArtifactPaths(model_path=str(model)),
+    )
+    cmd = captured["cmd"]
+    # extra_args appended last; allowlist skips because --quantization already in extra_joined
+    assert cmd.count("--quantization") == 1
+    assert cmd[cmd.index("--quantization") + 1] == "awq"

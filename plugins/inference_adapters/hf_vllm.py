@@ -222,6 +222,20 @@ class HfVllmAdapter(ModelAdapter):
             cmd.append("--enable-lora")
         if adapter_options.get("max_lora_rank") is not None and "--max-lora-rank" not in extra_joined:
             cmd.extend(["--max-lora-rank", str(int(adapter_options["max_lora_rank"]))])
+        dtype = str(adapter_options.get("dtype") or "").strip()
+        if dtype and "--dtype" not in extra_joined:
+            cmd.extend(["--dtype", dtype])
+        quantization = str(adapter_options.get("quantization") or "").strip()
+        if quantization and "--quantization" not in extra_joined:
+            cmd.extend(["--quantization", quantization])
+        load_format = str(adapter_options.get("load_format") or "").strip()
+        if load_format and "--load-format" not in extra_joined:
+            cmd.extend(["--load-format", load_format])
+        if adapter_options.get("enforce_eager") and "--enforce-eager" not in extra_joined:
+            cmd.append("--enforce-eager")
+        lora_modules = adapter_options.get("lora_modules")
+        if lora_modules and "--lora-modules" not in extra_joined:
+            cmd.extend(["--lora-modules", str(lora_modules)])
 
         if api_key:
             env["VLLM_API_KEY"] = api_key

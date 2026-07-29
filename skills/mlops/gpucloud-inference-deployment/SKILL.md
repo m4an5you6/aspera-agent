@@ -192,6 +192,15 @@ When `nnodes > 1` (assignment has `ray.enabled` and global
    For LoRA (rank0): serve path = **base HF**; set
    `adapter_options.enable_lora` (+ `max_lora_rank`); load the adapter via
    vLLM LoRA (do not replace base with a merged tree).
+   **Honor assignment `adapter_options`** (platform may set precision):
+   pass through `quantization`, `load_format`, `dtype`, `lora_modules`,
+   `enforce_eager`, and `extra_args` unchanged. Known keys are forwarded by
+   `hf_vllm`; unknown CLI flags must go in `extra_args`
+   (e.g. `["--quantization","bitsandbytes","--load-format","bitsandbytes"]`
+   for **4-bit** BitsAndBytes — say `bnb_4bit`, never a vague
+   “bitsandbytes” without bit width). After start, verify logs / vLLM
+   `Namespace` show `quantization=` / `dtype=` as intended — do not assume
+   a key “wrote” means it reached the CLI.
 8. **Health**: poll `inference_health` until `ready` (or timeout →
    `phase=health_timeout`). Local `curl http://127.0.0.1:<port>/health` is
    fine for probing only (rank0).
@@ -237,6 +246,12 @@ Failure: `success=false`, `details.phase` in
   the venv `bin/pip`.
 - Bare `pip install vllm` without `-i` mirror is a common stall; use Aliyun
   then Tsinghua before falling back.
+- Putting `quantization` / `load_format` only in free-form notes does nothing;
+  they must be in `adapter_options` (or `extra_args`). After OOM self-rescue
+  with **4-bit** BitsAndBytes, set
+  `quantization=bitsandbytes` + `load_format=bitsandbytes` (or the same via
+  `extra_args`) and confirm the serve log — unknown keys used to be dropped
+  silently by older adapters.
 - `vllm>=…` after a cu124 torch pin can upgrade torch **and** replace
   `libnccl.so.2` with a cuda13 build — see
   `references/torch-cuda-version-drift.md` and
