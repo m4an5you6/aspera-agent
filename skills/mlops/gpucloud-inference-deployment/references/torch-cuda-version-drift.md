@@ -44,4 +44,7 @@ Before any torch/vLLM pip, call `inference_ensure_runtime` with a full
 `compat_chain` (`status=planned`). After install + smoke, call again with
 `status=verified`. Ray and `inference_start_vllm` refuse work until verified.
 
+Pin choice: arch floor ∩ driver CUDA tag — see
+`references/vllm-torch-version-index.md`.
+
 See skill procedure and `inference_ensure_runtime` schema for required fields.

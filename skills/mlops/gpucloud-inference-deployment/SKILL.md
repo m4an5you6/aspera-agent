@@ -1,7 +1,7 @@
 ---
 name: gpucloud-inference-deployment
 description: Deploy inference via on-node agent until vLLM is ready.
-version: 2.5.3
+version: 2.6.0
 author: GPUCLOUD
 platforms: [linux]
 metadata:
@@ -39,7 +39,9 @@ enforce a full compatibility-chain decision before install and before serve.
 - Assignment JSON includes `model.local_path`, `gpus`, `serve`, optional
   `sources`, `model_hint`, `training_artifact_kind`, and for multi-node
   `node_rank` / `nnodes` / `local_visible_devices` / `ray`.
-- Read before install: `references/vllm-runtime-and-model-readiness.md` and
+- Read before install: `references/vllm-torch-version-index.md` (arch → min
+  vLLM, driver → torch cu tag, pin decision order),
+  `references/vllm-runtime-and-model-readiness.md`, and
   `references/torch-cuda-version-drift.md`.
 - Multi-node TP: also read `references/multinode-nccl-and-lib-drift.md`.
 
@@ -51,7 +53,8 @@ Work until ready, then call `inference_report_ready`.
 
 | Step | Action |
 |------|--------|
-| Probe | In the inference **venv** (not system `python3`): `nvidia-smi` + model family |
+| Probe | In the inference **venv** (not system `python3`): `nvidia-smi` + `config.json` arch |
+| Version pick | Arch min vLLM ∩ driver cu tag → exact pins (`vllm-torch-version-index`) |
 | Compat chain | **Before any torch/vLLM pip**: write full chain → `inference_ensure_runtime` (`planned`) |
 | Install | Exact `==` pins into that venv via **pip mirrors** (torch before vllm) |
 | Verify | CUDA smoke in venv → `inference_ensure_runtime` (`verified`) |
@@ -141,13 +144,18 @@ When `nnodes > 1` (assignment has `ray.enabled` and global
 1. **Inspect environment** with `terminal`: `nvidia-smi`, then the venv
    python above — `"$PY" -c "import torch,vllm"` (may fail — that is OK;
    install only into this venv if needed).
-2. **Identify model family** from `model.local_path` (`config.json`
-   `model_type` / `architectures`), directory name, and optional
-   `model_hint` / `training_artifact_kind` (e.g. gpt2, qwen2.5, qwen3,
-   megatron export). Newer Qwen often needs newer vLLM than GPT-2.
-3. **Compat chain** — read `references/torch-cuda-version-drift.md`, choose
-   exact pins, call `inference_ensure_runtime` (`planned`). Do **not** skip
-   this before pip.
+2. **Identify model family / arch** from `model.local_path` (`config.json`
+   `model_type` / `architectures` / `auto_map`), directory name, and optional
+   `model_hint` / `training_artifact_kind`. Map arch → **min native vLLM**
+   via `references/vllm-torch-version-index.md`. Do **not** treat an existing
+   cu-matched venv as “good enough” if its registry misses that arch.
+   Transformers fallback / `--trust-remote-code` alone is not a valid plan for
+   large MoE (e.g. Qwen3.6 / `qwen3_5_moe` needs vLLM ≥ 0.17 native).
+3. **Compat chain** — follow the decision order in
+   `references/vllm-torch-version-index.md` (arch floor ∩ driver cu tag →
+   exact pins), read `references/torch-cuda-version-drift.md`, then call
+   `inference_ensure_runtime` (`planned`). Do **not** skip this before pip.
+   Multi-node: every rank must plan the **same** `torch==` / `vllm==` pins.
 4. **Install stack** (only if the venv lacks a usable torch/vLLM): follow
    `install_order` with exact `==` pins from the chain. **Never** use
    `vllm>=…` or unpinned `vllm` after torch is pinned — that is the drift
@@ -238,8 +246,13 @@ Failure: `success=false`, `details.phase` in
 
 ## Pitfalls
 
-- Fixed pin matrices cannot cover all model families — decide from evidence,
-  but always record the decision via `inference_ensure_runtime`.
+- Use `references/vllm-torch-version-index.md` as **floors + landmines**, not a
+  frozen full pin matrix — still verify registry HIT for the HF architecture
+  before `ensure_runtime(planned)`.
+- Do not reuse an old cu-matched vLLM solely because the venv exists; arch
+  support is a separate gate (Qwen3.6 MoE / `qwen3_5_moe` ≠ classic
+  `qwen3_moe`).
+- Transformers fallback is not “supported” for large MoE serve plans.
 - Do not treat a failed system `python3 -c "import vllm"` as “no vLLM”;
   check the inference venv first.
 - Bare `pip` / `~/.local` installs miss the serve interpreter — always use
