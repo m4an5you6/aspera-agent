@@ -61,7 +61,7 @@ Work until ready, then call `inference_report_ready`.
 | Artifacts | Ensure HF-loadable dir; sync via `sources[]` if missing |
 | Multi-node align | Same torch/vLLM/**libnccl** on all ranks (`strings` on `.so`, not only `pip show`) |
 | NCCL smoke | Gloo then NCCL allreduce across ranks **before** vLLM TP>1 |
-| Multi-node | rank0: ray head → wait workers → vLLM TP=global + ray; worker: ray join → `worker_ready` |
+| Multi-node | rank0: ray head → wait workers → vLLM TP=global + ray; worker: ray_join polls until head up → `worker_ready` |
 | Serve | `inference_start_vllm` with that venv's `python_executable` (rank0 only when nnodes>1) |
 | Done | rank0: `phase=ready` + reachable visit_host; worker: `phase=worker_ready` |
 
@@ -121,16 +121,23 @@ When `nnodes > 1` (assignment has `ray.enabled` and global
 - Put `NCCL_*` / `GLOO_SOCKET_IFNAME` into the **ray worker process** env
   (`ray start` / `ray join`), not only the API server shell.
 - **rank>0**: compat chain verified → confirm **base HF** readable (LoRA
-  adapters not required on worker) → `inference_ray_join` to
-  `$GPUCLOUD_CLUSTER_ADVERTISED_ADDR` of head or master addr + `ray.head_port`
-  → `inference_report_ready` with `phase=worker_ready` (no API server).
+  adapters not required on worker) → call `inference_ray_join` **once** to
+  `$GPUCLOUD_CLUSTER_ADVERTISED_ADDR` of head or master addr + `ray.head_port`.
+  The tool **polls until the head is up** (default `timeout_seconds=0` =
+  forever) because rank0 may still be installing deps — do not give up after
+  180s/600s and do not report ready on join failure.
+  Only after join **success** → `inference_report_ready` with
+  `phase=worker_ready` (no API server).
   **Forbidden on worker:** megatron/swift LoRA export, `merged_model`, failing
-  `ensure_artifacts` only because `hf_lora_*` is missing locally.
+  `ensure_artifacts` only because `hf_lora_*` is missing locally; reporting
+  `worker_ready` without a successful `inference_ray_join`.
 - **rank0**: compat chain verified → own LoRA reuse/export (`hf_lora_*`) →
   `inference_ray_start` →
-  `inference_cluster_wait_workers` (must succeed; use `http://…` master URL) →
+  `inference_cluster_wait_workers` (must succeed; **only**
+  `http://<master>:8765` + `GPUCLOUD_CLUSTER_SECRET` Bearer — Ray ports
+  like 6379/6425 are rejected) →
   NCCL smoke OK → `inference_start_vllm` with global TP + `ray.enabled` +
-  base path + `enable_lora` →
+  base path + `enable_lora` (tool refuses if `ray status` GPUs < TP) →
   health → `phase=ready` with reachable `visit_host`. Never start two
   independent TP=1 servers.
 - **If NCCL smoke fails** after aligning `libnccl` / worker env: stop

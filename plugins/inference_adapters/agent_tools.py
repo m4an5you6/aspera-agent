@@ -158,6 +158,52 @@ def handle_inference_start_vllm(args: dict, **kwargs: Any) -> str:
     if blocked:
         return blocked
 
+    # Multi-node / Ray TP: refuse to start if cluster GPU count < TP.
+    use_ray = bool(ray.get("enabled")) or str(
+        ray.get("distributed_executor_backend")
+        or adapter_options.get("distributed_executor_backend")
+        or ""
+    ).lower() == "ray"
+    try:
+        tp = int(gpus.get("tensor_parallel") or 1)
+    except (TypeError, ValueError):
+        tp = 1
+    if use_ray and tp > 1:
+        from plugins.inference_adapters.ray_runtime import require_ray_gpus_for_tp
+
+        ray_addr = str(
+            ray.get("address")
+            or (args.get("env") or {}).get("RAY_ADDRESS")
+            or os.environ.get("RAY_ADDRESS")
+            or ""
+        ).strip()
+        if not ray_addr:
+            head_port = ray.get("head_port") or ray.get("port")
+            head_host = (
+                str(ray.get("head_host") or "").strip()
+                or os.environ.get("GPUCLOUD_CLUSTER_ADVERTISED_ADDR", "").strip()
+                or os.environ.get("MASTER_ADDR", "").strip()
+                or "127.0.0.1"
+            )
+            if head_port is not None:
+                ray_addr = f"{head_host}:{int(head_port)}"
+        gate = require_ray_gpus_for_tp(
+            tensor_parallel=tp,
+            address=ray_addr,
+            python_executable=python_executable,
+        )
+        if not gate.get("ok"):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": gate.get("error"),
+                    "phase": gate.get("phase") or "ray_gpu_gate",
+                    "tensor_parallel": gate.get("tensor_parallel"),
+                    "ray_gpus": gate.get("ray_gpus"),
+                    "ray_status": gate.get("ray_status"),
+                }
+            )
+
     spec: Dict[str, Any] = {
         "job_id": job_id,
         "adapter_id": adapter_id,
@@ -262,6 +308,10 @@ def handle_inference_ray_join(args: dict, **kwargs: Any) -> str:
         devices = [int(x) for x in devices]
     else:
         devices = None
+    # Default 0 = poll forever until head is up (rank0 may still be installing).
+    timeout_seconds = float(args.get("timeout_seconds") or 0)
+    poll_seconds = float(args.get("poll_seconds") or 15)
+    attempt_timeout_seconds = float(args.get("attempt_timeout_seconds") or 120)
     try:
         python_executable = _serve_python(args)
         if not job_id:
@@ -281,8 +331,20 @@ def handle_inference_ray_join(args: dict, **kwargs: Any) -> str:
             node_ip=str(args.get("node_ip") or "").strip(),
             python_executable=python_executable,
             cuda_visible_devices=devices,
+            timeout_seconds=timeout_seconds,
+            poll_seconds=poll_seconds,
+            attempt_timeout_seconds=attempt_timeout_seconds,
         )
         result["python_executable"] = python_executable
+        if result.get("success"):
+            from plugins.inference_adapters.ray_runtime import record_ray_join_success
+
+            record_ray_join_success(
+                job_id,
+                address=address,
+                python_executable=python_executable,
+            )
+            result["join_recorded"] = True
         return json.dumps(result)
     except InferenceVenvError as exc:
         return json.dumps({"success": False, "error": str(exc), "phase": "venv_gate"})
@@ -292,23 +354,49 @@ def handle_inference_ray_join(args: dict, **kwargs: Any) -> str:
 
 
 def handle_inference_cluster_wait_workers(args: dict, **kwargs: Any) -> str:
-    from plugins.inference_adapters.ray_runtime import wait_workers_ready
+    from plugins.inference_adapters.ray_runtime import (
+        normalize_cluster_master_url,
+        wait_workers_ready,
+    )
 
     gated = _role_gate("inference_cluster_wait_workers")
     if gated:
         return gated
     job_id = str(args.get("job_id") or "").strip()
-    master_url = str(args.get("master_url") or os.environ.get("GPUCLOUD_CLUSTER_MASTER_URL") or "").strip()
     if not job_id:
         return json.dumps({"success": False, "error": "job_id required"})
-    if not master_url:
-        # Common on-node default when this node is the cluster master.
-        master_url = "http://127.0.0.1:8765"
+    master_raw = str(
+        args.get("master_url") or os.environ.get("GPUCLOUD_CLUSTER_MASTER_URL") or ""
+    ).strip()
+    url_info = normalize_cluster_master_url(master_raw)
+    if not url_info.get("ok"):
+        return json.dumps(
+            {
+                "success": False,
+                "ready": False,
+                "error": url_info.get("error"),
+                "phase": url_info.get("phase") or "master_url_gate",
+            }
+        )
+    master_url = str(url_info["master_url"])
     secret = str(
         args.get("cluster_secret")
         or os.environ.get("GPUCLOUD_CLUSTER_SECRET")
         or ""
     ).strip()
+    if not secret:
+        return json.dumps(
+            {
+                "success": False,
+                "ready": False,
+                "error": (
+                    "cluster_secret required: set GPUCLOUD_CLUSTER_SECRET "
+                    "(Bearer for master :8765). Ray ports are not valid master_url."
+                ),
+                "phase": "auth_gate",
+                "master_url": master_url,
+            }
+        )
     try:
         result = wait_workers_ready(
             master_url=master_url,
@@ -372,6 +460,25 @@ def handle_inference_report_ready(args: dict, **kwargs: Any) -> str:
             details[key] = args[key]
     if success and not details.get("phase"):
         details["phase"] = "ready"
+
+    # Hard gate: worker_ready requires successful ray_join + living raylet.
+    phase = str(details.get("phase") or "").strip().lower()
+    if success and phase == "worker_ready":
+        from plugins.inference_adapters.ray_runtime import require_worker_ready_prereqs
+
+        gate = require_worker_ready_prereqs(job_id)
+        if not gate.get("ok"):
+            return json.dumps(
+                {
+                    "success": False,
+                    "stored": False,
+                    "error": gate.get("error"),
+                    "phase": gate.get("phase") or "ray_join_gate",
+                    "raylet": gate.get("raylet"),
+                    "join": gate.get("join"),
+                }
+            )
+
     payload = {"success": success, "summary": summary, "details": details}
     store_reported_outcome(job_id, payload)
     return json.dumps({"success": True, "stored": True, "outcome": payload})
@@ -428,6 +535,8 @@ INFERENCE_START_VLLM_SCHEMA = {
         "(tracks PID/logs for cancel). Prefer this over raw terminal background serves. "
         "Requires inference_ensure_runtime status=verified for job_id first. "
         "For multi-node TP, pass ray={enabled:true,address:host:port} and global tensor_parallel. "
+        "Refuses to start when ray.enabled and tensor_parallel>1 but `ray status` "
+        "cluster GPU count < TP (workers must have joined). "
         "Rank>0 must not call this. python_executable must be inference_venvs (not swift_venv). "
         "Honor assignment adapter_options (quantization/load_format/dtype/extra_args) from the "
         "platform precision field; verify serve logs after start."
@@ -487,7 +596,11 @@ INFERENCE_RAY_JOIN_SCHEMA = {
     "name": "inference_ray_join",
     "description": (
         "Join Ray worker on this node (rank>0 only) to the head address. "
-        "Requires inference_ensure_runtime status=verified for job_id. "
+        "Blocks and polls until the head port accepts TCP and join succeeds "
+        "(default timeout_seconds=0 = wait forever) — rank0 may still be "
+        "installing deps. Do NOT give up or report worker_ready after one "
+        "failure; call this once and let it poll. Requires "
+        "inference_ensure_runtime status=verified for job_id. "
         "Rank0 must use inference_ray_start. python_executable must be inference_venvs."
     ),
     "parameters": {
@@ -498,6 +611,21 @@ INFERENCE_RAY_JOIN_SCHEMA = {
             "num_gpus": {"type": "integer"},
             "visible_devices": {"type": "array", "items": {"type": "integer"}},
             "node_ip": {"type": "string"},
+            "timeout_seconds": {
+                "type": "number",
+                "description": (
+                    "Total join budget in seconds. 0 or omit = wait forever "
+                    "(recommended; rank0 install can exceed 600s)."
+                ),
+            },
+            "poll_seconds": {
+                "type": "number",
+                "description": "Sleep between probes/attempts when head is down (default 15).",
+            },
+            "attempt_timeout_seconds": {
+                "type": "number",
+                "description": "Per ray start --address attempt timeout (default 120).",
+            },
             "python_executable": {"type": "string", "description": _PYTHON_HINT},
         },
         "required": ["job_id", "address"],
@@ -507,14 +635,23 @@ INFERENCE_RAY_JOIN_SCHEMA = {
 INFERENCE_CLUSTER_WAIT_WORKERS_SCHEMA = {
     "name": "inference_cluster_wait_workers",
     "description": (
-        "Rank0 only: poll cluster master until all peer assignments report "
-        "phase/state worker_ready before starting multi-node vLLM."
+        "Rank0 only: poll cluster master HTTP API until all peer assignments "
+        "report phase/state worker_ready before starting multi-node vLLM. "
+        "master_url MUST be http://<master>:8765 (cluster API) — Ray GCS ports "
+        "(6379/6425/8265/…) are rejected. Requires GPUCLOUD_CLUSTER_SECRET Bearer."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "job_id": {"type": "string"},
-            "master_url": {"type": "string"},
+            "master_url": {
+                "type": "string",
+                "description": "http://<master>:8765 only (not Ray head port)",
+            },
+            "cluster_secret": {
+                "type": "string",
+                "description": "Bearer token; defaults to GPUCLOUD_CLUSTER_SECRET",
+            },
             "timeout_seconds": {"type": "number"},
             "poll_seconds": {"type": "number"},
         },
@@ -547,7 +684,9 @@ INFERENCE_REPORT_READY_SCHEMA = {
     "description": (
         "Report the final inference outcome contract to the cluster worker "
         "(success/failure + visit_host/port). Rank0 uses phase=ready; "
-        "workers use phase=worker_ready (no visit_host)."
+        "workers use phase=worker_ready (no visit_host). "
+        "worker_ready is refused unless this job already has a successful "
+        "inference_ray_join and a living local raylet."
     ),
     "parameters": {
         "type": "object",
