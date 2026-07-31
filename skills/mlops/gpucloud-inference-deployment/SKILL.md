@@ -213,16 +213,25 @@ When `nnodes > 1` (assignment has `ray.enabled` and global
      `merged_model`); reuse existing `hf_lora_*`; SWIFT `--merge_lora false`.
      MoE + SWIFT fail → `phase=ensure_artifacts` (no hand-merge).
    - **rank>0**: do **not** export LoRA. Confirm base HF readable for TP
-     shards; missing local `hf_lora_*` is OK (loaded on rank0). Only sync a
-     full model tree if the **base** path is absent — never fail solely for
-     missing adapters.
+     shards. **vLLM ≥0.17 Ray workers DO need `hf_lora_*` on their local
+     filesystem** (each worker loads adapter weights during LoRA activation).
+     Sync the adapter directory to every worker via `rsync` — missing local
+     `hf_lora_*` on a worker results in `ValueError: No adapter found for
+     <path>` at serve time. Only skip sync when the full model tree is absent;
+     never fail `ensure_artifacts` solely for missing adapters (sync them
+     instead).
 7. **Start**: single-node — `inference_start_vllm` with local devices.
    Multi-node — follow **Multi-node Ray TP** (align `libnccl`, NCCL smoke,
    then rank0 waits for workers and starts TP). Pass
    `--trust-remote-code` for custom Qwen configs when required.
-   For LoRA (rank0): serve path = **base HF**; set
-   `adapter_options.enable_lora` (+ `max_lora_rank`); load the adapter via
-   vLLM LoRA (do not replace base with a merged tree).
+   - For LoRA (rank0): serve path = **base HF**; set
+      `adapter_options.enable_lora` (+ `max_lora_rank`). When using
+      `adapter_options.lora_modules` as a list (e.g. `["name=path"]`), the
+      tool may wrap it with literal Python-list syntax in the CLI argument,
+      producing a broken path like `/path']`. **Prefer `extra_args`**:
+      `["--lora-modules","name=/absolute/path"]`. Verify the serve CLI with
+      `ps aux | grep vllm` — the path must not contain quotes or brackets.
+      Load the adapter via vLLM LoRA (do not replace base with a merged tree).
    **Honor assignment `adapter_options`** (platform may set precision):
    pass through `quantization`, `load_format`, `dtype`, `lora_modules`,
    `enforce_eager`, and `extra_args` unchanged. Known keys are forwarded by
@@ -307,7 +316,13 @@ Failure: `success=false`, `details.phase` in
 - Megatron / `swift_output` raw checkpoints need
   `gpucloud-megatron-weight-export` before serve.
 - Qwen LoRA: existing `hf_lora_*` → reuse on rank0; never build `merged_model/`.
-- Multi-node worker: no LoRA export; missing local `hf_lora_*` is OK.
+- Multi-node worker: sync `hf_lora_*` to every worker — vLLM ≥0.17 loads adapter
+  weights locally on each Ray worker.
+- **vLLM 0.17.0 + LoRA + MoE + CUDA graphs**: `slice_lora_b` in
+  `column_parallel_linear.py` throws `IndexError: list index out of range`
+  during `_capture_cudagraphs`. Fix: pass `enforce_eager=true` in
+  `adapter_options` to skip CUDA graph capture. This also avoids the
+  `RuntimeError: Engine core initialization failed` cascade.
 
 ## Verification
 
