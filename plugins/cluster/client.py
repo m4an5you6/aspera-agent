@@ -71,6 +71,43 @@ class ClusterClient:
     def stop_job(self, job_id: str) -> Dict[str, Any]:
         return self._request("POST", f"/api/jobs/{job_id}/stop", {})
 
+    def enqueue_nudge(
+        self,
+        job_id: str,
+        *,
+        type: str = "steer_text",
+        payload: Optional[Dict[str, Any]] = None,
+        route_mode: str = "guide",
+        node_ids: Optional[list] = None,
+    ) -> Dict[str, Any]:
+        body: Dict[str, Any] = {
+            "type": type,
+            "payload": payload or {},
+            "route_mode": route_mode,
+        }
+        if node_ids is not None:
+            body["node_ids"] = node_ids
+        return self._request("POST", f"/api/jobs/{job_id}/nudge", body)
+
+    def ack_nudge(
+        self,
+        job_id: str,
+        nudge_id: str,
+        *,
+        node_id: str,
+        success: bool = True,
+        detail: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/jobs/{job_id}/nudge/{nudge_id}/ack",
+            {
+                "node_id": node_id,
+                "success": success,
+                "detail": detail or {},
+            },
+        )
+
     def logs(self, **params: Any) -> Dict[str, Any]:
         q = "&".join(f"{k}={v}" for k, v in params.items() if v)
         path = f"/api/logs?{q}" if q else "/api/logs"

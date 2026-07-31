@@ -15,6 +15,7 @@ from plugins.cluster.models import (
     ClusterEvent,
     GpuInfo,
     HeartbeatPayload,
+    JobNudge,
     JobRecord,
     JobSpec,
     NodeRecord,
@@ -309,8 +310,82 @@ class ClusterStore(ABC):
         limit: int = 50,
     ) -> Dict[str, Any]: ...
 
+    @abstractmethod
+    def create_nudge(self, nudge: JobNudge) -> None: ...
 
-class MemoryClusterStore(ClusterStore):
+    @abstractmethod
+    def get_nudge(self, nudge_id: str) -> Optional[JobNudge]: ...
+
+    @abstractmethod
+    def list_nudges_for_job(self, job_id: str) -> List[JobNudge]: ...
+
+    @abstractmethod
+    def list_pending_nudges_for_node(self, node_id: str) -> List[JobNudge]: ...
+
+    @abstractmethod
+    def ack_nudge(
+        self,
+        nudge_id: str,
+        *,
+        node_id: str,
+        success: bool,
+        detail: Optional[Dict[str, Any]] = None,
+    ) -> bool: ...
+
+
+class _NudgeStoreMixin:
+    """In-process nudge queue shared by Memory and Postgres stores."""
+
+    def _ensure_nudge_state(self) -> None:
+        if not hasattr(self, "_nudges"):
+            self._nudges: Dict[str, JobNudge] = {}  # type: ignore[attr-defined]
+            self._nudge_lock = threading.RLock()  # type: ignore[attr-defined]
+
+    def create_nudge(self, nudge: JobNudge) -> None:
+        self._ensure_nudge_state()
+        with self._nudge_lock:  # type: ignore[attr-defined]
+            self._nudges[nudge.nudge_id] = nudge  # type: ignore[attr-defined]
+
+    def get_nudge(self, nudge_id: str) -> Optional[JobNudge]:
+        self._ensure_nudge_state()
+        with self._nudge_lock:  # type: ignore[attr-defined]
+            return self._nudges.get(nudge_id)  # type: ignore[attr-defined]
+
+    def list_nudges_for_job(self, job_id: str) -> List[JobNudge]:
+        self._ensure_nudge_state()
+        with self._nudge_lock:  # type: ignore[attr-defined]
+            return [n for n in self._nudges.values() if n.job_id == job_id]  # type: ignore[attr-defined]
+
+    def list_pending_nudges_for_node(self, node_id: str) -> List[JobNudge]:
+        self._ensure_nudge_state()
+        with self._nudge_lock:  # type: ignore[attr-defined]
+            return [
+                n
+                for n in self._nudges.values()  # type: ignore[attr-defined]
+                if n.node_id == node_id and n.state == "pending"
+            ]
+
+    def ack_nudge(
+        self,
+        nudge_id: str,
+        *,
+        node_id: str,
+        success: bool,
+        detail: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        self._ensure_nudge_state()
+        with self._nudge_lock:  # type: ignore[attr-defined]
+            nudge = self._nudges.get(nudge_id)  # type: ignore[attr-defined]
+            if not nudge or nudge.node_id != node_id:
+                return False
+            nudge.state = "acked" if success else "failed"
+            nudge.acked_at = time.time()
+            if detail:
+                nudge.detail = dict(detail)
+            return True
+
+
+class MemoryClusterStore(_NudgeStoreMixin, ClusterStore):
     """In-memory store for tests and dev without Postgres."""
 
     def __init__(self) -> None:
@@ -326,6 +401,7 @@ class MemoryClusterStore(ClusterStore):
         self._runs: Dict[str, ProcessRunLog] = {}
         self._log_refs: List[Dict[str, Any]] = []
         self._errors: List[Dict[str, Any]] = []
+        self._ensure_nudge_state()
 
     def ensure_schema(self) -> None:
         return
@@ -596,12 +672,13 @@ class MemoryClusterStore(ClusterStore):
             }
 
 
-class PostgresClusterStore(ClusterStore):
-    """Postgres-backed store using psycopg3."""
+class PostgresClusterStore(_NudgeStoreMixin, ClusterStore):
+    """Postgres-backed store using psycopg3. Nudges are in-process (ephemeral)."""
 
     def __init__(self, database_url: str) -> None:
         self._url = database_url
         self._conn = None
+        self._ensure_nudge_state()
 
     def _connect(self):
         import psycopg

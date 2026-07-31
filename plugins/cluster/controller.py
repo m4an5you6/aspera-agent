@@ -10,12 +10,15 @@ from plugins.cluster.config import ClusterConfig, compute_config_hash
 from plugins.cluster.events import ClusterEventBridge
 from plugins.cluster.cluster_logging import ClusterLogger
 from plugins.cluster.models import (
+    AgentActionLog,
     ClusterEvent,
     GpuInfo,
     HeartbeatPayload,
+    JobNudge,
     JobRecord,
     JobSpec,
     NodeRecord,
+    ProcessRunLog,
     RankAssignment,
     ValidationResult,
     new_id,
@@ -98,15 +101,43 @@ class ClusterController:
         )
         assignment = self.store.get_assignment_for_node(hb.node_id)
         cancel_job_ids: List[str] = []
+        seen: set[str] = set()
         if hb.running_job_id:
             running_job = self.store.get_job(str(hb.running_job_id))
             if running_job and running_job.state in ("stopped", "cancelled"):
                 cancel_job_ids.append(running_job.job_id)
+                seen.add(running_job.job_id)
+        # Also cancel when assignment is stopping / job already stopped even if
+        # the node cleared running_job_id after AutoGoal finally.
+        for job in self.store.list_jobs(limit=100):
+            if job.job_id in seen:
+                continue
+            if job.state not in ("stopped", "cancelled"):
+                continue
+            for a in self.store.list_assignments_for_job(job.job_id):
+                if a.node_id != hb.node_id:
+                    continue
+                if a.state in (
+                    "pending",
+                    "accepted",
+                    "running",
+                    "stopping",
+                    "worker_ready",
+                    "succeeded",
+                ):
+                    cancel_job_ids.append(job.job_id)
+                    seen.add(job.job_id)
+                    break
+        nudges = [
+            n.to_dict()
+            for n in self.store.list_pending_nudges_for_node(hb.node_id)
+        ]
         return {
             "ok": True,
             "master_epoch": self._master_epoch,
             "assignment": assignment.to_dict() if assignment else None,
             "cancel_job_ids": cancel_job_ids,
+            "nudges": nudges,
         }
 
     def status(self) -> Dict[str, Any]:
@@ -372,11 +403,13 @@ class ClusterController:
             return {"success": False, "error": "job not found"}
         assignments = self.store.list_assignments_for_job(job_id)
         logs = self.store.query_logs(job_id=job_id, limit=20)
+        nudges = [n.to_dict() for n in self.store.list_nudges_for_job(job_id)]
         return {
             "success": True,
             "job": job.to_dict(),
             "assignments": [a.to_dict() for a in assignments],
             "recent_logs": logs,
+            "nudges": nudges,
         }
 
     def stop_job(self, job_id: str) -> Dict[str, Any]:
@@ -386,7 +419,14 @@ class ClusterController:
         self.store.update_job_state(job_id, "stopped")
         stopped_assignments = []
         for assignment in self.store.list_assignments_for_job(job_id):
-            if assignment.state in ("pending", "accepted", "running"):
+            if assignment.state in (
+                "pending",
+                "accepted",
+                "running",
+                "worker_ready",
+                "succeeded",
+                "stopping",
+            ):
                 if self.store.ack_assignment(
                     assignment.assignment_id,
                     assignment.node_id,
@@ -406,6 +446,88 @@ class ClusterController:
             "state": "stopped",
             "assignments": stopped_assignments,
         }
+
+    def enqueue_nudge(
+        self,
+        job_id: str,
+        *,
+        type: str,
+        payload: Optional[Dict[str, Any]] = None,
+        route_mode: str = "guide",
+        node_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        job = self.store.get_job(job_id)
+        if not job:
+            return {"success": False, "error": "job not found"}
+        mode = str(route_mode or "guide").strip().lower()
+        allowed = {"record", "queue", "guide", "interrupt", "execute_direct"}
+        if mode not in allowed:
+            return {
+                "success": False,
+                "error": f"invalid route_mode={route_mode!r}; expected one of {sorted(allowed)}",
+            }
+        assignments = self.store.list_assignments_for_job(job_id)
+        if not assignments:
+            return {"success": False, "error": "job has no assignments"}
+        targets = list(node_ids or [])
+        if not targets:
+            targets = [a.node_id for a in assignments]
+        by_node = {a.node_id: a for a in assignments}
+        created: List[JobNudge] = []
+        for node_id in targets:
+            if node_id not in by_node:
+                return {
+                    "success": False,
+                    "error": f"node_id {node_id!r} is not an assignment for job {job_id}",
+                }
+            nudge = JobNudge(
+                nudge_id=new_id("nudge-"),
+                job_id=job_id,
+                node_id=node_id,
+                type=str(type or "").strip() or "steer_text",
+                payload=dict(payload or {}),
+                route_mode=mode,  # type: ignore[arg-type]
+                state="pending",
+            )
+            self.store.create_nudge(nudge)
+            created.append(nudge)
+        self.events.emit(
+            "job_nudge_enqueued",
+            {
+                "job_id": job_id,
+                "type": type,
+                "route_mode": mode,
+                "nudge_ids": [n.nudge_id for n in created],
+                "node_ids": [n.node_id for n in created],
+            },
+            job_id=job_id,
+            route_mode="record",
+        )
+        return {
+            "success": True,
+            "job_id": job_id,
+            "nudges": [n.to_dict() for n in created],
+        }
+
+    def ack_nudge(
+        self,
+        job_id: str,
+        nudge_id: str,
+        *,
+        node_id: str,
+        success: bool,
+        detail: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        ok = self.store.ack_nudge(
+            nudge_id,
+            node_id=node_id,
+            success=success,
+            detail=detail,
+        )
+        if not ok:
+            return {"success": False, "error": "nudge not found or node mismatch"}
+        nudge = self.store.get_nudge(nudge_id)
+        return {"success": True, "nudge": nudge.to_dict() if nudge else None}
 
     def node_action(self, node_id: str, action: str) -> Dict[str, Any]:
         node = self.store.get_node(node_id)

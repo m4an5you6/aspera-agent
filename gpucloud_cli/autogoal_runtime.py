@@ -485,8 +485,10 @@ class AutoGoalRuntime:
         agent_model_hint: str = "",
         task_id: Optional[str] = None,
         runtime_provider: Optional[Dict[str, Any]] = None,
+        retain_agent_on_success: bool = False,
     ) -> AutoGoalRunResult:
         defaults = dict(defaults or {})
+        _retain_agent = False
         inactivity_s = (
             float(inactivity_seconds)
             if inactivity_seconds is not None
@@ -691,6 +693,8 @@ class AutoGoalRuntime:
                     early.details.setdefault("segment_index", segment_index)
                     early.details.setdefault("segments_used", segment_index)
                     early.details.setdefault("max_segments", segments)
+                    if retain_agent_on_success and early.success:
+                        _retain_agent = True
                     return early
 
                 last_reason = (
@@ -732,6 +736,8 @@ class AutoGoalRuntime:
                     f"({segments}/{segments} segments × {iters} turns)"
                 )
                 final.error = final.summary
+            if retain_agent_on_success and final.success:
+                _retain_agent = True
             return final
         except Exception as exc:
             _log.exception("autogoal runtime failed for %s", session_id)
@@ -746,7 +752,8 @@ class AutoGoalRuntime:
         finally:
             # Match CLI: forget once at end of the run; never close() between
             # segments (close can kill ProcessRegistry bg procs for the task).
-            if forget_agent is not None:
+            # Inference cluster keeps the agent on success for post-ready nudges.
+            if forget_agent is not None and not _retain_agent:
                 try:
                     forget_agent(session_id)
                 except Exception:

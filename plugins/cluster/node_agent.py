@@ -116,6 +116,9 @@ class NodeAgent:
                 resp = self.heartbeat_once()
                 for job_id in resp.get("cancel_job_ids") or []:
                     self._stop_job(str(job_id))
+                for nudge in resp.get("nudges") or []:
+                    if isinstance(nudge, dict):
+                        self._handle_nudge(nudge)
                 assignment_raw = resp.get("assignment")
                 if assignment_raw and not self._running_job_id:
                     assignment = RankAssignment(**assignment_raw)
@@ -126,6 +129,23 @@ class NodeAgent:
                     message=str(exc),
                     node_id=self.cfg.node_id,
                 )
+
+    def _handle_nudge(self, nudge: Dict[str, Any]) -> None:
+        from plugins.cluster.nudge_dispatch import dispatch_nudge
+
+        def _ack(job_id: str, nudge_id: str, **kwargs: Any) -> Dict[str, Any]:
+            try:
+                return self.client.ack_nudge(job_id, nudge_id, **kwargs)
+            except Exception as exc:
+                self.logger.log_error(
+                    error_type="nudge_ack",
+                    message=str(exc),
+                    job_id=job_id,
+                    node_id=self.cfg.node_id,
+                )
+                return {"success": False, "error": str(exc)}
+
+        dispatch_nudge(nudge, node_id=self.cfg.node_id, ack_fn=_ack)
 
     def stop(self) -> None:
         self._stop.set()
@@ -248,7 +268,6 @@ class NodeAgent:
 
         from plugins.inference_adapters.agent_driver import (
             get_inference_driver,
-            interrupt_inference_agent,
             run_inference_agent,
         )
         from plugins.inference_adapters.registry import create_adapter
@@ -406,10 +425,9 @@ class NodeAgent:
                         adapter=adapter,
                     )
             finally:
-                # End the deploy agent only. Keep the serve process (e.g. vLLM)
-                # running after ready so clients can keep using visit_host/port.
-                # Explicit cluster cancel still calls stop_job_adapter via _stop_job.
-                interrupt_inference_agent(assignment.job_id, "inference thread exiting")
+                # Keep serve (vLLM) and retain AIAgent on success for post-ready
+                # nudges. Do NOT interrupt here — only cluster stop / nudge
+                # route_mode=interrupt clears the agent.
                 self._running_job_id = None
                 self._stopping_jobs.discard(assignment.job_id)
 
@@ -572,30 +590,36 @@ class NodeAgent:
     def _stop_job(self, job_id: str) -> None:
         self._stopping_jobs.add(job_id)
         try:
-            from plugins.inference_adapters.agent_driver import interrupt_inference_agent
+            from plugins.inference_adapters.agent_driver import (
+                forget_inference_agent,
+                interrupt_inference_agent,
+            )
 
             interrupt_inference_agent(job_id, "cluster stop requested")
+            forget_inference_agent(job_id)
         except Exception:
             pass
         try:
             from plugins.inference_adapters.runtime import stop_job_adapter
 
-            if stop_job_adapter(job_id):
-                if self._running_job_id == job_id:
-                    self._running_job_id = None
-                return
+            stop_job_adapter(job_id)
         except Exception:
             pass
         with _ACTIVE_LOCK:
             proc = _ACTIVE_PROCS.get(job_id)
-        if not proc:
-            if self._running_job_id == job_id:
-                self._running_job_id = None
-            return
+        if proc:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+        if self._running_job_id == job_id:
+            self._running_job_id = None
         try:
-            proc.terminate()
-        except OSError:
+            # Best-effort: mark assignment stopped if we still know the job.
             pass
+        except Exception:
+            pass
+        self._stopping_jobs.discard(job_id)
 
 
 def _agent_version() -> str:

@@ -690,9 +690,242 @@ def test_node_agent_stop_job_terminates_active_process(runtime_stack):
         agent._running_job_id = "job-stop"
         agent._stop_job("job-stop")
         assert proc.terminated is True
-        assert "job-stop" in agent._stopping_jobs
+        assert agent._running_job_id is None
+        assert "job-stop" not in agent._stopping_jobs
     finally:
         _ACTIVE_PROCS.pop("job-stop", None)
+
+
+def test_stop_cancel_without_running_job_id(runtime_stack):
+    """Stop must cancel via assignment state even when worker cleared running_job_id."""
+    _cfg, store, _logger, _events, controller = runtime_stack
+    controller.startup()
+    store.upsert_node(NodeRecord(
+        node_id="node-0",
+        advertised_addr="10.0.0.1",
+        state="ready",
+        gpus=[GpuInfo(index=0)],
+    ))
+    result = controller.submit_job({
+        "script": "train.py",
+        "nnodes": 1,
+        "nproc_per_node": 1,
+        "framework": "placeholder",
+    })
+    assert result["success"] is True
+    job_id = result["job"]["job_id"]
+    assignment_id = result["assignments"][0]["assignment_id"]
+    assert store.ack_assignment(assignment_id, "node-0", 1, "running")
+
+    stopped = controller.stop_job(job_id)
+    assert stopped["success"] is True
+
+    after = controller.heartbeat(HeartbeatPayload(
+        node_id="node-0",
+        state="ready",
+        running_job_id="",  # cleared after AutoGoal finally
+    ))
+    assert after["cancel_job_ids"] == [job_id]
+
+
+def test_nudge_enqueue_and_heartbeat_delivery(runtime_stack):
+    _cfg, store, _logger, _events, controller = runtime_stack
+    controller.startup()
+    store.upsert_node(NodeRecord(
+        node_id="node-0",
+        advertised_addr="10.0.0.1",
+        state="ready",
+        gpus=[GpuInfo(index=0)],
+    ))
+    result = controller.submit_job({
+        "script": "train.py",
+        "nnodes": 1,
+        "nproc_per_node": 1,
+        "framework": "placeholder",
+    })
+    job_id = result["job"]["job_id"]
+
+    bad = controller.enqueue_nudge(
+        job_id,
+        type="steer_text",
+        payload={"text": "hi"},
+        route_mode="steer",  # invalid — must use guide
+    )
+    assert bad["success"] is False
+
+    enq = controller.enqueue_nudge(
+        job_id,
+        type="steer_text",
+        payload={"text": "please sync lora"},
+        route_mode="guide",
+    )
+    assert enq["success"] is True
+    assert len(enq["nudges"]) == 1
+    nudge_id = enq["nudges"][0]["nudge_id"]
+
+    hb = controller.heartbeat(HeartbeatPayload(node_id="node-0", state="ready"))
+    assert len(hb["nudges"]) == 1
+    assert hb["nudges"][0]["nudge_id"] == nudge_id
+    assert hb["nudges"][0]["route_mode"] == "guide"
+
+    status = controller.job_status(job_id)
+    assert len(status["nudges"]) == 1
+
+    acked = controller.ack_nudge(
+        job_id,
+        nudge_id,
+        node_id="node-0",
+        success=True,
+        detail={"action": "steer"},
+    )
+    assert acked["success"] is True
+    hb2 = controller.heartbeat(HeartbeatPayload(node_id="node-0", state="ready"))
+    assert hb2["nudges"] == []
+
+
+def test_dispatch_nudge_route_modes(runtime_stack):
+    from plugins.cluster.nudge_dispatch import dispatch_nudge
+    from plugins.inference_adapters.agent_driver import (
+        forget_inference_agent,
+        get_inference_agent,
+        remember_inference_agent,
+    )
+
+    job_id = "job-nudge-modes"
+    forget_inference_agent(job_id)
+    acks: list = []
+
+    def _ack(jid, nid, **kwargs):
+        row = {"job_id": jid, "nudge_id": nid, **kwargs}
+        acks.append(row)
+        return {"success": True, **row}
+
+    # record — no agent needed
+    dispatch_nudge(
+        {
+            "job_id": job_id,
+            "nudge_id": "n1",
+            "type": "note",
+            "route_mode": "record",
+            "payload": {"text": "log only"},
+        },
+        node_id="node-0",
+        ack_fn=_ack,
+    )
+    assert acks[-1]["detail"]["action"] == "recorded"
+
+    # interrupt with no agent → already_idle
+    dispatch_nudge(
+        {
+            "job_id": job_id,
+            "nudge_id": "n2",
+            "type": "stop_agent",
+            "route_mode": "interrupt",
+            "payload": {"text": "bye"},
+        },
+        node_id="node-0",
+        ack_fn=_ack,
+    )
+    assert acks[-1]["detail"]["action"] == "already_idle"
+
+    # guide — relaunches stub agent then follow-up
+    dispatch_nudge(
+        {
+            "job_id": job_id,
+            "nudge_id": "n3",
+            "type": "steer_text",
+            "route_mode": "guide",
+            "payload": {"text": "install foo"},
+        },
+        node_id="node-0",
+        ack_fn=_ack,
+    )
+    assert acks[-1]["detail"]["action"] in ("followup_turn", "steer")
+    assert get_inference_agent(job_id) is not None
+
+    # queue — with agent present
+    dispatch_nudge(
+        {
+            "job_id": job_id,
+            "nudge_id": "n4",
+            "type": "steer_text",
+            "route_mode": "queue",
+            "payload": {"text": "next turn please"},
+        },
+        node_id="node-0",
+        ack_fn=_ack,
+    )
+    assert acks[-1]["detail"]["action"] in ("queued_started", "queued_busy")
+
+    # interrupt with live agent
+    class FakeAgent:
+        def __init__(self):
+            self.interrupted = None
+
+        def interrupt(self, reason=""):
+            self.interrupted = reason
+
+        def steer(self, text):
+            return True
+
+    live = FakeAgent()
+    remember_inference_agent(job_id, live)
+    dispatch_nudge(
+        {
+            "job_id": job_id,
+            "nudge_id": "n5",
+            "type": "hard_stop",
+            "route_mode": "interrupt",
+            "payload": {"text": "cluster nudge interrupt"},
+        },
+        node_id="node-0",
+        ack_fn=_ack,
+    )
+    assert acks[-1]["detail"]["action"] == "interrupt"
+    assert live.interrupted == "cluster nudge interrupt"
+    forget_inference_agent(job_id)
+
+
+def test_stop_job_interrupts_and_forgets_agent(runtime_stack):
+    cfg, store, logger, _events, _controller = runtime_stack
+    from plugins.inference_adapters.agent_driver import (
+        forget_inference_agent,
+        get_inference_agent,
+        remember_inference_agent,
+    )
+
+    job_id = "job-stop-agent"
+
+    class FakeAgent:
+        def __init__(self):
+            self.interrupted = None
+
+        def interrupt(self, reason=""):
+            self.interrupted = reason
+
+    fake = FakeAgent()
+    remember_inference_agent(job_id, fake)
+    try:
+        agent = NodeAgent(cfg, store, logger)
+        with patch(
+            "plugins.inference_adapters.runtime.stop_job_adapter",
+            return_value=None,
+        ):
+            agent._stop_job(job_id)
+        assert fake.interrupted == "cluster stop requested"
+        assert get_inference_agent(job_id) is None
+    finally:
+        forget_inference_agent(job_id)
+
+
+def test_launch_inference_finally_keeps_agent_reference():
+    """Source contract: AutoGoal finally must not interrupt by default."""
+    import inspect
+    from plugins.cluster import node_agent as na
+
+    src = inspect.getsource(na.NodeAgent._launch_inference)
+    assert "interrupt_inference_agent" not in src
+    assert "Keep serve" in src or "Do NOT interrupt" in src
 
 
 def test_node_agent_marks_failed_assignment_terminal(runtime_stack, tmp_path):

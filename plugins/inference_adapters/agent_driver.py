@@ -93,6 +93,11 @@ def forget_inference_agent(job_id: str) -> None:
         _AGENTS.pop(str(job_id), None)
 
 
+def get_inference_agent(job_id: str) -> Any:
+    with _AGENTS_LOCK:
+        return _AGENTS.get(str(job_id))
+
+
 def interrupt_inference_agent(job_id: str, reason: str = "inference job stopped") -> bool:
     with _AGENTS_LOCK:
         agent = _AGENTS.get(str(job_id))
@@ -104,6 +109,20 @@ def interrupt_inference_agent(job_id: str, reason: str = "inference job stopped"
             return True
     except Exception:
         _log.exception("failed to interrupt inference agent for %s", job_id)
+    return False
+
+
+def steer_inference_agent(job_id: str, text: str) -> bool:
+    with _AGENTS_LOCK:
+        agent = _AGENTS.get(str(job_id))
+    if agent is None:
+        return False
+    try:
+        steer = getattr(agent, "steer", None)
+        if callable(steer):
+            return bool(steer(text))
+    except Exception:
+        _log.exception("failed to steer inference agent for %s", job_id)
     return False
 
 
@@ -491,6 +510,7 @@ def run_inference_agent(
         defaults=defaults,
         agent_model_hint=str(rt.get("agent_model") or ""),
         task_id=f"inference-{job_id}",
+        retain_agent_on_success=True,
     )
 
     success = bool(run_result.success)

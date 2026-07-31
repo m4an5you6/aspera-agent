@@ -150,6 +150,28 @@ class ClusterEvent:
         return asdict(self)
 
 
+NudgeState = Literal["pending", "acked", "failed"]
+
+
+@dataclass
+class JobNudge:
+    """Master-selected delivery of a command to one assignment node."""
+
+    nudge_id: str
+    job_id: str
+    node_id: str
+    type: str
+    payload: Dict[str, Any] = field(default_factory=dict)
+    route_mode: RouteMode = "guide"
+    state: NudgeState = "pending"
+    created_at: float = field(default_factory=_now)
+    acked_at: Optional[float] = None
+    detail: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
 @dataclass
 class AgentActionLog:
     action_id: str

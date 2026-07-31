@@ -103,13 +103,45 @@ class ClusterHTTPHandler(BaseHTTPRequestHandler):
         if path == "/api/jobs/submit" and method == "POST":
             return 200, ctrl.submit_job(body, request_id=body.get("request_id", ""))
 
-        if path.startswith("/api/jobs/") and method == "GET":
-            job_id = path.split("/")[-1]
-            return 200, ctrl.job_status(job_id)
-
         if path.startswith("/api/jobs/") and path.endswith("/stop") and method == "POST":
             job_id = path.split("/")[-2]
             return 200, ctrl.stop_job(job_id)
+
+        if path.startswith("/api/jobs/") and path.endswith("/nudge") and method == "POST":
+            # /api/jobs/{id}/nudge
+            parts = path.strip("/").split("/")
+            job_id = parts[2] if len(parts) >= 3 else ""
+            return 200, ctrl.enqueue_nudge(
+                job_id,
+                type=str(body.get("type") or "steer_text"),
+                payload=body.get("payload") if isinstance(body.get("payload"), dict) else {},
+                route_mode=str(body.get("route_mode") or "guide"),
+                node_ids=body.get("node_ids") if isinstance(body.get("node_ids"), list) else None,
+            )
+
+        if (
+            path.startswith("/api/jobs/")
+            and "/nudge/" in path
+            and path.endswith("/ack")
+            and method == "POST"
+        ):
+            # /api/jobs/{id}/nudge/{nudge_id}/ack
+            parts = path.strip("/").split("/")
+            # api jobs {id} nudge {nudge_id} ack
+            job_id = parts[2] if len(parts) >= 6 else ""
+            nudge_id = parts[4] if len(parts) >= 6 else ""
+            return 200, ctrl.ack_nudge(
+                job_id,
+                nudge_id,
+                node_id=str(body.get("node_id") or ""),
+                success=bool(body.get("success", True)),
+                detail=body.get("detail") if isinstance(body.get("detail"), dict) else None,
+            )
+
+        # Generic job GET after more-specific /stop /nudge routes.
+        if path.startswith("/api/jobs/") and method == "GET" and path.count("/") == 3:
+            job_id = path.split("/")[-1]
+            return 200, ctrl.job_status(job_id)
 
         if path.startswith("/api/jobs/") and path.endswith("/outcome") and method == "POST":
             job_id = path.split("/")[-2]
