@@ -143,6 +143,45 @@ must produce the same HF markers.
 
 Success: dir has `adapter_config.json` + `adapter_model.safetensors`.
 
+**A2. Proven single-node path: `--adapters` (use when A hits distcp bugs)**
+
+`--mcore_adapter` loads the distcp tree (`iter_N/__*.distcp`) and on
+megatron-core 0.16.1 can die with
+`TypeError: object of type '_io.BytesIO' has no len()` (torch.py
+`_replace_sharded_keys_with_state_dict_keys`); non-master nodes also lack
+`latest_checkpointed_iteration.txt` / `metadata.json` / `.metadata` (only the
+master writes them), causing `iter_0000000 does not exist` / `is not a
+distributed checkpoint` / `.metadata No such file`. Also: `--ckpt_dir` is NOT
+a CLI arg for `megatron export` (internal; passing it fails with
+`remaining_argv: ['--ckpt_dir', ...]`).
+
+Instead load the PEFT safetensors the training run already saved on the master
+(`<output>/checkpoint-<N>/adapter_model.safetensors`) — TP=1, single node:
+
+```bash
+export NPROC_PER_NODE=1 NNODES=1 NODE_RANK=0 MASTER_ADDR=127.0.0.1 MASTER_PORT=29501
+"$SWIFT_MEGATRON" export \
+  --to_hf true \
+  --model "<base_hf_model_dir>" \
+  --model_type qwen3_5 \
+  --adapters "<checkpoint_dir>" \
+  --merge_lora false \
+  --tuner_type lora \
+  --tensor_model_parallel_size 1 \
+  --pipeline_model_parallel_size 1 \
+  --output_dir "<job_dir>/hf_lora_<iter>" \
+  --exist_ok true \
+  --bf16 true
+```
+
+megatron export always runs through torch.distributed.run — without the env
+vars above it dies `ValueError: environment variable RANK expected, but not
+set`. The output adapter keeps megatron layer names
+(`model.language_model.layers.N.linear_attn.in_proj_a/...`); do NOT hand-rename
+to HF names — vLLM >= 0.19.1 loads them natively for qwen3_5 (see
+gpucloud-inference-deployment `references/qwen35-vllm-lora-multinode.md`).
+Full detail: `references/qwen-lora-adapters-export.md`.
+
 **B. If SWIFT fails** — manual LoRA convert only when architecture is
 supported (not MoE / attention-only LoRA). Otherwise fail with diagnostic.
 
@@ -180,4 +219,8 @@ Then `inference_start_vllm` / health / `inference_report_ready`.
 ## See also
 
 - `references/export-recipes.md` — ordered steps, flags, readiness checks.
+- `references/qwen-lora-adapters-export.md` — proven single-node `--adapters`
+  export for Qwen LoRA (avoids distcp BytesIO bug / missing tracker-metadata on
+  workers); output keeps megatron layer names and loads natively in
+  vLLM >= 0.19.
 - Skill `gpucloud-inference-deployment` — serve after export.

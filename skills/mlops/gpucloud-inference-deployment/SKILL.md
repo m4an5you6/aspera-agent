@@ -29,6 +29,17 @@ enforce a full compatibility-chain decision before install and before serve.
 - Platform called `POST /api/inference/agent/deploy` and bootstrap already
   started `gpucloud gateway` on this host.
 
+## Direct serve on the user's own nodes (no platform tools)
+
+When the user asks to "open the inference service / deploy the model" on their
+training nodes (not a GPUCLOUD cluster assignment), the expected deliverable is
+a STANDING vLLM serve + curl POST. The user explicitly prefers this over
+one-shot SSH-executed python scripts ("一般开启服务的话只用curl,post的命令不就可以了吗") —
+deploy the serve, then hand over curl commands. Verified recipe (serve CLI with
+`--lora-modules`, readiness poll, curl POST with `"model": <lora-name>`,
+public access via the real public IP, measured timings):
+`references/direct-vllm-serve-lora.md`.
+
 ## Prerequisites
 
 - `model.api_key` in `~/.gpucloud/config.yaml` (agent LLM).
@@ -315,6 +326,48 @@ Failure: `success=false`, `details.phase` in
 - Prefer managed start tool so cluster stop can kill the serve PID.
 - Megatron / `swift_output` raw checkpoints need
   `gpucloud-megatron-weight-export` before serve.
+- vLLM 0.17.x pins `transformers<5`; models with `tokenizer_class:
+  TokenizersBackend` (transformers 5.x) fail at startup with `Tokenizer class
+  ... does not exist`. Use vLLM >= 0.19.1 (allows `transformers>=4.56`,
+  excludes 5.0–5.5.0; `transformers==5.12.1` verified) — same
+  `torch==2.10.0` pin.
+- Qwen3.5 (`qwen3_5`) megatron-trained LoRA adapters (megatron layer names:
+  `in_proj_a/in_proj_b/in_proj_qkv/in_proj_z`) load natively in vLLM >= 0.19:
+  `qwen3_5.py` stacked_params_mapping `in_proj_qkvz <- in_proj_qkv +
+  in_proj_z`, `in_proj_ba <- in_proj_b + in_proj_a`, plus the `language_model`
+  LoRA wrapper. Serve base HF + adapter; no merged model.
+- vLLM 0.19 LoRA API: no `llm.load_lora`; build
+  `LoRARequest(lora_name=..., lora_int_id=..., lora_path=...)` imported from
+  `vllm.lora.request` (NOT top-level `vllm`) and pass `lora_request=` to
+  `generate()`.
+- vLLM driver scripts MUST have `if __name__ == '__main__':` — EngineCore
+  spawn re-imports the main module and dies with
+  `RuntimeError: An attempt has been made to start a new process before the
+  current process has finished its bootstrapping phase.`
+- ray 2.48.x on py3.10 fails with `ValueError: <object ...> is not a valid
+  Sentinel` — use `ray[cgraph]==2.56.1`. `ray start --head` without dashboard
+  deps -> `Cannot include dashboard with missing packages` -> add
+  `--include-dashboard false`.
+- After a failed multi-node run, `ray status` shows GPUs `reserved in
+  placement groups` and the next serve fails `Current node has no GPU
+  available`; recover with `ray stop --force` on head AND workers, then
+  restart the cluster. A stale EngineCore holding VRAM gives `Free memory ...
+  less than desired GPU memory utilization` — kill it before retrying.
+- uv-created venvs may lack `bin/activate`; call the venv python by absolute
+  path (`<venv>/bin/python`), not `source .../activate`.
+- Qwen3.5 multi-node TP=2 detail (ray head/worker, serve flags, LoRARequest
+  smoke): `references/qwen35-vllm-lora-multinode.md`.
+- **Concurrent agent sessions deploying the same node kill each other** (seen
+  live: two GPUCLOUD sessions in separate terminals both deploying vLLM
+  TP=2; each session's cleanup killed the other's EngineCore/raylet/tmux, so
+  every attempt failed with SIGTERM and no error log). Before deploying,
+  `ps aux | grep gpucloud` and check for a second live session — if found,
+  stop and coordinate (wait / go read-only) instead of racing. Run serve
+  inside tmux or setsid so a peer cleanup cannot take it down; never
+  `pkill -f` broad `vllm`/`ray` patterns on a multi-session node.
+- Cross-node NCCL smoke before any TP>1: `scripts/nccl_smoke.py` (rank0 +
+  rank1 one-liners, expect allreduce=3.0), run with the serving venv's python
+  so that venv's own libnccl is validated against the driver.
 - Qwen LoRA: existing `hf_lora_*` → reuse on rank0; never build `merged_model/`.
 - Multi-node worker: sync `hf_lora_*` to every worker — vLLM ≥0.17 loads adapter
   weights locally on each Ray worker.
@@ -323,6 +376,29 @@ Failure: `success=false`, `details.phase` in
   during `_capture_cudagraphs`. Fix: pass `enforce_eager=true` in
   `adapter_options` to skip CUDA graph capture. This also avoids the
   `RuntimeError: Engine core initialization failed` cascade.
+- **vLLM ≥0.17 removed `LLM.load_lora()`** (AttributeError) AND the top-level
+  `from vllm import LoRARequest` (ImportError). Verified on vLLM 0.19.1:
+  `from vllm.lora.request import LoRARequest` (internal module, not re-exported
+  at top level), then `lora_req = LoRARequest(lora_name=..., lora_int_id=1,
+  lora_path=...)` and `llm.generate(prompts, params, lora_request=lora_req)`.
+  Check `inspect.signature(LLM.generate)` for the `lora_request` kwarg before
+  writing the smoke script.
+- **Public reachability: verify the node's ACTUAL public IP before claiming a
+  port is blocked.** NAT-gateway public IPs change and stale memory lies (a
+  wrong public IP once made us wrongly lecture the user about NAT/DNAT
+  forwarding while their ports were already open — the user corrected us:
+  "我已经放行了所有端口"). Get the IP from the user, then test from the PEER
+  node: `ssh <peer> 'curl -s -m 8 -o /dev/null -w "%{http_code}"
+  http://<public-ip>:8000/health'` — HTTP 200 means public access works; say
+  so and hand over the public curl. When the user says ports are open, verify
+  first — don't argue.
+- **GPU memory conflicts between concurrent smoke tests**: two smoke scripts
+  started minutes apart both request `gpu_memory_utilization=0.85`; the second
+  fails with `ValueError: Free memory on device cuda:0 (5.36/23.68 GiB) on
+  startup is less than desired GPU memory utilization`. Before launching any
+  vLLM smoke/serve, check `nvidia-smi --query-compute-apps=...` for another
+  EngineCore already holding VRAM; if one is running, wait for it or lower
+  `gpu_memory_utilization`.
 
 ## Verification
 

@@ -105,14 +105,33 @@ On RTX 3090 (24GB) with Qwen3.6-35B-A3B (35B MoE):
   but 0.8.0–0.8.2 pin unpublished `xgrammar==0.1.16` (landmine). Prefer
   vLLM 0.8.3 which pins `xgrammar==0.1.17`. For CUDA 12.4 drivers, vLLM
   0.8.3 + torch 2.6.0+cu124 is a viable combination (both available on
-  Tsinghua mirror). vLLM ≥0.15.0 requires torch ≥2.9.1 (cu128+) and is
-  incompatible with CUDA 12.4 drivers without a driver upgrade.
+  Tsinghua mirror). vLLM ≥0.15.0 requires torch ≥2.9.1 (cu128+).
+  **Do NOT pre-BLOCK cu128 on a 550.x (nominal "CUDA 12.4") driver** —
+  cu128 USER-SPACE wheels are legal inside the 12.x driver window. Verified
+  2026-08: vLLM 0.19.1 + torch 2.10.0+cu128 + NCCL 2.27.5+cuda12.9 runs TP=1
+  AND cross-node TP=2 on driver 550.142; only genuinely CUDA-13-era stacks
+  fail there. Smoke-test in the serving venv before declaring incompatibility
+  (see gpucloud-inference-deployment: intentional cu128 = exact pins +
+  dedicated venv + CUDA smoke).
 - **Resolution**: larger GPU (48GB+) or driver upgrade to ≥570 (CUDA 12.8+)
   with vLLM 0.17+ for native Qwen3.6 MoE; **or** vLLM 0.8.3 + Transformers
   fallback for CUDA 12.4 drivers.
 
 ## Pitfalls
 
+- **Benign cross-node warnings on RTX 3090 (8.6) — do NOT chase them**:
+  `SymmMemCommunicator: Device capability 8.6 not supported, communicator is
+  not available` and `Custom allreduce is disabled because this process group
+  spans across nodes` appear on EVERY cross-node TP vLLM startup on 8.6 GPUs
+  and mean nothing is wrong. The real failure signal is EngineCore dying AFTER
+  the `world_size=2 rank 0/1 ... backend=nccl` init lines (log ends with
+  `Shutting down Ray distributed executor` + SIGTERM) — that is leftover
+  state, not NCCL/code: stale EngineCore holding VRAM, placement-group GPU
+  reservations after a failed attempt, or a second agent session's cleanup
+  killing the process. Triage order: `ray stop --force` on head AND workers →
+  `rm -rf /tmp/ray` → kill stale EngineCore (`nvidia-smi --query-compute-apps`)
+  → rebuild cluster → retry. See gpucloud-inference-deployment for the
+  concurrent-session variant.
 - `ray start` on Python 3.10 with click>=8.4.2 breaks with `ValueError: <object object at ...> is not a valid Sentinel` during `copy.deepcopy(command)` in `ray/scripts/scripts.py:add_command_alias`. Fix: `pip install click==8.1.7 --no-deps`.
 - vLLM 0.7.3 requires ray==2.40.0 but ray 2.40.0 pulls click 8.4.2 via `click>=8.1.7`. Always pin click separately after any Ray install.
 - transformers 5.14.1 removes `all_special_tokens_extended`; vLLM 0.7.3 needs

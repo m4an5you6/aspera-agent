@@ -22,6 +22,10 @@ Always verify with the actual worker Python:
 python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.device_count())"
 ```
 
+The wheel's CUDA suffix (+cuXXX) must match the node driver. torch 2.13.0+cu130 on a CUDA-12.4-era driver (e.g. 550.x, warning "The NVIDIA driver on your system is too old (found version 12040)") reports `torch.cuda.is_available() == False` even though the wheel installs cleanly. Fix: install the matching wheel, e.g. torch 2.6.0+cu124 for driver 550 / CUDA 12.4, then re-verify with the snippet above (including a matmul).
+
+transformer-engine (required by the Megatron-SWIFT path) source builds via uv/pip frequently fail with `RuntimeError: Error compiling objects for extension` (ninja compile of the CUDA extensions). Repeated rebuilds rarely fix it. Prefer a prebuilt wheel for the exact torch build, or build with `--no-build-isolation` against a CUDA toolkit matching torch, and verify `import transformer_engine` before launching training.
+
 ## Megatron-LM Data Preparation
 
 Megatron `preprocess_data.py` expects JSONL, not raw text. Convert each record to a JSON object and pass the matching text key, for example `--json-keys text`.
