@@ -14,6 +14,8 @@ metadata:
       - gpt2 multi gpu training
       - gpucloud training yaml
       - backend training config
+      - training progress status
+      - 进行到哪一步
 ---
 
 # GPUCLOUD SFT and Training
@@ -79,8 +81,21 @@ Use backend GPU allocation data to produce one worker task per node. When each c
 - rank 0 aligns with `master_node_id` or the selected master GPU.
 - communication is owned by Megatron/PyTorch/NCCL or Megatron-SWIFT; GPUCLOUD only starts and monitors local worker processes.
 
+## Verifying Progress of a Running Job
+
+When asked "what step is the training at" / "现在进行到哪一步了" for a
+multi-node Megatron-SWIFT job, answer with a per-node READ-ONLY status report:
+torch/CUDA availability, matching ms-swift/megatron-core/mcore-bridge versions
+across nodes, transformer_engine import, model shard completeness (index json vs
+safetensors), dataset format, GPU utilization, and whether a previous agent
+session is still alive and modifying the venv. Do not propose or start fixes
+until asked. See `references/dual-node-training-status.md` for the checklist and
+exact commands.
+
 ## References
 
 - Read `references/backend-training-contract.md` for backend field names and endpoint lifecycle.
 - Read `references/distributed-gpu-mapping.md` for GPU ID to node/rank mapping rules.
 - Read `references/megatron-swift-qwen-sft.md` for Qwen LoRA SFT preset and Megatron-SWIFT details.
+- Read `references/dual-node-training-status.md` for the per-node status-check workflow and setup pitfalls (torch wheel vs driver CUDA version, transformer-engine builds, HF xet 401 mirror workaround).
+- Read `references/dual-node-training-ops-pitfalls.md` for runtime ops pitfalls: merged-checkpoint disk fill, rank1 EXIT=247 port-timing, tmux wrap, no-auto-resume, watchdog pattern, pkill self-match.

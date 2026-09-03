@@ -36,8 +36,14 @@ Verified 2026-08 on China domestic DC machines (RTX 3090 VMs, ~100Mbps egress, s
 
 - `huggingface-cli` is REMOVED in new huggingface_hub — use `hf download` (prints a deprecation hint if you try the old name).
 - New huggingface_hub defaults to **xet (CAS) transfer** which 401s against hf-mirror: `RuntimeError: ... CAS Client Error: HTTP status client error (401 Unauthorized), domain: https://cas-server.xethub.hf.co/...`. Fix: `export HF_HUB_DISABLE_XET=1` (and `HF_HUB_ENABLE_HF_TRANSFER=0`).
-- hf-mirror `/api/models/<id>` / `/api/datasets/<id>` return 401 for direct lookups, but `/api/models?search=...` and `/api/datasets?search=...` work WITHOUT auth. Use search to locate repos.
+- hf-mirror REST API is fully usable from CN via plain curl, NO auth needed for public repos (verified 2026-08):
+  - List/search: `curl 'https://hf-mirror.com/api/models?author=google&search=gemma&limit=100'` (owner filter + keyword; datasets use `/api/datasets`).
+  - Metadata: `curl 'https://hf-mirror.com/api/models/<owner>/<name>'` → JSON with downloads, createdAt, lastModified, likes, license tags. Direct per-repo lookup WORKS without auth for public repos (earlier 401 reports only hit auth-gated/private repos).
+  - Model card: `curl 'https://hf-mirror.com/<owner>/<repo>/raw/main/README.md'` → full spec table (param counts, context length, modalities, benchmarks, license). This is the fastest way to answer "what's the latest <vendor> series / what sizes exist" from a CN box with zero web access.
+  - **Exact bf16 weight size for VRAM capacity planning**: `curl -sL 'https://hf-mirror.com/<owner>/<repo>/resolve/main/model.safetensors.index.json'` → `metadata.total_size` (bytes ≈ params × 2). MUST pass `-L`: hf-mirror 302-redirects file URLs to `*.aws.cdn.hf.co` (xet-bridge) and those CDN redirects ARE reachable from CN — only huggingface.co itself is blocked. Fall back to `pytorch_model.bin.index.json` if the safetensors index 404s. Compare total_size vs total VRAM (6×RTX3090 = 144GB) to decide bf16 vs FP8/4-bit per model.
+  - Org-wide enumeration in release order: `curl 'https://hf-mirror.com/api/models?author=moonshotai&limit=100'` (downloads/likes) + per-repo `curl 'https://hf-mirror.com/api/models/<id>'` for `createdAt` (chronological). Full recipe verified 2026-08 for the 19-repo Kimi/moonshotai org: K2-family repos are 0.6–1.6TB (never fit 6×3090 even 4-bit), Linear-48B-A3B = 98GB bf16 (fits), Dev-72B = 145GB (needs FP8/4-bit).
 - HuggingFace model search via hf-mirror is the reliable way to find the real owner of a model the user named (e.g. exact match found via `search=Qwen3.5-9B-Claude-distill`).
+- ModelScope listing API (`https://modelscope.cn/api/v1/models?Name=...`) returns 404 — do NOT use it for model discovery; hf-mirror search API is the reliable listing path.
 
 ## ModelScope quirks
 
