@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@gpucloud/ink": ["src/types/gpucloud-ink.d.ts"]
+    }
+  }
+}

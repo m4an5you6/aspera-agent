@@ -1,0 +1,146 @@
+import pytest
+
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.base import MessageEvent, MessageType
+from gateway.run import GatewayRunner
+from gateway.session import SessionSource
+from gpucloud_cli import autogoals, goals
+
+
+class _FakeSessionEntry:
+    session_id = "sid-gateway-goal-config"
+
+
+class _FakeSessionStore:
+    def __init__(self):
+        self.entry = _FakeSessionEntry()
+
+    def get_or_create_session(self, source):
+        return self.entry
+
+    def _generate_session_key(self, source):
+        return "agent:main:discord:channel:goal-config"
+
+
+@pytest.mark.asyncio
+async def test_gateway_goal_uses_goals_max_turns_from_full_config(tmp_path, monkeypatch):
+    """Gateway /goal should honor top-level goals.max_turns from config.yaml."""
+    home = tmp_path / ".gpucloud"
+    home.mkdir()
+    (home / "config.yaml").write_text("goals:\n  max_turns: 7\n", encoding="utf-8")
+    monkeypatch.setenv("GPUCLOUD_HOME", str(home))
+    goals._DB_CACHE.clear()
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
+    )
+    runner.session_store = _FakeSessionStore()
+    runner.adapters = {}
+    runner._queued_events = {}
+
+    event = MessageEvent(
+        text="/goal ship the benchmark",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="chat-goal-config",
+            chat_type="channel",
+            user_id="user-goal-config",
+        ),
+        message_id="msg-goal-config",
+    )
+
+    response = await GatewayRunner._handle_goal_command(runner, event)
+
+    try:
+        assert "⊙ Goal set (7-turn budget): ship the benchmark" in response
+        state = goals.GoalManager("sid-gateway-goal-config").state
+        assert state is not None
+        assert state.max_turns == 7
+    finally:
+        goals._DB_CACHE.clear()
+
+
+@pytest.mark.asyncio
+async def test_gateway_autogoal_uses_autogoals_max_turns_from_full_config(tmp_path, monkeypatch):
+    home = tmp_path / ".gpucloud"
+    home.mkdir()
+    (home / "config.yaml").write_text("autogoals:\n  max_turns: 77\n", encoding="utf-8")
+    monkeypatch.setenv("GPUCLOUD_HOME", str(home))
+    goals._DB_CACHE.clear()
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
+    )
+    runner.session_store = _FakeSessionStore()
+    runner.adapters = {}
+    runner._queued_events = {}
+
+    event = MessageEvent(
+        text="/autogoal train and deploy",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="chat-autogoal-config",
+            chat_type="channel",
+            user_id="user-autogoal-config",
+        ),
+        message_id="msg-autogoal-config",
+    )
+
+    response = await GatewayRunner._handle_autogoal_command(runner, event)
+
+    try:
+        assert "⊙ AutoGoal set (77-turn budget): train and deploy" in response
+        state = autogoals.AutoGoalManager("sid-gateway-goal-config").state
+        assert state is not None
+        assert state.max_turns == 77
+    finally:
+        goals._DB_CACHE.clear()
+
+
+@pytest.mark.asyncio
+async def test_gateway_autogoal_uses_segment_budget_from_full_config(tmp_path, monkeypatch):
+    home = tmp_path / ".gpucloud"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "autogoals:\n  segment_max_turns: 100\n  max_segments: 20\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GPUCLOUD_HOME", str(home))
+    goals._DB_CACHE.clear()
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
+    )
+    runner.session_store = _FakeSessionStore()
+    runner.adapters = {}
+    runner._queued_events = {}
+
+    event = MessageEvent(
+        text="/autogoal train and deploy",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="chat-autogoal-segments",
+            chat_type="channel",
+            user_id="user-autogoal-segments",
+        ),
+        message_id="msg-autogoal-segments",
+    )
+
+    response = await GatewayRunner._handle_autogoal_command(runner, event)
+
+    try:
+        assert "2000-turn budget" in response
+        assert "20 segment(s) × 100 turns" in response
+        state = autogoals.AutoGoalManager("sid-gateway-goal-config").state
+        assert state is not None
+        assert state.max_turns == 2000
+        assert state.segment_max_turns == 100
+        assert state.max_segments == 20
+    finally:
+        goals._DB_CACHE.clear()

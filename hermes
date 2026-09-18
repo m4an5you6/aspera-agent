@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Deprecated Hermes CLI launcher.
+
+Use ``gpucloud`` instead.  This wrapper remains for old local checkouts and
+scripts that still execute ``./hermes`` directly.
+"""
+
+if __name__ == "__main__":
+    from gpucloud_cli.hermes_compat import main
+
+    main()

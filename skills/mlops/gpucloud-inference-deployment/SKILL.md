@@ -1,0 +1,412 @@
+---
+name: gpucloud-inference-deployment
+description: Deploy inference via on-node agent until vLLM is ready.
+version: 2.6.1
+author: GPUCLOUD
+platforms: [linux]
+metadata:
+  gpucloud:
+    tags: [gpucloud, inference, deployment, vllm, cluster, model-adapter, nccl]
+    related_skills: [gpucloud-worker-setup, gpucloud-sft-training, gpucloud-megatron-weight-export, serving-llms-vllm]
+    triggers:
+      - deploy trained model
+      - vllm from training
+      - gpucloud inference deployment
+      - adapter_id hf_vllm
+      - nccl unhandled cuda error
+---
+
+# GPUCLOUD Inference Deployment
+
+Use when a cluster inference assignment must expose a trained model through
+vLLM on **this GPU node**. An on-node LLM agent owns deps, artifacts, start,
+and health until ready (not a fixed pin matrix). You choose exact pins; tools
+enforce a full compatibility-chain decision before install and before serve.
+
+## When to Use
+
+- Cluster worker received `job_kind=inference` and you are the deploy agent.
+- Platform called `POST /api/inference/agent/deploy` and bootstrap already
+  started `gpucloud gateway` on this host.
+
+## Direct serve on the user's own nodes (no platform tools)
+
+When the user asks to "open the inference service / deploy the model" on their
+training nodes (not a GPUCLOUD cluster assignment), the expected deliverable is
+a STANDING vLLM serve + curl POST. The user explicitly prefers this over
+one-shot SSH-executed python scripts ("一般开启服务的话只用curl,post的命令不就可以了吗") —
+deploy the serve, then hand over curl commands. Verified recipe (serve CLI with
+`--lora-modules`, readiness poll, curl POST with `"model": <lora-name>`,
+public access via the real public IP, measured timings):
+`references/direct-vllm-serve-lora.md`.
+
+## Prerequisites
+
+- `model.api_key` in `~/.gpucloud/config.yaml` (agent LLM).
+- Tools: `terminal`, file tools, `inference_ensure_runtime`,
+  `inference_start_vllm`, `inference_health`, `inference_report_ready`;
+  multi-node also `inference_ray_start`, `inference_ray_join`,
+  `inference_cluster_wait_workers`.
+- Assignment JSON includes `model.local_path`, `gpus`, `serve`, optional
+  `sources`, `model_hint`, `training_artifact_kind`, and for multi-node
+  `node_rank` / `nnodes` / `local_visible_devices` / `ray`.
+- Read before install: `references/vllm-torch-version-index.md` (arch → min
+  vLLM, preferred vs intentional cu tag, smoke-before-BLOCK),
+  `references/vllm-runtime-and-model-readiness.md`, and
+  `references/torch-cuda-version-drift.md`.
+- Multi-node TP: also read `references/multinode-nccl-and-lib-drift.md`.
+
+## How to Run
+
+Work until ready, then call `inference_report_ready`.
+
+## Quick Reference
+
+| Step | Action |
+|------|--------|
+| Probe | In the inference **venv** (not system `python3`): `nvidia-smi` + `config.json` arch |
+| Version pick | Arch min vLLM first; preferred cu tag or intentional newer cu + smoke |
+| Compat chain | **Before any torch/vLLM pip**: write full chain → `inference_ensure_runtime` (`planned`) |
+| Install | Exact `==` pins into that venv via **pip mirrors** (torch before vllm) |
+| Verify | CUDA smoke in venv → `inference_ensure_runtime` (`verified`) |
+| Artifacts | Ensure HF-loadable dir; sync via `sources[]` if missing |
+| Multi-node align | Same torch/vLLM/**libnccl** on all ranks (`strings` on `.so`, not only `pip show`) |
+| NCCL smoke | Gloo then NCCL allreduce across ranks **before** vLLM TP>1 |
+| Multi-node | rank0: ray head → wait workers → vLLM TP=global + ray; worker: ray_join polls until head up → `worker_ready` |
+| Serve | `inference_start_vllm` with that venv's `python_executable` (rank0 only when nnodes>1) |
+| Done | rank0: `phase=ready` + reachable visit_host; worker: `phase=worker_ready` |
+
+## Runtime home
+
+Do all env checks and installs in the inference venv — system `python3` /
+bare `pip` are not the source of truth.
+
+1. Prefer `$INFERENCE_PYTHON` / `$VLLM_PYTHON` when set.
+2. Else use (or create) `~/.cache/gpu_platform/inference_venvs/<tag>/`
+   (e.g. `cu124`) — probe `bin/python`, install with `bin/pip`.
+3. Pass the chosen `bin/python` as `python_executable` to
+   `inference_ensure_runtime`, `inference_start_vllm`, and Ray tools.
+
+Details: `references/vllm-runtime-and-model-readiness.md`.
+
+## Compatibility chain (mandatory)
+
+**Any torch/vLLM pip install is forbidden until** you have called
+`inference_ensure_runtime` with `status=planned` and a complete
+`compat_chain`. **Ray / `inference_start_vllm` refuse** until a second call
+with `status=verified` (after pip + CUDA smoke) for the same `job_id`.
+
+Required `compat_chain` fields (align with the tool schema):
+
+| Field | Meaning |
+|-------|---------|
+| `driver` | `nvidia_smi_cuda` / `driver_version` from probe |
+| `model_family` | e.g. qwen3.6_moe from config / hint |
+| `venv_python` | Absolute path under `inference_venvs` |
+| `pins` | Exact `pkg==version` for **torch** and **vllm** (optional transformers/ray). Reject `>=`, bare names |
+| `install_order` | Ordered list; torch before vllm |
+| `pip_index` | China mirror URL (Aliyun preferred, else Tsinghua). Not official PyPI by default |
+| `pip_extra_index` | Optional; PyTorch CUDA wheel index only when needed |
+| `rationale` | Arch floor → torch cu tag (preferred or intentional upgrade) → vllm pin; mirror |
+| `rejected_alternatives` | ≥1 concrete reject (e.g. unpinned `vllm>=…` drift; `--no-deps` ABI mix) |
+| `smoke_cmd` | One-liner CUDA smoke planned after install |
+
+Flow: probe → write chain → `ensure_runtime(planned)` → pip exact pins with
+`-i <pip_index> --trusted-host …` → smoke → `ensure_runtime(verified)` →
+Ray/serve.
+
+## Multi-node Ray TP
+
+When `nnodes > 1` (assignment has `ray.enabled` and global
+`gpus.tensor_parallel` = total GPUs):
+
+- Use **local** `local_visible_devices` / `gpus.visible_devices` for this node only.
+- **Align stacks across ranks** before Ray/serve: same exact torch/vLLM pins
+  and the same `libnccl.so.2` version string (see
+  `references/multinode-nccl-and-lib-drift.md`). `pip show nvidia-nccl-cu12`
+  can lie after a cu130 drift — verify with `strings` on the `.so`.
+- **NCCL smoke before vLLM**: prove cross-node Gloo, then NCCL CUDA allreduce.
+  If NCCL fails with `driver … insufficient` / `unhandled cuda error` while
+  ping/SSH/Ray/`gloo` work, fix `libnccl` on every rank — do **not** keep
+  restarting `inference_start_vllm`, and do **not** degrade to single-node TP.
+- Put `NCCL_*` / `GLOO_SOCKET_IFNAME` into the **ray worker process** env
+  (`ray start` / `ray join`), not only the API server shell.
+- **rank>0**: compat chain verified → confirm **base HF** readable (LoRA
+  adapters not required on worker) → call `inference_ray_join` **once** to
+  `$GPUCLOUD_CLUSTER_ADVERTISED_ADDR` of head or master addr + `ray.head_port`.
+  The tool **polls until the head is up** (default `timeout_seconds=0` =
+  forever) because rank0 may still be installing deps — do not give up after
+  180s/600s and do not report ready on join failure.
+  Only after join **success** → `inference_report_ready` with
+  `phase=worker_ready` (no API server).
+  **Forbidden on worker:** megatron/swift LoRA export, `merged_model`, failing
+  `ensure_artifacts` only because `hf_lora_*` is missing locally; reporting
+  `worker_ready` without a successful `inference_ray_join`.
+- **rank0**: compat chain verified → own LoRA reuse/export (`hf_lora_*`) →
+  `inference_ray_start` →
+  `inference_cluster_wait_workers` (must succeed; **only**
+  `http://<master>:8765` + `GPUCLOUD_CLUSTER_SECRET` Bearer — Ray ports
+  like 6379/6425 are rejected) →
+  NCCL smoke OK → `inference_start_vllm` with global TP + `ray.enabled` +
+  base path + `enable_lora` (tool refuses if `ray status` GPUs < TP) →
+  health → `phase=ready` with reachable `visit_host`. Never start two
+  independent TP=1 servers.
+- **If NCCL smoke fails** after aligning `libnccl` / worker env: stop
+  restarting `inference_start_vllm` in a loop; fix the stack (same
+  `libnccl.so.2` + process-env on every rank) or fail `phase=start` with the
+  NCCL/`libnccl` diagnostic. Do **not** silently switch the assignment to
+  single-node TP=1.
+
+## Procedure
+
+1. **Inspect environment** with `terminal`: `nvidia-smi`, then the venv
+   python above — `"$PY" -c "import torch,vllm"` (may fail — that is OK;
+   install only into this venv if needed).
+2. **Identify model family / arch** from `model.local_path` (`config.json`
+   `model_type` / `architectures` / `auto_map`), directory name, and optional
+   `model_hint` / `training_artifact_kind`. Map arch → **min native vLLM**
+   via `references/vllm-torch-version-index.md`. Do **not** treat an existing
+   cu-matched venv as “good enough” if its registry misses that arch.
+   Transformers fallback / `--trust-remote-code` alone is not a valid plan for
+   large MoE (e.g. Qwen3.6 / `qwen3_5_moe` needs vLLM ≥ 0.17 native).
+3. **Compat chain** — follow the decision order in
+   `references/vllm-torch-version-index.md` (**arch floor first**; preferred
+   cu tag when possible; if the chosen vLLM requires a newer torch/cu tag,
+   plan an **intentional** dedicated venv + exact torch pin — do **not**
+   pre-BLOCK on `nvidia-smi` CUDA 12.4 alone, and do **not** `--no-deps`
+   mix ABI). Read `references/torch-cuda-version-drift.md`, then call
+   `inference_ensure_runtime` (`planned`). Do **not** skip this before pip.
+   Multi-node: every rank must plan the **same** `torch==` / `vllm==` pins.
+4. **Install stack** (only if the venv lacks a usable torch/vLLM): follow
+   `install_order` with exact `==` pins from the chain. **Never** use
+   `vllm>=…` or unpinned `vllm` after torch is pinned — that is the
+   *accidental* drift failure mode. For `nnodes>1` also pin/install `ray`
+   into the same venv.
+   **Default pip index is a China mirror** (not official PyPI):
+   1. Aliyun: `https://mirrors.aliyun.com/pypi/simple/`
+      (`--trusted-host mirrors.aliyun.com`)
+   2. Tsinghua: `https://pypi.tuna.tsinghua.edu.cn/simple`
+      (`--trusted-host pypi.tuna.tsinghua.edu.cn`)
+   3. Only if both fail: document `mirrors failed` in rationale and
+      re-`ensure_runtime`, then official PyPI / config index.
+   Torch CUDA wheels may add `--extra-index-url https://download.pytorch.org/whl/cuXXX`
+   — that does **not** replace the main mirror for vLLM.
+   Example (preferred cu124 when arch allows):
+   ```bash
+   PIP="$HOME/.cache/gpu_platform/inference_venvs/cu124/bin/pip"
+   $PIP install "torch==2.5.1+cu124" \
+     -i https://mirrors.aliyun.com/pypi/simple/ \
+     --trusted-host mirrors.aliyun.com \
+     --extra-index-url https://download.pytorch.org/whl/cu124
+   $PIP install "vllm==<exact-pin>" \
+     -i https://mirrors.aliyun.com/pypi/simple/ \
+     --trusted-host mirrors.aliyun.com
+   ```
+   Example (arch needs vLLM≥0.17 / torch 2.10 — intentional cu128):
+   ```bash
+   PIP="$HOME/.cache/gpu_platform/inference_venvs/cu128/bin/pip"
+   $PIP install "torch==2.10.0" "torchvision==0.25.0" "torchaudio==2.10.0" \
+     -i https://mirrors.aliyun.com/pypi/simple/ \
+     --trusted-host mirrors.aliyun.com \
+     --extra-index-url https://download.pytorch.org/whl/cu128
+   # CUDA smoke in this venv MUST pass before vLLM
+   $PIP install "vllm==0.17.0" \
+     -i https://mirrors.aliyun.com/pypi/simple/ \
+     --trusted-host mirrors.aliyun.com
+   ```
+   Avoid `| tail` on long installs; use `terminal(background=true)` and poll.
+5. **Verify**: run `smoke_cmd` in the venv, then
+   `inference_ensure_runtime` with `status=verified` (same chain / pins).
+6. **Artifacts** (role-aware on multi-node):
+   - **rank0 / single-node**: if `local_path` missing or not HF-loadable,
+     sync via `sources[]` / follow `gpucloud-megatron-weight-export`.
+     Qwen LoRA / `swift_output` → `hf_lora_*/` adapters (**not**
+     `merged_model`); reuse existing `hf_lora_*`; SWIFT `--merge_lora false`.
+     MoE + SWIFT fail → `phase=ensure_artifacts` (no hand-merge).
+   - **rank>0**: do **not** export LoRA. Confirm base HF readable for TP
+     shards. **vLLM ≥0.17 Ray workers DO need `hf_lora_*` on their local
+     filesystem** (each worker loads adapter weights during LoRA activation).
+     Sync the adapter directory to every worker via `rsync` — missing local
+     `hf_lora_*` on a worker results in `ValueError: No adapter found for
+     <path>` at serve time. Only skip sync when the full model tree is absent;
+     never fail `ensure_artifacts` solely for missing adapters (sync them
+     instead).
+7. **Start**: single-node — `inference_start_vllm` with local devices.
+   Multi-node — follow **Multi-node Ray TP** (align `libnccl`, NCCL smoke,
+   then rank0 waits for workers and starts TP). Pass
+   `--trust-remote-code` for custom Qwen configs when required.
+   - For LoRA (rank0): serve path = **base HF**; set
+      `adapter_options.enable_lora` (+ `max_lora_rank`). When using
+      `adapter_options.lora_modules` as a list (e.g. `["name=path"]`), the
+      tool may wrap it with literal Python-list syntax in the CLI argument,
+      producing a broken path like `/path']`. **Prefer `extra_args`**:
+      `["--lora-modules","name=/absolute/path"]`. Verify the serve CLI with
+      `ps aux | grep vllm` — the path must not contain quotes or brackets.
+      Load the adapter via vLLM LoRA (do not replace base with a merged tree).
+   **Honor assignment `adapter_options`** (platform may set precision):
+   pass through `quantization`, `load_format`, `dtype`, `lora_modules`,
+   `enforce_eager`, and `extra_args` unchanged. Known keys are forwarded by
+   `hf_vllm`; unknown CLI flags must go in `extra_args`
+   (e.g. `["--quantization","bitsandbytes","--load-format","bitsandbytes"]`
+   for **4-bit** BitsAndBytes — say `bnb_4bit`, never a vague
+   “bitsandbytes” without bit width). After start, verify logs / vLLM
+   `Namespace` show `quantization=` / `dtype=` as intended — do not assume
+   a key “wrote” means it reached the CLI.
+8. **Health**: poll `inference_health` until `ready` (or timeout →
+   `phase=health_timeout`). Local `curl http://127.0.0.1:<port>/health` is
+   fine for probing only (rank0).
+9. **Report**: `inference_report_ready` with success contract (see below).
+   **`visit_host` must be a client-reachable address**, not loopback (rank0).
+   Prefer in order: `$GPUCLOUD_CLUSTER_ADVERTISED_ADDR` → node public /
+   outer IP (e.g. `gpu_nodes.host` / `hostname -I` non-private) →
+   cluster `advertised_addr`. Never copy `127.0.0.1` / `localhost` from
+   `inference_start_vllm` into the outcome — that tool may return loopback
+   for local health even when serve binds `0.0.0.0`.
+
+## Outcome contract
+
+```json
+{
+  "success": true,
+  "summary": "inference ready",
+  "details": {
+    "phase": "ready",
+    "adapter_id": "hf_vllm",
+    "visit_host": "<advertised host>",
+    "visit_port": 8000,
+    "protocol": "http://",
+    "stream_path": "/v1/chat/completions",
+    "health_path": "/health",
+    "deploy_node_id": 20,
+    "callback_url": "",
+    "model_path": "/path/to/model"
+  }
+}
+```
+
+Failure: `success=false`, `details.phase` in
+`ensure_runtime|ensure_artifacts|start|health_timeout|cancelled|validate`.
+
+## Pitfalls
+
+- Use `references/vllm-torch-version-index.md` as **floors + landmines**, not a
+  frozen full pin matrix — still verify registry HIT for the HF architecture
+  before `ensure_runtime(planned)`.
+- Do not reuse an old cu-matched vLLM solely because the venv exists; arch
+  support is a separate gate (Qwen3.6 MoE / `qwen3_5_moe` ≠ classic
+  `qwen3_moe`).
+- Transformers fallback is not “supported” for large MoE serve plans.
+- Do not treat a failed system `python3 -c "import vllm"` as “no vLLM”;
+  check the inference venv first.
+- Bare `pip` / `~/.local` installs miss the serve interpreter — always use
+  the venv `bin/pip`.
+- Bare `pip install vllm` without `-i` mirror is a common stall; use Aliyun
+  then Tsinghua before falling back.
+- Putting `quantization` / `load_format` only in free-form notes does nothing;
+  they must be in `adapter_options` (or `extra_args`). After OOM self-rescue
+  with **4-bit** BitsAndBytes, set
+  `quantization=bitsandbytes` + `load_format=bitsandbytes` (or the same via
+  `extra_args`) and confirm the serve log — unknown keys used to be dropped
+  silently by older adapters.
+- `vllm>=…` after a cu124 torch pin can **accidentally** upgrade torch **and**
+  replace `libnccl.so.2` with a cuda13 build — see
+  `references/torch-cuda-version-drift.md` and
+  `references/multinode-nccl-and-lib-drift.md`. Intentional cu128 for arch
+  (exact pins + dedicated venv + smoke) is allowed; `--no-deps` ABI mixing
+  and pre-BLOCK “driver cannot run 12.8” without smoke are not.
+- Multi-node: Ray/SSH OK + NCCL fail usually means **`libnccl` / driver
+  mismatch**, not “no connectivity.” Check `strings` on both nodes.
+- Multi-node: never run independent TP=1 API servers on each node; rank0 must
+  wait for `worker_ready` before `phase=ready`.
+- Disk space under `~/.cache/pip` / `/tmp/pip-unpack-*` can fill during large
+  wheels — clean failed partial downloads when retrying.
+- Never put API keys in the outcome JSON.
+- Never report `visit_host=127.0.0.1` / `localhost` — platforms store that
+  as the client endpoint; use the advertised / public host instead.
+- Prefer managed start tool so cluster stop can kill the serve PID.
+- Megatron / `swift_output` raw checkpoints need
+  `gpucloud-megatron-weight-export` before serve.
+- vLLM 0.17.x pins `transformers<5`; models with `tokenizer_class:
+  TokenizersBackend` (transformers 5.x) fail at startup with `Tokenizer class
+  ... does not exist`. Use vLLM >= 0.19.1 (allows `transformers>=4.56`,
+  excludes 5.0–5.5.0; `transformers==5.12.1` verified) — same
+  `torch==2.10.0` pin.
+- Qwen3.5 (`qwen3_5`) megatron-trained LoRA adapters (megatron layer names:
+  `in_proj_a/in_proj_b/in_proj_qkv/in_proj_z`) load natively in vLLM >= 0.19:
+  `qwen3_5.py` stacked_params_mapping `in_proj_qkvz <- in_proj_qkv +
+  in_proj_z`, `in_proj_ba <- in_proj_b + in_proj_a`, plus the `language_model`
+  LoRA wrapper. Serve base HF + adapter; no merged model.
+- vLLM 0.19 LoRA API: no `llm.load_lora`; build
+  `LoRARequest(lora_name=..., lora_int_id=..., lora_path=...)` imported from
+  `vllm.lora.request` (NOT top-level `vllm`) and pass `lora_request=` to
+  `generate()`.
+- vLLM driver scripts MUST have `if __name__ == '__main__':` — EngineCore
+  spawn re-imports the main module and dies with
+  `RuntimeError: An attempt has been made to start a new process before the
+  current process has finished its bootstrapping phase.`
+- ray 2.48.x on py3.10 fails with `ValueError: <object ...> is not a valid
+  Sentinel` — use `ray[cgraph]==2.56.1`. `ray start --head` without dashboard
+  deps -> `Cannot include dashboard with missing packages` -> add
+  `--include-dashboard false`.
+- After a failed multi-node run, `ray status` shows GPUs `reserved in
+  placement groups` and the next serve fails `Current node has no GPU
+  available`; recover with `ray stop --force` on head AND workers, then
+  restart the cluster. A stale EngineCore holding VRAM gives `Free memory ...
+  less than desired GPU memory utilization` — kill it before retrying.
+- uv-created venvs may lack `bin/activate`; call the venv python by absolute
+  path (`<venv>/bin/python`), not `source .../activate`.
+- Qwen3.5 multi-node TP=2 detail (ray head/worker, serve flags, LoRARequest
+  smoke): `references/qwen35-vllm-lora-multinode.md`.
+- **Concurrent agent sessions deploying the same node kill each other** (seen
+  live: two GPUCLOUD sessions in separate terminals both deploying vLLM
+  TP=2; each session's cleanup killed the other's EngineCore/raylet/tmux, so
+  every attempt failed with SIGTERM and no error log). Before deploying,
+  `ps aux | grep gpucloud` and check for a second live session — if found,
+  stop and coordinate (wait / go read-only) instead of racing. Run serve
+  inside tmux or setsid so a peer cleanup cannot take it down; never
+  `pkill -f` broad `vllm`/`ray` patterns on a multi-session node.
+- Cross-node NCCL smoke before any TP>1: `scripts/nccl_smoke.py` (rank0 +
+  rank1 one-liners, expect allreduce=3.0), run with the serving venv's python
+  so that venv's own libnccl is validated against the driver.
+- Qwen LoRA: existing `hf_lora_*` → reuse on rank0; never build `merged_model/`.
+- Multi-node worker: sync `hf_lora_*` to every worker — vLLM ≥0.17 loads adapter
+  weights locally on each Ray worker.
+- **vLLM 0.17.0 + LoRA + MoE + CUDA graphs**: `slice_lora_b` in
+  `column_parallel_linear.py` throws `IndexError: list index out of range`
+  during `_capture_cudagraphs`. Fix: pass `enforce_eager=true` in
+  `adapter_options` to skip CUDA graph capture. This also avoids the
+  `RuntimeError: Engine core initialization failed` cascade.
+- **vLLM ≥0.17 removed `LLM.load_lora()`** (AttributeError) AND the top-level
+  `from vllm import LoRARequest` (ImportError). Verified on vLLM 0.19.1:
+  `from vllm.lora.request import LoRARequest` (internal module, not re-exported
+  at top level), then `lora_req = LoRARequest(lora_name=..., lora_int_id=1,
+  lora_path=...)` and `llm.generate(prompts, params, lora_request=lora_req)`.
+  Check `inspect.signature(LLM.generate)` for the `lora_request` kwarg before
+  writing the smoke script.
+- **Public reachability: verify the node's ACTUAL public IP before claiming a
+  port is blocked.** NAT-gateway public IPs change and stale memory lies (a
+  wrong public IP once made us wrongly lecture the user about NAT/DNAT
+  forwarding while their ports were already open — the user corrected us:
+  "我已经放行了所有端口"). Get the IP from the user, then test from the PEER
+  node: `ssh <peer> 'curl -s -m 8 -o /dev/null -w "%{http_code}"
+  http://<public-ip>:8000/health'` — HTTP 200 means public access works; say
+  so and hand over the public curl. When the user says ports are open, verify
+  first — don't argue.
+- **GPU memory conflicts between concurrent smoke tests**: two smoke scripts
+  started minutes apart both request `gpu_memory_utilization=0.85`; the second
+  fails with `ValueError: Free memory on device cuda:0 (5.36/23.68 GiB) on
+  startup is less than desired GPU memory utilization`. Before launching any
+  vLLM smoke/serve, check `nvidia-smi --query-compute-apps=...` for another
+  EngineCore already holding VRAM; if one is running, wait for it or lower
+  `gpu_memory_utilization`.
+
+## Verification
+
+- `inference_ensure_runtime` reached `status=verified` for this `job_id`
+- Chosen venv `python` imports torch + vLLM; CUDA smoke prints `CUDA_OK`
+- Multi-node: `strings` on `libnccl.so.2` matches across ranks; NCCL smoke OK
+- `inference_health` → `ready`
+- `curl -sS http://127.0.0.1:<port>/health` succeeds (local probe only)
+- `inference_report_ready` `visit_host` is reachable from outside the node
+  (not `127.0.0.1`)
+- `inference_report_ready` returned `stored: true`
