@@ -1,9 +1,10 @@
 /** Persistent manager behavior through a real profile Include and Loader. */
+import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { realpath } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { pathToFileURL } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
 import { expect, it, onTestFinished, vi } from 'vitest'
 import {
@@ -17,6 +18,38 @@ import type { PatchOptions } from '@deepseek-ai/cordis-plugin-include'
 import { Group } from '@deepseek-ai/cordis-plugin-loader'
 import * as operations from '../src/operations.ts'
 import { parse, parseDocument } from 'yaml'
+
+function launcherPnpm(): NonNullable<ProfileContext['packageManager']> {
+  const entry = resolvePnpmEntry()
+  if (/\.[cm]?js$/iu.test(entry)) return { command: process.execPath, args: [entry], env: { PATH: '' } }
+  return { command: entry, args: [], env: { PATH: '' } }
+}
+
+/** Path pnpm records as `npm_execpath` when it runs a lifecycle script. */
+function resolvePnpmEntry(): string {
+  const fromEnv = process.env.npm_execpath?.trim()
+  if (fromEnv !== undefined && fromEnv !== '' && existsSync(fromEnv)) return fromEnv
+  const dir = mkdtempSync(join(tmpdir(), 'plugin-manager-pnpm-'))
+  try {
+    writeFileSync(join(dir, 'package.json'), `${JSON.stringify({ private: true, scripts: { show: 'node show.js' } })}\n`)
+    writeFileSync(join(dir, 'show.js'), "process.stdout.write(process.env.npm_execpath ?? '')\n")
+    const stdout = runPnpm(['run', 'show'], dir)
+    const entry = stdout.split(/\r?\n/).map(line => line.trim()).find(line => line !== '' && existsSync(line))
+    if (entry === undefined) throw new Error('plugin-manager: pnpm did not report npm_execpath')
+    return entry
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+function runPnpm(args: readonly string[], cwd: string): string {
+  if (process.platform === 'win32') {
+    const comspec = process.env.ComSpec
+    if (comspec === undefined || comspec === '') throw new Error('plugin-manager: ComSpec is required to resolve pnpm on Windows')
+    return execFileSync(comspec, ['/d', '/s', '/c', 'pnpm', ...args], { cwd, encoding: 'utf8' })
+  }
+  return execFileSync('pnpm', [...args], { cwd, encoding: 'utf8' })
+}
 
 async function fixture(reload: 'live' | 'startup' = 'live', overlay = false, prepare?: (ctx: Context) => void, config: Config = {}, packageManager?: ProfileContext['packageManager']) {
   // pnpm resolves workspace roots through native realpath, including Windows 8.3 aliases.
@@ -219,7 +252,7 @@ it('retains approved policy and reports it as changed when the registry fails be
   expect(parse(readFileSync(join(dir, 'pnpm-workspace.yaml'), 'utf8'))).toEqual({ allowBuilds: { native: true } })
 })
 
-it('runs a real pnpm dependency script only after approval and retry', async () => {
+it('runs a real pnpm dependency script only after approval and retry', { timeout: 30_000 }, async () => {
   const { manager, dir, profile } = await fixture('startup')
   const addon = join(profile.cwd, 'addon')
   mkdirSync(addon)
@@ -744,14 +777,11 @@ it('applies watched configuration while pnpm installation is still running', asy
   expect(ctx.get('managedProbe')).toBeUndefined()
 })
 
-it('installs and removes with the bundled pnpm when PATH contains no pnpm', async () => {
-  const pnpm = fileURLToPath(new URL('../../../../apps/desktop/node_modules/pnpm/bin/pnpm.mjs', import.meta.url))
-  const { manager, dir } = await fixture('startup', false, undefined, { pnpmCommand: 'must-not-be-used' }, {
-    command: process.execPath, args: ['--expose-internals', pnpm], env: { PATH: '', ELECTRON_RUN_AS_NODE: '1' },
-  })
+it('installs and removes with a launcher-owned pnpm invocation when PATH contains no pnpm', { timeout: 30_000 }, async () => {
+  const { manager, dir } = await fixture('startup', false, undefined, { pnpmCommand: 'must-not-be-used' }, launcherPnpm())
   const target = join(dir, 'local-bundle')
   mkdirSync(target)
-  writeFileSync(join(target, 'package.json'), JSON.stringify({ name: '@test/desktop-manager', version: '1.0.0',
+  writeFileSync(join(target, 'package.json'), JSON.stringify({ name: '@test/local-manager', version: '1.0.0',
     dsh: { bundle: { patch: './cordis.patch.yml' } } }))
   writeFileSync(join(target, 'cordis.patch.yml'), '[]\n')
   // Fixture-only packages need no registry resolution during this local install.
@@ -761,9 +791,9 @@ it('installs and removes with the bundled pnpm when PATH contains no pnpm', asyn
   const installed = await manager.installBundle(target)
   expect(installed.error).toBeUndefined()
   expect(installed.packageResult?.exitCode).toBe(0)
-  expect(readProfileManifest('test', dir).dependencies).toHaveProperty('@test/desktop-manager')
-  const removed = await manager.removeBundle('@test/desktop-manager')
+  expect(readProfileManifest('test', dir).dependencies).toHaveProperty('@test/local-manager')
+  const removed = await manager.removeBundle('@test/local-manager')
   expect(removed.error).toBeUndefined()
   expect(removed.packageResult?.exitCode).toBe(0)
-  expect(readProfileManifest('test', dir).dependencies ?? {}).not.toHaveProperty('@test/desktop-manager')
+  expect(readProfileManifest('test', dir).dependencies ?? {}).not.toHaveProperty('@test/local-manager')
 })

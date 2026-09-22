@@ -163,9 +163,9 @@ describe('default product isolation', () => {
 
   it('follows private application intermediaries and terminates cycles', () => {
     const root = fixture()
-    write(root, 'apps/desktop/package.json', { name: '@fixture/desktop', private: true,
+    write(root, 'apps/private/package.json', { name: '@fixture/private', private: true,
       dependencies: { [core]: '*', [experimental]: '*' } })
-    manifest(root, 'packages/core/core/package.json', { peerDependencies: { '@fixture/desktop': '*' } })
+    manifest(root, 'packages/core/core/package.json', { peerDependencies: { '@fixture/private': '*' } })
 
     expect(verifyDefaultProductIsolation(root).failures.join('\n')).toContain(experimental)
   })
@@ -342,11 +342,11 @@ describe('default product isolation', () => {
     expect(verifyDefaultProductIsolation(root).failures).toEqual([])
   })
 
-  it('checks desktop configuration reached through a source URL', () => {
+  it('checks application configuration reached through a source URL', () => {
     const root = fixture()
-    write(root, 'apps/desktop-host/package.json', { name: '@fixture/desktop-host', private: true })
-    write(root, 'apps/desktop-host/src/index.ts', "new URL('../config/desktop.cordis.patch.yml', import.meta.url)")
-    write(root, 'apps/desktop-host/config/desktop.cordis.patch.yml', [{ insert: [{ name: experimental }] }])
+    write(root, 'apps/cli/package.json', { name: '@fixture/cli', private: true })
+    write(root, 'apps/cli/src/index.ts', "new URL('../config/cli.cordis.patch.yml', import.meta.url)")
+    write(root, 'apps/cli/config/cli.cordis.patch.yml', [{ insert: [{ name: experimental }] }])
 
     expect(verifyDefaultProductIsolation(root).failures.join('\n')).toContain(experimental)
   })

@@ -1,6 +1,7 @@
 # Agent Note: Desktop standard macOS window menus
 
 Status: implemented
+Archived: 2026-09-21
 
 English | [中文](2026-09-16-desktop-window-menus.zh.md)
 

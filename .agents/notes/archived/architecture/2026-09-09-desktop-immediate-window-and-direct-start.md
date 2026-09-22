@@ -1,6 +1,7 @@
 # Agent Note: Show the Desktop window before starting the Host
 
 Status: implemented
+Archived: 2026-09-21
 
 English | [中文](2026-09-09-desktop-immediate-window-and-direct-start.zh.md)
 

@@ -1,6 +1,7 @@
 # Agent Note: Package and update the Electron desktop application
 
 Status: implemented
+Archived: 2026-09-21
 
 English | [中文](2026-08-25-electron-desktop-packaging-and-updates.zh.md)
 

@@ -1,6 +1,7 @@
 # Agent Note: 在打包时验证 Desktop 发布兼容性
 
 Status: implemented
+Archived: 2026-09-21
 
 [English](2026-09-09-desktop-build-release-validation.md) | 中文
 

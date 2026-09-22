@@ -1,6 +1,7 @@
 # Agent Note: 在 Desktop 生产启动前清理应用管理的包
 
 Status: implemented
+Archived: 2026-09-21
 
 [English](2026-09-15-desktop-profile-core-cleanup.md) | 中文
 

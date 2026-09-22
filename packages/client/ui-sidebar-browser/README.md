@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-Browse HTTP(S) pages, including loopback services, inside independent right-Sidebar tabs. The current carrier is an iframe with application-managed history in both Web and Desktop. The package never injects Electron or Node access into visited content.
+Browse HTTP(S) pages, including loopback services, inside independent right-Sidebar tabs. The current carrier is an iframe with application-managed history. The package never injects Electron or Node access into visited content.
 
 ## Table of Contents
 
@@ -25,7 +25,7 @@ Browse HTTP(S) pages, including loopback services, inside independent right-Side
 <a id="use-this-package"></a>
 ## Use this package
 
-The shipped Web and Desktop compositions already mount this package. Open **Browser** from the right-Sidebar guide, enter an HTTP(S) URL, or select an HTTP(S) link in Assistant Markdown. A host name without a scheme becomes HTTPS. Public and loopback targets use the same default sandbox. Each guide action or message-link activation creates another Browser tab.
+The shipped Web composition already mounts this package. Open **Browser** from the right-Sidebar guide, enter an HTTP(S) URL, or select an HTTP(S) link in Assistant Markdown. A host name without a scheme becomes HTTPS. Public and loopback targets use the same default sandbox. Each guide action or message-link activation creates another Browser tab.
 
 ### When to choose it
 
@@ -58,7 +58,7 @@ The address parser accepts HTTP and HTTPS, including loopback targets. It reject
 
 ### Iframe carrier
 
-Web and Desktop use `sandbox="allow-scripts allow-forms allow-same-origin allow-popups allow-popups-to-escape-sandbox"` by default. The frame has no direct download or top-navigation flag. Popups leave the sandbox; in Web, an escaped popup retains its opener and can navigate the top-level application. The visited origin can use its own cookies and Web storage but a cross-origin target cannot read DSH DOM, storage, or API responses. The iframe sends no referrer and adds no package-owned Permissions Policy, so browser defaults and user grants apply. The toolbar can remove the sandbox for the current tab occurrence; the choice is not persisted. An unsandboxed page can navigate the top-level application under browser activation rules and use downloads, modal dialogs, and input locks. The package does not proxy or probe remote pages.
+The iframe uses `sandbox="allow-scripts allow-forms allow-same-origin allow-popups allow-popups-to-escape-sandbox"` by default. The frame has no direct download or top-navigation flag. Popups leave the sandbox; an escaped popup retains its opener and can navigate the top-level application. The visited origin can use its own cookies and Web storage but a cross-origin target cannot read DSH DOM, storage, or API responses. The iframe sends no referrer and adds no package-owned Permissions Policy, so browser defaults and user grants apply. The toolbar can remove the sandbox for the current tab occurrence; the choice is not persisted. An unsandboxed page can navigate the top-level application under browser activation rules and use downloads, modal dialogs, and input locks. The package does not proxy or probe remote pages.
 
 Web records toolbar submissions and typed tab opens. A navigation state machine treats the first iframe load for each controlled revision as known and a later load as proof that the page changed to an unreadable URL. In that unknown state the address is marked, Back, Forward, and external-open are disabled, and Reload returns to the last controlled URL. A remounted body reloads the latest application-known URL and uses its optional initial URL only before the first controlled target. History API and fragment changes that emit no iframe load remain invisible. An iframe `error` event displays a transient load-failure notice until the next controlled load without changing URL history.
 
@@ -97,7 +97,7 @@ None; browsing does not enter a model request.
 The isolation policy deliberately gives up some browser compatibility:
 
 - Many sites refuse iframe embedding or need downloads or top-level navigation withheld from the frame by the default sandbox. An HTTPS application can also block public HTTP pages as mixed content. Disabling the sandbox trades its restrictions for compatibility but does not bypass mixed-content or private-network policy. The unsandboxed frame can navigate the top-level application under browser activation rules and use downloads, modal dialogs, and input locks. It does not isolate the visited origin's cookies per Browser tab or prevent an in-frame page from choosing its own next URL.
-- In Web, a popup that escapes the sandbox retains its opener and can use that chain to navigate the top-level application. Desktop handles popup creation separately.
+- In Web, a popup that escapes the sandbox retains its opener and can use that chain to navigate the top-level application.
 - A later iframe load reveals that navigation occurred but not the new cross-origin URL. History API and fragment changes may remain invisible; Web Back and Forward are unavailable after the state becomes unknown.
 - Browsers conceal many iframe failures for security: DNS, TLS, mixed-content, CSP, and `X-Frame-Options` failures may emit `load` or no actionable event instead of `error`. The load-failure notice is best-effort.
 - Browser history survives body remounts and ordinary page reloads, but closing the tab or unloading `ui-sidebar-right` aborts its occurrence and removes the stored history bucket.

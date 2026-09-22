@@ -18,7 +18,7 @@ Status: implemented
 
 地址解析器接受 `http:` 与 `https:`，包括 loopback 目标；不带 scheme 的主机名补为 HTTPS。它拒绝内嵌凭据、应用自身 origin、畸形地址、`file:` URL，以及所有其他 scheme。本地文件继续由 Document Preview 负责。
 
-当前 Web 与 Desktop 都使用 iframe 载体。它的默认 Web 策略是 `sandbox="allow-scripts allow-forms allow-same-origin allow-popups allow-popups-to-escape-sandbox"`；frame 没有直接的下载或顶层导航 flag。popup 会脱离 sandbox，Web popup 会保留 opener，并可以通过该链导航顶层应用。same-origin 允许被访问的 origin 使用自己的 Cookie 与 Web storage；它不会让跨域目标与 DSH 变成同源。iframe 不发送 referrer，也不添加包自有的 Permissions Policy，因此浏览器默认策略与用户授权生效。最右侧 toolbar 开关会为当前 tab occurrence 移除 sandbox attribute；该模式不持久化，启用期间持续显示警告。未受 sandbox 约束的页面可以按浏览器 activation 规则导航顶层应用，并使用下载、模态对话框和输入锁定。本包不执行 Host 侧 URL probe 或代理。
+当前 Web GUI 使用 iframe 载体。它的默认 Web 策略是 `sandbox="allow-scripts allow-forms allow-same-origin allow-popups allow-popups-to-escape-sandbox"`；frame 没有直接的下载或顶层导航 flag。popup 会脱离 sandbox，Web popup 会保留 opener，并可以通过该链导航顶层应用。same-origin 允许被访问的 origin 使用自己的 Cookie 与 Web storage；它不会让跨域目标与 DSH 变成同源。iframe 不发送 referrer，也不添加包自有的 Permissions Policy，因此浏览器默认策略与用户授权生效。最右侧 toolbar 开关会为当前 tab occurrence 移除 sandbox attribute；该模式不持久化，启用期间持续显示警告。未受 sandbox 约束的页面可以按浏览器 activation 规则导航顶层应用，并使用下载、模态对话框和输入锁定。本包不执行 Host 侧 URL probe 或代理。
 
 每个 tab 获得一个 `BrowserController` class。它的命令接口只有 `loadUrl`、`goBack`、`goForward` 与 `reload`；它负责地址校验和 `BrowserNavigation` 状态机。`BrowserFrame` 接口负责临时 sandbox 与 document 状态以及载体操作，`IframeImpl` 为当前 iframe 载体实现该接口。Slot injection 通过 `useBrowserFrame` 提供按 key 索引的 frame 状态，并提供普通 callback，因此 React body 不接收 controller 或 observable source；它只负责可编辑草稿与 iframe DOM。未来的 `ElectronWebViewImpl` 可以实现相同接口，而不把 URL 或载体状态放进组件。
 
@@ -43,7 +43,7 @@ Browser 状态只属于呈现层，不进入 Session log、模型请求、resour
 
 Electron `<webview>` 支持已经完成设计，但当前不注册也不测试。controller 保持相同的四个命令，独立的 per-tab view 对象负责 attachment、detachment、状态观察与 target identity。这沿用 Playwright 的 Android WebView 划分：`AndroidWebView` 是由 package、process 与调试 socket 标识的 target 和生命周期 handle，`page()` 返回负责 Web 导航与 DOM 命令的普通 `Page`；设备级输入仍属于 `AndroidDevice`。
 
-Desktop 设计只在应用窗口启用 `webviewTag`。其隔离 preload 获得不可猜的 per-window capability，每个 Browser tab 再追加新的 UUID，形成独立非持久化 partition。主进程只接受携带该 capability 且初始地址为 `about:blank` 的 guest，删除任何 preload，并强制启用 sandbox 与 context isolation、在所有 frame 禁用 Node integration、启用 Web security 与安全内容检查、禁用嵌套 webview 和 plugin。
+延期的原生 GUI 设计只在应用窗口启用 `webviewTag`。其隔离 preload 获得不可猜的 per-window capability，每个 Browser tab 再追加新的 UUID，形成独立非持久化 partition。主进程只接受携带该 capability 且初始地址为 `about:blank` 的 guest，删除任何 preload，并强制启用 sandbox 与 context isolation、在所有 frame 禁用 Node integration、启用 Web security 与安全内容检查、禁用嵌套 webview 和 plugin。
 
 主进程只允许页面发起的 main-frame 导航与重定向前往不含凭据的 HTTP(S)。请求可以使用 HTTP(S)、WebSocket、data 与 Blob URL；直接 file、自定义协议、extension 与特权请求都会被取消。permission 检查与请求、显示捕获、设备授权、下载、弹窗和拖放导航全部拒绝。
 
@@ -69,6 +69,6 @@ view 对象把非活动 guest 保持连接并停放在自有隐藏 DOM host 中�
 
 ## Consequences
 
-Browser 不增加 Electron 权限，并在当前 Web 与 Desktop 构建中保持相同行为。很多站点拒绝 iframe 嵌入，或者依赖默认 sandbox 不向 frame 提供的下载或顶层导航。HTTPS 应用可能按 mixed-content 策略阻止公共 HTTP 页面，或限制 private-network 请求；关闭 sandbox 也无法绕过这些浏览器策略。关闭 sandbox 在其他方面会用自身保护换取兼容性：frame 可以按浏览器 activation 规则导航顶层应用，并使用下载、模态对话框和输入锁定。逃逸出 sandbox 的 Web popup 会保留 opener，并可以通过该链导航顶层应用。这两条路径都不会增加 Electron 或 Node API。URL 检查无法阻止 iframe 内页面自行选择目标。后续 iframe load 能表明已经发生导航，但无法给出跨域 URL；History API 与 fragment 变化可能完全不可见。延期的 Electron 载体必须通过真实打包应用验证，才能成为当前行为。
+Browser 不增加 Electron 权限，并在 Web GUI 中使用 iframe 载体。很多站点拒绝 iframe 嵌入，或者依赖默认 sandbox 不向 frame 提供的下载或顶层导航。HTTPS 应用可能按 mixed-content 策略阻止公共 HTTP 页面，或限制 private-network 请求；关闭 sandbox 也无法绕过这些浏览器策略。关闭 sandbox 在其他方面会用自身保护换取兼容性：frame 可以按浏览器 activation 规则导航顶层应用，并使用下载、模态对话框和输入锁定。逃逸出 sandbox 的 Web popup 会保留 opener，并可以通过该链导航顶层应用。这两条路径都不会增加 Electron 或 Node API。URL 检查无法阻止 iframe 内页面自行选择目标。后续 iframe load 能表明已经发生导航，但无法给出跨域 URL；History API 与 fragment 变化可能完全不可见。延期的 Electron 载体必须先有原生 GUI 产品，再通过真实打包应用验证，才能成为当前行为。
 
 站点 Cookie 行为遵循用户浏览器，并不按 Browser tab 隔离。本地文件会被拒绝，并继续由 Document Preview 负责。持久化 URL 可能含敏感 query 或 fragment，因此用户不应在地址栏输入不希望保留在应用本地浏览器存储中的凭据。

@@ -2,5 +2,5 @@
 # side as of the last confirmed-consistent state. Both languages carry equal authority;
 # after editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write .agents/notes/implemented/architecture/2026-09-16-desktop-policy-login-loading.md
-2026-09-16-desktop-policy-login-loading.md: 26fd635c6cc5b92cad8011919382a11497d2e835
-2026-09-16-desktop-policy-login-loading.zh.md: 16de25323afc971b3142d5359c769df50c08800d
+2026-09-16-desktop-policy-login-loading.md: ea9c04edf9811b09bc58f104a2abfa8fa70bbaac
+2026-09-16-desktop-policy-login-loading.zh.md: cd71f4c7fcfe8b8c330db270bc4b2bc3850bed24

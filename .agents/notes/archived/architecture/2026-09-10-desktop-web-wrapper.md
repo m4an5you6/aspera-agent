@@ -1,6 +1,7 @@
 # Agent Note: Run Desktop through the shared Web application
 
 Status: implemented
+Archived: 2026-09-21
 
 English | [中文](2026-09-10-desktop-web-wrapper.zh.md)
 

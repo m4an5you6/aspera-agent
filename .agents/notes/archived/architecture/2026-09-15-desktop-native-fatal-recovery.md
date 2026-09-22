@@ -1,6 +1,7 @@
 # Agent Note: Native Desktop fatal recovery
 
 Status: implemented
+Archived: 2026-09-21
 
 English | [中文](2026-09-15-desktop-native-fatal-recovery.zh.md)
 

@@ -236,7 +236,7 @@ it('asks the registry through pnpm view in the profile directory and reports how
 
 it('uses application-owned executable arguments and environment for package operations and inspection', async () => {
   const { dir, context } = fixture()
-  const runtime = { command: '/app/electron', args: ['--expose-internals', '/app/pnpm.mjs'], env: { ELECTRON_RUN_AS_NODE: '1', PATH: '/app/bin' } }
+  const runtime = { command: '/usr/bin/node', args: ['--expose-internals', '/app/pnpm.cjs'], env: { NODE_OPTIONS: '', PATH: '/app/bin' } }
   command.run.mockImplementationOnce(() => result(0, ''))
   await runProfilePnpm(context, ['add', './extra'], { ...runtime, execution: 'service', outputBytes: 100, activateNewBundles: false })
   expect(command.run).toHaveBeenLastCalledWith(runtime.command, [...runtime.args, 'add', resolve(context.cwd, 'extra')],

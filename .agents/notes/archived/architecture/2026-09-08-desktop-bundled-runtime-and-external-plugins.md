@@ -1,6 +1,7 @@
 # Agent Note: Bundle the Desktop runtime and retain external plugins
 
 Status: implemented
+Archived: 2026-09-21
 
 English | [中文](2026-09-08-desktop-bundled-runtime-and-external-plugins.zh.md)
 

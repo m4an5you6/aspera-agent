@@ -1,6 +1,7 @@
 # Agent Note: 基于隔离 App 副本的并行 macOS 公证
 
 Status: implemented
+Archived: 2026-09-21
 
 [English](2026-09-09-parallel-macos-notarization.md) | 中文
 

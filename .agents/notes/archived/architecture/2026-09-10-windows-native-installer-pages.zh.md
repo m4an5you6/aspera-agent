@@ -1,6 +1,7 @@
 # Agent Note: 原生 Windows 安装页面
 
 Status: implemented
+Archived: 2026-09-21
 
 [English](2026-09-10-windows-native-installer-pages.md) | 中文
 

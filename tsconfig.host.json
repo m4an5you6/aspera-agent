@@ -7,9 +7,6 @@
     "noEmit": true,
     "rewriteRelativeImportExtensions": false
   },
-  "files": [
-    "packages/client/ui-settings-general/src/client/desktop-update-bridge.ts"
-  ],
   "include": [
     "apps/web/product-isolation.ts",
     "apps/web/tests/default-product-isolation.e2e.ts",
@@ -131,9 +128,6 @@
     "apps/web/tests/workflow-run.e2e.ts",
     "apps/web/stress-tests/reasoning-chunks.stress.ts",
     "apps/cli/tests/**/*.ts",
-    "apps/desktop/scripts/**/*.ts",
-    "apps/desktop/tests/**/*.ts",
-    "apps/desktop-host/tests/**/*.ts",
     "benchmarks/**/*.ts",
     "packages/*/*/tests/**/*.ts",
     "scripts/**/*.ts",
@@ -403,8 +397,6 @@
     { "path": "./packages/lsp/lsp" },
     { "path": "./packages/lsp/lsp-stdio" },
     { "path": "./packages/lsp/tool-lsp" },
-    { "path": "./apps/cli" },
-    { "path": "./apps/desktop-host" },
-    { "path": "./apps/desktop" }
+    { "path": "./apps/cli" }
   ]
 }

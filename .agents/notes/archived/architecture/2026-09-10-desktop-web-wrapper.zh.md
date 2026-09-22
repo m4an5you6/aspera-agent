@@ -1,6 +1,7 @@
 # Agent Note: 通过共享 Web 应用运行 Desktop
 
 Status: implemented
+Archived: 2026-09-21
 
 [English](2026-09-10-desktop-web-wrapper.md) | 中文
 

@@ -1,6 +1,7 @@
 # Agent Note: macOS hidden titlebar with vibrancy sidebar
 
 Status: implemented
+Archived: 2026-09-21
 
 [English](2026-09-13-macos-hidden-titlebar-vibrancy.md) | 中文
 

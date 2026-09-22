@@ -1,6 +1,7 @@
 # Agent Note: Present delayed Windows installer
 
 Status: implemented
+Archived: 2026-09-21
 
 English | [中文](2026-09-16-present-delayed-windows-installer.zh.md)
 

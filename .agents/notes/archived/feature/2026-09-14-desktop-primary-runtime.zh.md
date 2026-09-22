@@ -1,6 +1,7 @@
 # Agent Note: Desktop 第一方 Runtime
 
 Status: implemented
+Archived: 2026-09-21
 
 [English](2026-09-14-desktop-primary-runtime.md) | 中文
 

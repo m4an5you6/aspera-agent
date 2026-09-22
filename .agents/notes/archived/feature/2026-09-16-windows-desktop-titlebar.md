@@ -1,6 +1,7 @@
 # Agent Note: Windows desktop caption and application menus
 
 Status: implemented
+Archived: 2026-09-21
 
 English | [中文](2026-09-16-windows-desktop-titlebar.zh.md)
 

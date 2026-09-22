@@ -1,6 +1,7 @@
 # Agent Note: 延迟显示的 Windows 安装窗口
 
 Status: implemented
+Archived: 2026-09-21
 
 [English](2026-09-16-present-delayed-windows-installer.md) | 中文
 

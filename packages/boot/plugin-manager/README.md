@@ -7,7 +7,7 @@ kind: "package-reference"
 
 English | [中文](README.zh.md)
 
-Application-owned profiles supply their bundled package-manager invocation through launcher facts. It takes precedence over `pnpmCommand` for package operations and registry inspection; its environment applies only to those subprocesses.
+A launcher may supply a package-manager invocation through profile facts. It takes precedence over `pnpmCommand` for package operations and registry inspection; its environment applies only to those subprocesses.
 
 ## Summary
 

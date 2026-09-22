@@ -1,6 +1,7 @@
 # Agent Note: Windows 桌面顶栏与应用菜单
 
 Status: implemented
+Archived: 2026-09-21
 
 [English](2026-09-16-windows-desktop-titlebar.md) | 中文
 

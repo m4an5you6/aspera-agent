@@ -10,7 +10,7 @@ Status: implemented
 
 ## 决策
 
-每个随附 profile 统一挂载 `mcp-resources` 一次：包括 Desktop 在内的基于 base 的 profile 从 `dsh-base` 继承该行；独立的 `sdk-minimal` 拥有自己的行。用户只需配置 `mcp-client` 条目。默认不启用任何 MCP 服务器。
+每个随附 profile 统一挂载 `mcp-resources` 一次：基于 base 的 profile 从 `dsh-base` 继承该行；独立的 `sdk-minimal` 拥有自己的行。用户只需配置 `mcp-client` 条目。默认不启用任何 MCP 服务器。
 
 资源服务使用调用方作用域中的已配置提供方注册，包括由其他提供方挂载的 MCP 客户端。可见注册表为空时，不贡献资源提示词、native 工具 schema、PTC 声明或 PTC 绑定。作用域中的首个提供方启用共享工具；移除最后一个提供方时移除这些本地注册，同时保留继承的提供方与工具。资源服务独立于任何服务器插件拥有共享工具 effect。
 
@@ -30,7 +30,7 @@ Status: implemented
 
 ## 验证
 
-[资源测试](../../../../packages/mcp/mcp-resources/tests/resources.spec.ts)覆盖空 native 与 PTC 视图、作用域继承、首个与最后一个提供方的变化、释放，以及已配置提供方调用失败。[真实 SDK 测试](../../../../packages/mcp/mcp-client/tests/protocol.spec.ts)固定了只提供工具的服务器返回空发现结果，以及不受支持的读取报错。[Profile 组合测试](../../../../apps/cli/tests/profile-mcp.spec.ts)解析每个随附 CLI 模板；[Desktop 组合测试](../../../../apps/desktop/tests/profile-mcp.spec.ts)包含其 profile 与 Host overlay。空 native 与 PTC 录制会话使用随附 headless 组合，不添加资源条目。
+[资源测试](../../../../packages/mcp/mcp-resources/tests/resources.spec.ts)覆盖空 native 与 PTC 视图、作用域继承、首个与最后一个提供方的变化、释放，以及已配置提供方调用失败。[真实 SDK 测试](../../../../packages/mcp/mcp-client/tests/protocol.spec.ts)固定了只提供工具的服务器返回空发现结果，以及不受支持的读取报错。[Profile 组合测试](../../../../apps/cli/tests/profile-mcp.spec.ts)解析每个随附 CLI 模板。空 native 与 PTC 录制会话使用随附 headless 组合，不添加资源条目。
 
 ## 后果
 

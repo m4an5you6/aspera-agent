@@ -9,7 +9,6 @@ import { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { SettingsRootComponentProps } from '../src/client/shell-contract.ts'
 import { SettingsRoot } from '../src/client/SettingsRoot.tsx'
 import { en, zh } from '../src/client/locales.ts'
-import type { DesktopUpdateView } from '../src/client/desktop-update-bridge.ts'
 
 // Every fixture carries the resource hook the resources plugin merges into GlobalStandardProps.
 const useResource = (() => ({ status: 'none' as const, value: undefined, failure: undefined, reload: () => {} })) as GlobalStandardProps['useResource']
@@ -40,7 +39,6 @@ function mount({
   wide = true,
   dictionary = en,
   connectionState = 'connected',
-  desktopUpdate = { failed: false, opening: false },
   onboardingActive = true,
   mainView = true,
   rows = [
@@ -56,7 +54,6 @@ function mount({
   wide?: boolean
   dictionary?: typeof en | typeof zh
   connectionState?: ConnectionSnapshot
-  desktopUpdate?: DesktopUpdateView
   onboardingActive?: boolean
   mainView?: boolean
   rows?: Row[]
@@ -98,8 +95,6 @@ function mount({
     useWorkspaces: unusedHook,
     wide,
     reconnect,
-    openDesktopUpdate: () => {},
-    useDesktopUpdate: select => select(desktopUpdate),
     t: makeTranslate(dictionary),
     useConnectionState: (select) => {
       const [, force] = useState(0)
@@ -135,11 +130,7 @@ function mount({
       for (const fn of [...connectionListeners]) fn()
     })
   }
-  const setDesktopUpdate = (next: DesktopUpdateView) => {
-    desktopUpdate = next
-    view.rerender(<SettingsRoot {...props} />)
-  }
-  return { view, renderSlot, bump, listeners, reconnect, setConnectionState, setDesktopUpdate }
+  return { view, renderSlot, bump, listeners, reconnect, setConnectionState }
 }
 
 function openPanel() {
@@ -150,17 +141,6 @@ function openPanel() {
 }
 
 describe('SettingsRoot trigger', () => {
-  it('shows installation instead of expected backend reconnection and restores connection feedback after failure', () => {
-    const presentation = { phase: 'installing' as const, version: '1.0.1' }
-    const f = mount({ dictionary: zh, connectionState: 'connecting',
-      desktopUpdate: { failed: false, opening: false, presentation } })
-    expect(screen.getByRole('button', { name: '正在准备重启…' })).toBeTruthy()
-    expect(screen.queryByText('重新连接中')).toBeNull()
-    f.setDesktopUpdate({ failed: false, opening: false,
-      presentation: { phase: 'error', version: presentation.version, failure: 'install' } })
-    expect(screen.queryByRole('button', { name: '重试更新' })).toBeNull()
-    expect(screen.getByText('重新连接中')).toBeTruthy()
-  })
   it.each([
     { column: 'expanded English', wide: true, dictionary: en, name: 'Settings' },
     { column: 'collapsed English', wide: false, dictionary: en, name: 'Settings' },

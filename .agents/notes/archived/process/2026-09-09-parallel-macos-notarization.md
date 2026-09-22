@@ -1,6 +1,7 @@
 # Agent Note: Parallel macOS notarization from isolated App copies
 
 Status: implemented
+Archived: 2026-09-21
 
 English | [中文](2026-09-09-parallel-macos-notarization.zh.md)
 

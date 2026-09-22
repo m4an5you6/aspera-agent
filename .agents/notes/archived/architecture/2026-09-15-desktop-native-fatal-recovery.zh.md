@@ -1,6 +1,7 @@
 # Agent Note: 原生 Desktop 致命错误恢复
 
 Status: implemented
+Archived: 2026-09-21
 
 [English](2026-09-15-desktop-native-fatal-recovery.md) | 中文
 

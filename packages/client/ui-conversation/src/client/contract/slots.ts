@@ -152,11 +152,9 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
       owner: ConversationHeaderActionOwnerProps
     }
     /**
-     * Leading seat before the Session breadcrumbs, for window-chrome-adjacent
-     * controls (macOS desktop sidebar reopen and New Session while the sidebar
-     * is hidden). The seat is laid out only while its occupant renders
-     * something, and it stays mounted through the blank-session state so a
-     * hidden sidebar always keeps a reopen control on screen.
+     * Leading seat before the Session breadcrumbs. The seat is laid out only
+     * while its occupant renders something, and it stays mounted through the
+     * blank-session state.
      */
     'conversation.session.header.leading': {
       kind: 'single'

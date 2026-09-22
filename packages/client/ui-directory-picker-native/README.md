@@ -1,5 +1,5 @@
 ---
-description: "Native directory-picker surface: the browser half that drives the local Desktop or Host OS chooser for workspace-directory flows; for users and maintainers choosing a picking interaction."
+description: "Native directory-picker surface: the browser half that drives the Host OS chooser for workspace-directory flows; for users and maintainers choosing a picking interaction."
 kind: "package-reference"
 ---
 
@@ -26,8 +26,6 @@ This package provides the native directory-picking surface for the Web GUI: when
 ## Use this package
 
 Mount this plugin alongside `ui-workspace` and the host backend [`dsh-host-directory-picker-native`](../../host/directory-picker-native/README.md); one `cordis.yml` row then composes the whole native picking interaction. When a workspace add or picker flow opens a directory request, the user sees the operating system's folder dialog; the picked path is adopted by the workspace flow, and cancelling closes the dialog.
-
-In the local Electron application, this flow uses the narrow preload directory-picker bridge. Cancellation and failure never retry through the Host chooser. Ordinary Web uses the Host call; the separate browse composition always lists Host directories.
 
 ### When to choose it
 
@@ -76,8 +74,8 @@ None; this package neither assembles nor sends a provider request.
 These limits define when the native chooser fits. They are current package constraints, not a general picker comparison or a task backlog.
 
 - **No cancellation of an open chooser** — the wire has no per-request abort, so a chooser already on the local display cannot be closed from the browser; a discarded settlement is ignored.
-- **Local carriers only** — the Electron dialog selects local paths; ordinary Web opens the Host chooser. Remote-browser and in-process deployments use the `-browse` composition. Platform failures surface through the owner's retryable folder dialog.
-- **Linux automatic selection** — without zenity or kdialog, the Host selects browse even in Desktop; the Electron dialog is not used.
+- **Local carriers only** — the Host OS chooser selects local paths. Remote-browser and in-process deployments use the `-browse` composition. Platform failures surface through the owner's retryable folder dialog.
+- **Linux automatic selection** — without zenity or kdialog, the Host selects browse.
 
 <a id="dev-note"></a>
 ### Dev Note

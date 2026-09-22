@@ -30,21 +30,6 @@
   margin-left: auto;
 }
 
-/* macOS hiddenInset titlebar: the title row doubles as the window drag
-   region; interactive children opt out. */
-:global([data-platform='darwin']) .titleRow {
-  -webkit-app-region: drag;
-}
-
-:global([data-platform='darwin']) .titleRow button,
-:global([data-platform='darwin']) .titleRow a,
-:global([data-platform='darwin']) .headerLeading,
-:global([data-platform='darwin']) .headerActions,
-:global([data-platform='darwin']) .headerUtilities,
-:global([data-platform='darwin']) .headerCorner {
-  -webkit-app-region: no-drag;
-}
-
 .titleRow {
   display: flex;
   align-items: center;

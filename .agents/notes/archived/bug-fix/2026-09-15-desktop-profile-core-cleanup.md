@@ -1,6 +1,7 @@
 # Agent Note: Clean application-owned packages before Desktop production boot
 
 Status: implemented
+Archived: 2026-09-21
 
 English | [中文](2026-09-15-desktop-profile-core-cleanup.zh.md)
 

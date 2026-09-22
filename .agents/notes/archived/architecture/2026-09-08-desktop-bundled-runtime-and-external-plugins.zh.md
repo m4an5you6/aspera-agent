@@ -1,6 +1,7 @@
 # Agent Note: 内置 Desktop 运行时并保留外部插件
 
 Status: implemented
+Archived: 2026-09-21
 
 [English](2026-09-08-desktop-bundled-runtime-and-external-plugins.md) | 中文
 

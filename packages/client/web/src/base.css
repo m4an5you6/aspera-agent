@@ -32,13 +32,6 @@ body {
   text-autospace: normal;
 }
 
-/* macOS desktop (the Electron preload sets data-platform): the window's
-   sidebar vibrancy shows only through a transparent page background. */
-html[data-platform='darwin'],
-html[data-platform='darwin'] body {
-  background: transparent;
-}
-
 code,
 pre,
 [data-diff],

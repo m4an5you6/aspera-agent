@@ -1,6 +1,7 @@
 # Agent Note: 使用 Electron 作为 Desktop 的 Node 运行时
 
 Status: implemented
+Archived: 2026-09-21
 
 [English](2026-09-11-desktop-electron-node-runtime.md) | 中文
 
