@@ -1,0 +1,49 @@
+# Local terminal goal dispatches to the independent worker.
+- id: user-questions
+  config:
+    unattended: true
+- id: tools
+  config:
+    mode: native
+- id: approval
+  config:
+    policy: never
+- id: tool-goal
+  config:
+    unattended: true
+    blockedAfterConsecutiveRounds: 1
+- id: headless-runner
+  config:
+    task: !!js ctx.headlessStartup.task
+    sessionId: !!js ctx.headlessStartup.sessionId
+    json: !!js ctx.headlessStartup.json
+    goalFromTask: true
+- id: plan-mode
+  disabled: true
+- id: plugin-manager
+  disabled: true
+- id: tool-subagent
+  disabled: true
+- id: tool-subagent-fork
+  disabled: true
+- id: tool-subagent-control
+  disabled: true
+- id: tool-subagent-list-agents
+  disabled: true
+- id: tool-workflow
+  disabled: true
+- insert:
+    - id: experiment-dispatch
+      name: '@deepseek-ai/dsh-experiment-dispatch'
+      config:
+        host: !!js process.env.DSH_EXPERIMENT_TARGET
+        sshPort: !!js Number(process.env.DSH_EXPERIMENT_SSH_PORT ?? 22)
+        remotePort: !!js Number(process.env.DSH_EXPERIMENT_PORT ?? 43019)
+        remoteRoot: !!js process.env.DSH_EXPERIMENT_REMOTE_ROOT
+        localRepo: !!js process.cwd()
+        identityFile: !!js process.env.DSH_EXPERIMENT_SSH_IDENTITY
+        dataRoots: !!js process.env.DSH_EXPERIMENT_DATA_ROOTS?.split(';') ?? []
+        allowedSystemPackages: !!js process.env.DSH_EXPERIMENT_SYSTEM_PACKAGES?.split(',') ?? ['bubblewrap']
+        tokenRef: !!js process.env.DSH_EXPERIMENT_TOKEN_REF ?? 'DSH_EXPERIMENT_TOKEN'
+        agentCredentialRefs: !!js process.env.DSH_EXPERIMENT_AGENT_CREDENTIAL_REFS?.split(',').filter(Boolean) ?? ['DEEPSEEK_API_KEY']
+        toolTimeoutMs: !!js Number(process.env.DSH_EXPERIMENT_SETUP_TIMEOUT_MS ?? 1800000)

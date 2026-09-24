@@ -20,6 +20,7 @@
  * @module @deepseek-ai/dsh-sandbox-policy
  */
 
+import { statSync } from 'node:fs'
 import { isAbsolute } from 'node:path'
 import { Context, Service } from '@deepseek-ai/cordis'
 import { z as zod } from 'zod'
@@ -76,6 +77,10 @@ export interface Config {
    * `process.cwd()`). Normal agent calls use their session cwd instead.
    */
   workspaceRoot?: string
+  /** Allocated NVIDIA character devices available to confined training processes. */
+  devicePaths?: string[]
+  /** Existing private directories masked inside bwrap subprocesses. */
+  hiddenPaths?: string[]
 }
 
 /** Inputs that select the sandbox policy for one capability call. */
@@ -114,6 +119,8 @@ export class SandboxPolicyService extends Service {
     // No schema default: process.cwd() is resolved in the constructor so the
     // stored root is always absolute regardless of how it was supplied.
     workspaceRoot: z.string(),
+    devicePaths: z.array(z.string()).default([]),
+    hiddenPaths: z.array(z.string()).default([]),
   })
 
   static inject = ['sessionProjections']
@@ -122,6 +129,10 @@ export class SandboxPolicyService extends Service {
   readonly defaultMode: SandboxMode
   /** The absolute `workspace-write` fallback root for calls without a session cwd. */
   readonly workspaceRoot: string
+  /** Validated deployment grants; absent from read-only calls. */
+  readonly devicePaths: readonly string[]
+  /** Private paths masked from confined subprocesses. */
+  readonly hiddenPaths: readonly string[]
   constructor(ctx: Context, config: Config) {
     super(ctx, 'sandboxPolicy')
     // schemastery (static Config) already filled `mode`; the cast records that
@@ -129,6 +140,25 @@ export class SandboxPolicyService extends Service {
     // the process cwd is real branching, resolved absolute either way.
     this.defaultMode = config.mode as SandboxMode
     this.workspaceRoot = resolveWorkspaceRoot(config.workspaceRoot ?? process.cwd())
+    this.devicePaths = [...new Set(config.devicePaths ?? [])]
+    this.hiddenPaths = [...new Set(config.hiddenPaths ?? [])]
+    if (this.devicePaths.length > 0 && process.platform !== 'linux') {
+      throw new Error('sandbox-policy: NVIDIA device grants require Linux')
+    }
+    for (const path of this.devicePaths) {
+      if (!/^\/dev\/nvidia(?:[0-9]+|ctl|uvm(?:-tools)?|modeset|caps\/nvidia-cap[0-9]+)$/.test(path)
+        || !statSync(path).isCharacterDevice()) {
+        throw new Error(`sandbox-policy: device grant must name an existing NVIDIA character device: ${path}`)
+      }
+    }
+    if (this.hiddenPaths.length > 0 && process.platform !== 'linux') {
+      throw new Error('sandbox-policy: private path masks require Linux bwrap')
+    }
+    for (const path of this.hiddenPaths) {
+      if (!isAbsolute(path) || !statSync(path).isDirectory()) {
+        throw new Error(`sandbox-policy: private path mask must name an existing absolute directory: ${path}`)
+      }
+    }
 
     ctx.sessionProjections.register({
       key: 'sandboxMode',
@@ -166,6 +196,9 @@ export class SandboxPolicyService extends Service {
     return {
       mode: request.mode ?? (session === undefined ? undefined : this.overrideOf(session)) ?? this.defaultMode,
       workspaceRoot: resolveWorkspaceRoot(session?.header.cwd ?? this.workspaceRoot),
+      ...this.devicePaths.length === 0 || (request.mode ?? (session === undefined ? undefined : this.overrideOf(session)) ?? this.defaultMode) !== 'workspace-write'
+        ? {} : { devicePaths: this.devicePaths },
+      ...this.hiddenPaths.length === 0 ? {} : { hiddenPaths: this.hiddenPaths },
       ...session === undefined ? {} : { sessionId: session.id },
     }
   }

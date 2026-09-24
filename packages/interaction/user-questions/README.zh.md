@@ -44,6 +44,8 @@ kind: "package-reference"
 
 `intent` 声明某个问题本身就是一种已知决策，因此认识该标签的 UI 可以照此呈现——`plan-review` 表示 `detail` 是一份待审阅的计划，`dsh-plan-mode` 会在 `exit_plan_mode` 的问题上设置它。意图只改变呈现：遵循它的 UI 回答的仍是通用 UI 会发送的那些选项标签，不认识该标签的 UI 渲染通用选项列表，因此调用方两种情况下读到的回答字段相同。`approve` 指名表示批准的标签，而不依赖选项顺序。有两项断言无法通过类型表达，`ask()` 会以 `BAD_INTENT` 拒绝它们：`approve` 未命中该问题自身的任一选项，以及意图落在没有 `detail` 的问题上——而 `detail` 正是它自称在审阅的东西。
 
+`config.unattended: true` 会让 `ask()` 在调用任何回答方前以 `UNATTENDED_QUESTION` 拒绝请求，即使 Web 回答方已连接也一样。无人值守 profile 启用此选项；交互 profile 保持默认行为。
+
 <a id="role"></a>
 ## 职责
 

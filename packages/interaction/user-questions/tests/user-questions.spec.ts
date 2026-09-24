@@ -58,6 +58,17 @@ describe('UserQuestionService', () => {
       .rejects.toMatchObject({ name: 'UserQuestionError', code: 'NO_PROVIDER' })
   })
 
+  it('rejects unattended questions before a connected answerer can wait', async () => {
+    const ctx = new Context()
+    await ctx.plugin(UserQuestionService, { unattended: true })
+    const p = provider()
+    registerAnswerer(ctx, p)
+
+    await expect(ctx.userQuestions.ask({ questions: [{ id: 'confirm', question: 'Proceed?' }] }))
+      .rejects.toMatchObject({ code: 'UNATTENDED_QUESTION' })
+    expect(p.seen).toEqual([])
+  })
+
   it('registers providers with HMR-safe disposal', async () => {
     const ctx = new Context()
     await ctx.plugin(UserQuestionService)

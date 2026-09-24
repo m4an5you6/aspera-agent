@@ -7,9 +7,9 @@
 
 已发布插件向 `ctx.tools` 提供的所有面向模型的工具：模型通过系统提示词组装获得的 `name`、`description` 和 JSON Schema `parameters`。本目录是[子系统页面](subsystems/core.zh.md)（类型及每页生成的 `cordis-surface` 接线区域）的补充；本页列出的是向 agent（智能体）提供的*工具*。
 
-英文源文件由系统**生成**，并通过 `pnpm run verify-tool-catalog`（`doc-sync`（文档同步门禁）的一部分）验证新鲜度；本中文文件作为经评审对侧通过双语配对维护。与 Cordis 目录（纯源码 AST 处理）不同，英文生成器会在真实上下文中**启动**每个工具插件并读取 `ctx.tools.schemas()`，因为工具 schema 无法通过静态分析完全确定，例如运行时展开的枚举、拼接的描述、由配置决定的名称以及使用原始 JSON Schema 的 MCP 工具。完整性守卫会 glob 匹配 `packages/*/tool-*`；如果生成器的启动 manifest（元数据清单）遗漏任何包，检查就会失败，因此新工具不会在无人察觉的情况下缺少文档。
+英文源文件由系统**生成**，并通过 `pnpm run verify-tool-catalog`（`doc-sync`（文档同步门禁）的一部分）验证新鲜度；本中文文件作为经评审对侧通过双语配对维护。与 Cordis 目录（纯源码 AST 处理）不同，英文生成器会在真实上下文中**启动**每个工具插件并读取 `ctx.tools.schemas()`，因为工具 schema 无法通过静态分析完全确定，例如运行时展开的枚举、拼接的描述、由配置决定的名称以及使用原始 JSON Schema 的 MCP 工具。完整性守卫会 glob 匹配 `packages/*/tool-*`；如果启动清单遗漏此类包，检查就会失败。位于其他路径、但提供工具的 bundle 有明确的启动配置。
 
-范围：`packages/*/tool-*` 下已发布的产品工具，每个工具均使用其**默认**配置启动；但如果某个 Config 字段是**必填项**且没有默认值，生成器就必须作出选择，对应包的说明会记录本页展示的是哪个分支。注册的工具**名称**可以是加载时配置，例如 `tool-subagent` 的 `toolName`，因此部署可能以不同名称或额外名称提供某个包；如果存在随产品发布的别名，对应包的说明会予以记录。`examples/` 中的演示工具（例如 `echo`）不在范围内，这与 Cordis 目录仅涵盖包的范围一致。
+范围：启动清单中的已发布产品工具，包括所有 `packages/*/tool-*` 包和明确列出的工具 bundle。每项配置使用其**默认**值；如果某个 Config 字段是**必填项**且没有默认值，生成器就必须作出选择，对应包的说明会记录本页展示的是哪个分支。注册的工具**名称**可以是加载时配置，例如 `tool-subagent` 的 `toolName`，因此部署可能以不同名称或额外名称提供某个包；如果存在随产品发布的别名，对应包的说明会予以记录。`examples/` 中的演示工具（例如 `echo`）不在范围内，这与 Cordis 目录仅涵盖包的范围一致。
 
 <a id="tool-package-map"></a>
 
@@ -48,6 +48,7 @@
 | `@deepseek-ai/dsh-tool-todo` | `todo_write` | `ctx.tools`、`owning Agent session` | `tool/call`、`todo/write`、`tool/result` | - | todo_write 是会话所有的状态；UI 将最新的 todo/write 事件渲染为检查清单。`allowParallelInProgress` 是没有默认值的必填项，因此本目录明确选择 `true`，对应描述允许同时存在多个 `in_progress` 项。选择 `false` 的部署会获得同一工具，但描述会要求只能有 1 个活动任务。 |
 | `@deepseek-ai/dsh-tool-workflow` | `workflow` | `ctx.tools`、`ctx.workflowEngine`、`ctx.systemPrompt`、`a calling Agent (exec.agent parents the script children)` | `tool/call`、`tool/result` | - | - |
 | `@deepseek-ai/dsh-tool-web` | `web_fetch`、`web_search` | `ctx.tools`、`ctx.web`、`ctx.systemPrompt` | `tool/call`、`tool/result` | - | web_search 和 web_fetch 将提供方选择置于 ctx.web 之后，使模型可见 schema 在更换后端时保持稳定。 |
+| `@deepseek-ai/dsh-experiment-dispatch` | `cancel_experiment`、`get_experiment_status`、`prepare_experiment_environment`、`submit_experiment` | `ctx.tools`、`ctx.agents`、`ctx.credentials`、`ctx.storageDomain`、`ctx.systemPrompt` | `tool/call`、`tool/result`、`remote experiment receiver record` | - | 四个工具要求存活的根 Agent 与独立认证的 Linux 工作端；接管回执不表示训练完成。 |
 
 <a id="deepseek-aidsh-plugin-manager"></a>
 
@@ -2496,3 +2497,113 @@ todo_write 是会话所有的状态；UI 将最新的 todo/write 事件渲染为
 来源：[`packages/web/tool-web/src/index.ts`](../packages/web/tool-web/src/index.ts)
 
 web_search 和 web_fetch 将提供方选择置于 ctx.web 之后，使模型可见 schema 在更换后端时保持稳定。
+
+<a id="deepseek-aidsh-experiment-dispatch"></a>
+
+## `@deepseek-ai/dsh-experiment-dispatch`
+
+### `cancel_experiment`
+
+取消远端实验，并等待所属 Agent 及其子进程停止。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "submission_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "submission_id"
+  ]
+}
+```
+
+来源：[`packages/workflow/experiment-dispatch/src/index.ts`](../packages/workflow/experiment-dispatch/src/index.ts)
+
+### `get_experiment_status`
+
+读取已提交实验在远端的持久状态。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "submission_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "submission_id"
+  ]
+}
+```
+
+来源：[`packages/workflow/experiment-dispatch/src/index.ts`](../packages/workflow/experiment-dispatch/src/index.ts)
+
+### `prepare_experiment_environment`
+
+将当前 DSH 源码部署到配置的 GPU 目标，并在提交前实际验证沙箱与 CUDA 访问。
+
+```json
+{
+  "type": "object",
+  "properties": {}
+}
+```
+
+来源：[`packages/workflow/experiment-dispatch/src/index.ts`](../packages/workflow/experiment-dispatch/src/index.ts)
+
+### `submit_experiment`
+
+向已准备的工作端提交一项实验。返回的接管回执表示远端 DSH 已独立持有该任务。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "preparation_id": {
+      "type": "string"
+    },
+    "objective": {
+      "type": "string"
+    },
+    "agent_model_provider": {
+      "type": "string"
+    },
+    "agent_model_id": {
+      "type": "string"
+    },
+    "training_model": {
+      "type": "string"
+    },
+    "training_method": {
+      "type": "string"
+    },
+    "required_gpus": {
+      "type": "number"
+    },
+    "dataset_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "constraints": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "preparation_id",
+    "objective"
+  ]
+}
+```
+
+来源：[`packages/workflow/experiment-dispatch/src/index.ts`](../packages/workflow/experiment-dispatch/src/index.ts)
+
+这四个工具要求存活的根 Agent 和独立认证的 Linux 工作端。提交成功的回执表示远端接管，不表示训练完成。

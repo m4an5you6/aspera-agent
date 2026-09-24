@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-The workflow group lets an agent run orchestration scripts that delegate work to subagents and return a final value. The `workflow` tool supports scripted fan-out; the opt-in `ralph` tool runs a fixed sequence of fresh agents. Scripts use the shared PTC Node process runtime under the calling Session's file policy. Workflow hooks and child lifecycle remain owned by the workflow engine.
+The workflow group lets an agent run orchestration scripts that delegate work to subagents and return a final value. The `workflow` tool supports scripted fan-out; the opt-in `ralph` tool runs a fixed sequence of fresh agents. The experiment bundles let a local Goal prepare a GPU worker and hand an independent Goal to that worker. Workflow scripts use the shared PTC Node process runtime under the calling Session's file policy; the experiment worker uses its own Session and file policy.
 
 ## Table of Contents
 
@@ -28,6 +28,8 @@ The workflow group lets an agent run orchestration scripts that delegate work to
 | [`workflow-ptc`](workflow-ptc/README.md) | Runs workflow scripts through the shared sandboxed PTC Node process runtime | registers on `ctx.workflowEngine` |
 | [`tool-workflow`](tool-workflow/README.md) | Gives the model the `workflow` tool for scripted multi-agent orchestration | registers on `ctx.tools` |
 | [`tool-ralph`](tool-ralph/README.md) | Gives the model the `ralph` tool for fresh-agent iterative loops | registers on `ctx.tools` |
+| [`experiment-dispatch`](experiment-dispatch/README.md) | Deploys and dispatches one unattended GPU experiment from the local DSH | registers on `ctx.tools` |
+| [`experiment-worker`](experiment-worker/README.md) | Owns the remote authenticated receiver, Session, Goal, and durable receipt | HTTP receiver |
 
 -----
 

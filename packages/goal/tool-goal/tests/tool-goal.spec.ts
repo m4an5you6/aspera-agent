@@ -20,6 +20,16 @@ import ToolRuntime from '@deepseek-ai/dsh-tools'
 import type { ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import * as toolGoal from '@deepseek-ai/dsh-tool-goal'
 import { createInboxStub } from '@deepseek-ai/dsh-agent-loop-testkit'
+import { renderWrapupContext } from '../src/wrapup.ts'
+
+it('ends unattended goals with evidence and blockers without requesting an answer', () => {
+  const complete = renderWrapupContext('train model', undefined, true)[0]
+  const blocked = renderWrapupContext('train model', 'GPU unavailable', true)[0]
+  if (complete?.type !== 'text' || blocked?.type !== 'text') throw new Error('expected text wrap-ups')
+  expect(complete.text).toContain('Do not call any more tools or wait for an answer')
+  expect(blocked.text).toContain('GPU unavailable')
+  expect(blocked.text).not.toContain('need from the user')
+})
 
 const testToolSignal = new AbortController().signal
 

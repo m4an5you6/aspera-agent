@@ -48,7 +48,7 @@ kind: "package-reference"
     blockedAfterConsecutiveRounds: 3
 ```
 
-该值必须是正的安全整数。它既提供模型自行报告阻塞的硬下限，也决定模型指引中指明的数值。生成的[配置目录](../../../docs/config-catalog.zh.md#deepseek-aidsh-tool-goal)是每个受支持字段的穷尽式真源。
+该值必须是正的安全整数。它既提供模型自行报告阻塞的硬下限，也决定模型指引中指明的数值。无人值守 profile 设置 `unattended: true` 后，终局消息报告结果和阻塞原因，不要求人类继续回答。生成的[配置目录](../../../docs/config-catalog.zh.md#deepseek-aidsh-tool-goal)是每个受支持字段的穷尽式真源。
 
 ### 权限规则
 

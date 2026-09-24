@@ -1,0 +1,73 @@
+# Independent receiver: only loopback control, no browser or human wait path.
+- id: hmr
+  disabled: true
+- id: user-questions
+  config:
+    unattended: true
+- id: credentials
+  config:
+    path: !!js process.env.DSH_EXPERIMENT_MODEL_CREDENTIAL_FILE
+- id: tools
+  config:
+    mode: native
+- id: approval
+  config:
+    policy: never
+- id: sandbox-policy
+  config:
+    mode: workspace-write
+    workspaceRoot: !!js process.env.DSH_EXPERIMENT_WORKSPACE
+    devicePaths: !!js process.env.DSH_EXPERIMENT_DEVICES?.split(',') ?? []
+    hiddenPaths: !!js process.env.DSH_EXPERIMENT_HIDDEN_PATHS?.split(',') ?? []
+- id: sandbox
+  config:
+    runnerCommand: !!js "[process.env.DSH_EXPERIMENT_BWRAP]"
+    runnerFailureSignatures:
+      - 'bwrap:'
+- id: permission
+  config:
+    presets:
+      unattended:
+        sandbox: workspace-write
+        approval: never
+    defaultPreset: unattended
+- id: tool-goal
+  config:
+    unattended: true
+    blockedAfterConsecutiveRounds: 1
+- id: plan-mode
+  disabled: true
+- id: plugin-manager
+  disabled: true
+- id: tool-subagent
+  disabled: true
+- id: tool-subagent-fork
+  disabled: true
+- id: tool-subagent-control
+  disabled: true
+- id: tool-subagent-list-agents
+  disabled: true
+- id: tool-workflow
+  disabled: true
+- id: tool-web
+  disabled: true
+- id: tool-fs
+  disabled: true
+- id: tool-fs-search
+  disabled: true
+- id: tool-skill
+  disabled: true
+- insert:
+    - id: experiment-webserver
+      name: '@deepseek-ai/dsh-host-webserver'
+      config:
+        host: 127.0.0.1
+        port: !!js Number(process.env.DSH_EXPERIMENT_PORT)
+    - id: experiment-worker
+      name: '@deepseek-ai/dsh-experiment-worker'
+      config:
+        workspaceRoot: !!js process.env.DSH_EXPERIMENT_WORKSPACE
+        tokenFile: !!js process.env.DSH_EXPERIMENT_TOKEN_FILE
+        logFile: !!js process.env.DSH_EXPERIMENT_LOG_FILE
+        deploymentId: !!js process.env.DSH_EXPERIMENT_DEPLOYMENT_ID
+        devicePaths: !!js process.env.DSH_EXPERIMENT_DEVICES?.split(',') ?? []

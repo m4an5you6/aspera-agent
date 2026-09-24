@@ -94,6 +94,28 @@ describe('profile dialects', () => {
     expect(landlockProfileArgs(WW)).toEqual(['--ro', '/', '--rw', '/dev/null', '--rw', '/tmp', '--rw', '/ws'])
   })
 
+  it('grants only explicitly allocated GPU devices to workspace-write processes', () => {
+    const gpu: SandboxPolicy = { ...WW, devicePaths: ['/dev/nvidia1', '/dev/nvidiactl'] }
+    expect(bwrapProfileArgs(gpu)).toEqual([
+      ...bwrapProfileArgs(WW), '--dev-bind', '/dev/nvidia1', '/dev/nvidia1',
+      '--dev-bind', '/dev/nvidiactl', '/dev/nvidiactl',
+    ])
+    expect(landlockProfileArgs(gpu)).toEqual([
+      ...landlockProfileArgs(WW), '--rw', '/dev/nvidia1', '--rw', '/dev/nvidiactl',
+    ])
+    expect(bwrapProfileArgs({ ...gpu, mode: 'read-only' })).toEqual(bwrapProfileArgs(RO))
+  })
+
+  it('masks private directories with bwrap and rejects a Landlock fallback', () => {
+    const policy: SandboxPolicy = { ...WW, hiddenPaths: ['/worker/secrets', '/worker/state'] }
+    expect(bwrapProfileArgs(policy)).toEqual([
+      '--ro-bind', '/', '/', '--dev', '/dev', '--unshare-pid', '--proc', '/proc', '--die-with-parent',
+      '--tmpfs', '/worker/secrets', '--tmpfs', '/worker/state',
+      '--tmpfs', '/tmp', '--bind', '/ws', '/ws',
+    ])
+    expect(() => landlockProfileArgs(policy)).toThrow('bwrap is required')
+  })
+
   it('seatbelt read-only: allow-default with every file write denied except the /dev/null literal', () => {
     expect(seatbeltProfileArgs(RO)).toEqual(['-p', SEATBELT_RO_PROFILE])
   })

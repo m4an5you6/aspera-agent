@@ -18,6 +18,7 @@ import { installModelSelection } from '@deepseek-ai/dsh-agent'
 import type { Agent, ModelSelectionRef } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
 import type {} from '@deepseek-ai/dsh-fs'
+import type {} from '@deepseek-ai/dsh-goal'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { assertNever } from '@deepseek-ai/dsh-util-values'
 import { SessionSeq } from '@deepseek-ai/dsh-session'
@@ -46,13 +47,40 @@ export interface Config {
   sessionId?: string
   /** Whether stdout carries the machine-readable event stream instead of final text. */
   json?: boolean
+  /** Create a Goal from the task and wait for its terminal state before exiting. */
+  goalFromTask?: boolean
 }
 
 export const Config: z<Config> = z.object({
   task: z.string(),
   sessionId: z.string(),
   json: z.boolean(),
+  goalFromTask: z.boolean(),
 })
+
+/** Wait for a locally owned Goal to end, including its closing turn. */
+async function waitForGoal(ctx: Context, agent: Agent): Promise<'complete' | 'blocked'> {
+  const goals = ctx.get('goals')
+  if (goals === undefined) throw new Error('headless-runner: goalFromTask requires the Goal service')
+  const phase = await new Promise<'complete' | 'blocked'>((resolve, reject) => {
+    let offGoal = () => {}
+    let offError = () => {}
+    const finish = (value: 'complete' | 'blocked'): void => { offGoal(); offError(); resolve(value) }
+    const fail = (error: Error): void => { offGoal(); offError(); reject(error) }
+    offGoal = ctx.on('goal/changed', ({ agent: changed, change }) => {
+      if (changed !== agent || change.goal === undefined) return
+      if (change.goal.phase === 'complete' || change.goal.phase === 'blocked') finish(change.goal.phase)
+      if (change.goal.phase === 'paused') fail(new Error('headless Goal paused without a human answer'))
+    })
+    offError = ctx.on('agent/error', ({ agent: failed }) => {
+      if (failed === agent) fail(new Error('headless Goal Agent failed before reaching a terminal state'))
+    })
+    const current = goals.get(agent)
+    if (current?.phase === 'complete' || current?.phase === 'blocked') finish(current.phase)
+  })
+  await agent.whenIdle()
+  return phase
+}
 
 /** Outcome of one owned run interval. */
 interface RunOutcome {
@@ -360,13 +388,25 @@ async function run(ctx: Context, config: Config, io: HeadlessIo): Promise<void> 
   const firstSeq = agent.session.seq
   const projection = config.json === true ? projectJsonRun(ctx, agent, io.stdout, { cwd }) : undefined
   const stopReasoning = projection === undefined ? streamReasoning(ctx, agent, io.stderr) : undefined
+  let goalPhase: 'complete' | 'blocked' | undefined
   try {
     try {
+      if (config.goalFromTask === true) {
+        const goals = ctx.get('goals')
+        if (goals === undefined) throw new Error('headless-runner: goalFromTask requires the Goal service')
+        const previous = goals.get(agent)
+        if (previous === undefined || previous.phase === 'complete') goals.create(agent, { objective: task })
+        else {
+          if (previous.objective !== task) throw new Error('headless-runner: resumed Goal has a different objective')
+          goals.resume(agent, previous)
+        }
+      }
       agent.followup(createUserMessage({
         content: [{ type: 'text', text: task }],
         source: { kind: 'user' },
       }))
-      await agent.whenIdle()
+      goalPhase = config.goalFromTask === true ? await waitForGoal(ctx, agent) : undefined
+      if (goalPhase === undefined) await agent.whenIdle()
     } finally {
       stopReasoning?.()
     }
@@ -377,7 +417,7 @@ async function run(ctx: Context, config: Config, io: HeadlessIo): Promise<void> 
     if (outcome.reason?.kind === 'error') {
       io.stderr.write(`dsh: ${outcome.reason.error.code}: ${outcome.reason.error.message}\n`)
     }
-    io.exit(outcome.reason?.kind === 'completed' ? 0 : 1)
+    io.exit(outcome.reason?.kind === 'completed' && goalPhase !== 'blocked' ? 0 : 1)
   } finally {
     projection?.dispose()
   }

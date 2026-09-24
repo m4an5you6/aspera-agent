@@ -46,6 +46,8 @@ kind: "package-reference"
 |---|---|---|
 | `mode` | `read-only` | 会话起始的部署默认模式，加载时验证 |
 | `workspaceRoot` | `process.cwd()` | 无 agent 调用或没有 cwd 的会话所用的绝对回退根目录；相对值在加载时拒绝。普通 agent 调用使用会话的不可变 cwd |
+| `devicePaths` | `[]` | 授予 Linux 上 `workspace-write` 受限进程使用的现有 NVIDIA 字符设备；由部署方指定并在加载时检查 |
+| `hiddenPaths` | `[]` | 在 bwrap 子进程内隐藏的现有 Linux 目录；Landlock 无法隐藏读取，因此拒绝此类请求 |
 
 生成的[配置目录](../../../docs/config-catalog.zh.md#deepseek-aidsh-sandbox-policy)是每个受支持字段及其 JSDoc 的穷尽式真源。
 

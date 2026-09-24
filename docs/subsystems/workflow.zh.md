@@ -127,6 +127,10 @@ interface WorkflowRun {
 
 `dsh-client-ui-workflow-run` 通过 Conversation Node 引擎把四类事件折叠为一个 `workflow-run` Chat 节点，以 run-start 序号锚定在原工作流工具节点之后。阶段组只来自真正开始过的成员，并保留精确字符串，包括字段缺省与 `''` 的区别。Location 关闭时，缺失终点会显示为已中断。[界面包 README](../../packages/client/ui-workflow-run/README.zh.md)负责定义 disclosure、状态与同父本地导航行为。
 
+## 远端实验记录
+
+[实验工作端](../../packages/workflow/experiment-worker/README.zh.md)导出 `ExperimentSpec`、`ExperimentSubmission` 和 `ExperimentRecord`。`ExperimentSpec` 区分 `agentModel` 与 `trainingModel`；目标、数据引用、训练方式、GPU 数量要求、约束及相对输出路径构成提交要求。`ExperimentSubmission` 增加稳定提交编号和部署源码摘要。`ExperimentRecord` 增加内容摘要、Session 和 Goal 编号、输出及工作进程日志路径、时间戳，以及接收端生命周期状态（`reserved`、`accepted`、`complete`、`blocked`、`failed`、`cancelled` 或 `interrupted`）。仅当工作端仍管理该 Agent 时，状态响应才包含实时 `goalPhase`；持久接收状态不代替 Session 内的 Goal 历史。
+
 <!-- BEGIN GENERATED cordis-surface (gen-cordis-catalog.ts) — do not edit between markers -->
 
 <a id="cordis-surface"></a>

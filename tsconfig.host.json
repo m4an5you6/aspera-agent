@@ -368,6 +368,8 @@
     { "path": "./packages/workflow/workflow-ptc" },
     { "path": "./packages/workflow/tool-workflow" },
     { "path": "./packages/workflow/tool-ralph" },
+    { "path": "./packages/workflow/experiment-dispatch" },
+    { "path": "./packages/workflow/experiment-worker" },
     { "path": "./packages/webhook/webhook" },
     { "path": "./packages/webhook/webhook-github" },
     { "path": "./packages/todo/tool-todo" },

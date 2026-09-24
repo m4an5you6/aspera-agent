@@ -39,13 +39,14 @@ The agent works through the task, streams each non-empty provider reasoning delt
 { echo "Summarize these changes:"; git diff --stat; } | dsh --profile headless
 ```
 
-The task and run options are supplied through three settings:
+The task and run options are supplied through four settings:
 
 | Field | Default | Meaning |
 |---|---|---|
 | `task` | stdin | The task text; stdin supplies it when omitted or `-` |
 | `sessionId` | `session-<uuid>` | Exact Session identity to adopt; an unknown id fails |
 | `json` | `false` | Project the run as newline-delimited events on stdout |
+| `goalFromTask` | `false` | Create a Goal from the task and wait for completion or blockage before exiting |
 
 The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-headless) is the exhaustive source for every accepted field and its JSDoc.
 
@@ -77,7 +78,7 @@ The runner is a direct driver over the core API carrier: it resolves the Agent i
 
 ### Run flow
 
-The runner awaits the complete application (`ctx.get('loader')?.await()`) so the composed tools and adapters are not half-mounted, reads the shared [`agentDefaultModel`](../../core/agent-default-model/README.md) selection, resolves the task from config or stdin, then resolves the Agent identity: a fresh `session-<uuid>` by default, or the persisted Session `--session-id` names, which it adopts through [`sessionQuery`](../../session-query/session-query/README.md) and refuses when no log exists. It submits the task as an ordinary user message. Without `--json` it streams that Agent's non-empty reasoning deltas to stderr; with `--json` it projects the run instead. It waits for quiescence, then flushes the Session and folds the owned interval (`firstSeq` onward) into the last non-empty `assistant/message` text and final `turn/end` reason. It writes the final text to stdout (or the `final` event) and requests exit.
+The runner awaits the complete application (`ctx.get('loader')?.await()`) so the composed tools and adapters are not half-mounted, reads the shared [`agentDefaultModel`](../../core/agent-default-model/README.md) selection, resolves the task from config or stdin, then resolves the Agent identity: a fresh `session-<uuid>` by default, or the persisted Session `--session-id` names, which it adopts through [`sessionQuery`](../../session-query/session-query/README.md) and refuses when no log exists. With `goalFromTask`, it creates a Goal from the task before submitting the ordinary user message and waits for a terminal Goal state. Without `--json` it streams that Agent's non-empty reasoning deltas to stderr; with `--json` it projects the run instead. It waits for quiescence, then flushes the Session and folds the owned interval (`firstSeq` onward) into the last non-empty `assistant/message` text and final `turn/end` reason. It writes the final text to stdout (or the `final` event) and requests exit.
 
 ### Patch surface over base
 
@@ -85,7 +86,7 @@ The patch rides over `dsh-base`: it inherits the projection cache and shared PTC
 
 ### Exit mapping
 
-A completed final `turn/end` exits 0; any other outcome — aborted, error, or no turn in the owned interval — exits 1. An `error` reason also writes `dsh: <code>: <message>` to stderr. A direct driver failure (for example, Agent creation or an unusable `--session-id`) writes `dsh: <message>` to stderr and exits 1, and in `--json` mode also emits an `error` event.
+A completed final `turn/end` exits 0 unless `goalFromTask` ended blocked; a blocked Goal, aborted or errored turn, or no turn in the owned interval exits 1. An `error` reason also writes `dsh: <code>: <message>` to stderr. A direct driver failure (for example, Agent creation or an unusable `--session-id`) writes `dsh: <message>` to stderr and exits 1, and in `--json` mode also emits an `error` event.
 
 ### Source map
 

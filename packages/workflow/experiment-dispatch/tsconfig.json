@@ -1,0 +1,15 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": { "rootDir": "src", "outDir": "lib/types" },
+  "include": ["src"],
+  "references": [
+    { "path": "../../../vendor/cordis" },
+    { "path": "../../../vendor/schemastery" },
+    { "path": "../../core/agent" },
+    { "path": "../../core/system-prompt" },
+    { "path": "../../core/tools" },
+    { "path": "../../credentials/credentials" },
+    { "path": "../../storage/storage-domain" },
+    { "path": "../experiment-worker" }
+  ]
+}

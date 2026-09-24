@@ -75,6 +75,7 @@ import WorkflowEngine from '@deepseek-ai/dsh-workflow'
 import type { WorkflowRun, WorkflowStartRequest } from '@deepseek-ai/dsh-workflow'
 import * as ToolRalph from '@deepseek-ai/dsh-tool-ralph'
 import * as ToolWorkflow from '@deepseek-ai/dsh-tool-workflow'
+import * as ExperimentDispatch from '../packages/workflow/experiment-dispatch/src/index.ts'
 import { githubSlug } from './verify-md-links.ts'
 
 /** Attachment seam marker that makes the attachments-conditional `read_image` schema harvestable. */
@@ -654,6 +655,26 @@ const TOOL_PACKAGES: ToolPackage[] = [
     note:
       'web_search and web_fetch keep provider selection behind ctx.web so model-visible schemas stay stable across backend swaps.',
   },
+  {
+    pkg: '@deepseek-ai/dsh-experiment-dispatch',
+    dir: 'experiment-dispatch',
+    source: 'packages/workflow/experiment-dispatch/src/index.ts',
+    requires: ['ctx.tools', 'ctx.agents', 'ctx.credentials', 'ctx.storageDomain', 'ctx.systemPrompt'],
+    writes: ['tool/call', 'tool/result', 'remote experiment receiver record'],
+    async mount(ctx) {
+      ctx.provide('agents', {} as never)
+      ctx.provide('credentials', {} as never)
+      ctx.provide('storageDomain', {
+        open: () => Promise.resolve({ close: () => Promise.resolve() }),
+      } as never)
+      await ctx.plugin(ExperimentDispatch, {
+        host: 'catalog.invalid', sshPort: 22, remotePort: 43019,
+        remoteRoot: '/tmp/dsh-experiment-catalog', localRepo: root,
+        tokenRef: 'DSH_EXPERIMENT_TOKEN',
+      })
+    },
+    note: 'These four tools require a live root Agent and a separately authenticated Linux worker. A successful submit receipt means remote ownership, not training completion.',
+  },
 ]
 
 /** One package's contribution to the catalog: its schemas plus attribution. */
@@ -795,9 +816,9 @@ export function render(catalog: ToolCatalog): string {
     '',
     'Every model-facing tool a shipped plugin contributes to `ctx.tools`: the `name`, `description`, and JSON-Schema `parameters` the model receives via the system-prompt assembly. It complements the [subsystem pages](subsystems/core.md) (the types plus each page\'s generated Cordis API region) — this page is the *tools* the agent is offered.',
     '',
-    'This file is GENERATED and verified fresh by `pnpm run verify-tool-catalog` (part of `doc-sync`) — do not edit it by hand. Unlike the cordis catalog (a pure source-AST pass), this generator BOOTS each tool plugin on a real context and reads `ctx.tools.schemas()`, because a tool schema is not statically knowable (runtime-spread enums, concatenated descriptions, config-driven names, raw-JSON-Schema MCP tools). A completeness guard globs `packages/*/tool-*` and fails if any package is missing from the generator\'s boot manifest, so a new tool cannot be silently undocumented.',
+    'This file is GENERATED and verified fresh by `pnpm run verify-tool-catalog` (part of `doc-sync`) — do not edit it by hand. Unlike the cordis catalog (a pure source-AST pass), this generator BOOTS each tool plugin on a real context and reads `ctx.tools.schemas()`, because a tool schema is not statically knowable (runtime-spread enums, concatenated descriptions, config-driven names, raw-JSON-Schema MCP tools). A completeness guard globs `packages/*/tool-*` and fails if any such package is missing from the generator\'s boot manifest; tool-bearing bundles outside that path have explicit boot recipes.',
     '',
-    'Scope: shipped product tools under `packages/*/tool-*`, each booted with its DEFAULT config, except where a Config field is REQUIRED with no default — there the generator must choose, and the per-package note records which branch this page shows. The registered tool NAME can be a load-time config (e.g. `tool-subagent`\'s `toolName`), so a deployment may expose a package under a different or additional name — a per-package note records those shipped aliases where they exist. The `examples/` demo tools (e.g. `echo`) are excluded, matching the cordis catalog\'s packages-only scope.',
+    'Scope: shipped product tools in the boot manifest, including every `packages/*/tool-*` package and explicitly listed tool-bearing bundles. Each recipe uses its DEFAULT config, except where a Config field is REQUIRED with no default — there the generator must choose, and the per-package note records which branch this page shows. The registered tool NAME can be a load-time config (e.g. `tool-subagent`\'s `toolName`), so a deployment may expose a package under a different or additional name — a per-package note records those shipped aliases where they exist. The `examples/` demo tools (e.g. `echo`) are excluded, matching the cordis catalog\'s packages-only scope.',
     '',
     '## Tool Package Map',
     '',

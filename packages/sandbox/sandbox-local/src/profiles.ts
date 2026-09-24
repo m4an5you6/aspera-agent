@@ -15,9 +15,11 @@ import type { SandboxPolicy } from '@deepseek-ai/dsh-sandbox'
  */
 export function bwrapProfileArgs(policy: SandboxPolicy): string[] {
   const args = ['--ro-bind', '/', '/', '--dev', '/dev', '--unshare-pid', '--proc', '/proc', '--die-with-parent']
+  for (const path of policy.hiddenPaths ?? []) args.push('--tmpfs', path)
   if (policy.mode === 'workspace-write') {
     args.push('--tmpfs', '/tmp')
     args.push('--bind', policy.workspaceRoot, policy.workspaceRoot)
+    for (const device of policy.devicePaths ?? []) args.push('--dev-bind', device, device)
   }
   return args
 }
@@ -28,9 +30,11 @@ export function bwrapProfileArgs(policy: SandboxPolicy): string[] {
  * @returns launcher grant arguments before the trailing separator and command argv.
  */
 export function landlockProfileArgs(policy: SandboxPolicy): string[] {
+  if (policy.hiddenPaths?.length) throw new Error('Landlock cannot mask private read paths; bwrap is required')
   const readWrite = ['/dev/null']
   if (policy.mode === 'workspace-write') {
     readWrite.push('/tmp', policy.workspaceRoot)
+    readWrite.push(...policy.devicePaths ?? [])
   }
   return landlockGrantArgs({ readOnly: ['/'], readWrite })
 }

@@ -25,11 +25,14 @@ export const inject = ['agents', 'goals', 'tools', 'systemPrompt', 'sessionProje
 export interface Config {
   /** Minimum admitted goal rounds before the model may self-report `blocked`. */
   blockedAfterConsecutiveRounds?: number
+  /** Render terminal instructions without requesting a human answer. */
+  unattended?: boolean
 }
 
 /** Schemastery config for the goal-tool policy. */
 export const Config: z<Config> = z.object({
   blockedAfterConsecutiveRounds: z.number().step(1).min(1).default(3),
+  unattended: z.boolean().default(false),
 })
 
 /** Fully materialized tool policy. */
@@ -320,8 +323,8 @@ export function apply(ctx: Context, config: Config): void {
       if (authority.kind === 'goal-round') {
         exec.deferContext(createUserMessage({
           content: args.action === 'complete'
-            ? renderWrapupContext(goal.objective)
-            : renderWrapupContext(goal.objective, args.blocked_reason as string),
+            ? renderWrapupContext(goal.objective, undefined, config.unattended === true)
+            : renderWrapupContext(goal.objective, args.blocked_reason as string, config.unattended === true),
           source: {
             kind: 'plugin',
             plugin: 'tool-goal',

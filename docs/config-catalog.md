@@ -571,6 +571,66 @@ export interface Config {
 
 Source: [`packages/credentials/credentials-local/src/index.ts:64`](../packages/credentials/credentials-local/src/index.ts)
 
+<a id="deepseek-aidsh-experiment-dispatch"></a>
+
+## `@deepseek-ai/dsh-experiment-dispatch`
+
+Requires: `agents` · `credentials` · `tools` · `storageDomain` · `systemPrompt`
+
+```ts config-catalog
+/** Fixed deployment target and bounded setup operations. */
+export interface Config {
+  /** Known-hosts-verified OpenSSH destination for the GPU target. */
+  readonly host: string
+  /** Remote SSH listener port. */
+  readonly sshPort: number
+  /** Loopback HTTP receiver port reached through an SSH tunnel. */
+  readonly remotePort: number
+  /** Absolute private deployment directory on the target. */
+  readonly remoteRoot: string
+  /** Absolute local checkout whose current source is deployed. */
+  readonly localRepo: string
+  /** Optional OpenSSH private identity file for non-interactive login. */
+  readonly identityFile?: string
+  /** Local directories from which dataset files may be transferred. */
+  readonly dataRoots?: string[]
+  /** System packages permitted for extraction into the private tools directory. */
+  readonly allowedSystemPackages?: string[]
+  /** Credential reference for the receiver Bearer token. */
+  readonly tokenRef: string
+  /** Credential references copied into the remote worker's private model store. */
+  readonly agentCredentialRefs?: string[]
+  /** Preparation/submission tool deadline and process timeout for archives, SSH and SCP, in milliseconds. */
+  readonly toolTimeoutMs?: number
+}
+```
+
+Source: [`packages/workflow/experiment-dispatch/src/index.ts:25`](../packages/workflow/experiment-dispatch/src/index.ts)
+
+<a id="deepseek-aidsh-experiment-worker"></a>
+
+## `@deepseek-ai/dsh-experiment-worker`
+
+Requires: `agents` · `agentDefaultModel` · `goals` · `sessions` · `storageDomain` · `webServer`
+
+```ts config-catalog
+/** Worker deployment settings; secrets stay in an owner-only file. */
+export interface Config {
+  /** Absolute writable directory assigned to the experiment. */
+  readonly workspaceRoot: string
+  /** Owner-only file containing the receiver Bearer token. */
+  readonly tokenFile: string
+  /** Absolute path receiving worker process logs. */
+  readonly logFile: string
+  /** Content digest of the immutable deployed source release. */
+  readonly deploymentId: string
+  /** Explicitly granted NVIDIA character devices. */
+  readonly devicePaths: string[]
+}
+```
+
+Source: [`packages/workflow/experiment-worker/src/index.ts:28`](../packages/workflow/experiment-worker/src/index.ts)
+
 <a id="deepseek-aidsh-experimental-agent-team"></a>
 
 ## `@deepseek-ai/dsh-experimental-agent-team`
@@ -933,10 +993,12 @@ export interface Config {
   sessionId?: string
   /** Whether stdout carries the machine-readable event stream instead of final text. */
   json?: boolean
+  /** Create a Goal from the task and wait for its terminal state before exiting. */
+  goalFromTask?: boolean
 }
 ```
 
-Source: [`packages/bundle/headless/src/index.ts:42`](../packages/bundle/headless/src/index.ts)
+Source: [`packages/bundle/headless/src/index.ts:43`](../packages/bundle/headless/src/index.ts)
 
 <a id="deepseek-aidsh-hmr"></a>
 
@@ -2093,12 +2155,16 @@ export interface Config {
    * `process.cwd()`). Normal agent calls use their session cwd instead.
    */
   workspaceRoot?: string
+  /** Allocated NVIDIA character devices available to confined training processes. */
+  devicePaths?: string[]
+  /** Existing private directories masked inside bwrap subprocesses. */
+  hiddenPaths?: string[]
 }
 ```
 
 Depends on: [`SandboxMode`](subsystems/sandbox.md)
 
-Source: [`packages/sandbox/sandbox-policy/src/index.ts:71`](../packages/sandbox/sandbox-policy/src/index.ts)
+Source: [`packages/sandbox/sandbox-policy/src/index.ts:72`](../packages/sandbox/sandbox-policy/src/index.ts)
 
 <a id="deepseek-aidsh-sdk-app"></a>
 
@@ -3118,6 +3184,8 @@ Requires: `agents` · `goals` · `tools` · `systemPrompt` · `sessionProjection
 export interface Config {
   /** Minimum admitted goal rounds before the model may self-report `blocked`. */
   blockedAfterConsecutiveRounds?: number
+  /** Render terminal instructions without requesting a human answer. */
+  unattended?: boolean
 }
 ```
 
@@ -3545,6 +3613,20 @@ export type ApprovalPolicy = 'ask' | 'never'
 
 Source: [`packages/interaction/user-approval/src/index.ts:128`](../packages/interaction/user-approval/src/index.ts)
 
+<a id="deepseek-aidsh-user-questions"></a>
+
+## `@deepseek-ai/dsh-user-questions`
+
+```ts config-catalog
+/** Deployment policy for human questions. */
+export interface Config {
+  /** Reject questions before invoking any answerer. */
+  readonly unattended?: boolean
+}
+```
+
+Source: [`packages/interaction/user-questions/src/index.ts:35`](../packages/interaction/user-questions/src/index.ts)
+
 <a id="deepseek-aidsh-web"></a>
 
 ## `@deepseek-ai/dsh-web`
@@ -3860,7 +3942,6 @@ These load from a `cordis.yml` entry with no `config:` block; they declare no co
 - `@deepseek-ai/dsh-tool-call-timeout-policy` — requires `tools` ([`packages/guard/timeout-policy/src/index.ts`](../packages/guard/timeout-policy/src/index.ts))
 - `@deepseek-ai/dsh-tool-cordis` — requires `tools` · `systemPrompt` · `cordisInspect` ([`packages/extensions/tool-cordis/src/index.ts`](../packages/extensions/tool-cordis/src/index.ts))
 - `@deepseek-ai/dsh-tool-subagent-control` — requires `tools` · `subagents` ([`packages/subagent/tool-subagent-control/src/index.ts`](../packages/subagent/tool-subagent-control/src/index.ts))
-- `@deepseek-ai/dsh-user-questions` ([`packages/interaction/user-questions/src/index.ts`](../packages/interaction/user-questions/src/index.ts))
 - `@deepseek-ai/dsh-webhook` — requires `agents` · `agentDefaultModel` · `agentPresets` · `permissionPresets` · `sessionTitle` · `workspaceRegistry` ([`packages/webhook/webhook/src/index.ts`](../packages/webhook/webhook/src/index.ts))
 - `@deepseek-ai/dsh-workspace` — requires `storageDomain` · `sessionPersistence` ([`packages/workspace/workspace/src/index.ts`](../packages/workspace/workspace/src/index.ts))
 

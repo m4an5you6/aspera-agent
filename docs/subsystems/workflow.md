@@ -127,6 +127,10 @@ The top-level `dsh-tool-workflow` consumer projects display facts into its calli
 
 `dsh-client-ui-workflow-run` folds the four events through the Conversation Node engine into one `workflow-run` Chat node anchored at the run-start sequence, after the original workflow tool node. Phase groups come only from actual member starts and preserve exact strings, including the distinction between an omitted phase and `''`. Closed Locations turn missing terminal facts into interrupted presentation. The [UI package README](../../packages/client/ui-workflow-run/README.md) owns disclosure, status, and same-parent local navigation behavior.
 
+## Remote experiment records
+
+The [experiment worker](../../packages/workflow/experiment-worker/README.md) exports `ExperimentSpec`, `ExperimentSubmission`, and `ExperimentRecord`. `ExperimentSpec` separates `agentModel` from `trainingModel`; its objective, dataset references, training method, GPU requirement, constraints, and relative output path are the submitted requirements. `ExperimentSubmission` adds a stable submission id and deployed source digest. `ExperimentRecord` adds the payload digest, Session and Goal ids, output and worker-log paths, timestamps, and receiver lifecycle state (`reserved`, `accepted`, `complete`, `blocked`, `failed`, `cancelled`, or `interrupted`). The live `goalPhase` is included in status responses only while the worker owns the Agent; the durable receiver state does not replace the Session's Goal history.
+
 <!-- BEGIN GENERATED cordis-surface (gen-cordis-catalog.ts) — do not edit between markers -->
 
 <a id="cordis-surface"></a>

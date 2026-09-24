@@ -8,6 +8,7 @@
  */
 
 import { Context, Service } from '@deepseek-ai/cordis'
+import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-agent'
 import { HarnessError } from '@deepseek-ai/dsh-llm'
 import { scopeTarget } from '@deepseek-ai/dsh-scope'
@@ -29,6 +30,12 @@ export type {
 
 /** Request for a human answer. */
 export interface AskUserQuestionRequest extends AskUserQuestionRequestEvent {}
+
+/** Deployment policy for human questions. */
+export interface Config {
+  /** Reject questions before invoking any answerer. */
+  readonly unattended?: boolean
+}
 
 /** Stable error taxonomy for user-questions failures. */
 export class UserQuestionError extends HarnessError {
@@ -63,7 +70,9 @@ function restoreUserQuestionError(reason: unknown): unknown {
 
 /** `ctx.userQuestions`: validation plus the scoped answerer waterfall. */
 export class UserQuestionService extends Service {
-  constructor(ctx: Context) {
+  static Config: z<Config> = z.object({ unattended: z.boolean().default(false) })
+
+  constructor(ctx: Context, private readonly config: Config = {}) {
     super(ctx, 'userQuestions')
   }
 
@@ -84,6 +93,12 @@ export class UserQuestionService extends Service {
    *   that live agent is owned by another agent.
    */
   async ask(request: AskUserQuestionRequest): Promise<AskUserQuestionAnswer> {
+    if (this.config.unattended === true) {
+      throw new UserQuestionError(
+        'human questions are disabled in this unattended run; choose within the stated constraints or report a blocker',
+        'UNATTENDED_QUESTION',
+      )
+    }
     if (request.signal?.aborted) {
       throw abortedQuestion()
     }

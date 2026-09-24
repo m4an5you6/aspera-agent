@@ -9,7 +9,7 @@ kind: "package-group"
 
 ## 概述
 
-workflow 组让 agent（智能体）可以运行编排脚本，将工作委派给 subagent 并返回最终值。`workflow` 工具支持脚本化扇出；需显式启用的 `ralph` 工具运行固定的全新 agent 序列。脚本使用共享 PTC Node 进程运行时，遵守调用 Session 的文件策略。工作流钩子和子 agent 生命周期仍由工作流引擎负责。
+workflow 组让 agent（智能体）可以运行编排脚本，将工作委派给 subagent 并返回最终值。`workflow` 工具支持脚本化扇出；需显式启用的 `ralph` 工具运行固定的全新 agent 序列。实验组合包让本机 Goal 准备 GPU 工作端，再将独立 Goal 移交给它。工作流脚本在调用 Session 的文件策略下使用共享 PTC Node 进程运行时；实验工作端使用自己的 Session 与文件策略。
 
 ## 目录
 
@@ -28,6 +28,8 @@ workflow 组让 agent（智能体）可以运行编排脚本，将工作委派�
 | [`workflow-ptc`](workflow-ptc/README.zh.md) | 通过共享的沙箱化 PTC Node 进程运行时执行工作流脚本 | 注册到 `ctx.workflowEngine` |
 | [`tool-workflow`](tool-workflow/README.zh.md) | 把 `workflow` 工具交给模型，用于脚本化多 agent 编排 | 注册到 `ctx.tools` |
 | [`tool-ralph`](tool-ralph/README.zh.md) | 把 `ralph` 工具交给模型，用于全新 agent 迭代循环 | 注册到 `ctx.tools` |
+| [`experiment-dispatch`](experiment-dispatch/README.zh.md) | 从本机 DSH 部署并派发一个无人值守的 GPU 实验 | 注册到 `ctx.tools` |
+| [`experiment-worker`](experiment-worker/README.zh.md) | 管理远端认证接收端、Session、Goal 和持久回执 | HTTP 接收端 |
 
 -----
 

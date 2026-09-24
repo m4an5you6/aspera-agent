@@ -16,6 +16,7 @@ import AgentDefaultModelConfig from '@deepseek-ai/dsh-agent-default-model'
 import { LlmAttemptId, ToolCallId, createAssistantMessage, createToolResultMessage, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import SessionStore from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
+import GoalService from '@deepseek-ai/dsh-goal'
 import type { Session, SessionId, UserMessage } from '@deepseek-ai/dsh-session'
 import { SessionQueryError } from '@deepseek-ai/dsh-session-query'
 import { createInboxStub } from '@deepseek-ai/dsh-agent-loop-testkit'
@@ -46,6 +47,7 @@ interface BenchOptions {
   readStdin?: () => Promise<string>
   sessionId?: string
   json?: boolean
+  goalFromTask?: boolean
   observe?: () => Promise<ObservationStub>
   /** Leave the query service unmounted to exercise the fail-loud path. */
   omitSessionQuery?: boolean
@@ -172,6 +174,7 @@ async function bench(script: Script, options: BenchOptions = {}): Promise<{
   await ctx.plugin(SessionStore)
   await ctx.plugin(SessionProjectionRegistry)
   await ctx.plugin(AgentRegistry)
+  if (options.goalFromTask === true) await ctx.plugin(GoalService)
   await ctx.plugin(AgentDefaultModelConfig, { provider: 'test-provider', model: 'test-model' })
   ctx.agents.setFactory({
     async createAgent(ownerCtx: Context, createOptions: CreateAgentOptions): Promise<AgentHandle> {
@@ -217,6 +220,7 @@ async function bench(script: Script, options: BenchOptions = {}): Promise<{
         ...options.useStdin === true ? {} : { task: options.task ?? 'do the thing' },
         ...options.sessionId === undefined ? {} : { sessionId: options.sessionId },
         ...options.json === undefined ? {} : { json: options.json },
+        ...options.goalFromTask === undefined ? {} : { goalFromTask: options.goalFromTask },
       })
       return { code: await exited, out, err, order }
     },
@@ -224,6 +228,31 @@ async function bench(script: Script, options: BenchOptions = {}): Promise<{
 }
 
 describe('headless runner', () => {
+  it('creates a Goal from the local task and exits after its terminal result', async () => {
+    const test = await bench({
+      afterPrompt(session, message, agent) {
+        const goal = agent.ctx.goals.get(agent)
+        expect(goal?.objective).toBe('dispatch the training')
+        appendTurn(session, 1, message, 'remote accepted', true)
+        agent.ctx.goals.complete(agent, goal!)
+      },
+    }, { task: 'dispatch the training', goalFromTask: true })
+    try { expect(await test.run()).toMatchObject({ code: 0, out: 'remote accepted\n' }) }
+    finally { await test.ctx.fiber.dispose() }
+  })
+
+  it('returns a nonzero exit when the local Goal is blocked', async () => {
+    const test = await bench({
+      afterPrompt(session, message, agent) {
+        const goal = agent.ctx.goals.get(agent)
+        appendTurn(session, 1, message, 'SSH credentials missing', true)
+        agent.ctx.goals.block(agent, goal!, { code: 'remote-unavailable', message: 'SSH credentials missing' })
+      },
+    }, { goalFromTask: true })
+    try { expect(await test.run()).toMatchObject({ code: 1, out: 'SSH credentials missing\n' }) }
+    finally { await test.ctx.fiber.dispose() }
+  })
+
   it('records a fresh Session in the filesystem provider working directory', async () => {
     const cwd = '/remote/workspace'
     const test = await bench({

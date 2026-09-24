@@ -41,6 +41,10 @@ export interface SandboxExecutionPolicy {
   mode: SandboxMode
   /** Absolute root directory `workspace-write` may write under. */
   workspaceRoot: string
+  /** Deployment-authorized character devices for `workspace-write` process calls. */
+  devicePaths?: readonly string[]
+  /** Existing private directories hidden from confined subprocesses. */
+  hiddenPaths?: readonly string[]
   /**
    * Opaque identity of the calling session (the branded `dsh-session`
    * SessionId). Backends key per-session state off it (e.g. windows-acl gives

@@ -5,9 +5,9 @@
 
 Every model-facing tool a shipped plugin contributes to `ctx.tools`: the `name`, `description`, and JSON-Schema `parameters` the model receives via the system-prompt assembly. It complements the [subsystem pages](subsystems/core.md) (the types plus each page's generated Cordis API region) — this page is the *tools* the agent is offered.
 
-This file is GENERATED and verified fresh by `pnpm run verify-tool-catalog` (part of `doc-sync`) — do not edit it by hand. Unlike the cordis catalog (a pure source-AST pass), this generator BOOTS each tool plugin on a real context and reads `ctx.tools.schemas()`, because a tool schema is not statically knowable (runtime-spread enums, concatenated descriptions, config-driven names, raw-JSON-Schema MCP tools). A completeness guard globs `packages/*/tool-*` and fails if any package is missing from the generator's boot manifest, so a new tool cannot be silently undocumented.
+This file is GENERATED and verified fresh by `pnpm run verify-tool-catalog` (part of `doc-sync`) — do not edit it by hand. Unlike the cordis catalog (a pure source-AST pass), this generator BOOTS each tool plugin on a real context and reads `ctx.tools.schemas()`, because a tool schema is not statically knowable (runtime-spread enums, concatenated descriptions, config-driven names, raw-JSON-Schema MCP tools). A completeness guard globs `packages/*/tool-*` and fails if any such package is missing from the generator's boot manifest; tool-bearing bundles outside that path have explicit boot recipes.
 
-Scope: shipped product tools under `packages/*/tool-*`, each booted with its DEFAULT config, except where a Config field is REQUIRED with no default — there the generator must choose, and the per-package note records which branch this page shows. The registered tool NAME can be a load-time config (e.g. `tool-subagent`'s `toolName`), so a deployment may expose a package under a different or additional name — a per-package note records those shipped aliases where they exist. The `examples/` demo tools (e.g. `echo`) are excluded, matching the cordis catalog's packages-only scope.
+Scope: shipped product tools in the boot manifest, including every `packages/*/tool-*` package and explicitly listed tool-bearing bundles. Each recipe uses its DEFAULT config, except where a Config field is REQUIRED with no default — there the generator must choose, and the per-package note records which branch this page shows. The registered tool NAME can be a load-time config (e.g. `tool-subagent`'s `toolName`), so a deployment may expose a package under a different or additional name — a per-package note records those shipped aliases where they exist. The `examples/` demo tools (e.g. `echo`) are excluded, matching the cordis catalog's packages-only scope.
 
 ## Tool Package Map
 
@@ -44,6 +44,7 @@ This table connects model-visible tool names to the plugin package and service s
 | `@deepseek-ai/dsh-tool-todo` | `todo_write` | `ctx.tools`, `owning Agent session` | `tool/call`, `todo/write`, `tool/result` | - | todo_write is session-owned state; UIs render the latest todo/write event as a checklist. `allowParallelInProgress` is required with no default, so the catalog states its choice: `true`, whose description invites several `in_progress` items. A deployment choosing `false` receives the same tool with a description asking for exactly one active task. |
 | `@deepseek-ai/dsh-tool-workflow` | `workflow` | `ctx.tools`, `ctx.workflowEngine`, `ctx.systemPrompt`, `a calling Agent (exec.agent parents the script children)` | `tool/call`, `tool/result` | - | - |
 | `@deepseek-ai/dsh-tool-web` | `web_fetch`, `web_search` | `ctx.tools`, `ctx.web`, `ctx.systemPrompt` | `tool/call`, `tool/result` | - | web_search and web_fetch keep provider selection behind ctx.web so model-visible schemas stay stable across backend swaps. |
+| `@deepseek-ai/dsh-experiment-dispatch` | `cancel_experiment`, `get_experiment_status`, `prepare_experiment_environment`, `submit_experiment` | `ctx.tools`, `ctx.agents`, `ctx.credentials`, `ctx.storageDomain`, `ctx.systemPrompt` | `tool/call`, `tool/result`, `remote experiment receiver record` | - | These four tools require a live root Agent and a separately authenticated Linux worker. A successful submit receipt means remote ownership, not training completion. |
 
 <a id="deepseek-aidsh-plugin-manager"></a>
 
@@ -2488,3 +2489,113 @@ Search the web for current information. Provide 1–4 queries in the required qu
 Source: [`packages/web/tool-web/src/index.ts`](../packages/web/tool-web/src/index.ts)
 
 web_search and web_fetch keep provider selection behind ctx.web so model-visible schemas stay stable across backend swaps.
+
+<a id="deepseek-aidsh-experiment-dispatch"></a>
+
+## `@deepseek-ai/dsh-experiment-dispatch`
+
+### `cancel_experiment`
+
+Cancel a remote experiment and wait for its owned Agent and children to stop.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "submission_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "submission_id"
+  ]
+}
+```
+
+Source: [`packages/workflow/experiment-dispatch/src/index.ts`](../packages/workflow/experiment-dispatch/src/index.ts)
+
+### `get_experiment_status`
+
+Read the durable remote status of a submitted experiment.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "submission_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "submission_id"
+  ]
+}
+```
+
+Source: [`packages/workflow/experiment-dispatch/src/index.ts`](../packages/workflow/experiment-dispatch/src/index.ts)
+
+### `prepare_experiment_environment`
+
+Deploy this DSH source to the configured GPU target and verify real sandbox and CUDA access before submission.
+
+```json
+{
+  "type": "object",
+  "properties": {}
+}
+```
+
+Source: [`packages/workflow/experiment-dispatch/src/index.ts`](../packages/workflow/experiment-dispatch/src/index.ts)
+
+### `submit_experiment`
+
+Submit one experiment to the prepared worker. The returned accepted receipt means the remote DSH owns the run independently.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "preparation_id": {
+      "type": "string"
+    },
+    "objective": {
+      "type": "string"
+    },
+    "agent_model_provider": {
+      "type": "string"
+    },
+    "agent_model_id": {
+      "type": "string"
+    },
+    "training_model": {
+      "type": "string"
+    },
+    "training_method": {
+      "type": "string"
+    },
+    "required_gpus": {
+      "type": "number"
+    },
+    "dataset_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "constraints": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "preparation_id",
+    "objective"
+  ]
+}
+```
+
+Source: [`packages/workflow/experiment-dispatch/src/index.ts`](../packages/workflow/experiment-dispatch/src/index.ts)
+
+These four tools require a live root Agent and a separately authenticated Linux worker. A successful submit receipt means remote ownership, not training completion.
