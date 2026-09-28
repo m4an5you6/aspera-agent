@@ -372,6 +372,44 @@ it('loads experiment receipts and updates status after refresh and cancellation'
   expect(cancel).toHaveBeenCalledWith('submission-1')
 })
 
+it('saves the exact SSH password separately and clears account status when the server changes', async () => {
+  const host = stubSettingsScope<ExperimentDispatchSettings>()
+  acceptWrites(host)
+  host.publish({ status: 'ready', writable: true, value: { authMode: 'key', identityFile: '/saved/key' }, base: {}, user: {} })
+  const configured = new Set<string>()
+  const setPassword = vi.fn(async (account: object, _value: string) => {
+    configured.add(JSON.stringify(account))
+    return { ok: true as const, value: undefined }
+  })
+  const controller = new ExperimentDispatchCardController(host.scope, ctxWith({
+    credentials: { describe: async () => ({ ok: true, value: {} }) },
+    experimentDispatch: {
+      passwordStatus: async (account: object) => ({
+        ok: true, value: { configured: configured.has(JSON.stringify(account)), writable: true },
+      }),
+      setPassword,
+    },
+  }))
+  const actions = controller.inject()
+  const state = () => actions.hooks.experimentDispatchCard.getSnapshot()
+  actions.edit('host', 'gpu.example')
+  actions.edit('username', 'ubuntu')
+  actions.edit('authMode', 'password')
+  actions.edit('sshPassword', '  exact password  ')
+  actions.save()
+  await vi.waitFor(() => { expect(state().sshPasswordConfigured).toBe(true); expect(state().sshPassword.text).toBe('') })
+  expect(setPassword).toHaveBeenCalledWith({ host: 'gpu.example', username: 'ubuntu', sshPort: 22 }, '  exact password  ')
+  expect(JSON.stringify(host.scope.getSnapshot())).not.toContain('exact password')
+  actions.edit('host', 'another-gpu.example')
+  await vi.waitFor(() => { expect(state().sshPasswordConfigured).toBe(false) })
+  actions.edit('sshPassword', 'unsaved password')
+  actions.edit('authMode', 'key')
+  expect(state().sshPassword.text).toBe('')
+  actions.save()
+  await vi.waitFor(() => { expect(state().saving).toBe(false) })
+  expect(setPassword).toHaveBeenCalledTimes(1)
+})
+
 it('writes the receiver token under a newly saved credential reference', async () => {
   const host = stubSettingsScope<ExperimentDispatchSettings>()
   acceptWrites(host)

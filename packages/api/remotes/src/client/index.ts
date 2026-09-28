@@ -43,6 +43,8 @@ export type {} from '@deepseek-ai/dsh-experiment-dispatch/remote'
 export type ExperimentDispatchEntry = import('@deepseek-ai/dsh-experiment-dispatch/types').ExperimentDispatchEntry
 /** Complete record returned by the remote receiver. */
 export type ExperimentDispatchRecord = import('@deepseek-ai/dsh-experiment-dispatch/types').ExperimentDispatchRecord
+/** SSH account addressed by the experiment configuration form. */
+export type ExperimentSshAccount = import('@deepseek-ai/dsh-experiment-dispatch/types').ExperimentSshAccount
 export type {} from '@deepseek-ai/dsh-message-feedback/remote'
 export type {} from '@deepseek-ai/dsh-permission-presets/remote'
 export type {} from '@deepseek-ai/dsh-command-feedback/remote'
@@ -189,3 +191,5 @@ export async function apply(ctx: Context): Promise<() => Promise<void>> {
     for (const dispose of disposers.reverse()) await dispose()
   }
 }
+
+export type { FleetCreateRequest, FleetExperiment, FleetRegistry, FleetServerInput, ClusterChunk, ClusterFile, ClusterRecord, ClusterServer, ClusterState } from '@deepseek-ai/dsh-experiment-dispatch/types'

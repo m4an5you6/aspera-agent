@@ -1,0 +1,75 @@
+- button "返回插件列表":
+  - img
+  - text: 插件列表
+- heading "GPU 实验派发" [level=3]
+- paragraph: 配置 GPU 服务器，并在远端接管后查看实验状态。
+- paragraph: 新的准备工作使用此处的配置。已提交的实验保留原服务器和凭据引用。
+- text: SSH 登录方式
+- combobox "SSH 登录方式":
+  - option "密码" [selected]
+  - option "SSH 密钥"
+- paragraph: 只使用所选方式；选择密码时不会尝试已保存的密钥。
+- text: SSH 主机 已覆盖
+- button "恢复默认"
+- textbox "SSH 主机":
+  - /placeholder: ""
+  - text: gpu.example.test
+- paragraph: 已通过 known_hosts 验证的 GPU 服务器地址。
+- text: SSH 用户名 已覆盖
+- button "恢复默认"
+- textbox "SSH 用户名":
+  - /placeholder: ""
+  - text: ubuntu
+- paragraph: 服务器登录账号，例如 root 或 ubuntu；密码登录时必填。
+- text: SSH 端口
+- textbox "SSH 端口":
+  - /placeholder: ""
+  - text: "22"
+- paragraph: SSH 连接所用端口。
+- text: 工作器端口
+- textbox "工作器端口":
+  - /placeholder: ""
+  - text: "43019"
+- paragraph: 通过 SSH 访问的远端回环接收端口。
+- text: 远端目录 已覆盖
+- button "恢复默认"
+- textbox "远端目录":
+  - /placeholder: ""
+  - text: /srv/dsh-experiments
+- paragraph: GPU 服务器上的私有部署绝对路径。
+- text: 本地源码目录
+- textbox "本地源码目录":
+  - /placeholder: ""
+  - text: {{cwd}}
+- paragraph: 待部署源码的绝对路径；留空使用当前工作目录。
+- text: 本地数据目录
+- textbox "本地数据目录":
+  - /placeholder: ""
+- paragraph: 可复制数据集文件的绝对路径，用逗号分隔。
+- text: 接收端令牌引用
+- textbox "接收端令牌引用":
+  - /placeholder: ""
+  - text: DSH_EXPERIMENT_TOKEN
+- paragraph: 凭据引用；密钥值保存在凭据存储中。
+- text: 模型凭据引用
+- textbox "模型凭据引用":
+  - /placeholder: ""
+  - text: DEEPSEEK_API_KEY
+- paragraph: 复制到远端工作器的凭据引用，用逗号分隔。
+- text: 工具超时（毫秒）
+- textbox "工具超时（毫秒）":
+  - /placeholder: ""
+  - text: "1800000"
+- paragraph: 准备和提交操作的最长时间。
+- text: 服务器密码 已为此账号保存密码。
+- textbox "服务器密码"
+- paragraph: 按服务器、端口和用户名单独保存到凭据存储；留空保留该账号已保存的密码，空格原样保留。
+- text: 接收端令牌 已配置令牌。
+- textbox "接收端令牌"
+- paragraph: 按上方引用保存在凭据存储中；留空保留当前令牌。
+- button "保存" [disabled]
+- paragraph: 保存后，在会话中输入 /goal 并写明实验要求，代理会准备服务器并提交实验；之后可在下方刷新状态或取消实验。
+- region "实验":
+  - heading "实验" [level=3]
+  - button "重新加载"
+  - status: 此部署尚未提交实验。

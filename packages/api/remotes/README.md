@@ -31,6 +31,8 @@ The Client assembly mounts Office conversion, Commands, credentials, settings, G
 
 This facade is also the front door for the wire type vocabulary a Client package names. It re-exports, type-only, the Remote failure vocabulary (`RemoteResult`, `RemoteFailure`, `RemoteErrorCode`, `RemoteErrorDetailsMap`), the Host facts (`RemoteHostFacts`), and each selected domain's client-safe payload types, so a Client feature package imports one specifier instead of reaching into `dsh-typert-protocol`, the Gateway, or an owner's Host entry. Two kinds of package deliberately skip this door: the API-layer packages this assembly itself selects — importing it back would close a dependency cycle — and their tests, which take the failure vocabulary from `dsh-typert-protocol` directly. A UI package's tests instead take the `RemoteError` constructor from [`dsh-client-test-runtime`](../../test-support/client-runtime/README.md).
 
+The experiment dispatch contribution exposes saved experiments and SSH password management. Its Client types describe the SSH account and password presence; password values are accepted only by the credential write operation and are never returned to the browser.
+
 This package owns no physical transport or Host service discovery. It projects the application selection into generated Remote contributions and an independent Host event source per Client; API Gateway owns endpoints, carriers, cancellation, and reconnection. Its Client face can be reused by Web or a future TUI that provides the same React-free `ctx.remote` contract.
 
 -----

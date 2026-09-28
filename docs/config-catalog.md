@@ -584,6 +584,14 @@ export interface Config {
   readonly host?: string
   /** Remote SSH listener port. */
   readonly sshPort?: number
+  /** SSH login name; may also be supplied by a legacy user@host destination. */
+  readonly username?: string
+  /** Exactly one authentication method; existing configurations use keys. */
+  readonly authMode?: 'key' | 'password'
+  /** Optional password reference; by default each server, port and username has its own credential. */
+  readonly passwordRef?: string
+  /** OpenSSH known_hosts file; defaults to the DSH host user's ~/.ssh/known_hosts. */
+  readonly knownHostsFile?: string
   /** Loopback HTTP receiver port reached through an SSH tunnel. */
   readonly remotePort?: number
   /** Absolute private deployment directory on the target. */
@@ -605,7 +613,7 @@ export interface Config {
 }
 ```
 
-Source: [`packages/workflow/experiment-dispatch/src/index.ts:33`](../packages/workflow/experiment-dispatch/src/index.ts)
+Source: [`packages/workflow/experiment-dispatch/src/index.ts:34`](../packages/workflow/experiment-dispatch/src/index.ts)
 
 <a id="deepseek-aidsh-experiment-worker"></a>
 

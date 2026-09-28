@@ -99,3 +99,16 @@
   color: var(--dsw-alias-label-error);
   font-size: 12px;
 }
+.loginMethod {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.loginMethod select {
+  padding: 8px;
+  color: inherit;
+  background: var(--dsw-alias-bg-base);
+  border: 1px solid var(--dsw-alias-border-default);
+  border-radius: 6px;
+}

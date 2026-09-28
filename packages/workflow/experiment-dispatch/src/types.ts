@@ -1,5 +1,20 @@
 /** Browser-safe experiment dispatch records. */
 
+/** SSH account whose password is stored separately from deployment settings. */
+export interface ExperimentSshAccount {
+  readonly host: string
+  readonly username: string
+  readonly sshPort: number
+  /** Optional profile-owned credential reference; otherwise the account selects its own reference. */
+  readonly passwordRef?: string | undefined
+}
+
+/** Password presence and writability without exposing its value. */
+export interface ExperimentPasswordStatus {
+  readonly configured: boolean
+  readonly writable: boolean
+}
+
 /** Complete receiver record retained for status and handover presentation. */
 export interface ExperimentDispatchRecord {
   readonly submissionId: string
@@ -40,3 +55,6 @@ export interface ExperimentDispatchEntry {
   readonly receipt?: ExperimentDispatchRecord
   readonly latest?: ExperimentDispatchRecord
 }
+
+export type { FleetCreateRequest, FleetExperiment, FleetRegistry, FleetServerInput } from './fleet.ts'
+export type { ClusterChunk, ClusterFile, ClusterRecord, ClusterServer, ClusterState } from '@deepseek-ai/dsh-experiment-worker'

@@ -42,6 +42,8 @@ export interface CardFieldSpec {
 export interface CardSecretSpec {
   /** Field name addressing this control inside the card's form. */
   field: string
+  /** Keep leading and trailing whitespace when it is part of a password. */
+  preserveWhitespace?: boolean
   /** Write the staged text; resolves to whether the Host accepted it. */
   write: (text: string) => Promise<boolean>
 }
@@ -310,7 +312,7 @@ export class CardForm<T> {
     for (const [field, staged] of this.staged) {
       const secret = this.secretSpecs.get(field)
       if (secret !== undefined) {
-        const value = staged.text.trim()
+        const value = secret.preserveWhitespace === true ? staged.text : staged.text.trim()
         if (value !== '') plan.push({ field, run: () => secret.write(value) })
         continue
       }

@@ -25,13 +25,17 @@ kind: "package-bundle"
 <a id="use-this-package"></a>
 ## 使用
 
-将 `DSH_EXPERIMENT_TARGET` 配置为已记录主机密钥、可非交互认证的 SSH 主机，将 `DSH_EXPERIMENT_REMOTE_ROOT` 配置为绝对路径的私有目录，并通过 DSH 凭据服务提供 `DSH_EXPERIMENT_TOKEN`。可选项为 `DSH_EXPERIMENT_SSH_PORT`、`DSH_EXPERIMENT_PORT`、`DSH_EXPERIMENT_SSH_IDENTITY`、分号分隔的 `DSH_EXPERIMENT_DATA_ROOTS`、逗号分隔的系统包白名单 `DSH_EXPERIMENT_SYSTEM_PACKAGES`（默认 `bubblewrap`），以及 `DSH_EXPERIMENT_SETUP_TIMEOUT_MS`。可用的 bubblewrap 缺失时，安装流程将白名单内的软件包解压到私有工具目录。`DSH_EXPERIMENT_AGENT_CREDENTIAL_REFS` 指定逗号分隔的模型提供方凭据引用；默认为 `DEEPSEEK_API_KEY`，空值表示不传输。这些引用对应的值被复制到每个版本专用的私有凭据文件，不进入源码包或 Goal 文本。
+将 `DSH_EXPERIMENT_TARGET` 配置为已记录主机密钥的 SSH 主机，将 `DSH_EXPERIMENT_REMOTE_ROOT` 配置为绝对路径的私有目录，并通过 DSH 凭据服务提供 `DSH_EXPERIMENT_TOKEN`。可选项为 `DSH_EXPERIMENT_SSH_PORT`、`DSH_EXPERIMENT_PORT`、`DSH_EXPERIMENT_SSH_IDENTITY`、分号分隔的 `DSH_EXPERIMENT_DATA_ROOTS`、逗号分隔的系统包白名单 `DSH_EXPERIMENT_SYSTEM_PACKAGES`（默认 `bubblewrap`），以及 `DSH_EXPERIMENT_SETUP_TIMEOUT_MS`。可用的 bubblewrap 缺失时，安装流程将白名单内的软件包解压到私有工具目录。`DSH_EXPERIMENT_AGENT_CREDENTIAL_REFS` 指定逗号分隔的模型提供方凭据引用；默认为 `DEEPSEEK_API_KEY`，空值表示不传输。这些引用对应的值被复制到每个版本专用的私有凭据文件，不进入源码包或 Goal 文本。
+
+SSH 登录方式二选一：设置 `DSH_EXPERIMENT_SSH_AUTH_MODE=password` 并填写 `DSH_EXPERIMENT_SSH_USERNAME`，或使用默认的 `key` 方式读取 OpenSSH 密钥。仍支持原有的 `user@host` 地址。密码方式在 Windows、macOS 和 Linux 上通过 SSH 密码认证执行命令、SFTP 上传和接收端请求，不会尝试已保存的密钥。Web 按服务器、端口和用户名分别保存密码，空格与特殊字符原样保留。无界面 profile 可用 `DSH_EXPERIMENT_SSH_PASSWORD_REF` 显式指定 `GPU_PASSWORD` 等凭据引用，并通过凭据服务提供其值。密码不进入部署设置、准备记录、工具参数或源码归档。
+
+派发前，在运行 DSH 的机器上用 OpenSSH 核验服务器主机密钥。密码方式读取该用户的 `~/.ssh/known_hosts`，也可通过 `DSH_EXPERIMENT_KNOWN_HOSTS_FILE` 指定文件；支持哈希记录和非默认端口。主机密钥未知、变更或被撤销时，连接在密码认证前终止。密码方式要求可直接连接的服务器地址和 SSH 密码认证；SSH 别名、代理命令及交互式验证不会触发隐式回退。
 
 `DSH_EXPERIMENT_SETUP_TIMEOUT_MS` 设置准备和提交工具的截止时间，以及源码归档、SSH 命令和 SCP 传输的进程超时；默认值为 1,800,000 毫秒。调大后，远端安装和构建可以运行更长时间。接收端每次 HTTP 请求仍有独立的 15 秒截止时间。
 
 在仓库根目录运行 `pnpm dsh --profile experiment-dispatch "<实验目标>"`。本机 Agent 先调用 `prepare_experiment_environment`，再用返回的准备编号调用 `submit_experiment`。`get_experiment_status` 和 `cancel_experiment` 使用返回的提交编号。明确指定的模型、数据集、方法、GPU 数量和其他约束会传给远端 Goal。本机数据文件必须位于显式配置的数据根目录；未配置时不允许传输本机文件。接管前完成传输；其他数据引用必须已在远端工作目录中。
 
-在 Web 中打开「插件 → GPU 实验派发」，设置 SSH 主机、远端目录、端口、本地源码与数据目录、凭据引用及接收端令牌。令牌值写入凭据存储，不进入设置文档。然后将实验作为 Web Goal 输入。接管后，同一页面显示已保存的接管说明、回执与远端状态；「刷新」和「取消」始终使用提交时保存的服务器，即使当前配置已切换。若提交期间修改了本地 Goal，旧回执不会结束修改后的 Goal。
+在 Web 中打开「插件 → GPU 实验派发」，选择「密码」，填写服务器地址、SSH 用户名、端口、服务器密码与远端目录。接收端令牌和模型凭据需要单独配置，服务器密码不能代替它们。保存后，在会话中输入 `/goal` 并写明实验要求。保存操作只配置目标，Goal 才会启动准备与派发。接管后，同一页面显示已保存的接管说明、回执与远端状态；「刷新」和「取消」始终使用提交时保存的服务器、账号与登录方式，即使当前配置已切换。若提交期间修改了本地 Goal，旧回执不会结束修改后的 Goal。
 
 取消本机提交会停止自动重试，并保留已保存的提交编号。接收端可能已经接管实验；应先查询该编号的状态，再决定是否通过 `cancel_experiment` 取消远端运行。
 

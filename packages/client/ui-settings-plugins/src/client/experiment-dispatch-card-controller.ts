@@ -2,7 +2,7 @@
 
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-api-remotes/client'
-import type { ExperimentDispatchEntry } from '@deepseek-ai/dsh-api-remotes/client'
+import type { ExperimentDispatchEntry, ExperimentSshAccount } from '@deepseek-ai/dsh-api-remotes/client'
 import type { SnapshotStore } from '@deepseek-ai/dsh-client-store'
 import type { SettingsScope } from '@deepseek-ai/dsh-client-ui-settings/client'
 import {
@@ -19,6 +19,9 @@ const TOKEN_FIELD = 'receiverToken'
 export interface ExperimentDispatchSettings {
   host?: string
   sshPort?: number
+  username?: string
+  authMode?: 'key' | 'password'
+  passwordRef?: string
   remotePort?: number
   remoteRoot?: string
   localRepo?: string
@@ -31,7 +34,7 @@ export interface ExperimentDispatchSettings {
 
 /** The experiment configuration fields shown in the card. */
 export const experimentFields = [
-  'host', 'sshPort', 'remotePort', 'remoteRoot', 'localRepo', 'identityFile',
+  'host', 'username', 'authMode', 'sshPort', 'remotePort', 'remoteRoot', 'localRepo', 'identityFile',
   'dataRoots', 'tokenRef', 'agentCredentialRefs', 'toolTimeoutMs',
 ] as const
 
@@ -41,6 +44,9 @@ export interface ExperimentDispatchCardState extends CardShell {
   receiverToken: CardFieldState
   receiverTokenConfigured: boolean
   receiverTokenWritable: boolean
+  sshPassword: CardFieldState
+  sshPasswordConfigured: boolean
+  sshPasswordWritable: boolean
   records: readonly ExperimentDispatchEntry[]
   loading: boolean
   loaded: boolean
@@ -66,6 +72,8 @@ export class ExperimentDispatchCardController {
   private busyId: string | undefined
   private recordError: string | undefined
   private credential = { ref: '', configured: false, writable: true }
+  private password = { configured: false, writable: true }
+  private passwordRead = 0
 
   /**
    * @param scope - the deployment's experiment dispatch settings scope.
@@ -73,13 +81,17 @@ export class ExperimentDispatchCardController {
    */
   constructor(private readonly scope: SettingsScope<ExperimentDispatchSettings>, private readonly ctx: ClientContext) {
     this.form = new CardForm(scope, [
-      textField('host'), numberField('sshPort'), numberField('remotePort'), textField('remoteRoot'),
+      textField('host'), textField('username'), textField('authMode'), numberField('sshPort'), numberField('remotePort'), textField('remoteRoot'),
       textField('localRepo'), textField('identityFile'), stringListField('dataRoots'),
       textField('tokenRef'), stringListField('agentCredentialRefs'), numberField('toolTimeoutMs'),
-    ], [{ field: TOKEN_FIELD, write: text => this.writeToken(text) }])
+    ], [
+      { field: TOKEN_FIELD, write: text => this.writeToken(text) },
+      { field: 'sshPassword', preserveWhitespace: true, write: text => this.writePassword(text) },
+    ])
     this.store = this.form.bind(() => this.projection())
-    scope.subscribe(() => { void this.readCredential() })
+    scope.subscribe(() => { void this.readCredential(); void this.readPassword() })
     void this.readCredential()
+    void this.readPassword()
   }
 
   private projection(): ExperimentDispatchCardState {
@@ -89,6 +101,9 @@ export class ExperimentDispatchCardController {
       receiverToken: this.form.field(TOKEN_FIELD),
       receiverTokenConfigured: this.credential.configured,
       receiverTokenWritable: this.credential.writable,
+      sshPassword: this.form.field('sshPassword'),
+      sshPasswordConfigured: this.password.configured,
+      sshPasswordWritable: this.password.writable,
       records: this.records,
       loading: this.loading,
       loaded: this.loaded,
@@ -131,6 +146,36 @@ export class ExperimentDispatchCardController {
     if (!result.ok) return false
     await this.readCredential()
     return this.credential.configured
+  }
+
+  private account(draft: boolean): ExperimentSshAccount | undefined {
+    const saved = this.scope.getSnapshot().value
+    const host = draft ? this.form.field('host').text.trim() : saved?.host ?? ''
+    const username = draft ? this.form.field('username').text.trim() : saved?.username ?? ''
+    const sshPort = draft ? Number(this.form.field('sshPort').text || 22) : saved?.sshPort ?? 22
+    if (host === '' || username === '' || !Number.isSafeInteger(sshPort) || sshPort < 1 || sshPort > 65535) return undefined
+    return { host, username, sshPort, ...(saved?.passwordRef === undefined ? {} : { passwordRef: saved.passwordRef }) }
+  }
+
+  private async readPassword(): Promise<void> {
+    const generation = ++this.passwordRead
+    const account = this.account(true)
+    this.password = { configured: false, writable: true }
+    this.publish()
+    if (account === undefined) return
+    const result = await this.ctx.remote.experimentDispatch.passwordStatus(account)
+    if (!result.ok || generation !== this.passwordRead) return
+    this.password = result.value
+    this.publish()
+  }
+
+  private async writePassword(value: string): Promise<boolean> {
+    const account = this.account(false)
+    if (account === undefined || this.scope.getSnapshot().value?.authMode !== 'password') return false
+    const result = await this.ctx.remote.experimentDispatch.setPassword(account, value)
+    if (!result.ok) return false
+    await this.readPassword()
+    return true
   }
 
   /** Load locally saved experiments. */
@@ -177,9 +222,21 @@ export class ExperimentDispatchCardController {
    * @returns The card snapshot and its actions.
    */
   inject(): ExperimentDispatchCardFace {
+    const actions = this.form.actions()
     return {
       hooks: { experimentDispatchCard: this.store },
-      ...this.form.actions(),
+      ...actions,
+      edit: (field, text) => {
+        actions.edit(field, text)
+        if (field === 'authMode' && text !== 'password') actions.edit('sshPassword', '')
+        if (field === 'host' || field === 'username' || field === 'sshPort') void this.readPassword()
+      },
+      resetField: (field) => {
+        actions.resetField(field)
+        if (field === 'authMode' && this.form.field(field).text !== 'password') actions.edit('sshPassword', '')
+        void this.readPassword()
+      },
+      discard: () => { actions.discard(); void this.readPassword() },
       loadRecords: () => { void this.loadRecords() },
       refreshRecord: (submissionId) => { void this.changeRecord(submissionId, 'refresh') },
       cancelRecord: (submissionId) => { void this.changeRecord(submissionId, 'cancel') },

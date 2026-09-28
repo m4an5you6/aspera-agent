@@ -42,10 +42,10 @@ function paths(config: DeploymentConfig, digest: string) {
   }
 }
 
-async function installSource(config: DeploymentConfig, snapshot: SourceSnapshot, signal?: AbortSignal): Promise<void> {
+async function installSource(config: DeploymentConfig, snapshot: SourceSnapshot, signal?: AbortSignal, password?: string): Promise<void> {
   const p = paths(config, snapshot.digest)
-  await remote(config, `umask 077; mkdir -p ${[`${p.root}/incoming`, `${p.root}/releases`, p.workspace, p.outside, `${p.root}/secrets`, p.state, p.logs, p.tools].map(shellQuote).join(' ')}; chmod 700 ${[p.root, `${p.root}/incoming`, `${p.root}/releases`, p.workspace, p.outside, `${p.root}/secrets`, p.state, p.logs, p.tools].map(shellQuote).join(' ')}`, signal)
-  await copy(config, snapshot.archive, p.archive, signal)
+  await remote(config, `umask 077; mkdir -p ${[`${p.root}/incoming`, `${p.root}/releases`, p.workspace, p.outside, `${p.root}/secrets`, p.state, p.logs, p.tools].map(shellQuote).join(' ')}; chmod 700 ${[p.root, `${p.root}/incoming`, `${p.root}/releases`, p.workspace, p.outside, `${p.root}/secrets`, p.state, p.logs, p.tools].map(shellQuote).join(' ')}`, signal, password)
+  await copy(config, snapshot.archive, p.archive, signal, password)
   const script = `set -eu
 test "$(sha256sum ${shellQuote(p.archive)} | cut -d ' ' -f 1)" = ${shellQuote(snapshot.archiveHash)}
 if [ -e ${shellQuote(p.release)} ] && [ ! -f ${shellQuote(p.release + '/.ready')} ]; then
@@ -70,10 +70,12 @@ if [ ! -f ${shellQuote(p.release + '/.ready')} ]; then
   touch .ready
   if [ ! -e ${shellQuote(p.release)} ]; then mv "$stage" ${shellQuote(p.release)}; fi
 fi`
-  await remote(config, script, signal)
+  await remote(config, script, signal, password)
 }
 
-async function validateEnvironment(config: DeploymentConfig, digest: string, signal?: AbortSignal): Promise<PreparedEnvironment> {
+async function validateEnvironment(
+  config: DeploymentConfig, digest: string, signal?: AbortSignal, password?: string,
+): Promise<PreparedEnvironment> {
   const p = paths(config, digest)
   const script = `set -eu
 workspace=${shellQuote(p.workspace)}
@@ -114,7 +116,7 @@ trap 'rm -f -- "$secret_probe"' EXIT
 "$bwrap_bin" "$@" -- nvidia-smi -L
 "$bwrap_bin" "$@" -- python3 ${shellQuote(p.release + '/packages/workflow/experiment-worker/scripts/probe-gpu.py')}
 printf 'DSH_DEVICES=%s\\nDSH_BWRAP=%s\\nDSH_HIDDEN=%s\\n' "$devices" "$bwrap_bin" "$private_paths"`
-  const output = await remote(config, script, signal)
+  const output = await remote(config, script, signal, password)
   const match = /^DSH_DEVICES=(.+)$/m.exec(output)
   const backend = /^DSH_BWRAP=(.+)$/m.exec(output)
   const hidden = /^DSH_HIDDEN=(.+)$/m.exec(output)
@@ -128,20 +130,22 @@ printf 'DSH_DEVICES=%s\\nDSH_BWRAP=%s\\nDSH_HIDDEN=%s\\n' "$devices" "$bwrap_bin
   }
 }
 
-async function installPrivateFile(config: DeploymentConfig, destination: string, content: string, signal?: AbortSignal): Promise<void> {
+async function installPrivateFile(
+  config: DeploymentConfig, destination: string, content: string, signal?: AbortSignal, password?: string,
+): Promise<void> {
   const directory = mkdtempSync(join(tmpdir(), 'dsh-experiment-secret-'))
   const local = join(directory, 'value')
   const incoming = `${destination}.incoming-${randomUUID()}`
   try {
     writeFileSync(local, content, { mode: 0o600 })
-    await copy(config, local, incoming, signal)
-    await remote(config, `umask 077; chmod 600 ${shellQuote(incoming)}; mv -f -- ${shellQuote(incoming)} ${shellQuote(destination)}`, signal)
+    await copy(config, local, incoming, signal, password)
+    await remote(config, `umask 077; chmod 600 ${shellQuote(incoming)}; mv -f -- ${shellQuote(incoming)} ${shellQuote(destination)}`, signal, password)
   } finally {
     rmSync(directory, { recursive: true, force: true })
   }
 }
 
-async function launch(config: DeploymentConfig, prepared: PreparedEnvironment, signal?: AbortSignal): Promise<void> {
+async function launch(config: DeploymentConfig, prepared: PreparedEnvironment, signal?: AbortSignal, password?: string): Promise<void> {
   const p = paths(config, prepared.deploymentId)
   const script = `set -eu
 pidfile=${shellQuote(p.state + '/worker.pid')}
@@ -169,7 +173,7 @@ export PATH=${shellQuote(p.tools + '/usr/bin')}:"$PATH"
 setsid node ${shellQuote(p.release + '/apps/cli/lib/bin.js')} --profile experiment-worker </dev/null >>${shellQuote(p.logs + '/worker-' + prepared.deploymentId + '.log')} 2>&1 &
 echo "$!" > "$pidfile"
 printf '%s' ${shellQuote(prepared.deploymentId)} > ${shellQuote(p.state + '/worker.deployment')}`
-  await remote(config, script, signal)
+  await remote(config, script, signal, password)
 }
 
 /**
@@ -179,6 +183,7 @@ printf '%s' ${shellQuote(prepared.deploymentId)} > ${shellQuote(p.state + '/work
  * @param token - receiver secret from the credential service.
  * @param modelCredentials - model-provider credentials resolved through the local credential service.
  * @param signal - aborts setup and transport.
+ * @param password - operation-scoped SSH password, separate from deployment settings.
  * @returns the verified release and device report.
  */
 export async function deploy(
@@ -187,27 +192,28 @@ export async function deploy(
   token: string,
   modelCredentials: Readonly<Record<string, string>>,
   signal?: AbortSignal,
+  password?: string,
 ): Promise<PreparedEnvironment> {
-  await installSource(config, snapshot, signal)
-  const prepared = await validateEnvironment(config, snapshot.digest, signal)
+  await installSource(config, snapshot, signal, password)
+  const prepared = await validateEnvironment(config, snapshot.digest, signal, password)
   const p = paths(config, snapshot.digest)
-  await installPrivateFile(config, p.tokenFile, `${token}\n`, signal)
-  await installPrivateFile(config, p.modelCredentials, `${JSON.stringify({ version: 1, refs: modelCredentials })}\n`, signal)
-  const active = await remote(config, `if [ -f ${shellQuote(p.state + '/worker.pid')} ] && kill -0 "$(cat ${shellQuote(p.state + '/worker.pid')})" 2>/dev/null; then cat ${shellQuote(p.state + '/worker.deployment')}; fi`, signal)
+  await installPrivateFile(config, p.tokenFile, `${token}\n`, signal, password)
+  await installPrivateFile(config, p.modelCredentials, `${JSON.stringify({ version: 1, refs: modelCredentials })}\n`, signal, password)
+  const active = await remote(config, `if [ -f ${shellQuote(p.state + '/worker.pid')} ] && kill -0 "$(cat ${shellQuote(p.state + '/worker.pid')})" 2>/dev/null; then cat ${shellQuote(p.state + '/worker.deployment')}; fi`, signal, password)
   const previous = active.trim()
   if (previous !== '' && previous !== snapshot.digest) {
-    const health = await request(config, token, '/experiment/v1/health', 'GET', undefined, signal)
+    const health = await request(config, token, '/experiment/v1/health', 'GET', undefined, signal, password)
     const body = experimentHealthSchema.safeParse(health.value)
     if (health.status !== 200 || !body.success || body.data.busy || body.data.deploymentId !== previous) {
       throw new Error('previous worker is busy or unhealthy; deployment remains staged')
     }
-    const stop = await request(config, token, '/experiment/v1/shutdown', 'POST', {}, signal)
+    const stop = await request(config, token, '/experiment/v1/shutdown', 'POST', {}, signal, password)
     if (stop.status !== 200) throw new Error('previous worker refused idle shutdown')
-    await remote(config, `pid=$(cat ${shellQuote(p.state + '/worker.pid')}); for n in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$pid" 2>/dev/null || exit 0; sleep 1; done; exit 1`, signal)
+    await remote(config, `pid=$(cat ${shellQuote(p.state + '/worker.pid')}); for n in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$pid" 2>/dev/null || exit 0; sleep 1; done; exit 1`, signal, password)
   }
   try {
-    await launch(config, prepared, signal)
-    const health = await request(config, token, '/experiment/v1/health', 'GET', undefined, signal)
+    await launch(config, prepared, signal, password)
+    const health = await request(config, token, '/experiment/v1/health', 'GET', undefined, signal, password)
     const body = experimentHealthSchema.safeParse(health.value)
     if (health.status !== 200 || !body.success || body.data.deploymentId !== snapshot.digest) {
       throw new Error('new worker did not return valid health for the deployed version')
@@ -224,9 +230,9 @@ if [ -f "$pidfile" ] && [ "$(cat ${shellQuote(p.state + '/worker.deployment')})"
   for n in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
   kill -9 "$pid" 2>/dev/null || true
   rm -f -- "$pidfile" ${shellQuote(p.state + '/worker.deployment')}
-fi`, signal)
-        await launch(config, { ...prepared, deploymentId: previous }, signal)
-        const restored = await request(config, token, '/experiment/v1/health', 'GET', undefined, signal)
+fi`, signal, password)
+        await launch(config, { ...prepared, deploymentId: previous }, signal, password)
+        const restored = await request(config, token, '/experiment/v1/health', 'GET', undefined, signal, password)
         const body = experimentHealthSchema.safeParse(restored.value)
         if (restored.status !== 200 || !body.success || body.data.deploymentId !== previous) {
           throw new Error('previous worker did not recover after the new release failed')

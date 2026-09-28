@@ -16,7 +16,7 @@
     "./src/*": "./src/*",
     "./package.json": "./package.json"
   },
-  "files": ["lib/*.js", "cordis.patch.yml", "lib/types/types.js", "lib/types/**/*.d.ts", "lib/typert.host.js", "lib/typert.host.d.ts", "lib/typert.remote-client.js", "lib/typert.remote-client.d.ts"],
+  "files": ["lib/index.js", "cordis.patch.yml", "lib/types/**/*.js", "lib/types/**/*.d.ts", "lib/typert.host.js", "lib/typert.host.d.ts", "lib/typert.remote-client.js", "lib/typert.remote-client.d.ts"],
   "license": "MIT",
   "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
   "dependencies": {
@@ -30,8 +30,9 @@
     "@deepseek-ai/dsh-tools": "workspace:^",
     "@deepseek-ai/dsh-typert-protocol": "workspace:^",
     "@deepseek-ai/schemastery": "workspace:^",
+    "ssh2": "^1.17.0",
     "zod": "^4.4.3"
   },
   "peerDependencies": { "@deepseek-ai/cordis": "workspace:^" },
-  "devDependencies": { "@deepseek-ai/cordis": "workspace:^" }
+  "devDependencies": { "@deepseek-ai/cordis": "workspace:^", "@types/ssh2": "^1.15.6" }
 }

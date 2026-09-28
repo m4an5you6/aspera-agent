@@ -31,6 +31,8 @@ Client 组合挂载 Office 转换、Commands、凭据、settings、Goal、动态
 
 本 facade 同时是 Client 包指称 wire 类型词汇的正门。它以 type-only 方式转出 Remote 失败词汇（`RemoteResult`、`RemoteFailure`、`RemoteErrorCode`、`RemoteErrorDetailsMap`）、Host 事实（`RemoteHostFacts`），以及各已选领域对 Client 安全的载荷类型，因此 Client 功能包只 import 一个 specifier，不必伸手进 `dsh-typert-protocol`、Gateway 或某个拥有方的 Host 入口。有两类包刻意不走这道门：本装配自己选中的 API 层包——反向 import 会形成依赖环——以及它们的测试，后者直接从 `dsh-typert-protocol` 取失败词汇。UI 包的测试则从 [`dsh-client-test-runtime`](../../test-support/client-runtime/README.zh.md) 取 `RemoteError` 构造器。
 
+实验派发 contribution 提供已保存的实验记录与 SSH 密码管理。其 Client 类型描述 SSH 账号及密码配置状态；密码值只由凭据写入操作接收，不会返回浏览器。
+
 本包不拥有物理传输或 Host 服务发现。它只把应用选择投影为生成的 Remote contribution，以及每个 Client 各自独立的 Host 事件源；API Gateway 负责 endpoint、carrier、取消与重连。Web 或未来的 TUI 只要提供同一份不依赖 React 的 `ctx.remote` 约定，均可复用其 Client face。
 
 -----

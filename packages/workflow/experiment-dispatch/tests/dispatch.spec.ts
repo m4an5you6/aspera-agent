@@ -11,6 +11,7 @@ import { deploy } from '../src/deploy.ts'
 import type { DeploymentConfig, PreparedEnvironment } from '../src/deploy.ts'
 import { snapshotSource } from '../src/snapshot.ts'
 import { request } from '../src/transport.ts'
+import { sshPasswordRef } from '../src/ssh-account.ts'
 
 vi.mock('../src/transport.ts', () => ({ request: vi.fn() }))
 vi.mock('../src/deploy.ts', () => ({ deploy: vi.fn() }))
@@ -73,6 +74,44 @@ function receipt(submitted: ExperimentSubmission): ExperimentRecord {
     workerLogPath: '/worker/logs/worker.log', createdAt: 1, updatedAt: 2,
   }
 }
+
+it('stops preparation before source packaging when the selected account has no password', async () => {
+  const f = fixture()
+  const ctx = { get: () => undefined, logger: f.ctx.logger, credentials: { resolve: async () => undefined } } as unknown as Context
+  const dispatcher = new ExperimentDispatcher(ctx, { ...f.config, authMode: 'password', username: 'ubuntu' }, f.store)
+  const result = await dispatcher.prepare()
+  expect(result.state).toBe('failed')
+  if (result.state === 'failed') expect(result.detail).toContain('SSH password is not configured')
+  expect(snapshotSource).not.toHaveBeenCalled()
+  expect(deploy).not.toHaveBeenCalled()
+})
+
+it('pins the SSH account, resolves its password for each operation, and never persists its value', async () => {
+  const f = fixture()
+  f.preparations.clear()
+  const credentials = new Map<string, string>([['DSH_EXPERIMENT_TOKEN', 'receiver-token']])
+  const initial = { ...f.config, username: 'ubuntu', authMode: 'password' as const }
+  const ref = sshPasswordRef(initial)
+  credentials.set(ref, ' first password ')
+  const resolve = vi.fn(async (ref: string) => credentials.has(ref) ? { value: credentials.get(ref)! } : undefined)
+  const ctx = { get: () => undefined, logger: f.ctx.logger, credentials: { resolve } } as unknown as Context
+  const live = { ...initial }
+  const dispatcher = new ExperimentDispatcher(ctx, initial, f.store, () => ({ host: live.host }))
+  const prepared = await dispatcher.prepare()
+  expect(prepared.state).toBe('ready')
+  expect(vi.mocked(deploy).mock.calls[0]?.[5]).toBe(' first password ')
+  expect(JSON.stringify([...f.preparations.values()])).not.toContain('first password')
+  live.host = 'another-gpu.example'
+  credentials.set(ref, ' rotated password ')
+  const receipt = await dispatcher.submit('local-session', goal(), prepared.preparationId, f.input)
+  expect(vi.mocked(request).mock.calls.every(call => call[0].host === initial.host && call[6] === ' rotated password ')).toBe(true)
+  expect(JSON.stringify([...f.submissions.values()])).not.toContain('password ')
+  vi.mocked(request).mockResolvedValue({ status: 200, value: receipt })
+  await dispatcher.status(receipt.submissionId)
+  await dispatcher.cancel(receipt.submissionId)
+  expect(vi.mocked(request).mock.lastCall?.[0]).toMatchObject({ host: initial.host, username: 'ubuntu', authMode: 'password' })
+  expect(resolve).not.toHaveBeenCalledWith(sshPasswordRef(live))
+})
 
 it('retries a lost acceptance receipt with the same id even after the remote Goal completes', async () => {
   const { dispatcher, preparationId, submissions, health, input } = fixture()

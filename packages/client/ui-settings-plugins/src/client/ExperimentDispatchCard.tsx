@@ -16,6 +16,7 @@ export type ExperimentDispatchCardProps =
 
 const fields = [
   { field: 'host', labelKey: 'experimentHost', hintKey: 'experimentHostHint' },
+  { field: 'username', labelKey: 'experimentUsername', hintKey: 'experimentUsernameHint' },
   { field: 'sshPort', labelKey: 'experimentSshPort', hintKey: 'experimentSshPortHint', numeric: true },
   { field: 'remotePort', labelKey: 'experimentRemotePort', hintKey: 'experimentRemotePortHint', numeric: true },
   { field: 'remoteRoot', labelKey: 'experimentRemoteRoot', hintKey: 'experimentRemoteRootHint' },
@@ -47,7 +48,16 @@ export function ExperimentDispatchCard(props: ExperimentDispatchCardProps) {
     <div className={css.page}>
       <PluginConfigForm t={t} state={state} onSave={props.save} onDiscard={props.discard}>
         <p className={css.intro}>{t('experimentTargetIntro')}</p>
-        {fields.map(({ field, labelKey, hintKey, ...options }) => (
+        <div className={css.loginMethod}>
+          <label htmlFor="plugin-config-experiment-auth-mode">{t('experimentAuthMode')}</label>
+          <select id="plugin-config-experiment-auth-mode" value={state.fields.authMode.text || 'key'} disabled={!state.writable}
+            onChange={(event) => { props.edit('authMode', event.target.value) }}>
+            <option value="password">{t('experimentPasswordMode')}</option>
+            <option value="key">{t('experimentKeyMode')}</option>
+          </select>
+        </div>
+        <p className={css.intro}>{t('experimentAuthModeHint')}</p>
+        {fields.filter(({ field }) => field !== 'identityFile' || state.fields.authMode.text !== 'password').map(({ field, labelKey, hintKey, ...options }) => (
           <ValueField
             key={field}
             id={`plugin-config-experiment-${field}`}
@@ -64,6 +74,16 @@ export function ExperimentDispatchCard(props: ExperimentDispatchCardProps) {
             onReset={() => { props.resetField(field) }}
           />
         ))}
+        {state.fields.authMode.text === 'password' ? <SecretField
+          id="plugin-config-experiment-ssh-password"
+          label={t('experimentSshPassword')}
+          hint={t('experimentSshPasswordHint')}
+          text={state.sshPassword.text}
+          configured={state.sshPasswordConfigured}
+          stateLabel={t(state.sshPasswordConfigured ? 'experimentPasswordSet' : 'experimentPasswordUnset')}
+          disabled={!state.writable || !state.sshPasswordWritable}
+          onEdit={(text) => { props.edit('sshPassword', text) }}
+        /> : null}
         <SecretField
           id="plugin-config-experiment-receiver-token"
           label={t('experimentReceiverToken')}
@@ -75,6 +95,7 @@ export function ExperimentDispatchCard(props: ExperimentDispatchCardProps) {
           onEdit={(text) => { props.edit('receiverToken', text) }}
         />
       </PluginConfigForm>
+      <p className={css.intro}>{t('experimentUsage')}</p>
       <section aria-label={t('experimentRecordsTitle')} className={css.records}>
         <div className={css.heading}>
           <h3>{t('experimentRecordsTitle')}</h3>

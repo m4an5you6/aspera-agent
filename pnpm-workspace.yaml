@@ -46,6 +46,9 @@ allowBuilds:
   '@deepseek-ai/dsh-subprocess-local@file:packages/subprocess/subprocess-local': true
   # Store-index rewriting only needs msgpackr's portable JavaScript codec.
   msgpackr-extract: false
+  # SSH password transport uses the portable JavaScript implementation.
+  ssh2: false
+  cpu-features: false
 
 minimumReleaseAgeExclude:
   # Office engines and their API are qualified and released together by the kit repository.

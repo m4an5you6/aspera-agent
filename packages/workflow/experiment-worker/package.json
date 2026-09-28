@@ -13,7 +13,7 @@
     "./src/*": "./src/*",
     "./package.json": "./package.json"
   },
-  "files": ["lib/*.js", "cordis.patch.yml", "lib/types/**/*.d.ts", "scripts/*"],
+  "files": ["lib/index.js", "cordis.patch.yml", "lib/types/**/*.d.ts"],
   "license": "MIT",
   "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
   "dependencies": {

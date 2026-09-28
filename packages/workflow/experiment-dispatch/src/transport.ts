@@ -2,11 +2,16 @@
 import { spawn } from 'node:child_process'
 import { createServer } from 'node:net'
 import type { AddressInfo } from 'node:net'
+import { passwordCopy, passwordRemote, passwordRequest } from './password-transport.ts'
 
 /** Deployment address and SSH identity selected by the trusted profile. */
 export interface Target {
   readonly host: string
   readonly sshPort: number
+  readonly username?: string | undefined
+  readonly authMode?: 'key' | 'password' | undefined
+  readonly passwordRef?: string | undefined
+  readonly knownHostsFile?: string | undefined
   readonly identityFile?: string | undefined
   readonly remotePort: number
   /** Configured maximum lifetime of an SSH command or SCP transfer in milliseconds. */
@@ -61,7 +66,9 @@ export async function run(program: string, args: readonly string[], timeoutMs: n
 export function sshOptions(target: Target): string[] {
   return [
     '-p', String(target.sshPort), '-o', 'BatchMode=yes',
+    '-o', 'PreferredAuthentications=publickey',
     '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=15',
+    ...target.knownHostsFile === undefined ? [] : ['-o', `UserKnownHostsFile=${target.knownHostsFile}`],
     ...target.identityFile === undefined ? [] : ['-i', target.identityFile],
   ]
 }
@@ -71,10 +78,17 @@ export function sshOptions(target: Target): string[] {
  * @param target - trusted target configuration.
  * @param script - remote shell program.
  * @param signal - aborts the SSH process.
+ * @param password - operation-scoped password, resolved outside persisted target settings.
  * @returns remote stdout after successful exit.
  */
-export function remote(target: Target, script: string, signal?: AbortSignal): Promise<string> {
-  return run('ssh', [...sshOptions(target), target.host, `sh -c ${shellQuote(script)}`], target.toolTimeoutMs, signal)
+export function remote(target: Target, script: string, signal?: AbortSignal, password?: string): Promise<string> {
+  const command = `sh -c ${shellQuote(script)}`
+  if (target.authMode === 'password') return passwordRemote(target, password, command, signal)
+  return run('ssh', [...sshOptions(target), destination(target), command], target.toolTimeoutMs, signal)
+}
+
+function destination(target: Target): string {
+  return target.username === undefined ? target.host : `${target.username}@${target.host}`
 }
 
 /**
@@ -83,12 +97,14 @@ export function remote(target: Target, script: string, signal?: AbortSignal): Pr
  * @param localPath - source file.
  * @param remotePath - destination file.
  * @param signal - aborts SCP.
+ * @param password - operation-scoped password.
  * @returns bounded SCP stdout after successful exit.
  */
-export function copy(target: Target, localPath: string, remotePath: string, signal?: AbortSignal): Promise<string> {
+export function copy(target: Target, localPath: string, remotePath: string, signal?: AbortSignal, password?: string): Promise<string> {
+  if (target.authMode === 'password') return passwordCopy(target, password, localPath, remotePath, signal)
   const options = sshOptions(target)
   options[0] = '-P'
-  return run('scp', [...options, localPath, `${target.host}:${remotePath}`], target.toolTimeoutMs, signal)
+  return run('scp', [...options, localPath, `${destination(target)}:${remotePath}`], target.toolTimeoutMs, signal)
 }
 
 async function freePort(): Promise<number> {
@@ -113,6 +129,7 @@ async function freePort(): Promise<number> {
  * @param method - HTTP method.
  * @param body - optional JSON request body.
  * @param signal - aborts the tunnel and request.
+ * @param password - operation-scoped password.
  * @returns HTTP status and parsed JSON response.
  */
 export async function request(
@@ -122,13 +139,15 @@ export async function request(
   method: 'GET' | 'POST',
   body?: unknown,
   signal?: AbortSignal,
+  password?: string,
 ): Promise<{ status: number; value: unknown }> {
+  if (target.authMode === 'password') return passwordRequest(target, password, token, path, method, body, signal)
   signal?.throwIfAborted()
   const port = await freePort()
   signal?.throwIfAborted()
   const child = spawn('ssh', [
     ...sshOptions(target), '-o', 'ExitOnForwardFailure=yes',
-    '-N', '-L', `127.0.0.1:${port}:127.0.0.1:${target.remotePort}`, target.host,
+    '-N', '-L', `127.0.0.1:${port}:127.0.0.1:${target.remotePort}`, destination(target),
   ], { windowsHide: true, stdio: 'ignore' })
   let startError: Error | undefined
   child.once('error', (error) => { startError = error })

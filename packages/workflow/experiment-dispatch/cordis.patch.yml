@@ -37,6 +37,10 @@
       name: '@deepseek-ai/dsh-experiment-dispatch'
       config:
         host: !!js process.env.DSH_EXPERIMENT_TARGET
+        username: !!js process.env.DSH_EXPERIMENT_SSH_USERNAME
+        authMode: !!js process.env.DSH_EXPERIMENT_SSH_AUTH_MODE ?? 'key'
+        passwordRef: !!js process.env.DSH_EXPERIMENT_SSH_PASSWORD_REF
+        knownHostsFile: !!js process.env.DSH_EXPERIMENT_KNOWN_HOSTS_FILE
         sshPort: !!js Number(process.env.DSH_EXPERIMENT_SSH_PORT ?? 22)
         remotePort: !!js Number(process.env.DSH_EXPERIMENT_PORT ?? 43019)
         remoteRoot: !!js process.env.DSH_EXPERIMENT_REMOTE_ROOT

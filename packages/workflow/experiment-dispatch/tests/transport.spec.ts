@@ -4,7 +4,7 @@ import { PassThrough } from 'node:stream'
 import { afterEach, expect, it, vi } from 'vitest'
 import { copy, remote } from '../src/transport.ts'
 
-vi.mock('node:child_process', () => ({ spawn: vi.fn() }))
+vi.mock('node:child_process', async importOriginal => ({ ...await importOriginal<typeof import('node:child_process')>(), spawn: vi.fn() }))
 
 afterEach(() => {
   vi.useRealTimers()

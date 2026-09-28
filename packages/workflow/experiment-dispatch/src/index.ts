@@ -22,9 +22,10 @@ import type { DeploymentConfig, PreparedEnvironment } from './deploy.ts'
 import { snapshotSource } from './snapshot.ts'
 import type { SourceSnapshot } from './snapshot.ts'
 import { copy, remote, request, shellQuote } from './transport.ts'
+import { sshAddress, sshPasswordRef } from './ssh-account.ts'
 import { installGoalUnattended } from './unattended.ts'
-import type { ExperimentDispatchEntry, ExperimentDispatchRecord } from './types.ts'
-export type { ExperimentDispatchEntry, ExperimentDispatchRecord } from './types.ts'
+import type { ExperimentDispatchEntry, ExperimentDispatchRecord, ExperimentPasswordStatus, ExperimentSshAccount } from './types.ts'
+export type { ExperimentDispatchEntry, ExperimentDispatchRecord, ExperimentPasswordStatus, ExperimentSshAccount } from './types.ts'
 
 export const name = 'experiment-dispatch'
 export const inject = ['agents', 'credentials', 'goals', 'tools', 'storageDomain', 'systemPrompt']
@@ -35,6 +36,14 @@ export interface Config {
   readonly host?: string
   /** Remote SSH listener port. */
   readonly sshPort?: number
+  /** SSH login name; may also be supplied by a legacy user@host destination. */
+  readonly username?: string
+  /** Exactly one authentication method; existing configurations use keys. */
+  readonly authMode?: 'key' | 'password'
+  /** Optional password reference; by default each server, port and username has its own credential. */
+  readonly passwordRef?: string
+  /** OpenSSH known_hosts file; defaults to the DSH host user's ~/.ssh/known_hosts. */
+  readonly knownHostsFile?: string
   /** Loopback HTTP receiver port reached through an SSH tunnel. */
   readonly remotePort?: number
   /** Absolute private deployment directory on the target. */
@@ -58,6 +67,10 @@ export interface Config {
 export const Config: z<Config> = z.object({
   host: z.string(),
   sshPort: z.number().step(1).min(1).max(65535).default(22),
+  username: z.string(),
+  authMode: z.union(['key', 'password']).default('key'),
+  passwordRef: z.string(),
+  knownHostsFile: z.string(),
   remotePort: z.number().step(1).min(1).max(65535).default(43019),
   remoteRoot: z.string(),
   localRepo: z.string().default(''),
@@ -71,6 +84,8 @@ export const Config: z<Config> = z.object({
 
 const pinnedTargetSchema = zod.object({
   host: zod.string(), sshPort: zod.number().int(), remotePort: zod.number().int(),
+  username: zod.string().optional(), authMode: zod.enum(['key', 'password']).optional(),
+  passwordRef: zod.string().optional(), knownHostsFile: zod.string().optional(),
   remoteRoot: zod.string(), localRepo: zod.string(), identityFile: zod.string().optional(),
   dataRoots: zod.array(zod.string()), allowedSystemPackages: zod.array(zod.string()),
   tokenRef: zod.string(), agentCredentialRefs: zod.array(zod.string()), toolTimeoutMs: zod.number().int(),
@@ -100,7 +115,7 @@ const localSubmissionSchema = zod.object({
 })
 type LocalSubmission = zod.infer<typeof localSubmissionSchema>
 const storeSpec = defineDomain({
-  name: 'experiment_dispatch', version: 3, compatibleVersions: [1, 2], layout: 'per-record',
+  name: 'experiment_dispatch', version: 4, compatibleVersions: [1, 2, 3], layout: 'per-record',
   tables: {
     preparations: domainTable<string, zod.infer<typeof preparationSchema>>(preparationSchema),
     preparation_failures: domainTable<string, PreparationFailure>(preparationFailureSchema),
@@ -117,8 +132,8 @@ function validateConfig(config: Config): DeploymentConfig {
   if (config.host === undefined || config.host === '' || config.remoteRoot === undefined || config.remoteRoot === '') {
     throw new Error('experiment dispatch is not configured: set the GPU target host and remote root')
   }
-  if (!/^[a-zA-Z0-9_.@-]+$/.test(config.host) || config.host.startsWith('-')
-    || !/^\/[a-zA-Z0-9_./-]+$/.test(config.remoteRoot)
+  const address = sshAddress(config.host, config.username)
+  if (!/^\/[a-zA-Z0-9_./-]+$/.test(config.remoteRoot)
     || config.remoteRoot.split('/').includes('..')
     || !isAbsolute(localRepo)
     || !Number.isSafeInteger(sshPort) || sshPort < 1 || sshPort > 65535
@@ -134,10 +149,16 @@ function validateConfig(config: Config): DeploymentConfig {
     throw new Error('experiment-dispatch only supports bubblewrap in allowedSystemPackages')
   }
   credentialRef(tokenRef)
+  const passwordRef = config.passwordRef
+  if (config.authMode === 'password') sshPasswordRef({ ...address, username: address.username ?? '', sshPort, passwordRef })
+  if (passwordRef !== undefined) credentialRef(passwordRef)
   for (const ref of config.agentCredentialRefs ?? []) credentialRef(ref)
   return {
-    host: config.host,
+    ...address,
     sshPort,
+    ...(config.authMode === undefined ? {} : { authMode: config.authMode }),
+    ...(passwordRef === undefined ? {} : { passwordRef }),
+    ...(config.knownHostsFile === undefined ? {} : { knownHostsFile: config.knownHostsFile }),
     remotePort,
     remoteRoot: config.remoteRoot,
     localRepo,
@@ -153,6 +174,10 @@ function validateConfig(config: Config): DeploymentConfig {
 function pinTarget(config: DeploymentConfig): PinnedTarget {
   return {
     host: config.host, sshPort: config.sshPort, remotePort: config.remotePort, remoteRoot: config.remoteRoot,
+    ...(config.username === undefined ? {} : { username: config.username }),
+    ...(config.authMode === undefined ? {} : { authMode: config.authMode }),
+    ...(config.passwordRef === undefined ? {} : { passwordRef: config.passwordRef }),
+    ...(config.knownHostsFile === undefined ? {} : { knownHostsFile: config.knownHostsFile }),
     localRepo: config.localRepo, allowedSystemPackages: [...config.allowedSystemPackages],
     ...(config.identityFile === undefined ? {} : { identityFile: config.identityFile }),
     dataRoots: [...config.dataRoots], tokenRef: config.tokenRef,
@@ -182,12 +207,14 @@ export class ExperimentDispatcher {
 
   private target(): DeploymentConfig {
     const saved = this.settings()
-    const { identityFile: baseIdentity, ...base } = this.config ?? {}
-    const { identityFile: savedIdentity, ...override } = saved ?? {}
-    const identityFile = savedIdentity ?? baseIdentity
+    const { identityFile, username, authMode, passwordRef, knownHostsFile, ...base } = { ...this.config, ...saved }
     return validateConfig({
-      ...base, ...override,
+      ...base,
       ...identityFile === undefined ? {} : { identityFile },
+      ...username === undefined ? {} : { username },
+      ...authMode === undefined ? {} : { authMode },
+      ...passwordRef === undefined ? {} : { passwordRef },
+      ...knownHostsFile === undefined ? {} : { knownHostsFile },
       dataRoots: [...(saved?.dataRoots ?? this.config?.dataRoots ?? [])],
       allowedSystemPackages: [...(saved?.allowedSystemPackages ?? this.config?.allowedSystemPackages ?? ['bubblewrap'])],
       agentCredentialRefs: [...(saved?.agentCredentialRefs ?? this.config?.agentCredentialRefs ?? ['DEEPSEEK_API_KEY'])],
@@ -216,6 +243,14 @@ export class ExperimentDispatcher {
     return credential.value
   }
 
+  private async password(target: DeploymentConfig): Promise<string | undefined> {
+    if (target.authMode !== 'password') return undefined
+    const ref = sshPasswordRef({ host: target.host, username: target.username ?? '', sshPort: target.sshPort, passwordRef: target.passwordRef })
+    const credential = await this.ctx.credentials.resolve(ref)
+    if (credential === undefined) throw new Error('SSH password is not configured for this server and username; save it in GPU experiment settings')
+    return credential.value
+  }
+
   private async modelCredentials(target: DeploymentConfig): Promise<Record<string, string>> {
     const values = Object.create(null) as Record<string, string>
     for (const name of target.agentCredentialRefs) {
@@ -239,13 +274,14 @@ export class ExperimentDispatcher {
     let snapshot: SourceSnapshot | undefined
     try {
       const target = this.target()
+      const password = await this.password(target)
       snapshot = await snapshotSource(target.localRepo, target.toolTimeoutMs, signal)
       const preparationId = createHash('sha256').update(snapshot.digest + '\0' + JSON.stringify(pinTarget(target))).digest('hex')
       const token = await this.token(target)
       const previous = this.store.table('preparations').get(preparationId)
       if (previous !== undefined) {
         try {
-          const health = await request(target, token, '/experiment/v1/health', 'GET', undefined, signal)
+          const health = await request(target, token, '/experiment/v1/health', 'GET', undefined, signal, password)
           const body = experimentHealthSchema.safeParse(health.value)
           if (health.status === 200 && body.success && body.data.deploymentId === snapshot.digest) {
             return previous
@@ -255,7 +291,7 @@ export class ExperimentDispatcher {
           this.ctx.logger.warn(`experiment-dispatch: cached receiver health failed; rerunning deployment probes: ${String(error)}`)
         }
       }
-      const prepared = { ...await deploy(target, snapshot, token, await this.modelCredentials(target), signal), preparationId }
+      const prepared = { ...await deploy(target, snapshot, token, await this.modelCredentials(target), signal, password), preparationId }
       await this.store.table('preparations').put(prepared.preparationId, {
         ...prepared, devicePaths: [...prepared.devicePaths], hiddenPaths: [...prepared.hiddenPaths], createdAt: Date.now(),
         target: pinTarget(target),
@@ -274,7 +310,9 @@ export class ExperimentDispatcher {
     }
   }
 
-  private async datasetRefs(targetConfig: DeploymentConfig, refs: readonly string[], signal?: AbortSignal): Promise<string[]> {
+  private async datasetRefs(
+    targetConfig: DeploymentConfig, refs: readonly string[], signal?: AbortSignal, password?: string,
+  ): Promise<string[]> {
     const staged: string[] = []
     const workspace = `${targetConfig.remoteRoot}/workspace`
     for (const ref of refs) {
@@ -290,12 +328,12 @@ export class ExperimentDispatcher {
         const name = basename(path).replaceAll(/[^a-zA-Z0-9._-]/g, '_')
         const target = `${workspace}/inputs/${digest}-${name}`
         const incoming = `${target}.partial-${randomUUID()}`
-        await remote(targetConfig, `umask 077; mkdir -p ${shellQuote(workspace + '/inputs')}`, signal)
+        await remote(targetConfig, `umask 077; mkdir -p ${shellQuote(workspace + '/inputs')}`, signal, password)
         try {
-          await copy(targetConfig, path, incoming, signal)
-          await remote(targetConfig, `set -eu; test "$(sha256sum ${shellQuote(incoming)} | cut -d ' ' -f 1)" = ${shellQuote(digest)}; if [ -e ${shellQuote(target)} ]; then test "$(sha256sum ${shellQuote(target)} | cut -d ' ' -f 1)" = ${shellQuote(digest)}; rm -- ${shellQuote(incoming)}; else mv -- ${shellQuote(incoming)} ${shellQuote(target)}; fi`, signal)
+          await copy(targetConfig, path, incoming, signal, password)
+          await remote(targetConfig, `set -eu; test "$(sha256sum ${shellQuote(incoming)} | cut -d ' ' -f 1)" = ${shellQuote(digest)}; if [ -e ${shellQuote(target)} ]; then test "$(sha256sum ${shellQuote(target)} | cut -d ' ' -f 1)" = ${shellQuote(digest)}; rm -- ${shellQuote(incoming)}; else mv -- ${shellQuote(incoming)} ${shellQuote(target)}; fi`, signal, password)
         } catch (error: unknown) {
-          await remote(targetConfig, `rm -f -- ${shellQuote(incoming)}`, signal).catch((cleanupError: unknown) => {
+          await remote(targetConfig, `rm -f -- ${shellQuote(incoming)}`, signal, password).catch((cleanupError: unknown) => {
             this.ctx.logger.warn(`experiment-dispatch: partial dataset cleanup failed: ${String(cleanupError)}`)
           })
           throw error
@@ -330,8 +368,9 @@ export class ExperimentDispatcher {
     if (preparation === undefined) throw new Error('unknown preparation; run prepare_experiment_environment first')
     if (preparation.target === undefined) throw new Error('legacy preparation has no pinned target; prepare again before submitting')
     const target = preparation.target
+    const password = await this.password(target)
     const token = await this.token(target)
-    const healthy = await request(target, token, '/experiment/v1/health', 'GET', undefined, signal)
+    const healthy = await request(target, token, '/experiment/v1/health', 'GET', undefined, signal, password)
     const health = experimentHealthSchema.safeParse(healthy.value)
     if (healthy.status !== 200 || !health.success || health.data.deploymentId !== preparation.deploymentId) {
       throw new Error('prepared worker did not return valid health for the expected version')
@@ -349,7 +388,7 @@ export class ExperimentDispatcher {
       || previous.preparationId !== preparationId || JSON.stringify(previous.target) !== JSON.stringify(target))) {
       throw new Error('this local Goal revision already submitted different experiment requirements or target')
     }
-    const refs = previous?.spec.datasetRefs ?? await this.datasetRefs(target, input.datasetRefs, signal)
+    const refs = previous?.spec.datasetRefs ?? await this.datasetRefs(target, input.datasetRefs, signal, password)
     const requested = { ...input, datasetRefs: refs }
     const submissionId = previous?.submissionId ?? createHash('sha256')
       .update(goal.id + '\0' + String(goal.revision) + '\0' + preparationId).digest('hex')
@@ -366,12 +405,12 @@ export class ExperimentDispatcher {
     let response
     try {
       signal?.throwIfAborted()
-      response = await request(target, token, '/experiment/v1/submit', 'POST', submission, signal)
+      response = await request(target, token, '/experiment/v1/submit', 'POST', submission, signal, password)
     } catch (error: unknown) {
       signal?.throwIfAborted()
       if (error instanceof Error && error.name === 'AbortError') throw error
       // The response may have been lost after acceptance. Replay the exact id.
-      response = await request(target, token, '/experiment/v1/submit', 'POST', submission, signal)
+      response = await request(target, token, '/experiment/v1/submit', 'POST', submission, signal, password)
     }
     const record = experimentRecordSchema.parse(response.value)
     if (response.status !== 200 || record.goalId === undefined || record.submissionId !== submissionId
@@ -421,7 +460,7 @@ export class ExperimentDispatcher {
    */
   async status(submissionId: string, signal?: AbortSignal): Promise<ExperimentRecord> {
     const { key, record: submission } = this.submissionFor(submissionId)
-    const response = await request(submission.target, await this.token(submission.target), `/experiment/v1/status/${encodeURIComponent(submissionId)}`, 'GET', undefined, signal)
+    const response = await request(submission.target, await this.token(submission.target), `/experiment/v1/status/${encodeURIComponent(submissionId)}`, 'GET', undefined, signal, await this.password(submission.target))
     if (response.status !== 200) throw new Error('experiment record was not found on the remote worker')
     const record = experimentRecordSchema.parse(response.value)
     if (record.submissionId !== submissionId) throw new Error('remote worker returned another submission')
@@ -437,7 +476,7 @@ export class ExperimentDispatcher {
    */
   async cancel(submissionId: string, signal?: AbortSignal): Promise<ExperimentRecord> {
     const { key, record: submission } = this.submissionFor(submissionId)
-    const response = await request(submission.target, await this.token(submission.target), `/experiment/v1/cancel/${encodeURIComponent(submissionId)}`, 'POST', {}, signal)
+    const response = await request(submission.target, await this.token(submission.target), `/experiment/v1/cancel/${encodeURIComponent(submissionId)}`, 'POST', {}, signal, await this.password(submission.target))
     if (response.status !== 200) throw new Error('experiment record was not found on the remote worker')
     const record = experimentRecordSchema.parse(response.value)
     if (record.submissionId !== submissionId) throw new Error('remote worker returned another submission')
@@ -450,6 +489,28 @@ export class ExperimentDispatcher {
 export class ExperimentDispatchRemote extends TypertRemoteService {
   constructor(ctx: Context, private readonly dispatcher: ExperimentDispatcher) {
     super(ctx, 'experimentDispatch')
+  }
+
+  /**
+   * Describe the password selected by an SSH account without returning its value.
+   * @param account - target server and login name from the configuration form.
+   * @returns password presence and writability.
+   */
+  @Remote('passwordStatus')
+  async passwordStatus(account: ExperimentSshAccount): Promise<ExperimentPasswordStatus> {
+    const info = await this.ctx.credentials.describe(sshPasswordRef(account))
+    return { configured: info.configured, writable: info.writable }
+  }
+
+  /**
+   * Store a password separately from settings and Session events.
+   * @param account - target server and login name from the configuration form.
+   * @param value - exact password, including whitespace.
+   */
+  @Remote('setPassword')
+  async setPassword(account: ExperimentSshAccount, value: string): Promise<void> {
+    if (value === '') throw new Error('SSH password must not be empty')
+    await this.ctx.credentials.set(sshPasswordRef(account), value)
   }
 
   /**

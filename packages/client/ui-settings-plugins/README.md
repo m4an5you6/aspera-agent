@@ -45,7 +45,7 @@ Saving the Subagent card validates both sections and writes their drafts through
 
 A key control starts blank, reports only whether one is configured, and writes through the credentials domain rather than the settings section; a blank draft writes nothing and keeps the stored key.
 
-The GPU experiment page stages the SSH target, local source and data paths, receiver token reference, and model credential references. The receiver token input writes its value to the credential store after the target settings are saved; the settings document never carries the value. Its experiment list shows the saved handover notice and receiver record, with remote status refresh and cancellation against each record's saved server.
+The GPU experiment page stages the server address, SSH username, password-or-key login method, local source and data paths, receiver token reference, and model credential references. Password mode shows a write-only server password control; key mode shows the identity file. Server passwords retain whitespace and are stored per server, port and username after the target settings are accepted. Passwords and receiver tokens stay in the credential store, outside the settings document. After saving, enter `/goal` with the experiment requirements in a conversation. The experiment list shows the saved handover notice and receiver record, with remote status refresh and cancellation against each record's saved server.
 
 -----
 

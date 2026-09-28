@@ -26,6 +26,9 @@ export type PluginsSettingsLocaleKey =
   | 'subagentModelSelectionUnavailableGroup' | 'subagentModelSelectionEmpty'
   | 'subagentModelSelectionRequired' | 'subagentModelSelectionConflict' | 'subagentModelSelectionOff'
   | 'experimentTitle' | 'experimentDescription' | 'experimentTargetIntro'
+  | 'experimentUsername' | 'experimentUsernameHint' | 'experimentAuthMode' | 'experimentAuthModeHint'
+  | 'experimentPasswordMode' | 'experimentKeyMode' | 'experimentSshPassword' | 'experimentSshPasswordHint'
+  | 'experimentPasswordSet' | 'experimentPasswordUnset' | 'experimentUsage'
   | 'experimentHost' | 'experimentHostHint' | 'experimentSshPort' | 'experimentSshPortHint'
   | 'experimentRemotePort' | 'experimentRemotePortHint' | 'experimentRemoteRoot' | 'experimentRemoteRootHint'
   | 'experimentLocalRepo' | 'experimentLocalRepoHint' | 'experimentIdentityFile' | 'experimentIdentityFileHint'
@@ -109,6 +112,13 @@ export const en: Record<PluginsSettingsLocaleKey, string> = {
   experimentDescription: 'Configure a GPU server and follow experiments after remote handover.',
   experimentTargetIntro: 'New preparations use these settings. Each submitted experiment keeps its original server and credential references.',
   experimentHost: 'SSH host', experimentHostHint: 'Known-hosts-verified destination for the GPU server.',
+  experimentUsername: 'SSH username', experimentUsernameHint: 'Server login account, such as root or ubuntu; required for password login.',
+  experimentAuthMode: 'SSH login method', experimentPasswordMode: 'Password', experimentKeyMode: 'SSH key',
+  experimentAuthModeHint: 'Only the selected method is used. Password login does not try saved keys.',
+  experimentSshPassword: 'Server password',
+  experimentSshPasswordHint: 'Stored separately for this server, port and username. Leave blank to keep its saved password. Spaces are preserved.',
+  experimentPasswordSet: 'A password is saved for this account.', experimentPasswordUnset: 'No password is saved for this account.',
+  experimentUsage: 'After saving, enter /goal followed by your experiment requirements in a conversation. The agent prepares the server and submits the experiment; use the list below to refresh its status or cancel it.',
   experimentSshPort: 'SSH port', experimentSshPortHint: 'Port for the SSH connection.',
   experimentRemotePort: 'Worker port', experimentRemotePortHint: 'Loopback receiver port reached through SSH.',
   experimentRemoteRoot: 'Remote directory', experimentRemoteRootHint: 'Absolute private deployment directory on the GPU server.',
@@ -202,6 +212,13 @@ export const zh: Record<PluginsSettingsLocaleKey, string> = {
   experimentDescription: '配置 GPU 服务器，并在远端接管后查看实验状态。',
   experimentTargetIntro: '新的准备工作使用此处的配置。已提交的实验保留原服务器和凭据引用。',
   experimentHost: 'SSH 主机', experimentHostHint: '已通过 known_hosts 验证的 GPU 服务器地址。',
+  experimentUsername: 'SSH 用户名', experimentUsernameHint: '服务器登录账号，例如 root 或 ubuntu；密码登录时必填。',
+  experimentAuthMode: 'SSH 登录方式', experimentPasswordMode: '密码', experimentKeyMode: 'SSH 密钥',
+  experimentAuthModeHint: '只使用所选方式；选择密码时不会尝试已保存的密钥。',
+  experimentSshPassword: '服务器密码',
+  experimentSshPasswordHint: '按服务器、端口和用户名单独保存到凭据存储；留空保留该账号已保存的密码，空格原样保留。',
+  experimentPasswordSet: '已为此账号保存密码。', experimentPasswordUnset: '此账号尚未保存密码。',
+  experimentUsage: '保存后，在会话中输入 /goal 并写明实验要求，代理会准备服务器并提交实验；之后可在下方刷新状态或取消实验。',
   experimentSshPort: 'SSH 端口', experimentSshPortHint: 'SSH 连接所用端口。',
   experimentRemotePort: '工作器端口', experimentRemotePortHint: '通过 SSH 访问的远端回环接收端口。',
   experimentRemoteRoot: '远端目录', experimentRemoteRootHint: 'GPU 服务器上的私有部署绝对路径。',
