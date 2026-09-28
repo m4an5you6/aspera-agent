@@ -10,7 +10,7 @@ import type {} from '@deepseek-ai/dsh-goal'
 import type { GoalRef } from '@deepseek-ai/dsh-goal'
 import type {} from '@deepseek-ai/dsh-settings'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
-import { experimentHealthSchema, experimentRecordSchema, experimentSpecSchema, submissionHash } from '@deepseek-ai/dsh-experiment-worker'
+import { experimentHealthSchema, experimentRecordSchema, experimentSpecSchema, submissionHash, clusterServerSchema, experimentIdSchema, serverIdSchema } from '@deepseek-ai/dsh-experiment-worker'
 import type { ExperimentRecord, ExperimentSpec, ExperimentSubmission } from '@deepseek-ai/dsh-experiment-worker'
 import { defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain'
 import type { Domain } from '@deepseek-ai/dsh-storage-domain'
@@ -21,22 +21,36 @@ import { deploy } from './deploy.ts'
 import type { DeploymentConfig, PreparedEnvironment } from './deploy.ts'
 import { snapshotSource } from './snapshot.ts'
 import type { SourceSnapshot } from './snapshot.ts'
-import { copy, remote, request, shellQuote } from './transport.ts'
+import { copy, remote, request, run, shellQuote } from './transport.ts'
 import { sshAddress, sshPasswordRef } from './ssh-account.ts'
 import { installGoalUnattended } from './unattended.ts'
+import { ExperimentFleet } from './fleet.ts'
+import { pinnedTargetSchema } from './deployment-settings.ts'
+import { ExperimentDownloads } from './downloads.ts'
+import type { FleetCreateRequest, FleetExperiment, FleetRegistry, FleetServerInput } from './types.ts'
+import type { ClusterChunk, ClusterFile } from '@deepseek-ai/dsh-experiment-worker/types'
+export type { FleetCreateRequest, FleetExperiment, FleetRegistry, FleetServerInput } from './types.ts'
+export type { ClusterChunk, ClusterFile, ClusterRecord, ClusterServer, ClusterState } from '@deepseek-ai/dsh-experiment-worker'
+import type {} from '@deepseek-ai/dsh-agent-default-model'
 import type { ExperimentDispatchEntry, ExperimentDispatchRecord, ExperimentPasswordStatus, ExperimentSshAccount } from './types.ts'
 export type { ExperimentDispatchEntry, ExperimentDispatchRecord, ExperimentPasswordStatus, ExperimentSshAccount } from './types.ts'
 
 export const name = 'experiment-dispatch'
-export const inject = ['agents', 'credentials', 'goals', 'tools', 'storageDomain', 'systemPrompt']
+export const inject = ['agents', 'agentDefaultModel', 'sessions', 'credentials', 'goals', 'tools', 'storageDomain', 'systemPrompt']
 
 /** Fixed deployment target and bounded setup operations. */
 export interface Config {
+  /** Lifetime of single-use Web artifact download URLs. */
+  readonly downloadTtlMs?: number
+  /** Interval for observing remote control startup and legacy receiver shutdown. */
+  readonly controlPollIntervalMs?: number
   /** Known-hosts-verified OpenSSH destination for the GPU target. */
   readonly host?: string
   /** Remote SSH listener port. */
   readonly sshPort?: number
-  /** SSH login name; may also be supplied by a legacy user@host destination. */
+  /**
+   * SSH login name; may also be supplied by a legacy user@host destination.
+   */
   readonly username?: string
   /** Exactly one authentication method; existing configurations use keys. */
   readonly authMode?: 'key' | 'password'
@@ -65,6 +79,8 @@ export interface Config {
 }
 
 export const Config: z<Config> = z.object({
+  downloadTtlMs: z.number().step(1).min(1000).default(60000),
+  controlPollIntervalMs: z.number().step(1).min(100).default(1000),
   host: z.string(),
   sshPort: z.number().step(1).min(1).max(65535).default(22),
   username: z.string(),
@@ -82,14 +98,7 @@ export const Config: z<Config> = z.object({
   toolTimeoutMs: z.number().step(1).min(60_000).default(1_800_000),
 })
 
-const pinnedTargetSchema = zod.object({
-  host: zod.string(), sshPort: zod.number().int(), remotePort: zod.number().int(),
-  username: zod.string().optional(), authMode: zod.enum(['key', 'password']).optional(),
-  passwordRef: zod.string().optional(), knownHostsFile: zod.string().optional(),
-  remoteRoot: zod.string(), localRepo: zod.string(), identityFile: zod.string().optional(),
-  dataRoots: zod.array(zod.string()), allowedSystemPackages: zod.array(zod.string()),
-  tokenRef: zod.string(), agentCredentialRefs: zod.array(zod.string()), toolTimeoutMs: zod.number().int(),
-})
+
 type PinnedTarget = zod.infer<typeof pinnedTargetSchema>
 const preparationSchema = zod.object({
   state: zod.literal('ready'),
@@ -134,7 +143,8 @@ function validateConfig(config: Config): DeploymentConfig {
   }
   const address = sshAddress(config.host, config.username)
   if (!/^\/[a-zA-Z0-9_./-]+$/.test(config.remoteRoot)
-    || config.remoteRoot.split('/').includes('..')
+    || config.remoteRoot.split('/').some(part => part === '.' || part === '..')
+    || config.remoteRoot.replaceAll('/', '') === ''
     || !isAbsolute(localRepo)
     || !Number.isSafeInteger(sshPort) || sshPort < 1 || sshPort > 65535
     || !Number.isSafeInteger(remotePort) || remotePort < 1 || remotePort > 65535) {
@@ -168,6 +178,7 @@ function validateConfig(config: Config): DeploymentConfig {
     allowedSystemPackages: config.allowedSystemPackages ?? ['bubblewrap'],
     agentCredentialRefs: config.agentCredentialRefs ?? ['DEEPSEEK_API_KEY'],
     toolTimeoutMs: config.toolTimeoutMs ?? 1_800_000,
+    controlPollIntervalMs: config.controlPollIntervalMs ?? 1000,
   }
 }
 
@@ -182,6 +193,7 @@ function pinTarget(config: DeploymentConfig): PinnedTarget {
     ...(config.identityFile === undefined ? {} : { identityFile: config.identityFile }),
     dataRoots: [...config.dataRoots], tokenRef: config.tokenRef,
     agentCredentialRefs: [...config.agentCredentialRefs], toolTimeoutMs: config.toolTimeoutMs,
+    controlPollIntervalMs: config.controlPollIntervalMs,
   }
 }
 
@@ -245,7 +257,8 @@ export class ExperimentDispatcher {
 
   private async password(target: DeploymentConfig): Promise<string | undefined> {
     if (target.authMode !== 'password') return undefined
-    const ref = sshPasswordRef({ host: target.host, username: target.username ?? '', sshPort: target.sshPort, passwordRef: target.passwordRef })
+    const ref = sshPasswordRef({ host: target.host, username: target.username ?? '', sshPort: target.sshPort,
+      passwordRef: target.passwordRef })
     const credential = await this.ctx.credentials.resolve(ref)
     if (credential === undefined) throw new Error('SSH password is not configured for this server and username; save it in GPU experiment settings')
     return credential.value
@@ -358,11 +371,13 @@ export class ExperimentDispatcher {
    * @param signal - stops transport and automatic retries while retaining the retry identity; remote acceptance may already have occurred.
    * @returns the receiver's durable acceptance record.
    */
-  async submit(sessionId: string, goal: GoalRef, preparationId: string, input: Omit<ExperimentSpec, 'outputPath'>, signal?: AbortSignal): Promise<ExperimentRecord> {
+  async submit(sessionId: string, goal: GoalRef, preparationId: string, input: Omit<ExperimentSpec, 'outputPath'>,
+    signal?: AbortSignal): Promise<ExperimentRecord> {
     return this.serialize(() => this.submitOnce(sessionId, goal, preparationId, input, signal))
   }
 
-  private async submitOnce(sessionId: string, goal: GoalRef, preparationId: string, input: Omit<ExperimentSpec, 'outputPath'>, signal?: AbortSignal): Promise<ExperimentRecord> {
+  private async submitOnce(sessionId: string, goal: GoalRef, preparationId: string, input: Omit<ExperimentSpec,
+    'outputPath'>, signal?: AbortSignal): Promise<ExperimentRecord> {
     signal?.throwIfAborted()
     const preparation = this.store.table('preparations').get(preparationId)
     if (preparation === undefined) throw new Error('unknown preparation; run prepare_experiment_environment first')
@@ -487,8 +502,124 @@ export class ExperimentDispatcher {
 
 /** Trusted browser controls over locally saved experiment identities. */
 export class ExperimentDispatchRemote extends TypertRemoteService {
-  constructor(ctx: Context, private readonly dispatcher: ExperimentDispatcher) {
+  constructor(ctx: Context, private readonly dispatcher: ExperimentDispatcher, private readonly fleet: ExperimentFleet,
+    private readonly downloads: ExperimentDownloads) {
     super(ctx, 'experimentDispatch')
+  }
+
+  /**
+   * Read configured servers without credential values.
+   * @returns configured servers and fixed coordinator identity.
+   */
+  @Remote('servers')
+  servers(): FleetRegistry { return this.fleet.servers() }
+
+  /**
+   * Issue an expiring artifact address for one assigned node.
+   * @param id - experiment.
+   * @param serverId - assigned node.
+   * @param path - relative output file.
+   * @returns single-use streaming download URL.
+   */
+  @Remote('downloadExperimentFile')
+  downloadExperimentFile(id: string, serverId: string, path: string): Promise<string> {
+    return this.downloads.issue(experimentIdSchema.parse(id), serverIdSchema.parse(serverId), path)
+  }
+
+  /**
+   * Save server settings while retaining the original coordinator.
+   * @param server - submitted server form.
+   * @returns persisted server registry.
+   */
+  @Remote('saveServer')
+  saveServer(server: FleetServerInput): Promise<FleetRegistry> { return this.fleet.saveServer(server) }
+
+  /**
+   * Remove an unused server from future selections.
+   * @param id - server identity.
+   * @returns registry after removal.
+   */
+  @Remote('removeServer')
+  removeServer(id: string): Promise<FleetRegistry> { return this.fleet.removeServer(serverIdSchema.parse(id)) }
+
+  /**
+   * Check the selected server’s SSH and GPU readiness.
+   * @param id - server identity.
+   * @returns GPU inventory and current allocations.
+   */
+  @Remote('probeServer')
+  probeServer(id: string): Promise<{ gpuInfo: string; allocations: string[] }> { return this.fleet.probe(serverIdSchema.parse(id)) }
+
+  /**
+   * Read independent experiments and their saved receipts.
+   * @returns independent local and remote experiment states.
+   */
+  @Remote('experiments')
+  experiments(): FleetExperiment[] { return this.fleet.list() }
+
+  /**
+   * Admit a browser Goal to independent background preparation.
+   * @param input - goal and explicit server selection.
+   * @returns saved preparation before remote work finishes.
+   */
+  @Remote('createExperiment')
+  createExperiment(input: FleetCreateRequest): Promise<FleetExperiment> { return this.fleet.create(input) }
+
+  /**
+   * Stage one bounded browser attachment chunk.
+   * @param id - new experiment.
+   * @param name - file basename.
+   * @param offset - upload byte cursor.
+   * @param data - base64 bytes.
+   * @returns next cursor.
+   */
+  @Remote('uploadExperimentInput')
+  uploadExperimentInput(id: string, name: string, offset: number, data: string): { nextOffset: number } {
+    return this.fleet.upload(experimentIdSchema.parse(id), name, offset, data)
+  }
+
+  /**
+   * Reconcile an experiment with its original coordinator.
+   * @param id - experiment identity.
+   * @returns reconciled remote status.
+   */
+  @Remote('refreshExperiment')
+  refreshExperiment(id: string): Promise<FleetExperiment> { return this.fleet.refresh(experimentIdSchema.parse(id)) }
+
+  /**
+   * Request cancellation on the saved coordinator.
+   * @param id - experiment identity.
+   * @returns cancellation state after admission or preparation.
+   */
+  @Remote('cancelExperiment')
+  cancelExperiment(id: string): Promise<FleetExperiment> { return this.fleet.cancel(experimentIdSchema.parse(id)) }
+
+  /**
+   * List metadata inside the assigned experiment workspace.
+   * @param id - experiment.
+   * @param serverId - assigned node.
+   * @returns bounded artifact metadata.
+   */
+  @Remote('experimentFiles')
+  experimentFiles(id: string, serverId: string): Promise<{ files: ClusterFile[]; truncated: boolean }> {
+    return this.fleet.files(experimentIdSchema.parse(id), serverIdSchema.parse(serverId))
+  }
+
+  /**
+   * Read incremental events, logs or artifact bytes.
+   * @param id - experiment.
+   * @param kind - stream or artifact.
+   * @param offset - byte cursor.
+   * @param serverId - assigned node.
+   * @param path - relative artifact path.
+   * @param generation - prior file identity.
+   * @returns bounded bytes and cursor.
+   */
+  @Remote('readExperiment')
+  readExperiment(id: string, kind: 'log' | 'file' | 'events' | 'agent-log', offset: number, serverId?: string, path?: string,
+    generation?: string): Promise<ClusterChunk> {
+    return this.fleet.read(experimentIdSchema.parse(id), kind, offset,
+      serverId === undefined ? undefined : serverIdSchema.parse(serverId), path, generation)
   }
 
   /**
@@ -571,14 +702,63 @@ export async function apply(ctx: Context, input: Config): Promise<void> {
     : validateConfig(input)
   const store = await ctx.storageDomain.open(storeSpec)
   const dispatcher = new ExperimentDispatcher(ctx, config, store, () => source())
-  new ExperimentDispatchRemote(ctx, dispatcher)
+  const legacy = async () => {
+    const current = source()
+    if (!current.host || !current.remoteRoot) return undefined
+    const target = validateConfig(current)
+    let username = target.username
+    if (username === undefined) {
+      const ssh = await run('ssh', ['-G', '-p', String(target.sshPort), target.host], target.toolTimeoutMs)
+      username = /^user (.+)$/m.exec(ssh)?.[1]?.trim()
+      if (username === undefined) throw new Error('Legacy SSH settings do not resolve a username; configure it before migrating the server.')
+    }
+    return clusterServerSchema.parse({
+      id: randomUUID(), name: target.host, host: target.host, username, sshPort: target.sshPort,
+      remotePort: target.remotePort, remoteRoot: target.remoteRoot, authMode: target.authMode ?? 'key',
+      passwordRef: target.passwordRef, identityFile: target.identityFile, knownHostsFile: target.knownHostsFile,
+    })
+  }
+  const fleet = await ExperimentFleet.open(ctx, (server) => {
+    const { passwordRef: _passwordRef, identityFile: _identityFile, knownHostsFile: _knownHostsFile, ...policy } = source()
+    return validateConfig({ ...policy,
+      host: server.host, username: server.username, sshPort: server.sshPort, remotePort: server.remotePort,
+      remoteRoot: server.remoteRoot, authMode: server.authMode,
+      ...(server.passwordRef === undefined ? {} : { passwordRef: server.passwordRef }),
+      ...(server.identityFile === undefined ? {} : { identityFile: server.identityFile }),
+      ...(server.knownHostsFile === undefined ? {} : { knownHostsFile: server.knownHostsFile }),
+    })
+  }, legacy)
+  new ExperimentDispatchRemote(ctx, dispatcher, fleet, new ExperimentDownloads(ctx, fleet, input.downloadTtlMs ?? 60000))
   const toolTimeoutMs = input.toolTimeoutMs ?? 1_800_000
+  ctx.effect(() => ctx.tools.register(defineTool({
+    name: 'list_experiment_servers', description: 'List configured servers and the fixed coordinator. Select only servers authorized by the user for a joint experiment.',
+    parameters: {}, output,
+    execute: (_args, exec) => { caller(ctx, exec); return Promise.resolve(toolJson(fleet.servers())) },
+  })))
+  ctx.effect(() => ctx.tools.register(defineTool({
+    name: 'dispatch_cluster_experiment', description: 'Prepare and queue one joint experiment across selected server IDs. Uses the same independent task service as Web. Returns preparing immediately; poll get_cluster_experiment until its full handover receipt is saved. Retries for the same Goal revision reuse the experiment.',
+    parameters: { objective: { type: 'string', required: true }, server_ids: { type: 'array', items: { type: 'string' }, required: true },
+      files: { type: 'array', items: { type: 'string' } } }, output,
+    execute: async (args, exec) => toolJson(await fleet.createForGoal(caller(ctx, exec), args.objective, args.server_ids,
+      args.files ?? [])),
+  })))
+  ctx.effect(() => ctx.tools.register(defineTool({
+    name: 'get_cluster_experiment', description: 'Read preparation, queued or running state and the complete remote handover receipt for a joint experiment.',
+    parameters: { experiment_id: { type: 'string', required: true } }, output,
+    execute: async (args, exec) => { caller(ctx,
+      exec); return toolJson(await fleet.refresh(experimentIdSchema.parse(args.experiment_id))) },
+  })))
+  ctx.effect(() => ctx.tools.register(defineTool({
+    name: 'cancel_cluster_experiment', description: 'Record cancellation of a joint experiment; its nodes stay occupied until managed processes have stopped.',
+    parameters: { experiment_id: { type: 'string', required: true } }, output,
+    execute: async (args, exec) => { caller(ctx, exec); return toolJson(await fleet.cancel(experimentIdSchema.parse(args.experiment_id))) },
+  })))
   ctx.effect(() => () => store.close(), 'experiment-dispatch: local records')
   ctx.systemPrompt.section({
     name: 'experiment:dispatch', order: ctx.systemPrompt.getSectionOrder('TOOL_GOAL'),
-    text: 'For a requested remote training experiment, prepare the environment, then submit explicit requirements only when preparation returns state ready. '
+    text: 'For joint experiments, list_experiment_servers exposes configured server IDs; dispatch_cluster_experiment prepares one independent task on the servers explicitly selected by the user. Poll get_cluster_experiment until its receipt is saved. '
       + 'Preserve the user\'s chosen model, data, method and constraints. Choose missing details within authorized resources and record them. '
-      + 'After submit returns accepted, the remote Goal owns execution; include the handover field verbatim when reporting its identifiers and status lookup. '
+      + 'A queued receipt transfers ownership before a remote Session or Goal exists; include the handover field verbatim and distinguish queued from running. Legacy single-target tools prepare before submitting and retain their saved target. '
       + 'Never wait for a human response or claim the training finished from the acceptance receipt.',
   })
   ctx.tools.register(defineTool({

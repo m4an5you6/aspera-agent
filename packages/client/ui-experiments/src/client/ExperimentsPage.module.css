@@ -1,0 +1,30 @@
+/* Experiment pages share the application's semantic theme tokens. */
+.page { height: 100%; overflow: auto; padding: 28px clamp(20px, 4vw, 48px); box-sizing: border-box; color: var(--dsw-alias-label-primary); }
+.page > * { max-width: 1100px; margin-inline: auto; }
+.header { display: flex; justify-content: space-between; gap: 24px; flex-wrap: wrap; margin-bottom: 24px; }
+.header h1 { font-size: 22px; margin: 0 0 8px; }
+.header p, .form p { color: var(--dsw-alias-label-secondary); font-size: 13px; line-height: 1.6; }
+.actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.list { display: grid; gap: 16px; margin-top: 20px; }
+.card { display: grid; gap: 10px; padding: 20px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 12px; background: var(--dsw-alias-bg-layer-1); color: inherit; text-align: left; font: inherit; overflow-wrap: anywhere; }
+button.card { cursor: pointer; }
+.card strong { font-size: 16px; white-space: pre-wrap; }
+.card h2, .card p { margin: 0; }
+.card small { color: var(--dsw-alias-label-secondary); }
+.form { display: grid; gap: 16px; max-width: 760px; margin-block: 20px; }
+.form label { display: grid; gap: 6px; }
+.form input, .form textarea, .detail select { font: inherit; }
+.form textarea, .detail select { padding: 10px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; color: inherit; background: var(--dsw-alias-bg-layer-1); }
+.form fieldset { display: grid; gap: 12px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; padding: 16px; }
+.detail { display: grid; gap: 18px; margin-top: 20px; }
+.detail h2 { white-space: pre-wrap; font-size: 20px; }
+.detail p { margin: 0; line-height: 1.6; }
+.handover { padding: 14px; border-radius: 8px; background: color-mix(in srgb, var(--dsw-alias-state-business-primary) 10%, transparent); }
+.error { color: var(--dsw-alias-state-error-primary); white-space: pre-wrap; }
+.facts { display: grid; grid-template-columns: max-content 1fr; gap: 14px 20px; }
+.facts dt { color: var(--dsw-alias-label-secondary); }
+.facts dd { margin: 0; overflow-wrap: anywhere; }
+.log { font-family: monospace; font-size: 12px; line-height: 1.7; padding: 16px; max-height: 60vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--dsw-alias-bg-module-platform); border-radius: 8px; }
+.file { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; padding: 12px 0; border-bottom: 1px solid var(--dsw-alias-border-l2); }
+.file span { flex: 1; overflow-wrap: anywhere; }
+@media (max-width: 640px) { .facts { grid-template-columns: 1fr; gap: 8px; } }

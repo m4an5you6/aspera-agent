@@ -17,15 +17,36 @@ import { defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain'
 import type { Domain, KvTable } from '@deepseek-ai/dsh-storage-domain'
 import { experimentRecordSchema, submissionSchema } from './protocol.ts'
 import type { ExperimentHealth, ExperimentRecord, ExperimentSubmission } from './protocol.ts'
+import { applyClusterRole } from './cluster.ts'
+export * from './cluster-protocol.ts'
+export { clusterPrivateSchema, clusterFileHash } from './cluster-runtime.ts'
+export type { ClusterPrivate } from './cluster-runtime.ts'
+export { copy, remote, request, run, shellQuote, sshOptions } from './transport.ts'
+export type { Target } from './transport.ts'
+export { passwordCopy, passwordRemote, passwordRequest } from './password-transport.ts'
 
 export { experimentHealthSchema, experimentRecordSchema, experimentSpecSchema, submissionSchema } from './protocol.ts'
 export type { ExperimentHealth, ExperimentSpec, ExperimentSubmission, ExperimentRecord } from './protocol.ts'
 
 export const name = 'experiment-worker'
-export const inject = ['agents', 'agentDefaultModel', 'goals', 'sessions', 'storageDomain', 'webServer']
+export const inject = ['agents', 'agentDefaultModel', 'goals', 'sessions', 'storageDomain', 'webServer', 'tools', 'subprocess', 'sandbox']
 
 /** Worker deployment settings; secrets stay in an owner-only file. */
 export interface Config {
+  /** Receiver, cluster control, node execution, or isolated experiment Agent. */
+  readonly role?: 'receiver' | 'coordinator' | 'node' | 'agent'
+  /** Private root shared by the cluster processes on this server. */
+  readonly clusterRoot?: string
+  /** Experiment selected for an isolated Agent process. */
+  readonly experimentId?: string
+  /** Maximum bytes in one file or log response. */
+  readonly chunkBytes?: number
+  /** Maximum files listed in one response. */
+  readonly fileLimit?: number
+  /** Time allowed for managed process cleanup and connectivity probes. */
+  readonly cleanupTimeoutMs?: number
+  /** Interval for observing execution identity receipts. */
+  readonly pollIntervalMs?: number
   /** Absolute writable directory assigned to the experiment. */
   readonly workspaceRoot: string
   /** Owner-only file containing the receiver Bearer token. */
@@ -39,6 +60,12 @@ export interface Config {
 }
 
 export const Config: z<Config> = z.object({
+  role: z.union(['receiver', 'coordinator', 'node', 'agent']).default('receiver'),
+  clusterRoot: z.string(), experimentId: z.string(),
+  chunkBytes: z.number().step(1).min(1024).max(262144).default(65536),
+  fileLimit: z.number().step(1).min(1).max(10000).default(1000),
+  cleanupTimeoutMs: z.number().step(1).min(1000).default(30000),
+  pollIntervalMs: z.number().step(1).min(100).default(1000),
   workspaceRoot: z.string().required(),
   tokenFile: z.string().required(),
   logFile: z.string().required(),
@@ -156,7 +183,8 @@ export class ExperimentReceiver {
   async recover(): Promise<void> {
     for (const [id, record] of this.table.entries()) {
       if (record.state === 'reserved' || record.state === 'accepted') {
-        await this.table.put(id, { ...record, state: 'interrupted', detail: 'worker process stopped before a terminal result', updatedAt: Date.now() })
+        await this.table.put(id, { ...record, state: 'interrupted',
+          detail: 'worker process stopped before a terminal result', updatedAt: Date.now() })
       }
     }
   }
@@ -390,6 +418,17 @@ export class ExperimentReceiver {
 
 /** Mount the authenticated loopback route and recover interrupted records. */
 export async function apply(ctx: Context, config: Config): Promise<void> {
+  if (config.role !== undefined && config.role !== 'receiver') {
+    if (config.clusterRoot === undefined) throw new Error('cluster role requires clusterRoot')
+    await applyClusterRole(ctx, {
+      role: config.role, root: config.clusterRoot, tokenFile: config.tokenFile, deploymentId: config.deploymentId,
+      devicePaths: config.devicePaths,
+      ...(config.experimentId === undefined ? {} : { experimentId: config.experimentId }),
+      chunkBytes: config.chunkBytes ?? 65536, fileLimit: config.fileLimit ?? 1000,
+      cleanupTimeoutMs: config.cleanupTimeoutMs ?? 30000, pollIntervalMs: config.pollIntervalMs ?? 1000,
+    })
+    return
+  }
   if (!isAbsolute(config.workspaceRoot) || !isAbsolute(config.tokenFile) || !isAbsolute(config.logFile)
     || !/^[a-f0-9]{64}$/.test(config.deploymentId)) {
     throw new Error('experiment-worker requires absolute workspace/token paths and a deployment digest')

@@ -48,7 +48,7 @@
 | `@deepseek-ai/dsh-tool-todo` | `todo_write` | `ctx.tools`、`owning Agent session` | `tool/call`、`todo/write`、`tool/result` | - | todo_write 是会话所有的状态；UI 将最新的 todo/write 事件渲染为检查清单。`allowParallelInProgress` 是没有默认值的必填项，因此本目录明确选择 `true`，对应描述允许同时存在多个 `in_progress` 项。选择 `false` 的部署会获得同一工具，但描述会要求只能有 1 个活动任务。 |
 | `@deepseek-ai/dsh-tool-workflow` | `workflow` | `ctx.tools`、`ctx.workflowEngine`、`ctx.systemPrompt`、`a calling Agent (exec.agent parents the script children)` | `tool/call`、`tool/result` | - | - |
 | `@deepseek-ai/dsh-tool-web` | `web_fetch`、`web_search` | `ctx.tools`、`ctx.web`、`ctx.systemPrompt` | `tool/call`、`tool/result` | - | web_search 和 web_fetch 将提供方选择置于 ctx.web 之后，使模型可见 schema 在更换后端时保持稳定。 |
-| `@deepseek-ai/dsh-experiment-dispatch` | `cancel_experiment`、`get_experiment_status`、`prepare_experiment_environment`、`submit_experiment` | `ctx.tools`、`ctx.agents`、`ctx.credentials`、`ctx.goals`、`ctx.storageDomain`、`ctx.systemPrompt` | `tool/call`、`tool/result`、`remote experiment receiver record` | - | 四个工具要求存活的根 Agent 与独立认证的 Linux 工作端；接管回执不表示训练完成。 |
+| `@deepseek-ai/dsh-experiment-dispatch` | `cancel_cluster_experiment`, `cancel_experiment`, `dispatch_cluster_experiment`, `get_cluster_experiment`, `get_experiment_status`, `list_experiment_servers`, `prepare_experiment_environment`, `submit_experiment` | `ctx.tools`, `ctx.agents`, `ctx.sessions`, `ctx.agentDefaultModel`, `ctx.credentials`, `ctx.goals`, `ctx.storageDomain`, `ctx.systemPrompt` | `tool/call`, `tool/result`, `remote experiment receiver record` | - | 实验工具与 Web 共用服务器列表和持久派发服务。排队回执确认远端接管；全部所选节点分配完成后，补齐执行会话和 Goal 编号。单服务器工具保留原接收协议。 |
 
 <a id="deepseek-aidsh-plugin-manager"></a>
 
@@ -2502,6 +2502,26 @@ web_search 和 web_fetch 将提供方选择置于 ctx.web 之后，使模型可�
 
 ## `@deepseek-ai/dsh-experiment-dispatch`
 
+### `cancel_cluster_experiment`
+
+记录联合实验取消请求；受管进程停止前，节点继续保留占用。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "experiment_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "experiment_id"
+  ]
+}
+```
+
+来源：[`packages/workflow/experiment-dispatch/src/index.ts`](../packages/workflow/experiment-dispatch/src/index.ts)
+
 ### `cancel_experiment`
 
 取消远端实验，并等待所属 Agent 及其子进程停止。
@@ -2516,6 +2536,59 @@ web_search 和 web_fetch 将提供方选择置于 ctx.web 之后，使模型可�
   },
   "required": [
     "submission_id"
+  ]
+}
+```
+
+来源：[`packages/workflow/experiment-dispatch/src/index.ts`](../packages/workflow/experiment-dispatch/src/index.ts)
+
+### `dispatch_cluster_experiment`
+
+在选中服务器上准备并排队执行一个联合实验，使用与 Web 相同的独立任务服务。立即返回准备中状态；轮询 get_cluster_experiment，直至完整接管回执保存。同一 Goal 版本的重试复用原实验。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "objective": {
+      "type": "string"
+    },
+    "server_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "objective",
+    "server_ids"
+  ]
+}
+```
+
+来源：[`packages/workflow/experiment-dispatch/src/index.ts`](../packages/workflow/experiment-dispatch/src/index.ts)
+
+### `get_cluster_experiment`
+
+读取联合实验的准备、排队或运行状态及完整远端接管回执。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "experiment_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "experiment_id"
   ]
 }
 ```
@@ -2542,9 +2615,22 @@ web_search 和 web_fetch 将提供方选择置于 ctx.web 之后，使模型可�
 
 来源：[`packages/workflow/experiment-dispatch/src/index.ts`](../packages/workflow/experiment-dispatch/src/index.ts)
 
+### `list_experiment_servers`
+
+列出已配置的服务器及固定调度主机。仅选择用户授权参与联合实验的服务器。
+
+```json
+{
+  "type": "object",
+  "properties": {}
+}
+```
+
+来源：[`packages/workflow/experiment-dispatch/src/index.ts`](../packages/workflow/experiment-dispatch/src/index.ts)
+
 ### `prepare_experiment_environment`
 
-将当前 DSH 源码部署到配置的 GPU 目标，并在提交前实际验证沙箱与 CUDA 访问。
+将当前 DSH 源码部署到配置的 GPU 目标，并在提交前实际验证沙箱和 CUDA 访问。
 
 ```json
 {
@@ -2557,7 +2643,7 @@ web_search 和 web_fetch 将提供方选择置于 ctx.web 之后，使模型可�
 
 ### `submit_experiment`
 
-向已准备的工作端提交一项实验。返回的接管回执表示远端 DSH 已独立持有该任务。
+向准备好的工作端提交一个实验。返回的接管回执表示远端 DSH 已独立拥有本次运行。
 
 ```json
 {
@@ -2606,4 +2692,4 @@ web_search 和 web_fetch 将提供方选择置于 ctx.web 之后，使模型可�
 
 来源：[`packages/workflow/experiment-dispatch/src/index.ts`](../packages/workflow/experiment-dispatch/src/index.ts)
 
-这四个工具要求存活的根 Agent 和独立认证的 Linux 工作端。提交成功的回执表示远端接管，不表示训练完成。
+实验工具与 Web 共用服务器列表和持久派发服务。排队回执确认远端接管；全部所选节点分配完成后，补齐执行会话和 Goal 编号。单服务器工具保留原接收协议。

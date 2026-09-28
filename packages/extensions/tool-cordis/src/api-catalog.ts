@@ -3659,6 +3659,14 @@ export const EVENT_API: readonly EventApiEntry[] = [
     parameters: [{ name: 'change', description: 'domain, table (`\'\'` for global), key (`\'\'` for global), operation discriminant, and on `put` the new snapshot.' }],
   },
   {
+    name: 'experiment-fleet/changed',
+    mode: 'emit',
+    signature: '\'experiment-fleet/changed\'(change: { kind: \'servers\' | \'experiments\' }): void',
+    summary: 'Saved experiment or server records changed; consumers reload their selection.',
+    description: 'Saved experiment or server records changed; consumers reload their selection.',
+    parameters: [{ name: 'change', description: 'the registry whose durable records changed.' }],
+  },
+  {
     name: 'feedback/committed',
     mode: 'parallel',
     signature: '\'feedback/committed\'(inspection: SessionInspection): void',

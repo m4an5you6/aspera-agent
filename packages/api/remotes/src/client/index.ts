@@ -192,4 +192,21 @@ export async function apply(ctx: Context): Promise<() => Promise<void>> {
   }
 }
 
-export type { FleetCreateRequest, FleetExperiment, FleetRegistry, FleetServerInput, ClusterChunk, ClusterFile, ClusterRecord, ClusterServer, ClusterState } from '@deepseek-ai/dsh-experiment-dispatch/types'
+/** New independent experiment request. */
+export type FleetCreateRequest = import('@deepseek-ai/dsh-experiment-dispatch/types').FleetCreateRequest
+/** Local dispatch identity and complete remote execution evidence. */
+export type FleetExperiment = import('@deepseek-ai/dsh-experiment-dispatch/types').FleetExperiment
+/** Configured servers with a fixed coordinator. */
+export type FleetRegistry = import('@deepseek-ai/dsh-experiment-dispatch/types').FleetRegistry
+/** Server configuration without credential values. */
+export type FleetServerInput = import('@deepseek-ai/dsh-experiment-dispatch/types').FleetServerInput
+/** Incremental experiment stream bytes. */
+export type ClusterChunk = import('@deepseek-ai/dsh-experiment-dispatch/types').ClusterChunk
+/** Confined output file metadata. */
+export type ClusterFile = import('@deepseek-ai/dsh-experiment-dispatch/types').ClusterFile
+/** Durable coordinator receipt. */
+export type ClusterRecord = import('@deepseek-ai/dsh-experiment-dispatch/types').ClusterRecord
+/** Pinned server definition. */
+export type ClusterServer = import('@deepseek-ai/dsh-experiment-dispatch/types').ClusterServer
+/** Remote queue and execution state. */
+export type ClusterState = import('@deepseek-ai/dsh-experiment-dispatch/types').ClusterState

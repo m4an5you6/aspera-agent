@@ -24,7 +24,7 @@ function fixture() {
   const config: DeploymentConfig = {
     host: 'gpu.example', sshPort: 22, remotePort: 43019, remoteRoot: '/worker',
     localRepo: '/repo', allowedSystemPackages: [], dataRoots: [],
-    tokenRef: 'DSH_EXPERIMENT_TOKEN', agentCredentialRefs: [], toolTimeoutMs: 60_000,
+    tokenRef: 'DSH_EXPERIMENT_TOKEN', agentCredentialRefs: [], toolTimeoutMs: 60_000, controlPollIntervalMs: 1000,
   }
   const preparationId = createHash('sha256').update(deploymentId + '\0' + JSON.stringify(config)).digest('hex')
   const prepared: PreparedEnvironment = {
@@ -47,7 +47,8 @@ function fixture() {
     logger: { warn: vi.fn() },
   } as unknown as Context
   const health = { deploymentId, ready: true, busy: false }
-  vi.mocked(snapshotSource).mockResolvedValue({ directory: '/snapshot', archive: '/snapshot/source.tar', digest: deploymentId, archiveHash: 'a'.repeat(64), dispose: vi.fn() })
+  vi.mocked(snapshotSource).mockResolvedValue({ directory: '/snapshot', archive: '/snapshot/source.tar',
+    digest: deploymentId, archiveHash: 'a'.repeat(64), dispose: vi.fn() })
   vi.mocked(deploy).mockResolvedValue(prepared)
   vi.mocked(request).mockImplementation(async (_target, _token, path, _method, body) => {
     if (path.endsWith('/health')) return { status: 200, value: health }
@@ -172,12 +173,16 @@ it('returns the handover notice in the submit tool result recorded by the local 
   const agents = {
     get: () => agent, currentInitiator: () => agent, roots: () => [agent],
   }
+  const records = new Map<string, unknown>()
   const ctx = {
     agents, goals: { get: () => ({ id: 'goal-1', revision: 2, phase: 'active' }) },
     tools: { register: (tool: ToolDefinition) => { tools.set(tool.name, tool); return () => {} } },
     systemPrompt: { section: () => {}, getSectionOrder: () => 0 },
-    storageDomain: { open: async () => ({ close: async () => {} }) },
-    provide: () => {}, reflect: { provide: () => {} }, inject: () => {}, effect: () => {},
+    storageDomain: { open: async () => ({ close: async () => {}, table: () => ({
+      get: (key: string) => records.get(key), put: async (key: string, value: unknown) => { records.set(key, value) },
+      entries: () => [].values(),
+    }) }) },
+    provide: () => {}, reflect: { provide: () => {} }, inject: () => {}, effect: () => {}, on: () => () => {},
   } as unknown as Context
   const submit = vi.spyOn(ExperimentDispatcher.prototype, 'submit').mockResolvedValue(accepted)
   try {
@@ -204,7 +209,7 @@ it('reads status from the target saved on the submission', async () => {
     target: {
       host: 'old.example', sshPort: 22, remotePort: 9, remoteRoot: '/old',
       localRepo: '/repo', allowedSystemPackages: [], dataRoots: [],
-      tokenRef: 'DSH_EXPERIMENT_TOKEN', agentCredentialRefs: [], toolTimeoutMs: 60_000,
+      tokenRef: 'DSH_EXPERIMENT_TOKEN', agentCredentialRefs: [], toolTimeoutMs: 60_000, controlPollIntervalMs: 1000,
     },
   })
   const hosts: string[] = []

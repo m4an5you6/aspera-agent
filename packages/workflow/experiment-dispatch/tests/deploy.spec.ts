@@ -15,9 +15,10 @@ function fixture(previous: string) {
   const config: DeploymentConfig = {
     host: 'gpu.example', sshPort: 22, remotePort: 43019, remoteRoot: '/worker',
     localRepo: '/repo', dataRoots: [], allowedSystemPackages: [], agentCredentialRefs: [],
-    tokenRef: 'DSH_EXPERIMENT_TOKEN', toolTimeoutMs: 3_600_000,
+    tokenRef: 'DSH_EXPERIMENT_TOKEN', controlPollIntervalMs: 1000, toolTimeoutMs: 3_600_000,
   }
-  const snapshot = { directory: '/snapshot', archive: '/snapshot/source.tar', digest: deploymentId, archiveHash: 'a'.repeat(64), dispose() {} }
+  const snapshot = { directory: '/snapshot', archive: '/snapshot/source.tar', digest: deploymentId,
+    archiveHash: 'a'.repeat(64), dispose() {} }
   const launches: string[] = []
   vi.mocked(copy).mockResolvedValue('')
   vi.mocked(remote).mockImplementation(async (_target, script) => {

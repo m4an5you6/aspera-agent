@@ -1,4 +1,18 @@
 /** Browser-safe experiment dispatch records. */
+import type { ClusterRecord, ClusterServer, ClusterSubmission, ExperimentId, ExperimentServerId } from '@deepseek-ai/dsh-experiment-worker/types'
+import type { z } from 'zod'
+import type { pinnedTargetSchema } from './deployment-settings.ts'
+
+declare module '@deepseek-ai/cordis' {
+  interface Events {
+    /**
+     * Saved experiment or server records changed; consumers reload their selection.
+     * @mode emit
+     * @param change - the registry whose durable records changed.
+     */
+    'experiment-fleet/changed'(change: { kind: 'servers' | 'experiments' }): void
+  }
+}
 
 /** SSH account whose password is stored separately from deployment settings. */
 export interface ExperimentSshAccount {
@@ -56,5 +70,43 @@ export interface ExperimentDispatchEntry {
   readonly latest?: ExperimentDispatchRecord
 }
 
-export type { FleetCreateRequest, FleetExperiment, FleetRegistry, FleetServerInput } from './fleet.ts'
-export type { ClusterChunk, ClusterFile, ClusterRecord, ClusterServer, ClusterState } from '@deepseek-ai/dsh-experiment-worker'
+export type { ClusterChunk, ClusterFile, ClusterRecord, ClusterServer, ClusterState } from '@deepseek-ai/dsh-experiment-worker/types'
+
+/** Browser goal and explicit joint participants, before request parsing. */
+export interface FleetCreateRequest {
+  experimentId: string
+  objective: string
+  serverIds: string[]
+  files?: string[]
+  uploads?: string[]
+}
+
+/** Server form with an unparsed UUID. Password values are accepted separately. */
+export type FleetServerInput = Omit<ClusterServer, 'id'> & { id: string }
+
+/** Stable coordinator identity and the complete saved server list. */
+export interface FleetRegistry {
+  coordinatorId?: ExperimentServerId | undefined
+  servers: ClusterServer[]
+}
+
+/** Concrete input and execution evidence for one independently dispatched experiment. */
+export interface FleetExperiment {
+  request: { experimentId: ExperimentId; objective: string; serverIds: ExperimentServerId[]; files: string[]; uploads: string[] }
+  coordinator: ClusterServer
+  servers: ClusterServer[]
+  coordinatorTarget: z.infer<typeof pinnedTargetSchema>
+  targets: z.infer<typeof pinnedTargetSchema>[]
+  createdAt: number
+  state: 'preparing' | 'submitted' | 'failed' | 'cancelled'
+  detail?: string | undefined
+  sessionId: string
+  goalId?: string | undefined
+  goalRevision?: number | undefined
+  sourceGoal?: { sessionId: string; id: string; revision: number } | undefined
+  submission?: ClusterSubmission | undefined
+  receipt?: ClusterRecord | undefined
+  handoverRecorded: boolean
+  latest?: ClusterRecord | undefined
+  waitingFor: ExperimentServerId[]
+}

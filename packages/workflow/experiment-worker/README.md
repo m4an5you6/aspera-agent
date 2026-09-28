@@ -1,5 +1,5 @@
 ---
-description: "Authenticated loopback receiver that owns remote unattended experiment Goals and their durable receipts."
+description: "Durable multi-server experiment scheduling and allocation-scoped remote execution."
 kind: "package-bundle"
 ---
 
@@ -9,79 +9,84 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-The `experiment-worker` profile runs as an independent DSH process on a Linux GPU target. An authenticated loopback HTTP route accepts one experiment, creates its own Session and Goal, and persists a receipt before acknowledging takeover. The process and its Agent handles do not depend on the dispatching SSH tunnel.
+The experiment-worker profile runs coordinator, node and experiment Agent roles as separate processes. The coordinator persists a FIFO queue and allocates complete server groups. Nodes own confined managed commands. Each admitted experiment uses an immutable source release and its own Session, Goal and directories; a queued receipt transfers ownership before execution begins.
 
 ## Table of Contents
 
 - [Use this package](#use-this-package)
 - [Understand the implementation](#understand-the-implementation)
 - [Further Exploration](#further-exploration)
-- [Dev Note](#dev-note)
 - [Model Experience](#model-experience)
 - [Known Limitations and Deferred Work](#known-limitations-and-deferred-work)
+- [Dev Note](#dev-note)
 
 -----
 
 <a id="use-this-package"></a>
 ## Use this package
 
-The dispatcher starts `dsh --profile experiment-worker` with a private Harness home, the workspace root, deployed source digest, allocated NVIDIA device paths, token file and loopback port. The profile disables human questions, interactive plan approval, plugin management and in-process file tools; its approval policy rejects escalation. The bwrap sandbox stays in `workspace-write` mode, grants only configured NVIDIA character devices, and masks the worker's secret and state directories from shell processes. Standard Python and model caches resolve inside the writable experiment workspace.
+The dispatcher launches every role through dsh --profile experiment-worker. Control routes listen on loopback and require private Bearer tokens; SSH provides transport. Linux nodes require usable NVIDIA devices, bubblewrap and the supported subprocess provider. The remote root, credentials, runtime limits and granted devices come from validated deployment configuration.
 
-The receiver exposes authenticated health, submit, status, cancel and idle-shutdown operations under `/experiment/v1` through the existing WebServer service. The Bearer token and version-specific model credentials are read from owner-only files and never included in the Goal text. A submit request carries a content-addressed deployment identity, submission id and explicit experiment requirements. The output path and dataset references must stay inside the worker workspace.
+Disjoint server groups run concurrently. Each server runs one experiment at a time, in the coordinator’s admission order. A waiting task holds no partial allocation; all requested servers must become available together. No node is dropped to make a task runnable. Missing training addresses or failed all-pairs connectivity stop multi-node startup with a recorded error.
 
-The health response requires a SHA-256 `deploymentId`, `ready: true` and a boolean `busy`, with no additional fields. Dispatch validates these fields before reusing a preparation, activating a release or restoring a previous worker. A busy worker accepts status queries and duplicate submissions but refuses deployment replacement.
+The Agent prepares dependencies, data and a coordinated training program using only assigned-node tools. Node commands run in their experiment workspace with granted GPU devices; credentials, control state and other experiment workspaces are masked. Inputs are content-checked before admission and again before execution. Human questions, approvals and plugin installation are disabled.
 
-Status includes the persisted receipt, live Goal phase while its Agent runs, worker log availability, and up to 128 relative artifact file paths with sizes. A truncated marker indicates more files may exist.
+Cancellation terminates managed commands on every selected node. A terminal result releases the group only when all nodes and the execution Agent confirm cleanup. Restart recovers queued tasks and reconciles prior allocations; ambiguous training is marked interrupted and never automatically replayed. Unconfirmed process cleanup keeps resources occupied for operator verification.
+
+Protocol 2 exposes admission, status, cancellation, per-source event/log cursors and confined artifact reads. Queued receipts may omit execution Session and Goal IDs; running records add them. Log cursors count bytes and include file identity, reset and end markers. File responses list node, relative path, size and modification time; content is read only on request.
+
+The receiver role retains protocol 1 and its historical records until its active experiment finishes. Its idle-shutdown operation refuses while work is active.
 
 <a id="understand-the-implementation"></a>
 ## Understand the implementation
 
 <details>
-<summary>Implementation internals — click to expand</summary>
+<summary>Implementation details — click to expand</summary>
 
-A storage-domain record reserves the submission id before Agent creation. The receiver creates and arms the Goal, logs the machine-sourced initial message, flushes the Session, then acknowledges acceptance. Concurrent and repeated requests with the same id and content return the same record; changed content conflicts. Terminal Goal results are saved after the Agent becomes idle and its Session is flushed. At process startup, unfinished records become `interrupted` without rerunning their training.
+One durable record reserves an entire group before any node allocation. Idempotency hashes bind the experiment ID to its full submission. Private admission verifies releases, staged data and delegated credentials before recording ownership. Each node persists allocation and command identities before spawning, so a retry cannot start the same command twice.
+
+Agent completion flushes the Session and checks real settled command results on every selected node. The coordinator keeps separate execution cleanup evidence. An Agent observes coordinator generation changes and stops after a coordinator restart; missing cleanup evidence remains conservative even if the Agent has exited.
 
 </details>
 
 <a id="further-exploration"></a>
 ## Further Exploration
 
-See the [dispatcher](../experiment-dispatch/README.md) for deployment and submission, the [Goal service](../../goal/goal/README.md) for continuation state, and the [handoff decision](../../../.agents/notes/implemented/architecture/2026-09-23-independent-gpu-experiment-handoff.md) for lifecycle ownership.
-
-<a id="dev-note"></a>
-## Dev Note
-
-<details>
-<summary>Working context for maintainers — click to expand</summary>
-
-The Session log owns Goal state; the storage record owns submission identity and receiver lifecycle. No invariant companion is published because neither is a duplicate projection of the other.
-
-</details>
+See the [dispatcher](../experiment-dispatch/README.md) for Web operation and private credential transfer.
 
 <a id="model-experience"></a>
 ## Model Experience
 
-### Experiment message
+### Joint execution instructions
 
 #### What the model sees
 
-The remote Agent receives a logged `experiment-worker` plugin message containing the objective, explicit model and dataset requirements, output directory and instruction to resolve only unspecified settings. It must wait for a managed training job's real exit result before completing the Goal.
+The logged initial message specifies the objective, stable node ranks, addresses, GPU inventory, inputs and allowed workspace. It requires one distributed run, verified collective communication, actual exit results and output reporting before `Goal` completion.
 
 #### Token effect
 
-The message adds task-dependent requirements to the initial remote model request and persists in its Session history.
+Each Session carries its own requirements, tools, node logs and command results. Incremental reads bound individual tool output.
 
 #### KV Cache effect
 
-Changing the experiment changes this Session's initial request prefix; retries of the same accepted submission do not append a second message.
+The initial requirements remain stable within one experiment; variable command evidence appends to that Session.
 
 ## Known Limitations and Deferred Work
 
 <a id="known-limitations-and-deferred-work"></a>
 
-The dispatcher builds the source and probes CUDA before this receiver starts; runtime limits remain:
+- A restarted node with an unconfirmed process range retains its allocation for operator inspection.
 
-- One target accepts only one active experiment.
-- A restarted worker reports interruption without restarting training.
-- Cancellation owns managed jobs and subprocesses; a program deliberately detached outside DSH's process ownership is not tracked.
-- The file sandbox does not provide complete network isolation.
+- The file sandbox constrains files and GPU devices; it does not provide complete network isolation.
+
+- Coordinator failover and automatic training replay are unavailable.
+
+<a id="dev-note"></a>
+### Dev Note
+
+<details>
+<summary>Implementation details — click to expand</summary>
+
+No invariant companion duplicates the queue: its record is the allocation authority. Node cleanup evidence is explicitly reconciled before releasing resources.
+
+</details>

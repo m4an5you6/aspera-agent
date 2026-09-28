@@ -16,6 +16,8 @@ export interface DeploymentConfig extends Target {
   readonly allowedSystemPackages: readonly string[]
   readonly agentCredentialRefs: readonly string[]
   readonly tokenRef: string
+  /** Interval for observing remote control process transitions. */
+  readonly controlPollIntervalMs: number
 }
 
 /** Probe result attached to one deployed version. */
@@ -42,7 +44,15 @@ function paths(config: DeploymentConfig, digest: string) {
   }
 }
 
-async function installSource(config: DeploymentConfig, snapshot: SourceSnapshot, signal?: AbortSignal, password?: string): Promise<void> {
+/**
+ * Install a content-checked source release without replacing active processes.
+ * @param config - fixed deployment target.
+ * @param snapshot - content-addressed source archive.
+ * @param signal - preparation cancellation.
+ * @param password - selected SSH credential.
+ */
+export async function installSource(config: DeploymentConfig, snapshot: SourceSnapshot, signal?: AbortSignal,
+  password?: string): Promise<void> {
   const p = paths(config, snapshot.digest)
   await remote(config, `umask 077; mkdir -p ${[`${p.root}/incoming`, `${p.root}/releases`, p.workspace, p.outside, `${p.root}/secrets`, p.state, p.logs, p.tools].map(shellQuote).join(' ')}; chmod 700 ${[p.root, `${p.root}/incoming`, `${p.root}/releases`, p.workspace, p.outside, `${p.root}/secrets`, p.state, p.logs, p.tools].map(shellQuote).join(' ')}`, signal, password)
   await copy(config, snapshot.archive, p.archive, signal, password)
@@ -73,7 +83,15 @@ fi`
   await remote(config, script, signal, password)
 }
 
-async function validateEnvironment(
+/**
+ * Verify sandbox confinement and allocated CUDA devices for an installed release.
+ * @param config - fixed deployment target.
+ * @param digest - installed release digest.
+ * @param signal - probe cancellation.
+ * @param password - selected SSH credential.
+ * @returns verified CUDA and sandbox facts.
+ */
+export async function validateEnvironment(
   config: DeploymentConfig, digest: string, signal?: AbortSignal, password?: string,
 ): Promise<PreparedEnvironment> {
   const p = paths(config, digest)
@@ -130,7 +148,15 @@ printf 'DSH_DEVICES=%s\\nDSH_BWRAP=%s\\nDSH_HIDDEN=%s\\n' "$devices" "$bwrap_bin
   }
 }
 
-async function installPrivateFile(
+/**
+ * Atomically install private runtime settings through the selected SSH login.
+ * @param config - fixed deployment target.
+ * @param destination - owner-only remote file path.
+ * @param content - private file contents.
+ * @param signal - transfer cancellation.
+ * @param password - selected SSH credential.
+ */
+export async function installPrivateFile(
   config: DeploymentConfig, destination: string, content: string, signal?: AbortSignal, password?: string,
 ): Promise<void> {
   const directory = mkdtempSync(join(tmpdir(), 'dsh-experiment-secret-'))

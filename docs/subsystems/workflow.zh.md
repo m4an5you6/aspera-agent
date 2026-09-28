@@ -157,6 +157,27 @@ abstract start(request: WorkflowStartRequest): WorkflowRun
 
 Source: [`packages/workflow/workflow/src/index.ts`](../../packages/workflow/workflow/src/index.ts)
 
+<a id="experiment-fleet-events"></a>
+
+### `experiment-fleet/*` events
+
+<a id="experiment-fleetchanged--emit"></a>
+
+#### `experiment-fleet/changed` — emit
+
+Saved experiment or server records changed; consumers reload their selection.
+
+```ts cordis-catalog
+/**
+ * Saved experiment or server records changed; consumers reload their selection.
+ * @mode emit
+ * @param change - the registry whose durable records changed.
+ */
+'experiment-fleet/changed'(change: { kind: 'servers' | 'experiments' }): void
+```
+
+Source: [`packages/workflow/experiment-dispatch/src/types.ts`](../../packages/workflow/experiment-dispatch/src/types.ts)
+
 <a id="workflow-events"></a>
 
 ### `workflow/*` events

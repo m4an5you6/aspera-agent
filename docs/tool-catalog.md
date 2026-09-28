@@ -44,7 +44,7 @@ This table connects model-visible tool names to the plugin package and service s
 | `@deepseek-ai/dsh-tool-todo` | `todo_write` | `ctx.tools`, `owning Agent session` | `tool/call`, `todo/write`, `tool/result` | - | todo_write is session-owned state; UIs render the latest todo/write event as a checklist. `allowParallelInProgress` is required with no default, so the catalog states its choice: `true`, whose description invites several `in_progress` items. A deployment choosing `false` receives the same tool with a description asking for exactly one active task. |
 | `@deepseek-ai/dsh-tool-workflow` | `workflow` | `ctx.tools`, `ctx.workflowEngine`, `ctx.systemPrompt`, `a calling Agent (exec.agent parents the script children)` | `tool/call`, `tool/result` | - | - |
 | `@deepseek-ai/dsh-tool-web` | `web_fetch`, `web_search` | `ctx.tools`, `ctx.web`, `ctx.systemPrompt` | `tool/call`, `tool/result` | - | web_search and web_fetch keep provider selection behind ctx.web so model-visible schemas stay stable across backend swaps. |
-| `@deepseek-ai/dsh-experiment-dispatch` | `cancel_experiment`, `get_experiment_status`, `prepare_experiment_environment`, `submit_experiment` | `ctx.tools`, `ctx.agents`, `ctx.credentials`, `ctx.goals`, `ctx.storageDomain`, `ctx.systemPrompt` | `tool/call`, `tool/result`, `remote experiment receiver record` | - | These four tools require a live root Agent and a separately authenticated Linux worker. A successful submit receipt means remote ownership, not training completion. |
+| `@deepseek-ai/dsh-experiment-dispatch` | `cancel_cluster_experiment`, `cancel_experiment`, `dispatch_cluster_experiment`, `get_cluster_experiment`, `get_experiment_status`, `list_experiment_servers`, `prepare_experiment_environment`, `submit_experiment` | `ctx.tools`, `ctx.agents`, `ctx.sessions`, `ctx.agentDefaultModel`, `ctx.credentials`, `ctx.goals`, `ctx.storageDomain`, `ctx.systemPrompt` | `tool/call`, `tool/result`, `remote experiment receiver record` | - | The experiment tools share the Web server registry and durable dispatch service. A queued receipt confirms remote ownership; execution Session and Goal identifiers arrive when all selected nodes are allocated. Single-server tools retain their receiver protocol. |
 
 <a id="deepseek-aidsh-plugin-manager"></a>
 
@@ -2494,6 +2494,26 @@ web_search and web_fetch keep provider selection behind ctx.web so model-visible
 
 ## `@deepseek-ai/dsh-experiment-dispatch`
 
+### `cancel_cluster_experiment`
+
+Record cancellation of a joint experiment; its nodes stay occupied until managed processes have stopped.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "experiment_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "experiment_id"
+  ]
+}
+```
+
+Source: [`packages/workflow/experiment-dispatch/src/index.ts`](../packages/workflow/experiment-dispatch/src/index.ts)
+
 ### `cancel_experiment`
 
 Cancel a remote experiment and wait for its owned Agent and children to stop.
@@ -2508,6 +2528,59 @@ Cancel a remote experiment and wait for its owned Agent and children to stop.
   },
   "required": [
     "submission_id"
+  ]
+}
+```
+
+Source: [`packages/workflow/experiment-dispatch/src/index.ts`](../packages/workflow/experiment-dispatch/src/index.ts)
+
+### `dispatch_cluster_experiment`
+
+Prepare and queue one joint experiment across selected server IDs. Uses the same independent task service as Web. Returns preparing immediately; poll get_cluster_experiment until its full handover receipt is saved. Retries for the same Goal revision reuse the experiment.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "objective": {
+      "type": "string"
+    },
+    "server_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "objective",
+    "server_ids"
+  ]
+}
+```
+
+Source: [`packages/workflow/experiment-dispatch/src/index.ts`](../packages/workflow/experiment-dispatch/src/index.ts)
+
+### `get_cluster_experiment`
+
+Read preparation, queued or running state and the complete remote handover receipt for a joint experiment.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "experiment_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "experiment_id"
   ]
 }
 ```
@@ -2529,6 +2602,19 @@ Read the durable remote status of a submitted experiment.
   "required": [
     "submission_id"
   ]
+}
+```
+
+Source: [`packages/workflow/experiment-dispatch/src/index.ts`](../packages/workflow/experiment-dispatch/src/index.ts)
+
+### `list_experiment_servers`
+
+List configured servers and the fixed coordinator. Select only servers authorized by the user for a joint experiment.
+
+```json
+{
+  "type": "object",
+  "properties": {}
 }
 ```
 
@@ -2598,4 +2684,4 @@ Submit one experiment to the prepared worker. The returned accepted receipt mean
 
 Source: [`packages/workflow/experiment-dispatch/src/index.ts`](../packages/workflow/experiment-dispatch/src/index.ts)
 
-These four tools require a live root Agent and a separately authenticated Linux worker. A successful submit receipt means remote ownership, not training completion.
+The experiment tools share the Web server registry and durable dispatch service. A queued receipt confirms remote ownership; execution Session and Goal identifiers arrive when all selected nodes are allocated. Single-server tools retain their receiver protocol.

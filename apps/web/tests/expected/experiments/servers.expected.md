@@ -1,0 +1,22 @@
+- heading "实验" [level=1]
+- paragraph: 将 Goal 提交到选中的服务器，单独跟踪每个实验。
+- button "服务器"
+- button "新建实验"
+- button "刷新"
+- button "返回"
+- paragraph: 第一台服务器管理队列，也可以参与训练。
+- button "添加服务器"
+- article:
+  - heading "GPU A 调度主机" [level=2]
+  - paragraph: trainer@gpu-a.example.test:22
+  - paragraph: 尚未检查连接
+  - button "编辑"
+  - button "检查连接"
+  - button "移除" [disabled]
+- article:
+  - heading "GPU B" [level=2]
+  - paragraph: trainer@gpu-b.example.test:22
+  - paragraph: 尚未检查连接
+  - button "编辑"
+  - button "检查连接"
+  - button "移除"

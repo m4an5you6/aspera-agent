@@ -1,0 +1,30 @@
+- heading "实验" [level=1]
+- paragraph: 将 Goal 提交到选中的服务器，单独跟踪每个实验。
+- button "服务器"
+- button "新建实验"
+- button "刷新"
+- button "返回"
+- article:
+  - heading "独立短训练 B" [level=2]
+  - status: 排队中
+  - paragraph: 本机派发完成，远端实验已接管
+  - button "复制为新实验"
+  - button "取消实验"
+  - navigation:
+    - button "概览"
+    - button "执行会话"
+    - button "节点日志"
+    - button "输出文件"
+  - term: 实验编号
+  - definition: EXPERIMENT_2
+  - term: 服务器
+  - definition: GPU A
+  - term: 派发会话
+  - definition: dispatch-EXPERIMENT_2
+  - term: 执行会话
+  - definition: 选中的服务器全部可用后，将开始执行会话。
+  - term: 源码版本
+  - definition: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  - term: 接管回执
+  - definition:
+    - group: 接管回执

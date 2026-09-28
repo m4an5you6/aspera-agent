@@ -1,0 +1,8 @@
+version: 1
+scenario: experiment-server-list
+profile: headless
+composition: experiment-dispatch
+recording: authored
+header:
+  class: experiment-dispatch
+  pin: true

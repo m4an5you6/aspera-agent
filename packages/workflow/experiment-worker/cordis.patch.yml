@@ -57,6 +57,8 @@
   disabled: true
 - id: tool-skill
   disabled: true
+- id: tool-bash
+  disabled: !!js process.env.DSH_EXPERIMENT_ROLE === 'agent'
 - insert:
     - id: experiment-webserver
       name: '@deepseek-ai/dsh-host-webserver'
@@ -66,6 +68,13 @@
     - id: experiment-worker
       name: '@deepseek-ai/dsh-experiment-worker'
       config:
+        role: !!js process.env.DSH_EXPERIMENT_ROLE ?? 'receiver'
+        clusterRoot: !!js process.env.DSH_CLUSTER_ROOT
+        experimentId: !!js process.env.DSH_CLUSTER_EXPERIMENT
+        chunkBytes: !!js Number(process.env.DSH_CLUSTER_CHUNK_BYTES ?? 65536)
+        fileLimit: !!js Number(process.env.DSH_CLUSTER_FILE_LIMIT ?? 1000)
+        cleanupTimeoutMs: !!js Number(process.env.DSH_CLUSTER_CLEANUP_MS ?? 30000)
+        pollIntervalMs: !!js Number(process.env.DSH_CLUSTER_POLL_MS ?? 1000)
         workspaceRoot: !!js process.env.DSH_EXPERIMENT_WORKSPACE
         tokenFile: !!js process.env.DSH_EXPERIMENT_TOKEN_FILE
         logFile: !!js process.env.DSH_EXPERIMENT_LOG_FILE

@@ -575,16 +575,22 @@ Source: [`packages/credentials/credentials-local/src/index.ts:64`](../packages/c
 
 ## `@deepseek-ai/dsh-experiment-dispatch`
 
-Requires: `agents` · `credentials` · `goals` · `tools` · `storageDomain` · `systemPrompt`
+Requires: `agents` · `agentDefaultModel` · `sessions` · `credentials` · `goals` · `tools` · `storageDomain` · `systemPrompt`
 
 ```ts config-catalog
 /** Fixed deployment target and bounded setup operations. */
 export interface Config {
+  /** Lifetime of single-use Web artifact download URLs. */
+  readonly downloadTtlMs?: number
+  /** Interval for observing remote control startup and legacy receiver shutdown. */
+  readonly controlPollIntervalMs?: number
   /** Known-hosts-verified OpenSSH destination for the GPU target. */
   readonly host?: string
   /** Remote SSH listener port. */
   readonly sshPort?: number
-  /** SSH login name; may also be supplied by a legacy user@host destination. */
+  /**
+   * SSH login name; may also be supplied by a legacy user@host destination.
+   */
   readonly username?: string
   /** Exactly one authentication method; existing configurations use keys. */
   readonly authMode?: 'key' | 'password'
@@ -613,17 +619,31 @@ export interface Config {
 }
 ```
 
-Source: [`packages/workflow/experiment-dispatch/src/index.ts:34`](../packages/workflow/experiment-dispatch/src/index.ts)
+Source: [`packages/workflow/experiment-dispatch/src/index.ts:42`](../packages/workflow/experiment-dispatch/src/index.ts)
 
 <a id="deepseek-aidsh-experiment-worker"></a>
 
 ## `@deepseek-ai/dsh-experiment-worker`
 
-Requires: `agents` · `agentDefaultModel` · `goals` · `sessions` · `storageDomain` · `webServer`
+Requires: `agents` · `agentDefaultModel` · `goals` · `sessions` · `storageDomain` · `webServer` · `tools` · `subprocess` · `sandbox`
 
 ```ts config-catalog
 /** Worker deployment settings; secrets stay in an owner-only file. */
 export interface Config {
+  /** Receiver, cluster control, node execution, or isolated experiment Agent. */
+  readonly role?: 'receiver' | 'coordinator' | 'node' | 'agent'
+  /** Private root shared by the cluster processes on this server. */
+  readonly clusterRoot?: string
+  /** Experiment selected for an isolated Agent process. */
+  readonly experimentId?: string
+  /** Maximum bytes in one file or log response. */
+  readonly chunkBytes?: number
+  /** Maximum files listed in one response. */
+  readonly fileLimit?: number
+  /** Time allowed for managed process cleanup and connectivity probes. */
+  readonly cleanupTimeoutMs?: number
+  /** Interval for observing execution identity receipts. */
+  readonly pollIntervalMs?: number
   /** Absolute writable directory assigned to the experiment. */
   readonly workspaceRoot: string
   /** Owner-only file containing the receiver Bearer token. */
@@ -637,7 +657,7 @@ export interface Config {
 }
 ```
 
-Source: [`packages/workflow/experiment-worker/src/index.ts:28`](../packages/workflow/experiment-worker/src/index.ts)
+Source: [`packages/workflow/experiment-worker/src/index.ts:35`](../packages/workflow/experiment-worker/src/index.ts)
 
 <a id="deepseek-aidsh-experimental-agent-team"></a>
 
@@ -3881,6 +3901,7 @@ These load from a `cordis.yml` entry with no `config:` block; they declare no co
 - `@deepseek-ai/dsh-client-ui-deliverables` — requires `systemPrompt` · `connection` · `sessionQuery` · `sessionController` · `workspaceFiles` · `fs` · `sandboxPolicy` · `workspaceChanges` ([`packages/client/ui-deliverables/src/index.ts`](../packages/client/ui-deliverables/src/index.ts))
 - `@deepseek-ai/dsh-client-ui-directory-picker-browse` ([`packages/client/ui-directory-picker-browse/src/index.ts`](../packages/client/ui-directory-picker-browse/src/index.ts))
 - `@deepseek-ai/dsh-client-ui-directory-picker-native` ([`packages/client/ui-directory-picker-native/src/index.ts`](../packages/client/ui-directory-picker-native/src/index.ts))
+- `@deepseek-ai/dsh-client-ui-experiments` ([`packages/client/ui-experiments/src/index.ts`](../packages/client/ui-experiments/src/index.ts))
 - `@deepseek-ai/dsh-client-ui-goal` ([`packages/client/ui-goal/src/index.ts`](../packages/client/ui-goal/src/index.ts))
 - `@deepseek-ai/dsh-client-ui-input-trigger` ([`packages/client/ui-input-trigger/src/index.ts`](../packages/client/ui-input-trigger/src/index.ts))
 - `@deepseek-ai/dsh-client-ui-jobs` ([`packages/client/ui-jobs/src/index.ts`](../packages/client/ui-jobs/src/index.ts))

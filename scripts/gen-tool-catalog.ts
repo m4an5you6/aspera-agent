@@ -383,8 +383,10 @@ const TOOL_PACKAGES: ToolPackage[] = [
     pkg: '@deepseek-ai/dsh-tool-fs',
     dir: 'tool-fs',
     source: 'packages/fs/tool-fs/src/index.ts',
-    requires: ['ctx.tools', 'ctx.fs', 'ctx.systemPrompt', 'ctx.attachments (image-tool registration)', 'ctx.llm + an image-capable route (image-tool execution)'],
-    writes: ['tool/call', 'fs/write-intent or fs/edit-intent for mutations', 'fs/observed after read presence/absence or successful file operation', 'durable attachment (read_image)', 'tool/result'],
+    requires: ['ctx.tools', 'ctx.fs', 'ctx.systemPrompt', 'ctx.attachments (image-tool registration)',
+      'ctx.llm + an image-capable route (image-tool execution)'],
+    writes: ['tool/call', 'fs/write-intent or fs/edit-intent for mutations',
+      'fs/observed after read presence/absence or successful file operation', 'durable attachment (read_image)', 'tool/result'],
     async mount(ctx) {
       // The tool needs `fs`; the bare provider is sufficient because policy
       // changes behavior, not schema shape. The catalog seam marker opts into
@@ -480,7 +482,8 @@ const TOOL_PACKAGES: ToolPackage[] = [
     pkg: '@deepseek-ai/dsh-tool-ralph',
     dir: 'tool-ralph',
     source: 'packages/workflow/tool-ralph/src/index.ts',
-    requires: ['ctx.tools', 'ctx.workflowEngine', 'ctx.subagents', 'ctx.systemPrompt', 'a calling Agent (exec.agent parents every fresh round)'],
+    requires: ['ctx.tools', 'ctx.workflowEngine', 'ctx.subagents', 'ctx.systemPrompt',
+      'a calling Agent (exec.agent parents every fresh round)'],
     writes: ['tool/call', 'tool/result', 'workflow and child session events during execution'],
     async mount(ctx) {
       await ctx.plugin(SubagentRuntime)
@@ -659,22 +662,40 @@ const TOOL_PACKAGES: ToolPackage[] = [
     pkg: '@deepseek-ai/dsh-experiment-dispatch',
     dir: 'experiment-dispatch',
     source: 'packages/workflow/experiment-dispatch/src/index.ts',
-    requires: ['ctx.tools', 'ctx.agents', 'ctx.credentials', 'ctx.goals', 'ctx.storageDomain', 'ctx.systemPrompt'],
+    requires: ['ctx.tools', 'ctx.agents', 'ctx.sessions', 'ctx.agentDefaultModel', 'ctx.credentials', 'ctx.goals',
+      'ctx.storageDomain', 'ctx.systemPrompt'],
     writes: ['tool/call', 'tool/result', 'remote experiment receiver record'],
     async mount(ctx) {
       ctx.provide('agents', {} as never)
+      ctx.provide('sessions', {} as never)
+      ctx.provide('agentDefaultModel', {} as never)
       ctx.provide('credentials', {} as never)
       ctx.provide('goals', {} as never)
       ctx.provide('storageDomain', {
-        open: () => Promise.resolve({ close: () => Promise.resolve() }),
+        open: () => {
+          const tables = new Map<string, Map<string, unknown>>()
+          return Promise.resolve({
+            table: (name: string) => {
+              let rows = tables.get(name)
+              if (rows === undefined) { rows = new Map(); tables.set(name, rows) }
+              const records = rows
+              return {
+                get: (key: string) => records.get(key),
+                put: (key: string, value: unknown) => { records.set(key, value); return Promise.resolve() },
+                entries: () => records.entries(),
+              }
+            },
+            close: () => Promise.resolve(),
+          })
+        },
       } as never)
       await ctx.plugin(ExperimentDispatch, {
-        host: 'catalog.invalid', sshPort: 22, remotePort: 43019,
+        host: 'catalog.invalid', username: 'catalog', sshPort: 22, remotePort: 43019,
         remoteRoot: '/tmp/dsh-experiment-catalog', localRepo: root,
         tokenRef: 'DSH_EXPERIMENT_TOKEN',
       })
     },
-    note: 'These four tools require a live root Agent and a separately authenticated Linux worker. A successful submit receipt means remote ownership, not training completion.',
+    note: 'The experiment tools share the Web server registry and durable dispatch service. A queued receipt confirms remote ownership; execution Session and Goal identifiers arrive when all selected nodes are allocated. Single-server tools retain their receiver protocol.',
   },
 ]
 
