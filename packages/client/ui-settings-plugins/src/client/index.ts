@@ -24,6 +24,7 @@ import { resolveSlotLabel } from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-api-remotes/client'
 import { AgentLoopCard } from './AgentLoopCard.tsx'
 import { BashCard } from './BashCard.tsx'
+import { ExperimentDispatchCard } from './ExperimentDispatchCard.tsx'
 import { PluginsSettingsSection } from './PluginsSettingsSection.tsx'
 import type { PluginsSettingsSectionInjected, PluginsSettingsTabEntry } from './PluginsSettingsSection.tsx'
 import { SubagentCard } from './SubagentCard.tsx'
@@ -32,6 +33,7 @@ import { SubagentLimitsCardController } from './subagent-limits-card-controller.
 import { WebSearchCard } from './WebSearchCard.tsx'
 import { AGENT_LOOP_NS, AgentLoopCardController } from './agent-loop-card-controller.ts'
 import { SHELL_NS, BashCardController } from './bash-card-controller.ts'
+import { EXPERIMENT_DISPATCH_NS, ExperimentDispatchCardController } from './experiment-dispatch-card-controller.ts'
 import {
   SUBAGENT_MODEL_SELECTION_NS, SubagentModelSelectionCardController,
 } from './subagent-model-selection-card-controller.ts'
@@ -53,7 +55,7 @@ const NS = 'settings.plugins'
 
 /** Required services (cordis fiber inject). */
 export const inject = [
-  'slots', 'locale', 'remote', 'remote.credentials', 'remote.session', 'settingsScope',
+  'slots', 'locale', 'remote', 'remote.credentials', 'remote.experimentDispatch', 'remote.session', 'settingsScope',
 ]
 
 /**
@@ -65,6 +67,8 @@ export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'ui-settings-plugins: section dictionaries')
 
   const bash = new BashCardController(ctx.settingsScope.bind({ namespace: SHELL_NS }))
+  const experimentDispatch = new ExperimentDispatchCardController(
+    ctx.settingsScope.bind({ namespace: EXPERIMENT_DISPATCH_NS }), ctx)
   const agentLoop = new AgentLoopCardController(ctx.settingsScope.bind({ namespace: AGENT_LOOP_NS }))
   const webSearch = new WebSearchCardController(
     ctx.settingsScope.bind({ namespace: WEB_SEARCH_NS }), ctx)
@@ -80,7 +84,10 @@ export function apply(ctx: ClientContext): void {
   // scope publishes nothing when one is written. This is the only signal that
   // a key written on another surface reached the Host.
   ctx.effect(
-    () => ctx.remote.$on('credentials/reference-updated', (ref) => { webSearch.refreshCredential(ref) }),
+    () => ctx.remote.$on('credentials/reference-updated', (ref) => {
+      webSearch.refreshCredential(ref)
+      experimentDispatch.refreshCredential(ref)
+    }),
     'ui-settings-plugins: credential invalidations',
   )
   ctx.effect(
@@ -119,6 +126,10 @@ export function apply(ctx: ClientContext): void {
     [[WEB_SEARCH_NS], () => ctx.slots.inject('plugins.item', () => ctx.slots.register({
       name: 'plugins.item', id: 'web-search', order: 40, label: () => t('webSearchTitle'), locale: NS, inject: () => webSearch.inject(),
     }, WebSearchCard))],
+    [[EXPERIMENT_DISPATCH_NS], () => ctx.slots.inject('plugins.item', () => ctx.slots.register({
+      name: 'plugins.item', id: 'experiment-dispatch', order: 50,
+      label: () => t('experimentTitle'), locale: NS, inject: () => experimentDispatch.inject(),
+    }, ExperimentDispatchCard))],
   ]
   // The shared SettingsScope mirror updates after document commits and reconnects.
   const describeFace = ctx.settingsScope.describe()

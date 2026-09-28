@@ -48,7 +48,7 @@
 | `@deepseek-ai/dsh-tool-todo` | `todo_write` | `ctx.tools`、`owning Agent session` | `tool/call`、`todo/write`、`tool/result` | - | todo_write 是会话所有的状态；UI 将最新的 todo/write 事件渲染为检查清单。`allowParallelInProgress` 是没有默认值的必填项，因此本目录明确选择 `true`，对应描述允许同时存在多个 `in_progress` 项。选择 `false` 的部署会获得同一工具，但描述会要求只能有 1 个活动任务。 |
 | `@deepseek-ai/dsh-tool-workflow` | `workflow` | `ctx.tools`、`ctx.workflowEngine`、`ctx.systemPrompt`、`a calling Agent (exec.agent parents the script children)` | `tool/call`、`tool/result` | - | - |
 | `@deepseek-ai/dsh-tool-web` | `web_fetch`、`web_search` | `ctx.tools`、`ctx.web`、`ctx.systemPrompt` | `tool/call`、`tool/result` | - | web_search 和 web_fetch 将提供方选择置于 ctx.web 之后，使模型可见 schema 在更换后端时保持稳定。 |
-| `@deepseek-ai/dsh-experiment-dispatch` | `cancel_experiment`、`get_experiment_status`、`prepare_experiment_environment`、`submit_experiment` | `ctx.tools`、`ctx.agents`、`ctx.credentials`、`ctx.storageDomain`、`ctx.systemPrompt` | `tool/call`、`tool/result`、`remote experiment receiver record` | - | 四个工具要求存活的根 Agent 与独立认证的 Linux 工作端；接管回执不表示训练完成。 |
+| `@deepseek-ai/dsh-experiment-dispatch` | `cancel_experiment`、`get_experiment_status`、`prepare_experiment_environment`、`submit_experiment` | `ctx.tools`、`ctx.agents`、`ctx.credentials`、`ctx.goals`、`ctx.storageDomain`、`ctx.systemPrompt` | `tool/call`、`tool/result`、`remote experiment receiver record` | - | 四个工具要求存活的根 Agent 与独立认证的 Linux 工作端；接管回执不表示训练完成。 |
 
 <a id="deepseek-aidsh-plugin-manager"></a>
 

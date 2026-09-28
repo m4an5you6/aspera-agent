@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { pathToFileURL } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
+import type { Agent } from '@deepseek-ai/dsh-agent'
 import { expect, it, onTestFinished, vi } from 'vitest'
 import {
   boot, composeEntries, initProfile, readProfilePatches, readProfileManifest, reconcileProfilePatches, OPTIONAL_BUNDLES,
@@ -111,6 +112,18 @@ it('lists bundle versions and current-profile plugin targets', async () => {
       rows: [{ rowId: 'managed', moduleName: pathToFileURL(join(dir, 'node_modules', 'extra', 'plugin.mjs')).href, entryId: 'include:managed' }], overrides: [],
     },
   ])
+})
+
+it('refuses direct profile mutations initiated by an unattended Goal', async () => {
+  const agent = {} as Agent
+  const { manager, dir } = await fixture('startup', false, (ctx) => {
+    ctx.provide('agents', { currentInitiator: () => agent })
+    ctx.provide('goalUnattended', { covers: (candidate: Agent | undefined) => candidate === agent })
+  })
+  const before = readFileSync(join(dir, 'cordis.patch.yml'), 'utf8')
+  const id = (await manager.listPlugins()).find(row => row.patchId === 'managed')!.entryId
+  await expect(manager.setPluginEnabled(id, false)).rejects.toThrow('disabled for an unattended Goal')
+  expect(readFileSync(join(dir, 'cordis.patch.yml'), 'utf8')).toBe(before)
 })
 
 it('describes a bundle by its manifest and patch: one-liner, rows without a live entry, and the built-in rows it changes', async () => {
@@ -260,7 +273,10 @@ it('runs a real pnpm dependency script only after approval and retry', { timeout
     scripts: { install: 'node build.cjs' }, dsh: { bundle: { patch: './cordis.patch.yml' } } }))
   writeFileSync(join(addon, 'build.cjs'), 'require("node:fs").writeFileSync("built.txt", "built")\n')
   writeFileSync(join(addon, 'cordis.patch.yml'), '[]\n')
-  writeFileSync(join(dir, 'package.json'), '{"name":"approval-fixture","private":true}\n')
+  const rootManifest = JSON.parse(readFileSync(new URL('../../../../package.json', import.meta.url), 'utf8')) as { packageManager: string }
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({
+    name: 'approval-fixture', private: true, packageManager: rootManifest.packageManager,
+  }) + '\n')
   const policy = parseDocument(readFileSync(join(dir, 'pnpm-workspace.yaml'), 'utf8'))
   policy.set('offline', true)
   policy.set('storeDir', join(profile.cwd, 'store'))

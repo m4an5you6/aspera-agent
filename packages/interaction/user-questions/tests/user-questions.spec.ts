@@ -69,6 +69,23 @@ describe('UserQuestionService', () => {
     expect(p.seen).toEqual([])
   })
 
+  it('rejects a covered Goal agent before a connected answerer can wait', async () => {
+    const ctx = new Context()
+    const agent = stubAgent('goal-agent')
+    ctx.provide('goalUnattended', { covers: (candidate: Agent | undefined) => candidate === agent })
+    await ctx.plugin(UserQuestionService)
+    const p = provider()
+    registerAnswerer(ctx, p)
+
+    await expect(ctx.userQuestions.ask({
+      agent, questions: [{ id: 'confirm', question: 'Proceed?' }],
+    })).rejects.toMatchObject({ code: 'UNATTENDED_QUESTION' })
+    expect(p.seen).toEqual([])
+    await expect(ctx.userQuestions.ask({ questions: [{ id: 'confirm', question: 'Proceed?' }] }))
+      .resolves.toMatchObject({ answers: [{ id: 'confirm', selected: ['approved'] }] })
+    expect(p.seen).toHaveLength(1)
+  })
+
   it('registers providers with HMR-safe disposal', async () => {
     const ctx = new Context()
     await ctx.plugin(UserQuestionService)

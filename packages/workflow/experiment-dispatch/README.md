@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-The `experiment-dispatch` profile runs on the local DSH checkout. Its tools package the current source, build an immutable release on a configured Linux target, prove that its sandbox can restrict files while using the allocated GPU, and submit one experiment to the independent worker. An accepted receipt ends local ownership; the remote Session and Goal continue when the local process exits.
+The `experiment-dispatch` profile and Web Goal flow package the local DSH source, build an immutable release on a configured Linux GPU server, check sandbox and CUDA access, and submit one experiment to an independent worker. An accepted receipt saves the handover notice, completes the same local Goal revision, and records the remote Session, Goal, artifacts, and worker log. The submit tool returns the notice in the local Session. The remote run continues when the local process exits.
 
 ## Table of Contents
 
@@ -31,9 +31,11 @@ Configure `DSH_EXPERIMENT_TARGET` as an SSH host with a known host key and non-i
 
 Run `pnpm dsh --profile experiment-dispatch "<experiment goal>"` from the repository root. The local agent calls `prepare_experiment_environment`, then `submit_experiment` with its returned preparation id. `get_experiment_status` and `cancel_experiment` accept the returned submission id. The model, dataset, method, GPU count and other explicit requirements travel to the remote Goal. Local dataset files must be under an explicitly configured data root; without one, no local file is eligible for transfer. They are staged before the acceptance receipt. Other dataset references must already exist relative to the remote workspace.
 
+In Web, open **Plugins → GPU experiment dispatch** to set the SSH host, remote directory, ports, local source and data directories, credential references, and receiver token. The token value goes to the credential store, not the settings document. Enter the experiment as a Web Goal. After handover, the same page shows the saved handover notice, receipt, and remote state; **Refresh** and **Cancel** use the server saved with that submission even after the configured server changes. A changed local Goal revision is left open when an older submission receives its receipt.
+
 Cancelling a local submission stops automatic retries and preserves its saved submission id. The receiver may already have accepted the experiment; query that id before deciding whether to cancel the remote run with `cancel_experiment`.
 
-The profile rejects human questions and approval requests. The SSH target, paths and secret reference come from deployment configuration rather than tool arguments. A missing credential, unknown SSH host, failed build, unusable sandbox or failed CUDA allocation stops preparation.
+An active Goal rejects human questions, approval requests, and agent-initiated plugin changes in both Web and the unattended profile; that rule is recovered after plugin reload. The SSH target, paths and secret reference come from deployment configuration rather than tool arguments. A missing credential, unknown SSH host, failed build, unusable sandbox or failed CUDA allocation stops preparation.
 
 <a id="understand-the-implementation"></a>
 ## Understand the implementation
@@ -41,7 +43,7 @@ The profile rejects human questions and approval requests. The SSH target, paths
 <details>
 <summary>Implementation internals — click to expand</summary>
 
-The source snapshot includes current regular tracked and untracked files, excluding credentials, dependencies, build outputs and common model artifacts. Its content digest selects a release directory. The worker's authenticated loopback receiver is reached through a short-lived SSH tunnel. A local storage-domain record pins one submission id to one Session and experiment description before transport; retrying after a lost reply uses the same id. The receiver's own durable reservation is the authoritative duplicate guard.
+The source snapshot includes current regular tracked and untracked files, excluding credentials, dependencies, build outputs and common model artifacts. Its content digest and the selected server configuration identify a preparation. The worker's authenticated loopback receiver is reached through a short-lived SSH tunnel. A local storage-domain record pins one submission id to one Session, exact Goal revision, experiment description, and server configuration before transport; retrying after a lost reply uses the same id and target. The complete receiver receipt is saved before the local Goal is completed. Records from older versions remain readable, but a submission without a saved server cannot be contacted or bound to a later Goal.
 
 </details>
 
@@ -72,7 +74,7 @@ The local Agent receives the dispatch instruction below in its system context.
 ##### Dispatch instruction
 
 ```markdown
-For a requested remote training experiment, prepare the environment, then submit explicit requirements only when preparation returns state ready. Preserve the user's chosen model, data, method and constraints. Choose missing details within authorized resources and record them. After submit returns accepted, the remote Goal owns execution; complete this local Goal by reporting its identifiers and status lookup. Never wait for a human response or claim the training finished from the acceptance receipt.
+For a requested remote training experiment, prepare the environment, then submit explicit requirements only when preparation returns state ready. Preserve the user's chosen model, data, method and constraints. Choose missing details within authorized resources and record them. After submit returns accepted, the remote Goal owns execution; include the handover field verbatim when reporting its identifiers and status lookup. Never wait for a human response or claim the training finished from the acceptance receipt.
 ```
 
 #### Token effect
@@ -104,6 +106,6 @@ Definitions stay stable across requests, while variable receipts and status resp
 Local file staging and existing remote workspace inputs are supported within these limits.
 
 - One worker runs one active experiment; the dispatcher does not schedule multiple targets.
-- The local Agent completes its Goal under the handoff instructions; receiving a receipt does not itself force local Goal completion.
+- A successful receipt completes the submitted local Goal only while its id and revision still match; an edited Goal needs a new submission.
 - Worker restart retains an interruption record but does not automatically resume GPU training.
 - Independent Verify assessment of training quality belongs to a later stage.

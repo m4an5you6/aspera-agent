@@ -659,11 +659,12 @@ const TOOL_PACKAGES: ToolPackage[] = [
     pkg: '@deepseek-ai/dsh-experiment-dispatch',
     dir: 'experiment-dispatch',
     source: 'packages/workflow/experiment-dispatch/src/index.ts',
-    requires: ['ctx.tools', 'ctx.agents', 'ctx.credentials', 'ctx.storageDomain', 'ctx.systemPrompt'],
+    requires: ['ctx.tools', 'ctx.agents', 'ctx.credentials', 'ctx.goals', 'ctx.storageDomain', 'ctx.systemPrompt'],
     writes: ['tool/call', 'tool/result', 'remote experiment receiver record'],
     async mount(ctx) {
       ctx.provide('agents', {} as never)
       ctx.provide('credentials', {} as never)
+      ctx.provide('goals', {} as never)
       ctx.provide('storageDomain', {
         open: () => Promise.resolve({ close: () => Promise.resolve() }),
       } as never)

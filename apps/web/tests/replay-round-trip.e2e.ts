@@ -60,7 +60,7 @@ describe('web e2e: fresh round trip through the real assembly', () => {
       ...(MODE === 'record' ? {} : { replayFixture: FIXTURE, paceMs: 15 }),
     })
     scaffold.ctx.on('session/event', (_session, event: SessionEvent) => { sessionEvents.push(event) })
-    browser = await chromium.launch()
+    browser = await chromium.launch(process.env.DSH_WEB_E2E_BROWSER_CHANNEL === 'chrome' ? { channel: 'chrome' } : {})
     page = await newEnglishPage(browser)
     tripwire = watchConsole(page)
     await page.goto(scaffold.authenticatedUrl, { waitUntil: 'load' })

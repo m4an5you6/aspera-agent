@@ -9,7 +9,7 @@ kind: "package-bundle"
 
 ## 概述
 
-`experiment-dispatch` profile 在本机 DSH 源码中运行。工具把当前源码打包，在配置好的 Linux 目标上构建独立版本，验证沙箱限制文件写入且能使用分配的 GPU，然后把实验提交给独立工作端。取得接管回执后，本机退出也不会停止远端 Session 和 Goal。
+`experiment-dispatch` profile 与 Web Goal 流程会打包本机 DSH 源码，在配置好的 Linux GPU 服务器上构建独立版本，检查沙箱与 CUDA，然后向独立工作端提交一项实验。接管回执会保存接管说明、完成同一版本的本地 Goal，并记录远端 Session、Goal、产物与工作器日志。提交工具也会把接管说明写入本机会话。本机进程退出后，远端实验继续运行。
 
 ## 目录
 
@@ -31,9 +31,11 @@ kind: "package-bundle"
 
 在仓库根目录运行 `pnpm dsh --profile experiment-dispatch "<实验目标>"`。本机 Agent 先调用 `prepare_experiment_environment`，再用返回的准备编号调用 `submit_experiment`。`get_experiment_status` 和 `cancel_experiment` 使用返回的提交编号。明确指定的模型、数据集、方法、GPU 数量和其他约束会传给远端 Goal。本机数据文件必须位于显式配置的数据根目录；未配置时不允许传输本机文件。接管前完成传输；其他数据引用必须已在远端工作目录中。
 
+在 Web 中打开「插件 → GPU 实验派发」，设置 SSH 主机、远端目录、端口、本地源码与数据目录、凭据引用及接收端令牌。令牌值写入凭据存储，不进入设置文档。然后将实验作为 Web Goal 输入。接管后，同一页面显示已保存的接管说明、回执与远端状态；「刷新」和「取消」始终使用提交时保存的服务器，即使当前配置已切换。若提交期间修改了本地 Goal，旧回执不会结束修改后的 Goal。
+
 取消本机提交会停止自动重试，并保留已保存的提交编号。接收端可能已经接管实验；应先查询该编号的状态，再决定是否通过 `cancel_experiment` 取消远端运行。
 
-该 profile 拒绝人工提问和审批。SSH 目标、路径与密钥引用均来自部署配置，模型工具参数不能修改。凭据缺失、未知 SSH 主机、构建失败、沙箱不可用或 CUDA 分配失败都会终止准备。
+Web 与无人值守 profile 中的活动 Goal 都拒绝人工提问、审批请求以及由 Agent 发起的插件变更；插件重载后仍会恢复这项限制。SSH 目标、路径与密钥引用均来自部署配置，模型工具参数不能修改。凭据缺失、未知 SSH 主机、构建失败、沙箱不可用或 CUDA 分配失败都会终止准备。
 
 <a id="understand-the-implementation"></a>
 ## 实现
@@ -41,7 +43,7 @@ kind: "package-bundle"
 <details>
 <summary>实现细节——点击展开</summary>
 
-源码快照包含当前常规的已跟踪与未跟踪文件，排除凭据、依赖、构建输出和常见模型产物。内容摘要对应远端独立版本目录。本机通过短时 SSH 隧道访问远端经过认证的回环地址接收服务。提交前，本机存储域将一个提交编号固定到当前 Session 和实验描述；响应丢失后重试使用同一编号。远端的持久预留记录负责最终去重。
+源码快照包含当前常规的已跟踪与未跟踪文件，排除凭据、依赖、构建输出和常见模型产物。内容摘要与选定服务器配置共同标识一次准备。本机通过短时 SSH 隧道访问远端经过认证的回环地址接收服务。提交前，本机存储域将一个提交编号固定到当前 Session、精确 Goal 版本、实验描述与服务器配置；响应丢失后重试使用相同编号与目标。完整的接收回执先保存，再完成本地 Goal。旧版本记录仍可读取，但未保存服务器的提交无法再访问，也不会绑定到后来的 Goal。
 
 </details>
 
@@ -72,7 +74,7 @@ kind: "package-bundle"
 ##### 派发指令
 
 ```markdown
-For a requested remote training experiment, prepare the environment, then submit explicit requirements only when preparation returns state ready. Preserve the user's chosen model, data, method and constraints. Choose missing details within authorized resources and record them. After submit returns accepted, the remote Goal owns execution; complete this local Goal by reporting its identifiers and status lookup. Never wait for a human response or claim the training finished from the acceptance receipt.
+For a requested remote training experiment, prepare the environment, then submit explicit requirements only when preparation returns state ready. Preserve the user's chosen model, data, method and constraints. Choose missing details within authorized resources and record them. After submit returns accepted, the remote Goal owns execution; include the handover field verbatim when reporting its identifiers and status lookup. Never wait for a human response or claim the training finished from the acceptance receipt.
 ```
 
 #### Token effect
@@ -104,6 +106,6 @@ For a requested remote training experiment, prepare the environment, then submit
 在以下限制内支持本机文件传输及已存在的远端工作目录输入。
 
 - 每个工作端只能同时运行一项实验，不调度多个目标。
-- 本机 Agent 根据交接指令完成 Goal；收到回执本身不会强制结束本机 Goal。
+- 成功回执仅在原本地 Goal 的编号和版本仍匹配时完成它；编辑后的 Goal 需要重新提交。
 - 工作进程重启后保留中断记录，但不自动恢复 GPU 训练。
 - 训练质量的独立 Verify 评估由后续阶段实现。

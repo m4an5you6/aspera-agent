@@ -17,6 +17,10 @@ import {
   type SubagentModelSelectionSettings,
 } from '../src/client/subagent-model-selection-card-controller.ts'
 import { WebSearchCardController, type WebSearchSettings } from '../src/client/web-search-card-controller.ts'
+import {
+  ExperimentDispatchCardController, type ExperimentDispatchSettings,
+} from '../src/client/experiment-dispatch-card-controller.ts'
+import type { ExperimentDispatchRecord } from '@deepseek-ai/dsh-api-remotes/client'
 
 /** Make the stub behave like a Host that accepts every write. */
 function acceptWrites<T>(host: StubSettingsScope<T>): void {
@@ -323,6 +327,85 @@ describe('CardForm', () => {
 
     expect(subject.shell()).toMatchObject({ available: false, writable: false })
   })
+})
+
+it('saves comma-separated GPU data roots as an array and retains accepted drafts', async () => {
+  const host = stubSettingsScope<ExperimentDispatchSettings>()
+  acceptWrites(host)
+  host.publish({ status: 'ready', writable: true, value: { dataRoots: [] }, base: { dataRoots: [] }, user: {} })
+  const controller = new ExperimentDispatchCardController(host.scope, ctxWith({
+    credentials: { describe: async () => ({ ok: true, value: {} }) },
+  }))
+  controller.inject().edit('dataRoots', '/data/one, /data/two')
+  controller.inject().save()
+  await vi.waitFor(() => { expect(host.set).toHaveBeenCalledWith('dataRoots', ['/data/one', '/data/two']) })
+  expect(controller.inject().hooks.experimentDispatchCard.getSnapshot().failed).toBe(false)
+})
+
+it('loads experiment receipts and updates status after refresh and cancellation', async () => {
+  const host = stubSettingsScope<ExperimentDispatchSettings>()
+  host.publish({ status: 'ready', writable: true, value: {}, base: {}, user: {} })
+  const receipt: ExperimentDispatchRecord = {
+    submissionId: 'submission-1', deploymentId: 'deployment-1', payloadHash: 'hash',
+    spec: { objective: 'train', datasetRefs: [], constraints: [], outputPath: 'artifacts/submission-1' },
+    sessionId: 'remote-session', goalId: 'remote-goal', artifactPath: '/artifacts', workerLogPath: '/worker.log',
+    state: 'accepted', createdAt: 1, updatedAt: 1,
+  }
+  const list = vi.fn(async () => ({ ok: true as const, value: [{
+    submissionId: 'submission-1', host: 'gpu', handover: '本机派发完成，远端实验已接管' as const, receipt,
+  }] }))
+  const refresh = vi.fn(async () => ({ ok: true as const, value: { ...receipt, state: 'blocked' as const } }))
+  const cancel = vi.fn(async () => ({ ok: true as const, value: { ...receipt, state: 'cancelled' as const } }))
+  const controller = new ExperimentDispatchCardController(host.scope, ctxWith({
+    credentials: { describe: async () => ({ ok: true, value: {} }) },
+    experimentDispatch: { list, refresh, cancel },
+  }))
+  const state = () => controller.inject().hooks.experimentDispatchCard.getSnapshot()
+  await controller.loadRecords()
+  expect(state().records[0]?.receipt?.goalId).toBe('remote-goal')
+  expect(state().records[0]?.handover).toBe('本机派发完成，远端实验已接管')
+  controller.inject().refreshRecord('submission-1')
+  await vi.waitFor(() => { expect(state().records[0]?.latest?.state).toBe('blocked') })
+  controller.inject().cancelRecord('submission-1')
+  await vi.waitFor(() => { expect(state().records[0]?.latest?.state).toBe('cancelled') })
+  expect(refresh).toHaveBeenCalledWith('submission-1')
+  expect(cancel).toHaveBeenCalledWith('submission-1')
+})
+
+it('writes the receiver token under a newly saved credential reference', async () => {
+  const host = stubSettingsScope<ExperimentDispatchSettings>()
+  acceptWrites(host)
+  host.publish({ status: 'ready', writable: true, value: { tokenRef: 'OLD_TOKEN' }, base: {}, user: {} })
+  const configured = new Set<string>()
+  const describe = vi.fn(async (refs: string[]) => ({ ok: true as const, value: Object.fromEntries(
+    refs.map(ref => [ref, { configured: configured.has(ref), writable: true }]),
+  ) }))
+  const set = vi.fn(async (ref: string) => { configured.add(ref); return { ok: true as const, value: undefined } })
+  const controller = new ExperimentDispatchCardController(host.scope, ctxWith({ credentials: { describe, set } }))
+  controller.inject().edit('receiverToken', 'secret-value')
+  controller.inject().edit('tokenRef', 'NEW_TOKEN')
+  controller.inject().save()
+  await vi.waitFor(() => {
+    expect(set).toHaveBeenCalledWith('NEW_TOKEN', 'secret-value')
+    expect(controller.inject().hooks.experimentDispatchCard.getSnapshot().receiverTokenConfigured).toBe(true)
+  })
+})
+
+it('keeps a receiver token draft when its new credential reference is rejected', async () => {
+  const host = stubSettingsScope<ExperimentDispatchSettings>()
+  host.publish({ status: 'ready', writable: true, value: { tokenRef: 'OLD_TOKEN' }, base: {}, user: {} })
+  const set = vi.fn(async () => ({ ok: true as const, value: undefined }))
+  const controller = new ExperimentDispatchCardController(host.scope, ctxWith({
+    credentials: { describe: async () => ({ ok: true, value: {} }), set },
+  }))
+  controller.inject().edit('tokenRef', 'NEW_TOKEN')
+  controller.inject().edit('receiverToken', 'secret-value')
+  controller.inject().save()
+  await vi.waitFor(() => {
+    expect(controller.inject().hooks.experimentDispatchCard.getSnapshot().failed).toBe(true)
+  })
+  expect(set).not.toHaveBeenCalled()
+  expect(controller.inject().hooks.experimentDispatchCard.getSnapshot().receiverToken.text).toBe('secret-value')
 })
 
 describe('BashCardController', () => {

@@ -66,6 +66,23 @@ it('checks the calling session on each execution, including after permission is 
   expect(manager.listPlugins).toHaveBeenCalledTimes(1)
 })
 
+it('allows inventory reads but refuses profile changes for an unattended Goal', async () => {
+  const { ctx, call, manager } = await fixture()
+  const agent = activeAgent()
+  ctx.provide('goalUnattended', { covers: (candidate: Agent | undefined) => candidate === agent })
+  expect((await call({ action: 'list_plugins' }, agent)).isError).toBe(false)
+  for (const action of ['set_plugin', 'set_bundle', 'install_bundle', 'remove_bundle']) {
+    const result = await call({ action, target: 'bundle', enabled: true }, agent)
+    expect(result.isError).toBe(true)
+    expect(JSON.stringify(result.content)).toContain('disabled for an unattended Goal')
+  }
+  expect(manager.listPlugins).toHaveBeenCalledTimes(1)
+  expect(manager.setPluginEnabled).not.toHaveBeenCalled()
+  expect(manager.setBundleEnabled).not.toHaveBeenCalled()
+  expect(manager.installBundle).not.toHaveBeenCalled()
+  expect(manager.removeBundle).not.toHaveBeenCalled()
+})
+
 function activeAgent(): Agent {
   const id = SessionId('manager-approval')
   const session = Session.create(id, undefined, { version: SESSION_FORMAT_VERSION, id, createdAt: 0, isSeeded: false })

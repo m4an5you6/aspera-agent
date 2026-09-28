@@ -9,7 +9,10 @@
     { "path": "../../core/system-prompt" },
     { "path": "../../core/tools" },
     { "path": "../../credentials/credentials" },
+    { "path": "../../goal/goal" },
+    { "path": "../../settings/settings" },
     { "path": "../../storage/storage-domain" },
+    { "path": "../../typert/protocol" },
     { "path": "../experiment-worker" }
   ]
 }

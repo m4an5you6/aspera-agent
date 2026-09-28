@@ -1,6 +1,7 @@
 /** Agent-facing current-profile management using the same service as Web controls. */
 import { assertNever } from '@deepseek-ai/dsh-util-values'
 import type { Context } from '@deepseek-ai/cordis'
+import type { Agent } from '@deepseek-ai/dsh-agent'
 import type {} from './index.ts'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
 import type {} from '@deepseek-ai/dsh-user-approval'
@@ -31,6 +32,10 @@ export function apply(ctx: Context): void {
       render: (_args, value) => [{ type: 'text', text: value }],
     },
     async execute(args, exec) {
+      const unattended = ctx.get('goalUnattended') as { covers(agent: Agent | undefined): boolean } | undefined
+      if (!args.action.startsWith('list_') && unattended?.covers(exec.agent) === true) {
+        throw new Error('plugin management is disabled for an unattended Goal')
+      }
       const policy = ctx.sandboxPolicy.resolve(exec.agent === undefined ? {} : { session: exec.agent.session })
       await approveEscalation({
         requestedMode: 'danger-full-access', effectiveMode: policy.mode, subject: 'plugin management operation',

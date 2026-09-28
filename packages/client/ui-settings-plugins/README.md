@@ -25,7 +25,7 @@ Use the **Built-in plugins** settings section to inspect the plugins this deploy
 <a id="use-this-package"></a>
 ## Use this package
 
-Open **Built-in plugins** in Settings for the read-only inventory; [ui-settings-plugin-inventory](../ui-settings-plugin-inventory/README.md) contributes it as the section's one tab, shown as the page itself. To configure a host-plane plugin, select **Plugins** in the sidebar: the Official group lists one card per plugin this deployment composes, in this order — the shell executor (`shell`), the agent loop's tool-call parallelism (`agent-loop`), Subagent delegation limits and model selection (`subagent` and `subagent-model-selection`), and the DeepSeek search provider (`web-search-deepseek`) — and a card opens the plugin's page with its form.
+Open **Built-in plugins** in Settings for the read-only inventory; [ui-settings-plugin-inventory](../ui-settings-plugin-inventory/README.md) contributes it as the section's one tab, shown as the page itself. To configure a host-plane plugin, select **Plugins** in the sidebar: the Official group lists one card per plugin this deployment composes, in this order — the shell executor (`shell`), the agent loop's tool-call parallelism (`agent-loop`), Subagent delegation limits and model selection (`subagent` and `subagent-model-selection`), the DeepSeek search provider (`web-search-deepseek`), and GPU experiment dispatch (`experiment-dispatch`) — and a card opens the plugin's page with its form.
 
 ### What appears here
 
@@ -44,6 +44,8 @@ Saving the Subagent card validates both sections and writes their drafts through
 ### Secret-role fields
 
 A key control starts blank, reports only whether one is configured, and writes through the credentials domain rather than the settings section; a blank draft writes nothing and keeps the stored key.
+
+The GPU experiment page stages the SSH target, local source and data paths, receiver token reference, and model credential references. The receiver token input writes its value to the credential store after the target settings are saved; the settings document never carries the value. Its experiment list shows the saved handover notice and receiver record, with remote status refresh and cancellation against each record's saved server.
 
 -----
 

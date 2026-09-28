@@ -7,7 +7,7 @@ import type { AddressInfo } from 'node:net'
 export interface Target {
   readonly host: string
   readonly sshPort: number
-  readonly identityFile?: string
+  readonly identityFile?: string | undefined
   readonly remotePort: number
   /** Configured maximum lifetime of an SSH command or SCP transfer in milliseconds. */
   readonly toolTimeoutMs: number

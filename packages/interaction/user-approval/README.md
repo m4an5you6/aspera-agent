@@ -33,7 +33,7 @@ Answerers are `approval/request` waterfall listeners: return an outcome to answe
 
 ### Setting the policy
 
-The effective policy is the one set for the session, falling back to the configured default. `ask` (the default) delegates to the composed answerers; `never` rejects every request deterministically before interactive dispatch — the strict headless stance for CI and unattended runs.
+The effective policy is the one set for the session, falling back to the configured default. `ask` (the default) delegates to the composed answerers; `never` rejects every request deterministically before interactive dispatch — the strict headless stance for CI and unattended runs. The experiment dispatcher also rejects approval requests from an active local Goal and its owned children, including after plugin reload.
 
 ```yaml
 - name: '@deepseek-ai/dsh-user-approval'

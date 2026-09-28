@@ -514,3 +514,16 @@
       name: '@deepseek-ai/dsh-agent-presets'
       config:
         default: standard
+    - id: experiment-dispatch
+      name: '@deepseek-ai/dsh-experiment-dispatch'
+      config:
+        host: !!js process.env.DSH_EXPERIMENT_TARGET
+        sshPort: !!js Number(process.env.DSH_EXPERIMENT_SSH_PORT ?? 22)
+        remotePort: !!js Number(process.env.DSH_EXPERIMENT_PORT ?? 43019)
+        remoteRoot: !!js process.env.DSH_EXPERIMENT_REMOTE_ROOT
+        localRepo: !!js process.cwd()
+        identityFile: !!js process.env.DSH_EXPERIMENT_SSH_IDENTITY
+        dataRoots: !!js process.env.DSH_EXPERIMENT_DATA_ROOTS?.split(';') ?? []
+        tokenRef: !!js process.env.DSH_EXPERIMENT_TOKEN_REF ?? 'DSH_EXPERIMENT_TOKEN'
+        agentCredentialRefs: !!js process.env.DSH_EXPERIMENT_AGENT_CREDENTIAL_REFS?.split(',').filter(Boolean) ?? ['DEEPSEEK_API_KEY']
+        toolTimeoutMs: !!js Number(process.env.DSH_EXPERIMENT_SETUP_TIMEOUT_MS ?? 1800000)

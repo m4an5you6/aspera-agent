@@ -1,0 +1,188 @@
+/** Settings form and saved experiment records for Web dispatch. */
+
+import type { Context as ClientContext } from '@deepseek-ai/cordis'
+import type {} from '@deepseek-ai/dsh-api-remotes/client'
+import type { ExperimentDispatchEntry } from '@deepseek-ai/dsh-api-remotes/client'
+import type { SnapshotStore } from '@deepseek-ai/dsh-client-store'
+import type { SettingsScope } from '@deepseek-ai/dsh-client-ui-settings/client'
+import {
+  CardForm, numberField, stringListField, textField,
+  type CardActions, type CardFieldState, type CardShell,
+} from './card-form.ts'
+
+/** Host settings namespace owned by experiment dispatch. */
+export const EXPERIMENT_DISPATCH_NS = 'experiment-dispatch'
+const DEFAULT_TOKEN_REF = 'DSH_EXPERIMENT_TOKEN'
+const TOKEN_FIELD = 'receiverToken'
+
+/** Editable deployment target values. */
+export interface ExperimentDispatchSettings {
+  host?: string
+  sshPort?: number
+  remotePort?: number
+  remoteRoot?: string
+  localRepo?: string
+  identityFile?: string
+  dataRoots?: string[]
+  tokenRef?: string
+  agentCredentialRefs?: string[]
+  toolTimeoutMs?: number
+}
+
+/** The experiment configuration fields shown in the card. */
+export const experimentFields = [
+  'host', 'sshPort', 'remotePort', 'remoteRoot', 'localRepo', 'identityFile',
+  'dataRoots', 'tokenRef', 'agentCredentialRefs', 'toolTimeoutMs',
+] as const
+
+/** One card snapshot, including persisted receiver records. */
+export interface ExperimentDispatchCardState extends CardShell {
+  fields: Record<(typeof experimentFields)[number], CardFieldState>
+  receiverToken: CardFieldState
+  receiverTokenConfigured: boolean
+  receiverTokenWritable: boolean
+  records: readonly ExperimentDispatchEntry[]
+  loading: boolean
+  loaded: boolean
+  busyId?: string
+  recordError?: string
+}
+
+/** The slot's browser-facing state and actions. */
+export interface ExperimentDispatchCardFace extends CardActions {
+  hooks: { experimentDispatchCard: SnapshotStore<ExperimentDispatchCardState> }
+  loadRecords: () => void
+  refreshRecord: (submissionId: string) => void
+  cancelRecord: (submissionId: string) => void
+}
+
+/** Bridges the settings namespace and dispatch Remote to one card. */
+export class ExperimentDispatchCardController {
+  private readonly form: CardForm<ExperimentDispatchSettings>
+  private readonly store: SnapshotStore<ExperimentDispatchCardState>
+  private records: readonly ExperimentDispatchEntry[] = []
+  private loading = false
+  private loaded = false
+  private busyId: string | undefined
+  private recordError: string | undefined
+  private credential = { ref: '', configured: false, writable: true }
+
+  /**
+   * @param scope - the deployment's experiment dispatch settings scope.
+   * @param ctx - browser context carrying the dispatch Remote.
+   */
+  constructor(private readonly scope: SettingsScope<ExperimentDispatchSettings>, private readonly ctx: ClientContext) {
+    this.form = new CardForm(scope, [
+      textField('host'), numberField('sshPort'), numberField('remotePort'), textField('remoteRoot'),
+      textField('localRepo'), textField('identityFile'), stringListField('dataRoots'),
+      textField('tokenRef'), stringListField('agentCredentialRefs'), numberField('toolTimeoutMs'),
+    ], [{ field: TOKEN_FIELD, write: text => this.writeToken(text) }])
+    this.store = this.form.bind(() => this.projection())
+    scope.subscribe(() => { void this.readCredential() })
+    void this.readCredential()
+  }
+
+  private projection(): ExperimentDispatchCardState {
+    return {
+      ...this.form.shell(),
+      fields: Object.fromEntries(experimentFields.map(field => [field, this.form.field(field)])) as ExperimentDispatchCardState['fields'],
+      receiverToken: this.form.field(TOKEN_FIELD),
+      receiverTokenConfigured: this.credential.configured,
+      receiverTokenWritable: this.credential.writable,
+      records: this.records,
+      loading: this.loading,
+      loaded: this.loaded,
+      ...this.busyId === undefined ? {} : { busyId: this.busyId },
+      ...this.recordError === undefined ? {} : { recordError: this.recordError },
+    }
+  }
+
+  private publish(): void {
+    this.store.set(this.projection())
+  }
+
+  private tokenRef(): string {
+    return this.scope.getSnapshot().value?.tokenRef || DEFAULT_TOKEN_REF
+  }
+
+  private async readCredential(): Promise<void> {
+    const ref = this.tokenRef()
+    if (ref !== this.credential.ref) {
+      this.credential = { ref, configured: false, writable: true }
+      this.publish()
+    }
+    const result = await this.ctx.remote.credentials.describe([ref])
+    if (!result.ok || ref !== this.tokenRef()) return
+    const view = result.value[ref]
+    this.credential = { ref, configured: view?.configured ?? false, writable: view?.writable ?? true }
+    this.publish()
+  }
+
+  /**
+   * Re-read the receiver token after another page changes its reference.
+   * @param ref - credential reference reported by the Host.
+   */
+  refreshCredential(ref: string): void {
+    if (ref === this.credential.ref) void this.readCredential()
+  }
+
+  private async writeToken(value: string): Promise<boolean> {
+    const result = await this.ctx.remote.credentials.set(this.tokenRef(), value)
+    if (!result.ok) return false
+    await this.readCredential()
+    return this.credential.configured
+  }
+
+  /** Load locally saved experiments. */
+  async loadRecords(): Promise<void> {
+    if (this.loading) return
+    this.loading = true
+    this.recordError = undefined
+    this.publish()
+    try {
+      const result = await this.ctx.remote.experimentDispatch.list()
+      if (result.ok) {
+        this.records = result.value
+        this.loaded = true
+      } else this.recordError = result.error.message
+    } catch (error: unknown) {
+      this.recordError = error instanceof Error ? error.message : String(error)
+    } finally {
+      this.loading = false
+      this.publish()
+    }
+  }
+
+  private async changeRecord(submissionId: string, action: 'refresh' | 'cancel'): Promise<void> {
+    if (this.busyId !== undefined) return
+    this.busyId = submissionId
+    this.recordError = undefined
+    this.publish()
+    try {
+      const result = await this.ctx.remote.experimentDispatch[action](submissionId)
+      if (result.ok) {
+        this.records = this.records.map(entry => entry.submissionId === submissionId
+          ? { ...entry, latest: result.value } : entry)
+      } else this.recordError = result.error.message
+    } catch (error: unknown) {
+      this.recordError = error instanceof Error ? error.message : String(error)
+    } finally {
+      this.busyId = undefined
+      this.publish()
+    }
+  }
+
+  /**
+   * Build the slot's form and experiment actions.
+   * @returns The card snapshot and its actions.
+   */
+  inject(): ExperimentDispatchCardFace {
+    return {
+      hooks: { experimentDispatchCard: this.store },
+      ...this.form.actions(),
+      loadRecords: () => { void this.loadRecords() },
+      refreshRecord: (submissionId) => { void this.changeRecord(submissionId, 'refresh') },
+      cancelRecord: (submissionId) => { void this.changeRecord(submissionId, 'cancel') },
+    }
+  }
+}

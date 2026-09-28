@@ -36,7 +36,7 @@ User-interaction Service Definition. It owns `ctx.userQuestions`, the service a 
 - `AskUserQuestionAnswer` — `{ answers: [{ id, selected, custom? }] }`.
 - `UserQuestionError` — `HarnessError` subclass with codes such as `EMPTY_QUESTIONS`, `BAD_INTENT`, `NO_PROVIDER`, `ASK_ABORTED`, `CALLER_NOT_LIVE`, and `DELEGATED_CALLER`.
 
-`config.unattended: true` makes `ask()` reject with `UNATTENDED_QUESTION` before any answerer runs, including when a Web answerer is connected. The deployment's unattended profile sets this option; interactive profiles retain the default.
+`config.unattended: true` makes `ask()` reject with `UNATTENDED_QUESTION` before any answerer runs, including when a Web answerer is connected. The experiment dispatcher also rejects questions for an active local Goal and its owned children; it derives that coverage from the live Goal and Session history after reload. Interactive sessions without an active Goal retain the default.
 
 For a single-select question, `custom` overrides the selected choice and `selected` is empty. For a multi-select question, `custom` may supplement the labels in `selected`. A UI may preserve a skipped item as `{ id, selected: [] }`, keeping the existing answer shape while retaining other answers in the batch.
 

@@ -146,6 +146,24 @@ export function textField(field: string): CardFieldSpec {
 }
 
 /**
+ * A comma-separated list of configuration values. Empty text clears the field.
+ * @param field - field name inside the namespace section.
+ * @returns the field's conversion spec.
+ */
+export function stringListField(field: string): CardFieldSpec {
+  return {
+    field,
+    format: value => Array.isArray(value) && value.every(item => typeof item === 'string')
+      ? value.join(', ') : '',
+    parse: (text) => {
+      const values = text.split(',').map(value => value.trim())
+      if (values.length === 1 && values[0] === '') return { kind: 'clear' }
+      return values.some(value => value === '') ? undefined : { kind: 'set', value: values }
+    },
+  }
+}
+
+/**
  * Stages one card's edits over one settings namespace and writes them on save.
  *
  * The form publishes through a snapshot store because slot components read
@@ -256,14 +274,24 @@ export class CardForm<T> {
    */
   async save(): Promise<void> {
     const plan = this.plan()
-    const writes = plan.flatMap(item => item.run === undefined ? [] : [item.run])
-    if (plan.length === 0 || this.saving || writes.length !== plan.length) return
+    // A credential reference may be edited in this same save. Store section
+    // fields first so the secret addresses the reference the Host accepted.
+    const sectionWrites = plan.filter(item => !this.secretSpecs.has(item.field))
+      .flatMap(item => item.run === undefined ? [] : [item.run])
+    const secretWrites = plan.filter(item => this.secretSpecs.has(item.field))
+      .flatMap(item => item.run === undefined ? [] : [item.run])
+    if (plan.length === 0 || this.saving || sectionWrites.length + secretWrites.length !== plan.length) return
     this.saving = true
     this.failed = false
     this.publish()
     let landed = true
-    for (const write of writes) {
+    for (const write of sectionWrites) {
       landed = await write() && landed
+    }
+    if (landed) {
+      for (const write of secretWrites) {
+        landed = await write() && landed
+      }
     }
     if (landed) this.staged.clear()
     this.saving = false
@@ -307,7 +335,10 @@ export class CardForm<T> {
 
   private async store(field: string, value: unknown): Promise<boolean> {
     await this.scope.set(field, value)
-    return this.userLayer()?.[field] === value
+    const stored = this.userLayer()?.[field]
+    return Array.isArray(value) && Array.isArray(stored)
+      ? JSON.stringify(stored) === JSON.stringify(value)
+      : stored === value
   }
 
   private stage(field: string, edit: StagedEdit): void {

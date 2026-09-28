@@ -9,7 +9,7 @@
 
 import { Context, Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import type {} from '@deepseek-ai/dsh-agent'
+import type { Agent } from '@deepseek-ai/dsh-agent'
 import { HarnessError } from '@deepseek-ai/dsh-llm'
 import { scopeTarget } from '@deepseek-ai/dsh-scope'
 
@@ -93,7 +93,8 @@ export class UserQuestionService extends Service {
    *   that live agent is owned by another agent.
    */
   async ask(request: AskUserQuestionRequest): Promise<AskUserQuestionAnswer> {
-    if (this.config.unattended === true) {
+    const covered = this.ctx.get('goalUnattended') as { covers(agent: Agent | undefined): boolean } | undefined
+    if (this.config.unattended === true || covered?.covers(request.agent) === true) {
       throw new UserQuestionError(
         'human questions are disabled in this unattended run; choose within the stated constraints or report a blocker',
         'UNATTENDED_QUESTION',

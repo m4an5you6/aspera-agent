@@ -25,6 +25,22 @@ export type PluginsSettingsLocaleKey =
   | 'subagentModelSelectionPartial' | 'subagentModelSelectionUnavailable'
   | 'subagentModelSelectionUnavailableGroup' | 'subagentModelSelectionEmpty'
   | 'subagentModelSelectionRequired' | 'subagentModelSelectionConflict' | 'subagentModelSelectionOff'
+  | 'experimentTitle' | 'experimentDescription' | 'experimentTargetIntro'
+  | 'experimentHost' | 'experimentHostHint' | 'experimentSshPort' | 'experimentSshPortHint'
+  | 'experimentRemotePort' | 'experimentRemotePortHint' | 'experimentRemoteRoot' | 'experimentRemoteRootHint'
+  | 'experimentLocalRepo' | 'experimentLocalRepoHint' | 'experimentIdentityFile' | 'experimentIdentityFileHint'
+  | 'experimentDataRoots' | 'experimentDataRootsHint' | 'experimentTokenRef' | 'experimentTokenRefHint'
+  | 'experimentAgentCredentialRefs' | 'experimentAgentCredentialRefsHint'
+  | 'experimentToolTimeoutMs' | 'experimentToolTimeoutMsHint' | 'experimentInvalidList'
+  | 'experimentRecordsTitle' | 'experimentReload' | 'experimentLoading' | 'experimentEmpty'
+  | 'experimentReserved' | 'experimentAccepted' | 'experimentComplete' | 'experimentBlocked'
+  | 'experimentFailed' | 'experimentCancelled' | 'experimentInterrupted' | 'experimentUnknown'
+  | 'experimentLegacyTarget' | 'experimentSubmissionId' | 'experimentLocalGoal'
+  | 'experimentRemoteSession' | 'experimentRemoteGoal' | 'experimentArtifacts'
+  | 'experimentWorkerLog' | 'experimentDetail' | 'experimentRefresh' | 'experimentCancel'
+  | 'experimentHandover'
+  | 'experimentBytes' | 'experimentReceiverToken' | 'experimentReceiverTokenHint'
+  | 'experimentTokenSet' | 'experimentTokenUnset'
 
 /** English copy. */
 export const en: Record<PluginsSettingsLocaleKey, string> = {
@@ -89,6 +105,34 @@ export const en: Record<PluginsSettingsLocaleKey, string> = {
   subagentModelSelectionRequired: 'Select at least one model before saving.',
   subagentModelSelectionConflict: 'Settings changed elsewhere. Discard your draft and try again.',
   subagentModelSelectionOff: 'Subagents use configured defaults or inherit the parent agent\'s model. Saved model choices are retained.',
+  experimentTitle: 'GPU experiment dispatch',
+  experimentDescription: 'Configure a GPU server and follow experiments after remote handover.',
+  experimentTargetIntro: 'New preparations use these settings. Each submitted experiment keeps its original server and credential references.',
+  experimentHost: 'SSH host', experimentHostHint: 'Known-hosts-verified destination for the GPU server.',
+  experimentSshPort: 'SSH port', experimentSshPortHint: 'Port for the SSH connection.',
+  experimentRemotePort: 'Worker port', experimentRemotePortHint: 'Loopback receiver port reached through SSH.',
+  experimentRemoteRoot: 'Remote directory', experimentRemoteRootHint: 'Absolute private deployment directory on the GPU server.',
+  experimentLocalRepo: 'Local source directory', experimentLocalRepoHint: 'Absolute checkout to deploy; blank uses the current working directory.',
+  experimentIdentityFile: 'SSH identity file', experimentIdentityFileHint: 'Optional private key path for unattended login.',
+  experimentDataRoots: 'Local data directories', experimentDataRootsHint: 'Absolute directories from which dataset files may be copied; separate with commas.',
+  experimentTokenRef: 'Receiver token reference', experimentTokenRefHint: 'Credential reference; the secret value stays in the credential store.',
+  experimentAgentCredentialRefs: 'Model credential references', experimentAgentCredentialRefsHint: 'References copied to the remote worker; separate with commas.',
+  experimentToolTimeoutMs: 'Tool timeout (ms)', experimentToolTimeoutMsHint: 'Maximum time for preparation and submission operations.',
+  experimentInvalidList: 'Enter comma-separated values without empty items.',
+  experimentRecordsTitle: 'Experiments', experimentReload: 'Reload', experimentLoading: 'Loading experiments…',
+  experimentEmpty: 'No experiment has been submitted from this deployment.',
+  experimentReserved: 'Reserved', experimentAccepted: 'Accepted', experimentComplete: 'Complete',
+  experimentBlocked: 'Blocked', experimentFailed: 'Failed', experimentCancelled: 'Cancelled',
+  experimentInterrupted: 'Interrupted', experimentUnknown: 'Awaiting receipt',
+  experimentLegacyTarget: 'Server not saved', experimentSubmissionId: 'Submission ID',
+  experimentLocalGoal: 'Local Goal', experimentRemoteSession: 'Remote session',
+  experimentRemoteGoal: 'Remote Goal', experimentArtifacts: 'Artifacts',
+  experimentWorkerLog: 'Worker log', experimentDetail: 'Detail',
+  experimentHandover: 'Local dispatch complete; the remote experiment has taken over.',
+  experimentRefresh: 'Refresh', experimentCancel: 'Cancel', experimentBytes: 'bytes',
+  experimentReceiverToken: 'Receiver token',
+  experimentReceiverTokenHint: 'Saved in the credential store under the reference above; leave blank to keep the current token.',
+  experimentTokenSet: 'A token is configured.', experimentTokenUnset: 'No token is configured.',
 }
 
 /** Simplified Chinese copy. */
@@ -154,4 +198,32 @@ export const zh: Record<PluginsSettingsLocaleKey, string> = {
   subagentModelSelectionRequired: '保存前请至少选择一个模型。',
   subagentModelSelectionConflict: '设置已在其他位置更新。请放弃修改后重试。',
   subagentModelSelectionOff: '关闭后，Subagent 使用配置的默认模型或继承父 Agent 的模型；已选模型会保留。',
+  experimentTitle: 'GPU 实验派发',
+  experimentDescription: '配置 GPU 服务器，并在远端接管后查看实验状态。',
+  experimentTargetIntro: '新的准备工作使用此处的配置。已提交的实验保留原服务器和凭据引用。',
+  experimentHost: 'SSH 主机', experimentHostHint: '已通过 known_hosts 验证的 GPU 服务器地址。',
+  experimentSshPort: 'SSH 端口', experimentSshPortHint: 'SSH 连接所用端口。',
+  experimentRemotePort: '工作器端口', experimentRemotePortHint: '通过 SSH 访问的远端回环接收端口。',
+  experimentRemoteRoot: '远端目录', experimentRemoteRootHint: 'GPU 服务器上的私有部署绝对路径。',
+  experimentLocalRepo: '本地源码目录', experimentLocalRepoHint: '待部署源码的绝对路径；留空使用当前工作目录。',
+  experimentIdentityFile: 'SSH 身份文件', experimentIdentityFileHint: '用于无人值守登录的可选私钥路径。',
+  experimentDataRoots: '本地数据目录', experimentDataRootsHint: '可复制数据集文件的绝对路径，用逗号分隔。',
+  experimentTokenRef: '接收端令牌引用', experimentTokenRefHint: '凭据引用；密钥值保存在凭据存储中。',
+  experimentAgentCredentialRefs: '模型凭据引用', experimentAgentCredentialRefsHint: '复制到远端工作器的凭据引用，用逗号分隔。',
+  experimentToolTimeoutMs: '工具超时（毫秒）', experimentToolTimeoutMsHint: '准备和提交操作的最长时间。',
+  experimentInvalidList: '请用逗号分隔，且不要留空项。',
+  experimentRecordsTitle: '实验', experimentReload: '重新加载', experimentLoading: '正在加载实验…',
+  experimentEmpty: '此部署尚未提交实验。',
+  experimentReserved: '已预留', experimentAccepted: '已接管', experimentComplete: '已完成',
+  experimentBlocked: '已阻塞', experimentFailed: '失败', experimentCancelled: '已取消',
+  experimentInterrupted: '已中断', experimentUnknown: '等待回执',
+  experimentLegacyTarget: '未保存服务器', experimentSubmissionId: '提交编号',
+  experimentLocalGoal: '本地 Goal', experimentRemoteSession: '远端会话',
+  experimentRemoteGoal: '远端 Goal', experimentArtifacts: '产物路径',
+  experimentWorkerLog: '工作器日志', experimentDetail: '详情',
+  experimentHandover: '本机派发完成，远端实验已接管',
+  experimentRefresh: '刷新', experimentCancel: '取消', experimentBytes: '字节',
+  experimentReceiverToken: '接收端令牌',
+  experimentReceiverTokenHint: '按上方引用保存在凭据存储中；留空保留当前令牌。',
+  experimentTokenSet: '已配置令牌。', experimentTokenUnset: '未配置令牌。',
 }

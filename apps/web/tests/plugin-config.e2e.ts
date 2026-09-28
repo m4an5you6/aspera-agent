@@ -9,7 +9,7 @@ import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import type { Browser, Locator, Page } from 'playwright'
 import { chromium } from 'playwright'
-import { afterAll, beforeAll, describe, expect, it, onTestFailed } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, onTestFailed, vi } from 'vitest'
 import { join } from 'node:path'
 import {
   assertFixtureInventory, captureStableAria, compareOrRefreshGolden,
@@ -22,6 +22,7 @@ const OFFICIAL_EXPECTED = join(SNAPSHOT_DIR, 'official.expected.md')
 const ROW_EXPECTED = join(SNAPSHOT_DIR, 'row.expected.md')
 const FIXTURE_PLUGINS = fileURLToPath(new URL('./fixtures/plugins', import.meta.url))
 const MODE = webSnapshotMode()
+const SHELL_DEFAULT_TIMEOUT = process.platform === 'win32' ? '120000' : '60000'
 
 describe('web e2e: plugin configuration pages', () => {
   let scaffold: WebScaffold
@@ -35,7 +36,7 @@ describe('web e2e: plugin configuration pages', () => {
     scaffold = await launchWebScaffold({
       profile: { packages: [{ dir: join(FIXTURE_PLUGINS, 'fixture-live-client') }] },
     })
-    browser = await chromium.launch()
+    browser = await chromium.launch(process.env.DSH_WEB_E2E_BROWSER_CHANNEL === 'chrome' ? { channel: 'chrome' } : {})
     // Chinese browser: the pages assert the localized copy the client derives
     // from it, as the rest of the settings surface does.
     page = await browser.newPage({ viewport: { width: 1680, height: 1000 }, locale: ZH_BROWSER_LOCALE })
@@ -90,8 +91,8 @@ describe('web e2e: plugin configuration pages', () => {
     await panel.getByRole('button', { name: '查看 网页搜索', exact: true }).waitFor({ timeout: 20_000 })
     const official = panel.locator('[data-plugin-group="official"]')
     expect(await official.locator('[data-plugin-package]').count()).toBe(2)
-    expect(await official.locator('[data-plugin-item]').count()).toBe(4)
-    for (const title of ['终端', 'Agent 循环', 'Subagent', '网页搜索']) {
+    expect(await official.locator('[data-plugin-item]').count()).toBe(5)
+    for (const title of ['终端', 'Agent 循环', 'Subagent', '网页搜索', 'GPU 实验派发']) {
       expect(await official.getByRole('button', { name: `查看 ${title}`, exact: true }).count()).toBe(1)
     }
     // A card carries the one-liner; the fields wait for the page.
@@ -101,6 +102,52 @@ describe('web e2e: plugin configuration pages', () => {
     const snapshot = await captureStableAria(page, '[data-plugin-panel]', scaffold.workspaceCwd)
     await compareOrRefreshGolden(OFFICIAL_EXPECTED, snapshot, MODE)
     expect(tripwire.pageErrors).toEqual([])
+  }, 60_000)
+
+  it('configures the GPU target through the real Web settings wire and reads saved experiments', async () => {
+    onTestFailed(() => saveFailureShot(page, 'web-e2e-experiment-dispatch-config'))
+    const panel = await openPlugins()
+    await openPage(panel, 'GPU 实验派发')
+    await panel.getByRole('heading', { name: '实验', exact: true }).waitFor()
+    await panel.getByText('此部署尚未提交实验。', { exact: true }).waitFor({ timeout: 10_000 })
+    const host = panel.getByLabel('SSH 主机', { exact: true })
+    const root = panel.getByLabel('远端目录', { exact: true })
+    await host.fill('gpu.example.test')
+    await root.fill('/srv/dsh-experiments')
+    await panel.getByLabel('接收端令牌', { exact: true }).fill('test-only-receiver-token')
+    expect(await settingsDocument()).not.toContain('gpu.example.test')
+    await panel.getByRole('button', { name: '保存', exact: true }).click()
+    await expect.poll(settingsDocument).toContain('gpu.example.test')
+    await expect.poll(settingsDocument).toContain('/srv/dsh-experiments')
+    await panel.getByText('已配置令牌。', { exact: true }).waitFor()
+    expect(await settingsDocument()).not.toContain('test-only-receiver-token')
+    await panel.getByRole('button', { name: '重新加载', exact: true }).click()
+    await panel.getByText('此部署尚未提交实验。', { exact: true }).waitFor()
+    expect(tripwire.pageErrors).toEqual([])
+  }, 60_000)
+
+  it('shows the saved handover notice with the receiver receipt', async () => {
+    const panel = await openPlugins()
+    await openPage(panel, 'GPU 实验派发')
+    const dispatch = scaffold.ctx.get('experimentDispatch') as { list: () => unknown[] } | undefined
+    if (dispatch === undefined) throw new Error('experiment dispatch Remote is unavailable')
+    const list = vi.spyOn(dispatch, 'list').mockReturnValue([{
+      submissionId: 'submission-1', host: 'gpu.example.test',
+      handover: '本机派发完成，远端实验已接管',
+      receipt: {
+        submissionId: 'submission-1', deploymentId: 'deployment-1', payloadHash: 'payload-hash',
+        spec: { objective: 'train', datasetRefs: [], constraints: [], outputPath: 'artifacts/submission-1' },
+        sessionId: 'remote-session', goalId: 'remote-goal', artifactPath: '/artifacts',
+        workerLogPath: '/worker.log', state: 'accepted', createdAt: 1, updatedAt: 1,
+      },
+    }])
+    try {
+      await panel.getByRole('button', { name: '重新加载', exact: true }).click()
+      await panel.getByText('本机派发完成，远端实验已接管', { exact: true }).waitFor()
+      expect(await panel.getByText('remote-session', { exact: true }).count()).toBe(1)
+    } finally {
+      list.mockRestore()
+    }
   }, 60_000)
 
   it('saves subagent limits and resets them to the deployment defaults', async () => {
@@ -204,7 +251,7 @@ describe('web e2e: plugin configuration pages', () => {
     const timeout = panel.getByLabel('命令超时（毫秒）')
     await timeout.waitFor({ timeout: 10_000 })
     // The composed default this deployment ships, before any user layer.
-    expect(await timeout.inputValue()).toBe('60000')
+    expect(await timeout.inputValue()).toBe(SHELL_DEFAULT_TIMEOUT)
     await timeout.fill('12000')
     await timeout.blur()
 
@@ -269,14 +316,14 @@ describe('web e2e: plugin configuration pages', () => {
     // The reset stages the composed default; the document still carries the
     // override until the save lands.
     await panel.getByRole('button', { name: '恢复默认' }).click()
-    await expect.poll(() => timeout.inputValue(), { timeout: 5_000 }).toBe('60000')
+    await expect.poll(() => timeout.inputValue(), { timeout: 5_000 }).toBe(SHELL_DEFAULT_TIMEOUT)
     expect(await settingsDocument()).toContain('timeoutMs: 12000')
 
     await panel.getByRole('button', { name: '保存', exact: true }).click()
 
     await expect.poll(async () => (await settingsDocument()).includes('timeoutMs'), { timeout: 10_000 })
       .toBe(false)
-    expect(await timeout.inputValue()).toBe('60000')
+    expect(await timeout.inputValue()).toBe(SHELL_DEFAULT_TIMEOUT)
     expect(await panel.getByText('已覆盖').count()).toBe(0)
     expect(tripwire.pageErrors).toEqual([])
   }, 60_000)

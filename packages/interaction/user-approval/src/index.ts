@@ -160,7 +160,8 @@ export class ApprovalService extends Service {
           const agent = context.agent
           // A bare assemble() (tests, diagnostics) has no session to state.
           if (agent === undefined) return ''
-          const policy = effective(agent)
+          const covered = scope.get('goalUnattended') as { covers(agent: Agent): boolean } | undefined
+          const policy = covered?.covers(agent) === true ? 'never' : effective(agent)
           return policy === 'never' ? NEVER_SENTENCE : ASK_SENTENCE
         },
       })
@@ -265,7 +266,8 @@ export class ApprovalService extends Service {
     // ahead of any gate LISTENER, so a listener-shaped gate cannot keep the
     // documented promise that 'never' rejects deterministically regardless
     // of registration order — only the service's own request path can.
-    if (this.effectivePolicy(session) === 'never') return 'rejected'
+    const covered = this.ctx.get('goalUnattended') as { covers(agent: Agent): boolean } | undefined
+    if (covered?.covers(req.agent) === true || this.effectivePolicy(session) === 'never') return 'rejected'
     // Enter the promise chain BEFORE dispatching: a listener that throws
     // SYNCHRONOUSLY (before its first await) must land in the same rejection
     // path as an async one — `Promise.resolve(call())` would let it escape

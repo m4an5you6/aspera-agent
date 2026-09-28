@@ -25,7 +25,7 @@ kind: "package-reference"
 <a id="use-this-package"></a>
 ## 使用本包
 
-打开设置中的**内置插件**查看只读的插件列表；它由 [ui-settings-plugin-inventory](../ui-settings-plugin-inventory/README.zh.md) 作为分区唯一的标签页贡献，直接显示为页面本身。要配置宿主平面插件，在侧栏选择**插件**：官方分组为本部署组装的每个插件列出一张卡片，顺序依次为 shell 执行器（`shell`）、agent loop 的工具调用并行度（`agent-loop`）、Subagent 委派限制和模型选择（`subagent` 与 `subagent-model-selection`）以及 DeepSeek 搜索提供方（`web-search-deepseek`），点开卡片就是该插件带表单的页面。
+打开设置中的**内置插件**查看只读的插件列表；它由 [ui-settings-plugin-inventory](../ui-settings-plugin-inventory/README.zh.md) 作为分区唯一的标签页贡献，直接显示为页面本身。要配置宿主平面插件，在侧栏选择**插件**：官方分组为本部署组装的每个插件列出一张卡片，顺序依次为 shell 执行器（`shell`）、agent loop 的工具调用并行度（`agent-loop`）、Subagent 委派限制和模型选择（`subagent` 与 `subagent-model-selection`）、DeepSeek 搜索提供方（`web-search-deepseek`）以及 GPU 实验派发（`experiment-dispatch`），点开卡片就是该插件带表单的页面。
 
 ### 这里会出现什么
 
@@ -44,6 +44,8 @@ kind: "package-reference"
 ### secret 角色字段
 
 密钥控件初始为空、只报告是否已配置，并经由 credentials 领域而非 settings 分节写入；空草稿不写入任何东西，保留已存密钥。
+
+GPU 实验页面暂存 SSH 目标、本地源码与数据路径、接收端令牌引用及模型凭据引用。接收端令牌在目标配置保存后将其值写入凭据存储；设置文档始终不包含该值。实验列表显示已保存的接管说明和接收端回执，并使用各记录保存的服务器刷新远端状态或取消实验。
 
 -----
 

@@ -1,0 +1,101 @@
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.intro {
+  margin: 0 0 14px;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.records {
+  border-top: 1px solid var(--dsw-alias-border-default);
+  padding-top: 18px;
+}
+
+.heading,
+.recordHead,
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.heading,
+.recordHead {
+  justify-content: space-between;
+}
+
+.heading h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.heading button,
+.actions button {
+  border: 1px solid var(--dsw-alias-border-default);
+  border-radius: 7px;
+  padding: 4px 10px;
+  background: transparent;
+  color: var(--dsw-alias-label-primary);
+  cursor: pointer;
+}
+
+.heading button:disabled,
+.actions button:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.record {
+  margin-top: 12px;
+  border: 1px solid var(--dsw-alias-border-default);
+  border-radius: 9px;
+  padding: 12px;
+  overflow-wrap: anywhere;
+}
+
+.recordHead {
+  font-size: 13px;
+}
+
+.recordHead span {
+  color: var(--dsw-alias-label-secondary);
+}
+
+.handover {
+  margin: 10px 0 0;
+  color: var(--dsw-alias-label-primary);
+  font-size: 13px;
+}
+
+.record dl {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 5px 10px;
+  margin: 12px 0;
+  font-size: 12px;
+}
+
+.record dt {
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.record dd {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.artifacts {
+  margin: 8px 0;
+  padding-left: 18px;
+  font-size: 12px;
+}
+
+.error {
+  color: var(--dsw-alias-label-error);
+  font-size: 12px;
+}

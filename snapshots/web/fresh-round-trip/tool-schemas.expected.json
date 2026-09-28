@@ -109,6 +109,21 @@
       }
     },
     {
+      "name": "cancel_experiment",
+      "description": "Cancel a remote experiment and wait for its owned Agent and children to stop.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "submission_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "submission_id"
+        ]
+      }
+    },
+    {
       "name": "create_goal",
       "description": "Create one persisted same-session completion goal when the current direct human request is a long-running objective that should continue across autonomous goal rounds. You may infer that intent without requiring the user to say \"create a goal\". Do not use this for trivial single-turn work. Execution rejects non-human and subagent authority.",
       "parameters": {
@@ -183,6 +198,21 @@
         },
         "required": [
           "plan"
+        ]
+      }
+    },
+    {
+      "name": "get_experiment_status",
+      "description": "Read the durable remote status of a submitted experiment.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "submission_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "submission_id"
         ]
       }
     },
@@ -321,6 +351,14 @@
             ]
           }
         }
+      }
+    },
+    {
+      "name": "prepare_experiment_environment",
+      "description": "Deploy this DSH source to the configured GPU target and verify real sandbox and CUDA access before submission.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
       }
     },
     {
@@ -479,6 +517,52 @@
         "required": [
           "description",
           "prompt"
+        ]
+      }
+    },
+    {
+      "name": "submit_experiment",
+      "description": "Submit one experiment to the prepared worker. The returned accepted receipt means the remote DSH owns the run independently.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "preparation_id": {
+            "type": "string"
+          },
+          "objective": {
+            "type": "string"
+          },
+          "agent_model_provider": {
+            "type": "string"
+          },
+          "agent_model_id": {
+            "type": "string"
+          },
+          "training_model": {
+            "type": "string"
+          },
+          "training_method": {
+            "type": "string"
+          },
+          "required_gpus": {
+            "type": "number"
+          },
+          "dataset_refs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "constraints": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "preparation_id",
+          "objective"
         ]
       }
     },

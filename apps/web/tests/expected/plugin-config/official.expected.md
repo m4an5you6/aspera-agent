@@ -5,7 +5,7 @@
   - img
   - text: 添加插件
 - heading "官方" [level=3]
-- text: "6"
+- text: "7"
 - list:
   - listitem:
     - button "查看 智能体团队": 智能体团队
@@ -27,6 +27,9 @@
   - listitem:
     - button "查看 网页搜索": 网页搜索
     - text: DeepSeek 搜索提供方。
+  - listitem:
+    - button "查看 GPU 实验派发": GPU 实验派发
+    - text: 配置 GPU 服务器，并在远端接管后查看实验状态。
 - heading "已安装" [level=3]
 - text: "1"
 - list:

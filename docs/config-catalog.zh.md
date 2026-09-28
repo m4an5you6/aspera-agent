@@ -577,21 +577,21 @@ export interface Config {
 
 ## `@deepseek-ai/dsh-experiment-dispatch`
 
-需要：`agents` · `credentials` · `tools` · `storageDomain` · `systemPrompt`
+需要：`agents` · `credentials` · `goals` · `tools` · `storageDomain` · `systemPrompt`
 
 ```ts config-catalog
 /** Fixed deployment target and bounded setup operations. */
 export interface Config {
   /** Known-hosts-verified OpenSSH destination for the GPU target. */
-  readonly host: string
+  readonly host?: string
   /** Remote SSH listener port. */
-  readonly sshPort: number
+  readonly sshPort?: number
   /** Loopback HTTP receiver port reached through an SSH tunnel. */
-  readonly remotePort: number
+  readonly remotePort?: number
   /** Absolute private deployment directory on the target. */
-  readonly remoteRoot: string
+  readonly remoteRoot?: string
   /** Absolute local checkout whose current source is deployed. */
-  readonly localRepo: string
+  readonly localRepo?: string
   /** Optional OpenSSH private identity file for non-interactive login. */
   readonly identityFile?: string
   /** Local directories from which dataset files may be transferred. */
@@ -599,7 +599,7 @@ export interface Config {
   /** System packages permitted for extraction into the private tools directory. */
   readonly allowedSystemPackages?: string[]
   /** Credential reference for the receiver Bearer token. */
-  readonly tokenRef: string
+  readonly tokenRef?: string
   /** Credential references copied into the remote worker's private model store. */
   readonly agentCredentialRefs?: string[]
   /** Preparation/submission tool deadline and process timeout for archives, SSH and SCP, in milliseconds. */
@@ -607,7 +607,7 @@ export interface Config {
 }
 ```
 
-来源：[`packages/workflow/experiment-dispatch/src/index.ts:25`](../packages/workflow/experiment-dispatch/src/index.ts)
+来源：[`packages/workflow/experiment-dispatch/src/index.ts:33`](../packages/workflow/experiment-dispatch/src/index.ts)
 
 <a id="deepseek-aidsh-experiment-worker"></a>
 
@@ -1960,7 +1960,7 @@ export interface Config {
 }
 ```
 
-来源： [`packages/boot/plugin-manager/src/index.ts:33`](../packages/boot/plugin-manager/src/index.ts)
+来源： [`packages/boot/plugin-manager/src/index.ts:34`](../packages/boot/plugin-manager/src/index.ts)
 
 <a id="deepseek-aidsh-plugin-package-inventory-deepseek"></a>
 

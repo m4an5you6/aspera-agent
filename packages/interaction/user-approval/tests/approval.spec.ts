@@ -419,6 +419,18 @@ describe('approval policy (the approval/policy fold)', () => {
     expect(session.snapshotEvents().filter(e => e.type === 'approval/decided')).toHaveLength(1)
   })
 
+  it('rejects approval for an unattended Goal even when approval policy is ask', async () => {
+    const ctx = new Context()
+    ctx.provide('goalUnattended', { covers: () => true })
+    await ctx.plugin(ApprovalService, { policy: 'ask' })
+    const consulted = vi.fn()
+    ctx.on('approval/request', () => { consulted(); return Promise.resolve<ApprovalOutcome>('allowed-once') })
+    const { agent, session } = sessionAgent('sess-unattended-goal')
+    await expect(ctx.approval.request({ agent, toolName: 'bash' })).resolves.toBe('rejected')
+    expect(consulted).not.toHaveBeenCalled()
+    expect(session.snapshotEvents().filter(e => e.type === 'approval/decided').at(-1)?.data.outcome).toBe('rejected')
+  })
+
   it('the gate decides FIRST even against an answerer registered before the service (prepend)', async () => {
     const ctx = new Context()
     ctx.on('approval/request', () => Promise.resolve<ApprovalOutcome>('allowed-once'))
