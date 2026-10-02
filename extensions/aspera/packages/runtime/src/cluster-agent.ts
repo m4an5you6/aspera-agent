@@ -21,6 +21,7 @@ import { clusterCommandStatuses, clusterNodeRequest, readClusterPrivate, writeCl
 import type { ClusterRuntimeConfig, ClusterPrivate } from './cluster-runtime.ts'
 import { installGoalContinuation } from './continuation.ts'
 import { installExperimentQuestions } from './questions.ts'
+import { serverRunRoot } from './storage.ts'
 
 const output = { schema: { type: 'string' as const }, render: (_args: object, value: string) => [{ type: 'text' as const, text: value }] }
 const presentCall = (args: object) => ({ card: 'generic' as const, title: 'Aspera node operation', kind: 'other' as const, rawInput: args })
@@ -50,7 +51,7 @@ function installKnowledge(ctx: Context, runtime: ClusterPrivate, config: Cluster
     parameters: { name: { type: 'string', required: true }, offset: { type: 'number', required: true }, generation: { type: 'string' } }, output, presentCall,
     execute: async args => {
       if (!runtime.submission.inputs.some(input => input.name === args.name)) throw new Error('input is outside this experiment')
-      const folder = resolve(config.root, 'runs', runtime.submission.experimentId, 'inputs')
+      const folder = resolve(serverRunRoot(runtime.submission.coordinator, runtime.submission.experimentId), 'inputs')
       return JSON.stringify(readClusterChunk(clusterPath(folder, args.name), args.offset, args.generation, config.chunkBytes, folder))
     } })))
 }
@@ -78,12 +79,12 @@ function installNodeTools(ctx: Context, runtime: ClusterPrivate, config: Cluster
     execute: async args => JSON.stringify(await clusterNodeRequest(runtime, serverIdSchema.parse(args.server_id), 'files')) })))
   ctx.effect(() => ctx.tools.register(defineTool({ name: 'record_experiment_execution', description: 'Persist the actual framework version, script path, isolated environment, parameters, artifacts and evaluation metrics for this step. JSON fields: serverId, framework, version, script, environment, parameters (string values), artifacts, evaluation (numeric values).',
     parameters: { json: { type: 'string', required: true } }, output, presentCall,
-    execute: async args => { const entry = executionEntrySchema.parse(JSON.parse(args.json)); if (!runtime.submission.nodes.some(node => node.server.id === entry.serverId)) throw new Error('execution node is outside this experiment'); appendFileSync(resolve(config.root, 'runs', runtime.submission.experimentId, 'executions.jsonl'), JSON.stringify(entry) + '\n', { mode: 0o600 }); return JSON.stringify(entry) } })))
+    execute: async args => { const entry = executionEntrySchema.parse(JSON.parse(args.json)); if (!runtime.submission.nodes.some(node => node.server.id === entry.serverId)) throw new Error('execution node is outside this experiment'); appendFileSync(resolve(serverRunRoot(runtime.submission.coordinator, runtime.submission.experimentId), 'executions.jsonl'), JSON.stringify(entry) + '\n', { mode: 0o600 }); return JSON.stringify(entry) } })))
   ctx.effect(() => ctx.tools.register(defineTool({ name: 'report_experiment_progress', description: 'Persist measured numeric metrics and the current phase. Do not invent measurements.', parameters: { phase: { type: 'string', required: true }, metrics_json: { type: 'string', required: true } }, output, presentCall,
     execute: async args => { const progress = progressSchema.parse({ phase: args.phase, metrics: JSON.parse(args.metrics_json), updatedAt: Date.now() }); writeClusterReceipt(config.root, runtime.submission.experimentId, progress, 'progress.json'); return JSON.stringify(progress) } })))
-  ctx.effect(() => ctx.tools.register(defineTool({ name: 'start_inference_service', description: 'Register a managed inference process on an assigned node. Use a stable service_id UUID for retries, bind the command to 127.0.0.1, supply a real HTTP health endpoint and relative model artifact. It survives Goal completion and retains the experiment server group until stopped. No automatic restart or public exposure is configured.',
-    parameters: { server_id: { type: 'string', required: true }, service_id: { type: 'string', required: true }, command: { type: 'string', required: true }, model_path: { type: 'string', required: true }, port: { type: 'number', required: true }, health_path: { type: 'string', required: true } }, output, presentCall,
-    execute: async args => { const id = serviceIdSchema.parse(args.service_id); return JSON.stringify(await run(args.server_id, `service-${id}`, 'register-service', { id, command: args.command, modelPath: args.model_path, port: args.port, healthPath: args.health_path })) } })))
+  ctx.effect(() => ctx.tools.register(defineTool({ name: 'start_inference_service', description: 'Register a managed inference process on an assigned node. Reuse service_id on retries. Bind the model command to 127.0.0.1 on an unused port, supply its real HTTP health path and model artifact. Set publish=true only when public inference is requested and the node has a saved inferenceMapping. The node opens that mapping port on 0.0.0.0 with separate Bearer authentication and forwards to the private model port; never bind the model to the mapping port. model_name is the model API identifier. No credentials are returned. Check both local health and external reachability. Services survive Goal completion; no automatic restart.',
+    parameters: { server_id: { type: 'string', required: true }, service_id: { type: 'string', required: true }, command: { type: 'string', required: true }, model_path: { type: 'string', required: true }, port: { type: 'number', required: true }, health_path: { type: 'string', required: true }, publish: { type: 'boolean' }, model_name: { type: 'string' } }, output, presentCall,
+    execute: async args => { const id = serviceIdSchema.parse(args.service_id); return JSON.stringify(await run(args.server_id, `service-${id}`, 'register-service', { id, command: args.command, modelPath: args.model_path, port: args.port, healthPath: args.health_path, publish: args.publish, modelName: args.model_name })) } })))
   ctx.effect(() => ctx.tools.register(defineTool({ name: 'get_inference_services', description: 'Read live process and HTTP health facts for registered inference services on every node.', parameters: {}, output, presentCall,
     execute: async () => JSON.stringify((await Promise.all(runtime.submission.nodes.map(node => clusterNodeRequest(runtime, node.server.id, 'services')))).flat()) })))
 }
@@ -93,7 +94,7 @@ function installNodeTools(ctx: Context, runtime: ClusterPrivate, config: Cluster
  */
 export async function runClusterAgent(ctx: Context, config: ClusterRuntimeConfig, id: ExperimentId, planning = false): Promise<void> {
   const runtime = readClusterPrivate(config.root, id)
-  const root = resolve(config.root, 'runs', id)
+  const root = serverRunRoot(runtime.submission.coordinator, id)
   mkdirSync(root, { recursive: true, mode: 0o700 })
   const generation = readFileSync(resolve(config.root, 'state', 'coordinator.generation'), 'utf8')
   if (generation !== process.env.DSH_CLUSTER_GENERATION) throw new Error('coordinator generation changed before Agent startup')
@@ -178,7 +179,7 @@ export async function runClusterAgent(ctx: Context, config: ClusterRuntimeConfig
       await ctx.sessionPersistence.flush()
     })().catch((failure: unknown) => { if (!retryLifetime.signal.aborted) finish('failed', String(failure)) })
   })
-  if (runtime.submission.protocol !== 2) throw new Error('Legacy experiments must retain their original release')
+  if (runtime.submission.protocol !== 3) throw new Error('Legacy experiments must retain their original release')
   installGoalContinuation(ctx, handle.agent, config.goalContinuationWindow)
   const goal = ctx.goals.create(handle.agent, { objective: runtime.submission.objective, maxGoalRounds: config.goalContinuationWindow })
   let approved = ''
@@ -190,7 +191,7 @@ export async function runClusterAgent(ctx: Context, config: ClusterRuntimeConfig
     + 'For multiple nodes, preserve stable ranks, shared rendezvous and verify a real collective communication test. Never reduce the node group or change explicit training requirements. '
     + (runtime.submission.strategy.mode === 'semi' ? 'When independent investigation cannot resolve a choice, use ask_user_question to pause for a desktop reply. A reply cannot change explicit requirements or grant permissions. ' : 'Human waiting is disabled. Decide unspecified parameters within the constraints, retry recoverable errors and use short measured runs to adjust. ')
     + 'There is no total task runtime, command or round budget. Do not install Harness plugins, change the control service environment, or detach unmanaged processes. Preserve specified models, data, training methods and servers. Mark blocked with a concrete reason and evidence when constraints cannot be satisfied; use a new experiment for changed requirements. '
-    + 'An inference service must bind to 127.0.0.1 and pass its HTTP health check before completion. Ordinary commands must settle. Use the finish tool to persist the final outcome.' }] }))
+    + 'An inference model must bind to 127.0.0.1 and pass its HTTP health check before completion. If external access is requested, use the saved node inferenceMapping with publish=true and verify external.state=reachable before reporting it usable. Never infer a platform URL from a private IP or SSH port. The node gateway manages authentication; do not print or request credentials. Ordinary commands must settle. Use the finish tool to persist the final outcome.' }] }))
   await ctx.sessionPersistence.flush()
   writeClusterReceipt(config.root, id, { sessionId, goalId: goal.id }, planning ? 'planning-started.json' : 'started.json')
 }

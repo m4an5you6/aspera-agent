@@ -5,10 +5,10 @@ import { resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { _electron as electron, expect } from '@playwright/test'
 import { openAspera, removeTestDirectory } from './test-app.mjs'
+import { desktopOutput } from './desktop-output.mjs'
 
-const root = resolve(import.meta.dirname, '..'); const artifacts = resolve(root, '.artifacts')
-const version = JSON.parse(readFileSync(resolve(root, 'apps/desktop/package.json'), 'utf8')).version
-const output = resolve(artifacts, `desktop-${version}`)
+const root = resolve(import.meta.dirname, '..')
+const output = desktopOutput(root)
 const executable = resolve(output, 'win-unpacked/Aspera.exe')
 assert.ok(existsSync(executable), 'Build the Windows desktop package first')
 const directory = mkdtempSync(resolve(tmpdir(), 'aspera-desktop-test-')); const userData = resolve(directory, 'user-data')

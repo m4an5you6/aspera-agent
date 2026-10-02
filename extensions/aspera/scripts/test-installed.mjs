@@ -20,13 +20,13 @@ try {
   await command(process.execPath, [pnpm, 'install', '--offline', '--frozen-lockfile', '--prod', '--store-dir', store], installRoot)
   const manifest = JSON.parse(readFileSync(resolve(installRoot, 'package.json'), 'utf8'))
   assert.equal(manifest.dependencies['@deepseek-ai/dsh'], '0.2.0-rc.2')
-  assert.equal(JSON.parse(readFileSync(resolve(installRoot, 'aspera-release.json'), 'utf8')).extension, '0.2.0')
+  assert.equal(JSON.parse(readFileSync(resolve(installRoot, 'aspera-release.json'), 'utf8')).extension, '0.1.1')
   assert.equal(existsSync(resolve(installRoot, 'packages')), false)
   assert.ok(existsSync(resolve(installRoot, 'node_modules/@aspera/console/lib/client/index.d.ts')))
   for (const name of ['experiments', 'runtime', 'dispatch', 'console']) {
     const packageRoot = resolve(installRoot, 'node_modules/@aspera', name)
     const publicPackage = JSON.parse(readFileSync(resolve(packageRoot, 'package.json'), 'utf8'))
-    assert.equal(publicPackage.version, '0.2.0')
+    assert.equal(publicPackage.version, '0.1.1')
     for (const [entry, fields] of Object.entries(publicPackage.exports)) {
       for (const file of typeof fields === 'string' ? [fields] : Object.values(fields)) assert.ok(existsSync(resolve(packageRoot, file)), `${name} export ${entry} is missing ${file}`)
     }
@@ -39,7 +39,10 @@ try {
   finally { repacked.dispose() }
   const home = resolve(installRoot, 'home')
   await command(process.execPath, ['setup.mjs'], installRoot, { DSH_HOME: home })
-  app = await launchProfile(installRoot, home, 'aspera')
+  const startup = performance.now()
+  console.log('Starting the independently installed profile')
+  app = await launchProfile(installRoot, home, 'aspera', {}, 180000)
+  console.log(`Installed profile ready in ${Math.round(performance.now() - startup)} ms`)
   browser = await chromium.launch({ channel: process.env.ASPERA_BROWSER_CHANNEL || 'chrome', headless: true })
   const page = await browser.newPage()
   const errors = []

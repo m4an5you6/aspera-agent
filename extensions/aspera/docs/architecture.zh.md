@@ -42,6 +42,10 @@ flowchart TB
     Browser[Web browser] --> Page
     Page --> Remote[Typed Remote: RPC + streams]
     Remote --> Fleet[Aspera dispatch: fleet / credentials / Sessions]
+    Fleet --> Inventory[Read-only SSH: mounts / space / interfaces]
+    Inventory --> Selection[Restricted Agent: candidate ID + reason]
+    Selection --> Placement[Persist placement before directory creation]
+    Placement --> Network[Mutual node identity and network checks]
   end
   subgraph Coordinator[First server: durable coordinator]
     Queue[Aspera experiments: queue / plans / resource groups]
@@ -50,7 +54,7 @@ flowchart TB
     Queue --> Planner
     Queue --> Executor
   end
-  Fleet -- SSH: pinned release / inputs / credentials --> Queue
+  Network -- SSH: pinned release / inputs / credentials --> Queue
   Queue -- receipt / state / logs / files --> Remote
   subgraph Nodes[Selected Linux GPU nodes]
     NodeA[Node A control profile] --> RunA[Isolated environment / managed commands]
@@ -58,6 +62,8 @@ flowchart TB
     RunA --> Frameworks[Megatron / MS-SWIFT / Unsloth]
     RunB --> Frameworks
     RunA --> Service[Registered inference services]
+    External[Platform HTTPS URL] --> Gateway[Authenticated inference gateway]
+    Gateway --> Service
   end
   Executor -- SSH tunnel + private HTTP --> NodeA
   Executor -- SSH tunnel + private HTTP --> NodeB
@@ -78,6 +84,9 @@ sequenceDiagram
   User->>UI: Submit Goal and server group
   UI->>Fleet: Create independent experiment
   Fleet-->>UI: Preparing; another Goal can be submitted
+  Fleet->>Node: Read mounts, space and network interfaces over SSH
+  Fleet->>Fleet: Agent selects candidate; persist paths and reason
+  Fleet->>Node: Create owned directories; deploy; verify mutual network
   Fleet->>Queue: Fixed release, inputs and private credentials
   Queue->>Queue: Validate and persist admission
   Queue-->>Fleet: Full handover receipt
@@ -90,6 +99,7 @@ sequenceDiagram
     Fleet->>Queue: Persist confirmation
   end
   Queue->>Queue: FIFO; allocate the entire free server group
+  Queue->>Node: Recheck selected mounts, free space and network
   Queue->>Agent: Start independent execution Session + Goal
   Agent->>Node: Prepare experiment environment; run scoped commands
   Node-->>Queue: Logs, metrics, artifacts and service health
@@ -110,9 +120,9 @@ sequenceDiagram
 <a id="execution-and-ownership"></a>
 ## 执行与归属
 
-管理 Host 固定请求，移交按内容寻址的发布包、输入摘要和私有凭据。调度主机检查材料后才持久接收。规划 Agent 使用实验专属 profile，不具有节点命令工具。确认后任务进入可分配状态，所有选定节点整组分配，再检查通信和输入。
+管理 Host 先记录只读 SSH 探测，再由受限派发 Agent 选择候选 ID 并说明理由。手动目录优先，也允许空间充足的系统盘。创建专属目录前保存选择；准备、上传及启动时复查挂载身份、归属、写入能力和空间。接收前通过短时双向通信证明核对节点及实验身份，排队分配后再次检查。失败会停止联合启动，不减少节点组。
 
-执行 Agent 使用独立的 profile 进程。其工具调用经过认证的节点控制服务，后者持久保存分配与命令身份。每个节点仅提供获准设备，隐藏控制凭据和状态目录，将实验工作目录设为可写，其余文件系统只读。网络共享用于依赖下载和训练通信，此处不提供网络隔离。框架环境创建在实验可写目录内。
+控制状态、队列和凭据位于登录用户固定的私有控制目录。发布文件及每个实验的输入、Agent 状态、日志、缓存、环境、临时文件和产物使用选中磁盘。节点工具只暴露获准设备，隐藏控制目录与已登记的实验存储根目录，仅将当前工作目录挂载为可写。框架缓存和环境变量指向该目录。网络仍共享以便下载和训练，此处不提供网络隔离。
 
 登记的推理进程归节点控制服务管理。Goal 结束或浏览器断线后，服务继续运行并占用整组资源。调度服务重启会恢复服务观察；训练结果或节点进程身份不明时标记为中断，保留未确认的资源占用。取消只有在每个节点确认清理后才释放整组资源。
 

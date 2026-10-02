@@ -9,17 +9,18 @@ import { pathToFileURL } from 'node:url'
 import { setupWorkerProfile } from '@aspera/runtime'
 import { clusterSubmissionSchema } from '@aspera/experiments'
 import { removeTestDirectory } from './test-app.mjs'
+import { resolvedFixture } from './fixtures/storage.mjs'
 
 const release = resolve(import.meta.dirname, '..')
 mkdirSync(resolve(release, '.artifacts'), { recursive: true })
 const directory = mkdtempSync(resolve(release, '.artifacts/worker-test-'))
 const root = process.platform === 'win32' ? directory.slice(2).replaceAll('\\', '/') : directory
 const generation = randomUUID(); const id = randomUUID(); const serverId = randomUUID()
-const server = { id: serverId, name: 'Local replay', host: 'fixture.test', sshPort: 22, username: 'trainer', remotePort: 43019, remoteRoot: root, authMode: 'password' }
-const submission = clusterSubmissionSchema.parse({ protocol: 2, experimentId: id, deploymentId: 'a'.repeat(64), objective: 'Prepare a version-specific experiment',
+const { server, inventory } = resolvedFixture({ id: serverId, name: 'Local replay', host: 'fixture.test', sshPort: 22, username: 'trainer', remotePort: 43019, remoteRoot: root, authMode: 'password' }, id, 'a'.repeat(64))
+const submission = clusterSubmissionSchema.parse({ protocol: 3, experimentId: id, deploymentId: 'a'.repeat(64), inventories: [{ serverId, inventory }], objective: 'Prepare a version-specific experiment',
   coordinator: server, nodes: [{ server, devicePaths: ['/dev/nvidia_fixture'], backendPath: '/fixture/bwrap', hiddenPaths: [], gpuInfo: 'Replay; no GPU' }],
   inputs: [{ name: 'data.txt', sha256: createHash('sha256').update('dataset row\n').digest('hex') }], createdAt: 1, strategy: { mode: 'automatic', coordinator: 'single-agent' },
-  versions: { dsh: '0.2.0-rc.2', extension: '0.2.0', harness: 'a'.repeat(64), data: [] } })
+  versions: { dsh: '0.2.0-rc.2', extension: '0.1.1', harness: 'a'.repeat(64), data: [] } })
 const run = resolve(directory, 'runs', id)
 mkdirSync(resolve(directory, 'secrets'), { recursive: true })
 mkdirSync(resolve(directory, 'state'), { recursive: true })
@@ -54,7 +55,7 @@ try {
         DSH_EXPERIMENT_MODEL_CREDENTIAL_FILE: modelFile, DSH_EXPERIMENT_PORT: '0', DSH_CLUSTER_GOAL_WINDOW: renewRounds ? '2' : '128', DSH_TELEMETRY_DISABLED: '1', DEEPSEEK_API_KEY: '' } })
     let output = ''; child.stdout.on('data', bytes => { output += bytes }); child.stderr.on('data', bytes => { output += bytes })
     let timedOut = false
-    const timer = setTimeout(() => { timedOut = true; child.kill('SIGTERM') }, 60000)
+    const timer = setTimeout(() => { timedOut = true; child.kill('SIGTERM') }, renewRounds ? 180000 : 60000)
     try {
       await once(child, 'exit')
       assert.equal(timedOut, false, output.slice(-6000))

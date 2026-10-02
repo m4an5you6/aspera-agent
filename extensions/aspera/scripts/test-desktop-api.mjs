@@ -5,11 +5,10 @@ import { resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { _electron as electron, expect } from '@playwright/test'
 import { openAspera, removeTestDirectory } from './test-app.mjs'
+import { desktopOutput } from './desktop-output.mjs'
 
 const root = resolve(import.meta.dirname, '..')
-const artifacts = resolve(root, '.artifacts')
-const version = JSON.parse(readFileSync(resolve(root, 'apps/desktop/package.json'), 'utf8')).version
-const output = resolve(artifacts, `desktop-${version}`)
+const output = desktopOutput(root)
 const executable = resolve(output, 'win-unpacked/Aspera.exe')
 assert.ok(existsSync(executable), 'The unpacked desktop directory must exist')
 const directory = mkdtempSync(resolve(tmpdir(), 'aspera-desktop-api-test-'))
@@ -21,7 +20,7 @@ mkdirSync(profile, { recursive: true })
 symlinkSync(resolve(runtime, 'node_modules'), resolve(profile, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir')
 writeFileSync(resolve(profile, 'aspera-desktop-profile.json'), JSON.stringify({ version: 1, runtime: resolve(runtime, 'node_modules') }))
 writeFileSync(resolve(profile, 'package.json'), JSON.stringify({ name: 'aspera-desktop-profile', private: true,
-  dependencies: { '@aspera/dispatch': '0.1.0', '@aspera/console': '0.1.0', '@deepseek-ai/dsh-web-app': '0.2.0-rc.2' },
+  dependencies: { '@aspera/dispatch': '0.1.1', '@aspera/console': '0.1.1', '@deepseek-ai/dsh-web-app': '0.2.0-rc.2' },
   dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', '@aspera/dispatch'] } } }))
 writeFileSync(resolve(profile, 'cordis.patch.yml'), JSON.stringify([
   { id: 'hmr', disabled: true }, { id: 'plugin-manager', disabled: true },
@@ -53,11 +52,36 @@ try {
   await page.locator('input[name=host]').fill('127.0.0.1')
   await page.locator('input[name=username]').fill('trainer')
   await page.locator('input[name=password]').fill('fixture-password')
-  await page.locator('input[name=remoteRoot]').fill('/workspace/aspera')
-  await page.getByRole('button', { name: /^(保存服务器|Save server)$/ }).click()
+  await expect(page.locator('input[name=remoteRoot]')).toHaveCount(0)
+  await page.screenshot({ path: resolve(root, '.artifacts/desktop-server-auto.png'), fullPage: true })
+  await page.locator('summary').filter({ hasText: /高级设置|Advanced settings/ }).click()
+  await expect(page.locator('input[name=remotePort]')).toHaveValue('43019')
+  await expect(page.locator('input[name=trainingAddress]')).toHaveValue('')
+  await page.getByRole('button', { name: /^(存储位置|Storage location)$/ }).click()
+  await page.getByText(/^(手动指定|Specify a directory)$/, { exact: true }).click()
+  await page.locator('input[name=remoteRoot]').fill('/mnt/training')
+  await page.screenshot({ path: resolve(root, '.artifacts/desktop-server-advanced.png'), fullPage: true })
+  await page.getByRole('button', { name: /^(存储位置|Storage location)$/ }).click()
+  await page.getByText(/^(自动选择|Choose automatically)$/, { exact: true }).click()
+  await expect(page.locator('input[name=remoteRoot]')).toHaveCount(0)
+  await page.locator('summary').filter({ hasText: /推理服务对外访问|External inference access/ }).click()
+  await page.locator('input[name=inferenceUrl]').fill('https://inference.example.test:8443')
+  await page.locator('input[name=inferencePort]').fill('17000')
+  const dialogBounds = await page.getByRole('dialog').evaluate(element => {
+    const bounds = element.getBoundingClientRect()
+    return { top: bounds.top, bottom: bounds.bottom, viewport: innerHeight }
+  })
+  assert.ok(dialogBounds.top >= 0 && dialogBounds.bottom <= dialogBounds.viewport, 'Expanded server settings must fit the desktop window')
+  const save = page.getByRole('button', { name: /^(保存服务器|Save server)$/ })
+  await save.scrollIntoViewIfNeeded()
+  await expect(save).toBeInViewport()
+  await page.screenshot({ path: resolve(root, '.artifacts/desktop-server-inference.png'), fullPage: true })
+  await save.click()
   await expect(page.getByText('API regression server', { exact: true })).toBeVisible()
   const saved = JSON.parse(readFileSync(resolve(registry, 'servers.json'), 'utf8'))
   assert.equal(saved.record.servers[0].name, 'API regression server')
+  assert.deepEqual(saved.record.servers[0].storagePreference, { mode: 'auto' })
+  assert.deepEqual(saved.record.servers[0].inferenceMapping, { url: 'https://inference.example.test:8443', port: 17000 })
   assert.ok(!JSON.stringify(saved).includes('fixture-password'))
   console.log('Upgraded desktop: real server API, saved server form and version-1 registry passed outside the checkout with a Unicode state path.')
 } finally { await app?.close(); removeTestDirectory(directory, tmpdir()) }

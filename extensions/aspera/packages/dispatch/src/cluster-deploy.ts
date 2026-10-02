@@ -38,15 +38,21 @@ export async function ensureClusterRole(target: DeploymentConfig, prepared: Prep
   role: 'coordinator' | 'node', token: string,
   password: string | undefined, signal: AbortSignal): Promise<void> {
   const control = { ...target, remotePort: target.remotePort + (role === 'coordinator' ? 1 : 0) }
+  const compatible = (value: unknown) => {
+    const health = z.object({ protocol: z.literal(3), role: z.literal(role), deploymentId: z.string().regex(/^[a-f0-9]{64}$/), features: z.array(z.string()).optional() }).safeParse(value)
+    return health.success && health.data.features?.includes('public-inference-v1') === true
+  }
   if (control.remotePort > 65535) throw new Error('coordinator port exceeds 65535')
   try {
     const health = await request(control, token, '/aspera/v1/health', 'GET', undefined, signal, password)
-    if (health.status === 200 && z.object({ protocol: z.literal(2), role: z.literal(role), deploymentId: z.string().regex(/^[a-f0-9]{64}$/) }).safeParse(health.value).success) return
+    if (health.status === 200 && compatible(health.value)) return
   } catch (error) { signal.throwIfAborted(); void error }
   const root = target.remoteRoot
+  const release = target.storagePlacement?.releaseRoot ?? `${root}/releases/${prepared.deploymentId}`
   const pidFile = `${root}/state/${role}.pid`
   const active = await remote(target, `if [ -f ${shellQuote(pidFile)} ] && kill -0 "$(cat ${shellQuote(pidFile)})" 2>/dev/null; then printf active; fi`, signal, password)
-  if (active === 'active') throw new Error(`${role} is already running but cannot authenticate or report readiness`)
+  if (active === 'active') throw new Error(`${role} on port ${control.remotePort} is running an incompatible or unavailable controller. Keep its original release until all tasks finish and cleanup is confirmed, then stop that controller before retrying.`)
+  await remote(target, `node --input-type=module -e ${shellQuote(`import { createServer } from 'node:net'; const server = createServer(); server.once('error', error => { console.error('Control port ${control.remotePort} is unavailable: ' + error.message); process.exitCode = 1 }); server.listen({ host: '127.0.0.1', port: ${control.remotePort}, exclusive: true }, () => server.close())`)}`, signal, password)
   const incomingToken = `${root}/secrets/${role}-${randomUUID()}.incoming`
   await installPrivateFile(target, incomingToken, token, signal, password)
   await remote(target, `set -eu
@@ -59,7 +65,7 @@ ln ${shellQuote(incomingToken)} ${shellQuote(root + '/secrets/' + role + '.token
     DSH_EXPERIMENT_MODEL_CREDENTIAL_FILE: `${root}/secrets/${role}-model.json`,
     DSH_EXPERIMENT_LOG_FILE: `${root}/logs/${role}.log`, DSH_EXPERIMENT_DEPLOYMENT_ID: prepared.deploymentId,
     DSH_EXPERIMENT_DEVICES: prepared.devicePaths.join(','), DSH_EXPERIMENT_BWRAP: prepared.backendPath,
-    DSH_EXPERIMENT_HIDDEN_PATHS: prepared.hiddenPaths.join(','), DSH_EXPERIMENT_PORT: String(control.remotePort),
+    DSH_EXPERIMENT_HIDDEN_PATHS_JSON: JSON.stringify(prepared.hiddenPaths), DSH_EXPERIMENT_PORT: String(control.remotePort),
   }
   await remote(target, `set -eu
 umask 077
@@ -69,8 +75,8 @@ trap 'rmdir "$lock"' EXIT
 if [ -f ${shellQuote(pidFile)} ] && kill -0 "$(cat ${shellQuote(pidFile)})" 2>/dev/null; then exit 0; fi
 ${Object.entries(env).map(([name, value]) => `export ${name}=${shellQuote(value)}`).join('\n')}
 cd ${shellQuote(root + '/workspace')}
-node ${shellQuote(root + '/releases/' + prepared.deploymentId + '/setup.mjs')} --worker
-setsid node ${shellQuote(root + '/releases/' + prepared.deploymentId + '/node_modules/@deepseek-ai/dsh/lib/bin.js')} --profile aspera-worker </dev/null >>${shellQuote(root + '/logs/' + role + '.log')} 2>&1 &
+node ${shellQuote(release + '/setup.mjs')} --worker
+setsid node ${shellQuote(release + '/node_modules/@deepseek-ai/dsh/lib/bin.js')} --profile aspera-worker </dev/null >>${shellQuote(root + '/logs/' + role + '.log')} 2>&1 &
 echo "$!" > ${shellQuote(pidFile)}`, signal, password)
   const deadline = Date.now() + target.toolTimeoutMs
   let lastError: unknown
@@ -78,7 +84,7 @@ echo "$!" > ${shellQuote(pidFile)}`, signal, password)
     signal.throwIfAborted()
     try {
       const health = await request(control, token, '/aspera/v1/health', 'GET', undefined, signal, password)
-      if (health.status === 200 && z.object({ protocol: z.literal(2), role: z.literal(role), deploymentId: z.string().regex(/^[a-f0-9]{64}$/) }).safeParse(health.value).success) return
+      if (health.status === 200 && compatible(health.value)) return
       lastError = new Error(`control HTTP ${health.status}`)
     } catch (error) { lastError = error }
     const alive = await remote(target, `kill -0 "$(cat ${shellQuote(pidFile)})" 2>/dev/null && printf active || true`, signal, password)

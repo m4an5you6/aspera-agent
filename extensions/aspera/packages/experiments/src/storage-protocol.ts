@@ -8,6 +8,7 @@ import type { ExperimentId, ExperimentServerId } from './cluster-protocol.ts'
 export type StorageCandidateId = string & Branded<'StorageCandidateId'>
 /** Absolute Linux paths accepted from SSH observations and explicit settings. */
 export const remotePathSchema = z.string().min(1).max(4096).refine(value => value.startsWith('/')
+  // oxlint-disable-next-line no-control-regex -- Reject control characters at the SSH and durable-data parser.
   && !/[\\\u0000-\u001f]/.test(value) && !value.split('/').some(part => part === '.' || part === '..')
   && (value === '/' || (!value.endsWith('/') && !value.includes('//'))), 'Use a normalized absolute Linux directory')
 const ownedPath = remotePathSchema.refine(value => value !== '/', 'An owned directory cannot be the filesystem root')
@@ -44,12 +45,16 @@ export type ServerInventory = z.infer<typeof serverInventorySchema>
 /** Actual locations are persisted before any directories or releases are created. */
 export const storagePlacementSchema = z.object({
   version: z.literal(1),
+  layout: z.enum(['legacy', 'separated']),
   serverId: z.uuid().transform(value => brandString<ExperimentServerId>(value)),
   experimentId: z.uuid().transform(value => brandString<ExperimentId>(value)),
   candidate: storageCandidateSchema, controlRoot: ownedPath, namespaceRoot: ownedPath,
   releaseRoot: ownedPath, runRoot: ownedPath, workspaceRoot: ownedPath,
   reason: z.string().trim().min(1).max(4000), minimumFreeBytes: z.number().int().positive(),
 }).strict().refine(value => value.runRoot === `${value.namespaceRoot}/runs/${value.experimentId}`
+  && (value.layout === 'legacy'
+    ? value.namespaceRoot === value.candidate.directory && value.controlRoot === value.namespaceRoot
+    : value.namespaceRoot === `${value.candidate.directory === '/' ? '' : value.candidate.directory}/.aspera/${value.serverId}`)
   && value.workspaceRoot === `${value.runRoot}/workspace`
   && value.releaseRoot.startsWith(`${value.namespaceRoot}/releases/`)
   && /^[a-f0-9]{64}$/.test(value.releaseRoot.slice(`${value.namespaceRoot}/releases/`.length)),

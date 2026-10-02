@@ -1,0 +1,12 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript"],
+  "categories": { "correctness": "error" },
+  "options": { "typeAware": false, "reportUnusedDisableDirectives": "error" },
+  "env": { "builtin": true, "browser": true, "node": true },
+  "ignorePatterns": ["**/lib/**", "**/node_modules/**", ".artifacts/**"],
+  "rules": {
+    "typescript/no-explicit-any": "error",
+    "no-unused-vars": ["error", { "argsIgnorePattern": "^_", "varsIgnorePattern": "^_", "caughtErrorsIgnorePattern": "^_" }]
+  }
+}

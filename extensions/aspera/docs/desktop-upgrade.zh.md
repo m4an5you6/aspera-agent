@@ -4,7 +4,7 @@
 
 ## 概要
 
-桌面端 0.2 使用已有 Harness home，并保留外部插件管理。完全退出旧应用，完整保留新应用目录，再运行 `win-unpacked/Aspera.exe`。构建只输出应用目录，不生成 ZIP。
+Aspera `0.1.1` 保留现有 Harness 状态目录及外部插件管理。先完全退出旧程序，使用完整的新应用目录，再运行 `win-unpacked/Aspera.exe`。每次构建的独立标识和 SHA-256 写入 `aspera-desktop-build.json`，程序内附 `resources/build-info.json`。应用版本编号不会改写历史 `0.2.0` 回执，也不改变桌面 profile 的归属标记。
 
 ## 目录
 

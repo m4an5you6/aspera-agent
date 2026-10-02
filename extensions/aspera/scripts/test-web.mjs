@@ -3,25 +3,35 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { createServer } from 'node:net'
 import { chromium, expect as baseExpect } from '@playwright/test'
 import { command, launchProfile, openAspera, removeTestDirectory } from './test-app.mjs'
 
 const root = resolve(import.meta.dirname, '..')
-const expect = baseExpect.configure({ timeout: 20000 })
+const expect = baseExpect.configure({ timeout: 40000 })
+// Fresh published DSH profiles have measured 128 s cold starts on Windows; readiness still requires the profile's own signal.
+const profileStartupMs = 180000
 mkdirSync(resolve(root, '.artifacts'), { recursive: true })
 const directory = mkdtempSync(resolve(root, '.artifacts/web-test-'))
 const home = resolve(directory, 'home')
+const portReservation = createServer()
+await new Promise((ready, reject) => { portReservation.once('error', reject); portReservation.listen(0, '127.0.0.1', ready) })
+const mappedPort = portReservation.address().port
+await new Promise(done => { portReservation.close(done) })
+const externalUrl = `http://127.0.0.1:${mappedPort}`
 await command(process.execPath, ['scripts/setup.mjs'], root, { ASPERA_HOME: home })
 const profile = resolve(home, 'profiles/aspera')
 writeFileSync(resolve(profile, 'cordis.patch.yml'), JSON.stringify([
+  { id: 'hmr', disabled: true },
+  { id: 'client-hmr', disabled: true },
   { id: 'aspera-dispatch', disabled: true },
   { id: 'aspera-console', config: { pollIntervalMs: 500 } },
   { insert: [{ id: 'aspera-test-fixture', name: pathToFileURL(resolve(root, 'scripts/fixtures/web.mjs')).href,
-    config: { role: 'web', root: resolve(directory, 'remote'), release: root } }] },
+    config: { role: 'web', root: resolve(directory, 'remote'), release: root, profileStartupMs } }] },
 ]))
 let app; let browser; let page
 try {
-  app = await launchProfile(root, home, 'aspera')
+  app = await launchProfile(root, home, 'aspera', {}, profileStartupMs)
   browser = await chromium.launch({ channel: process.env.ASPERA_BROWSER_CHANNEL || 'chrome', headless: true })
   const context = await browser.newContext({ acceptDownloads: true })
   const errors = []
@@ -38,7 +48,23 @@ try {
     await page.locator('input[name=host]').fill(name === 'CPU A' ? 'cpu-a.test' : 'cpu-b.test')
     await page.locator('input[name=username]').fill('trainer')
     await page.locator('input[name=password]').fill('test-fixture-password')
-    await page.locator('input[name=remoteRoot]').fill('/fixture/' + name.at(-1).toLowerCase())
+    await expect(page.locator('input[name=remoteRoot]')).toHaveCount(0)
+    if (name === 'CPU A') await page.screenshot({ path: resolve(root, '.artifacts/web-server-basic.png'), fullPage: true })
+    if (name === 'CPU A') {
+      await page.getByText(/推理服务对外访问（可选）|External inference access \(optional\)/, { exact: true }).click()
+      await page.locator('input[name=inferenceUrl]').fill(externalUrl)
+      await page.locator('input[name=inferencePort]').fill(String(mappedPort))
+      await page.locator('summary').filter({ hasText: /高级设置|Advanced settings/ }).click()
+      const dialogBounds = await page.getByRole('dialog').evaluate(element => {
+        const bounds = element.getBoundingClientRect()
+        return { top: bounds.top, bottom: bounds.bottom, viewport: innerHeight }
+      })
+      assert.ok(dialogBounds.top >= 0 && dialogBounds.bottom <= dialogBounds.viewport, 'Expanded server settings must fit the browser window')
+      const save = page.getByRole('button', { name: /^(保存服务器|Save server)$/ })
+      await save.scrollIntoViewIfNeeded()
+      await expect(save).toBeInViewport()
+      await page.screenshot({ path: resolve(root, '.artifacts/web-server-inference.png'), fullPage: true })
+    }
     await page.getByRole('button', { name: /^(保存服务器|Save server)$/ }).click()
     await expect(page.getByRole('heading', { name: new RegExp(name) })).toBeVisible()
   }
@@ -57,16 +83,27 @@ try {
     assert.equal(response.status(), 200)
     return response.json()
   }
+  await page.getByRole('button', { name: /^(检查连接|Check connection)$/ }).first().click()
+  await expect(page.getByText(/CPU test provider/, { exact: true }).first()).toBeVisible()
+  assert.deepEqual((await control()).storageCalls, [], 'Connection checks must not call a model')
+  await page.getByText(/磁盘与网络信息|Disk and network observations/, { exact: true }).first().click()
+  await page.screenshot({ path: resolve(root, '.artifacts/web-storage-inventory.png'), fullPage: true })
   await create('CPU semi experiment', 'CPU A', 'semi', true)
   await expect(page.getByRole('button', { name: /^(确认此计划|Confirm this plan)$/ })).toBeVisible()
   const semi = (await control()).experiments.find(row => row.request.objective === 'CPU semi experiment')
   assert.equal(semi.latest.resourcesReleased, true)
+  assert.equal(semi.submission.protocol, 3)
+  assert.equal(semi.submission.versions.extension, '0.1.1')
+  assert.deepEqual(semi.submission.nodes[0].server.inferenceMapping, { url: externalUrl, port: mappedPort })
+  assert.equal(semi.preparation.placements[0].layout, 'separated')
+  assert.equal(semi.preparation.placements[0].candidate.persistence, 'unknown')
+  await page.screenshot({ path: resolve(root, '.artifacts/web-storage-plan.png'), fullPage: true })
   await create('CPU independent experiment', 'CPU B')
-  await expect(page.getByRole('status')).toHaveText(/服务中|Serving/)
+  await expect(page.getByRole('status')).toHaveText(/服务中|Serving/, { timeout: profileStartupMs })
   await page.getByRole('button', { name: /^(返回|Back)$/ }).click()
   await page.getByRole('button').filter({ has: page.getByText('CPU semi experiment', { exact: true }) }).click()
   await page.getByRole('button', { name: /^(确认此计划|Confirm this plan)$/ }).click()
-  await expect(page.getByRole('status')).toHaveText(/服务中|Serving/)
+  await expect(page.getByRole('status')).toHaveText(/服务中|Serving/, { timeout: profileStartupMs })
   await create('CPU shared experiment', 'CPU A')
   await expect(page.getByRole('status')).toHaveText(/排队中|Queued/)
   await expect(page.getByText(/等待服务器|Waiting for servers/)).toBeVisible()
@@ -98,6 +135,15 @@ try {
   const downloaded = await downloadEvent
   assert.equal(readFileSync(await downloaded.path(), 'utf8'), 'local output\n')
   await page.getByRole('button', { name: /^(推理服务|Inference services)$/ }).last().click()
+  await expect(page.getByText(/外部地址已验证|External address verified/, { exact: true })).toBeVisible()
+  assert.equal((await page.request.get(externalUrl)).status(), 401)
+  await page.getByRole('button', { name: /查看调用信息与密钥|Show calling information and key/ }).click()
+  const keyExample = page.locator('pre').filter({ hasText: 'Authorization: Bearer' })
+  await expect(keyExample).toBeVisible()
+  const serviceKey = (await keyExample.innerText()).match(/Bearer ([a-f0-9]{64})/)[1]
+  assert.equal(JSON.stringify(await control()).includes(serviceKey), false)
+  assert.equal((await page.request.get(externalUrl, { headers: { authorization: 'Bearer ' + serviceKey } })).status(), 200)
+  await page.getByRole('button', { name: /隐藏调用信息|Hide calling information/ }).click()
   await page.getByRole('button', { name: /^(通过受管理的连接访问|Access through managed connection)$/ }).click()
   await expect(page.locator('pre').last()).toContainText('CPU fixture response')
   await page.screenshot({ path: resolve(root, '.artifacts/web-service.png'), fullPage: true })
@@ -105,13 +151,14 @@ try {
   page = await context.newPage()
   await openAspera(page, app.url)
   await page.getByRole('button').filter({ has: page.getByText('CPU semi experiment', { exact: true }) }).click()
-  await expect(page.getByRole('status')).toHaveText(/服务中|Serving/)
+  await expect(page.getByRole('status')).toHaveText(/服务中|Serving/, { timeout: profileStartupMs })
   await page.getByRole('button', { name: /^(推理服务|Inference services)$/ }).last().click()
   await page.getByRole('button', { name: /^(停止服务|Stop service)$/ }).click()
   await expect(page.getByRole('status')).toHaveText(/已完成|Completed/)
+  await expect(page.getByText(/外部访问已停止|External access stopped/, { exact: true })).toBeVisible()
   await page.getByRole('button', { name: /^(返回|Back)$/ }).click()
   await page.getByRole('button').filter({ has: page.getByText('CPU shared experiment', { exact: true }) }).click()
-  await expect(page.getByRole('status')).toHaveText(/服务中|Serving/)
+  await expect(page.getByRole('status')).toHaveText(/服务中|Serving/, { timeout: profileStartupMs })
   await page.getByRole('button', { name: /^(取消实验|Cancel experiment)$/ }).click()
   await expect(page.getByRole('status')).toHaveText(/已取消|Cancelled/)
   await page.getByRole('button', { name: /^(返回|Back)$/ }).click()
@@ -145,7 +192,7 @@ try {
   await questionCard().getByRole('button', { name: /回复并继续|Save reply and continue/ }).click()
   await expect(questionCard()).toHaveCount(0)
   await expect(page.getByLabel(/1 个实验待处理|1 experiments need attention/)).toHaveCount(0)
-  await expect(page.getByRole('status').first()).toHaveText(/服务中|Serving/)
+  await expect(page.getByRole('status').first()).toHaveText(/服务中|Serving/, { timeout: profileStartupMs })
   const answered = (await control()).experiments.find(row => row.request.experimentId === waiting.request.experimentId)
   assert.equal(answered.latest.sessionId, waiting.latest.sessionId)
   assert.equal(answered.latest.goalId, waiting.latest.goalId)
@@ -156,7 +203,12 @@ try {
   const dispatchEvents = final.events.filter(item => item.sessionId === first.sessionId)
   const snapshot = {
     dispatchGoalPhases: dispatchEvents.filter(item => item.event.type === 'goal/change').map(item => item.event.data.goal?.phase),
-    handover: dispatchEvents.filter(item => item.event.type === 'user/message').map(item => item.event.data.content[0].text.split('\n')[0]),
+    handover: dispatchEvents.filter(item => item.event.type === 'user/message' && item.event.data.content[0].text.startsWith('本机派发完成')).map(item => item.event.data.content[0].text.split('\n')[0]),
+    storageTools: final.storageCalls.filter(item => item.experimentId === first.request.experimentId).map(item => item.name),
+    storage: first.preparation.placements.map(item => ({ layout: item.layout, systemVolume: item.candidate.systemVolume, persistence: item.candidate.persistence })),
+    inference: { mapped: first.submission.nodes[0].server.inferenceMapping !== undefined,
+      external: first.latest.services[0].external.state, modelName: first.latest.services[0].modelName,
+      stopped: final.experiments.find(row => row.request.experimentId === first.request.experimentId).latest.services[0].external.state },
     receiptStates: final.experiments.filter(row => ['CPU semi experiment', 'CPU shared experiment', 'CPU failure experiment'].includes(row.request.objective))
       .sort((a, b) => a.request.objective.localeCompare(b.request.objective)).map(row => ({ goal: row.request.objective, handover: row.receipt.handover, state: row.latest.state })),
   }

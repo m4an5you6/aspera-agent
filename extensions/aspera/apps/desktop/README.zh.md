@@ -41,7 +41,11 @@ pnpm run test:desktop
 pnpm run start:desktop
 ```
 
-输出是 `.artifacts/desktop-0.2.0/win-unpacked/Aspera.exe` 和 `aspera-desktop-build.json`，不生成 ZIP。记录标识固定的 DSH、Aspera、Electron、架构及远端发布。暂存材料保留在独立的 `.artifacts/desktop-build-*` 目录。首次 Electron 及依赖下载需要网络。
+输出为 `.artifacts/desktop-0.1.1/<build-id>/win-unpacked/Aspera.exe` 和 `aspera-desktop-build.json`，不生成 ZIP，`latest.json` 指向最近成功构建。记录包含 可执行文件及运行时的 SHA-256、构建标识、固定的 DSH／Aspera／Electron 版本、协议／存储代数和远端发布摘要。程序内含 `resources/build-info.json`。暂存目录使用 `.artifacts/desktop-build-*`，首次下载依赖需要网络。
+
+桌面验证默认使用最近的构建，也可通过 `ASPERA_DESKTOP_BUILD_ID` 指定构建目录。
+
+构建中断后，设置 `ASPERA_DESKTOP_STAGE=.artifacts/desktop-build-<id>` 可复用该暂存目录，前提是其冻结发布摘要仍与当前构建相同。构建会重新检查生产锁文件并封装运行时，已完成的输出目录各自独立。
 
 打包验证使用私有 home，检查官方标题栏和字号，通过真实插件页面安装本地 bundle，并验证重启后加载。同时检查从封装运行时生成完整派发材料、原生快捷键、菜单关闭、渲染器隔离、托盘可见状态及 Host 退出回收。`node scripts/measure-desktop.mjs --runs=3 --assert-fixed` 将首个窗口、应用文档及可用页面的耗时记录到 `.artifacts/desktop/startup-measurement.json` 及按版本保存的报告。每个样本使用新的 home 和凭据存在状态测试值，不执行模型任务。文件缓存及 Windows 启动波动仍会影响测量。[验证说明](../../docs/verification.zh.md)介绍 Web、调度及 GPU 覆盖。`ASPERA_DESKTOP_STARTUP_MS` 和 `ASPERA_DESKTOP_SHUTDOWN_MS` 默认是 60000 和 30000 毫秒，接受 1000 至 2147483647 之间的整数。
 
@@ -52,7 +56,7 @@ pnpm run start:desktop
 
 Electron 管理窗口和托盘，其 Node 模式子进程通过已发布的 DSH profile runner 启动 `aspera-desktop`，不导入上游 Desktop 源码。浏览器认证将私有启动 token 换为 cookie。隔离的渲染器没有 Node 集成；适配器提供外观、应用／编辑菜单和已发布的 Desktop 快捷键协议，设备偏好通过原子文件写入保存。引导只通过已认证 RPC 查询模型凭据的存在状态。原生操作校验获准的顶层页面。页面停留在本机回环来源，通过系统浏览器打开无凭据的 HTTPS 链接，浏览器权限默认拒绝。
 
-`runtime.asar` 保存冻结的生产依赖和 pnpm，原生二进制及 pnpm 位于解包目录。可写 profile 保存外部插件依赖和启用选择，通过 DSH 共享解析器与不可变的 Aspera 运行时清单共同解析。该清单声明内置 Aspera 插件和 DSH，因此用户目录不需要源码仓库或第二份核心依赖。插件使用内置 pnpm 安装，启用变更在重启后生效；文件监听 HMR 关闭。应用补丁与用户补丁分开。升级先备份旧配置，再移除经验证的运行时链接和应用生成的管理限制，见[升级说明](../../docs/desktop-upgrade.zh.md)。框架环境仍在远端节点，已发布的浏览目录选择器提供目录选择。
+`runtime.asar` 保存冻结的生产依赖和 pnpm，原生二进制及 pnpm 位于解包目录。可写 profile 保存外部插件依赖和启用选择。DSH 共享解析器使用同时声明 Aspera 包和官方可选 DSH 插件的运行时清单；打包时从固定版本的 DSH 安装中读取可选插件名称和版本。用户目录不需要源码仓库或第二份核心依赖。插件使用内置 pnpm 安装，启用变更在重启后生效；文件监听 HMR 关闭。应用补丁与用户补丁分开。升级先备份旧配置，再移除经验证的运行时链接和应用生成的管理限制，见[升级说明](../../docs/desktop-upgrade.zh.md)。框架环境仍在远端节点，已发布的浏览目录选择器提供目录选择。
 
 [架构图](../../docs/architecture.zh.md#architecture-diagrams)展示模块归属及接管。策略及 profile 测试拒绝非法 IPC 地址、不安全导航、带凭据的链接及被修改的归属。私有 IPC 在 Windows 中调用 CLI 的正常退出信号处理，桌面壳等待 Host 结束。
 
@@ -61,4 +65,4 @@ Electron 管理窗口和托盘，其 Node 模式子进程通过已发布的 DSH 
 <a id="limits"></a>
 ## 限制
 
-这是未签名的 Windows x64 本地应用目录，不包含安装器、更新源或发布。macOS 和 Linux 包尚未验证。桌面壳复用 DSH 客户端的账户、引导和设置页面，不包含上游 Desktop 的原生 Account 窗口、自动更新或嵌入式 Platform 浏览器。GPU 训练和多节点同步需单独的 GPU 验收。
+交付为未签名的完整 Windows x64 程序目录，不含安装器、更新源或对外发布。macOS 和 Linux 包尚未验收。桌面壳复用 DSH 客户端账号、引导和设置页面，不包含上游桌面的原生账号窗口、自动更新或嵌入式 Platform 浏览器。GPU 训练和多机同步仍需实机验收。

@@ -2,13 +2,12 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
-import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { setTimeout as delay } from 'node:timers/promises'
 import { randomUUID } from 'node:crypto'
 import { isAbsolute } from 'node:path'
 import { experimentIdSchema, serverIdSchema } from '@aspera/experiments'
-import type { ClusterChunk, ClusterFile, ClusterServer, AnswerExperimentQuestion } from '@aspera/experiments/types'
+import type { ClusterChunk, ClusterFile, ServerSettings, ServerProbe, AnswerExperimentQuestion, ServiceAccessInfo } from '@aspera/experiments/types'
 import { ExperimentFleet } from './fleet.ts'
 import { ExperimentDownloads } from './downloads.ts'
 import { sshPasswordRef } from './ssh-account.ts'
@@ -24,6 +23,7 @@ export interface Config {
   toolTimeoutMs: number
   pollIntervalMs: number
   downloadTtlMs: number
+  minimumFreeBytes: number
 }
 /** Validated Host policy supplied by the independent profile. */
 export const Config: z<Config> = z.object({
@@ -33,6 +33,7 @@ export const Config: z<Config> = z.object({
   toolTimeoutMs: z.number().step(1).min(1000).default(300000),
   pollIntervalMs: z.number().step(1).min(100).default(1000),
   downloadTtlMs: z.number().step(1).min(1000).default(60000),
+  minimumFreeBytes: z.number().step(1).min(1).default(1073741824),
 })
 
 /** Experiment API shared by the independent page and Agent tool consumers. */
@@ -50,7 +51,7 @@ export class AsperaRemote extends TypertRemoteService {
   removeServer(id: string): Promise<FleetRegistry> { return this.fleet.removeServer(serverIdSchema.parse(id)) }
   /** @param id - configured server. @returns connection, GPU and allocation facts. */
   @Remote
-  probeServer(id: string): Promise<{ gpuInfo: string; allocations: string[] }> { return this.fleet.probe(serverIdSchema.parse(id)) }
+  probeServer(id: string): Promise<ServerProbe> { return this.fleet.probe(serverIdSchema.parse(id)) }
   /** @param account - configured SSH account. @returns presence and writability, without plaintext. */
   @Remote
   async passwordStatus(account: ExperimentSshAccount): Promise<ExperimentPasswordStatus> {
@@ -81,6 +82,9 @@ export class AsperaRemote extends TypertRemoteService {
   /** @param id - experiment. @returns reconciled remote state. */
   @Remote
   refreshExperiment(id: string): Promise<FleetExperiment> { return this.fleet.refresh(experimentIdSchema.parse(id)) }
+  /** @param id - interrupted v3 preparation. @returns resumed preparation with the same identity and directories. */
+  @Remote
+  retryPreparation(id: string): Promise<FleetExperiment> { return this.fleet.retry(experimentIdSchema.parse(id)) }
   /** @param id - experiment. @param revision - displayed plan revision. @returns queued state. */
   @Remote
   approvePlan(id: string, revision: number): Promise<FleetExperiment> { return this.fleet.approve(experimentIdSchema.parse(id), revision) }
@@ -114,6 +118,11 @@ export class AsperaRemote extends TypertRemoteService {
   async accessService(id: string, serviceId: string, path: string, method: 'GET' | 'POST', body?: string): Promise<string> {
     return JSON.stringify(await this.fleet.accessService(experimentIdSchema.parse(id), serviceId, path, method, body))
   }
+  /** @param id - owning experiment. @param serviceId - public service. @returns service-only credential after an explicit operator action. */
+  @Remote
+  serviceAccessInfo(id: string, serviceId: string): Promise<ServiceAccessInfo> {
+    return this.fleet.serviceAccessInfo(experimentIdSchema.parse(id), serviceId)
+  }
   /** @param signal - physical stream lifetime. @returns fresh snapshot followed by durable changes; reconnect starts from current records. */
   @Remote({ mode: 'stream' })
   async *watch(signal: AbortSignal): AsyncIterable<FleetSnapshot> {
@@ -131,10 +140,10 @@ export const inject = ['storage', 'storageDomain', 'agents', 'goals', 'credentia
 /** Mount the published DSH adapter without changing the Agent loop. @param ctx - Host services. @param config - resolved policy. */
 export async function apply(ctx: Context, config: Config): Promise<void> {
   if (!isAbsolute(config.extensionRoot) || config.dataRoots.some(path => !isAbsolute(path))) throw new Error('Aspera directories must be absolute')
-  const fleet = await ExperimentFleet.open(ctx, (server: ClusterServer) => ({ ...server,
+  const fleet = await ExperimentFleet.open(ctx, (server: ServerSettings) => ({ ...server,
     localRepo: config.extensionRoot, dataRoots: config.dataRoots, allowedSystemPackages: config.allowedSystemPackages,
     agentCredentialRefs: config.agentCredentialRefs, tokenRef: 'ASPERA_COORDINATOR', toolTimeoutMs: config.toolTimeoutMs,
-    controlPollIntervalMs: config.pollIntervalMs }))
+    controlPollIntervalMs: config.pollIntervalMs, minimumFreeBytes: config.minimumFreeBytes }))
   new AsperaRemote(ctx, fleet, new ExperimentDownloads(ctx, fleet, config.downloadTtlMs), config)
   const output = { schema: { type: 'string' as const }, render: (_args: object, value: string) => [{ type: 'text' as const, text: value }] }
   const presentCall = (args: object) => ({ card: 'generic' as const, title: 'Aspera experiment', kind: 'other' as const, rawInput: args })

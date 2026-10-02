@@ -4,19 +4,22 @@ import { afterEach, expect, it, vi } from 'vitest'
 import type { ExperimentTable } from '../src/table.ts'
 import { ClusterQueue } from '../src/cluster-queue.ts'
 import type { ClusterExecutor, ClusterOutcome } from '../src/cluster-queue.ts'
-import { clusterSubmissionSchema, legacyClusterSubmissionSchema, clusterRecordSchema, serverIdSchema, experimentQuestionSchema, needsExperimentAttention } from '../src/cluster-protocol.ts'
+import { clusterSubmissionSchema, clusterSubmissionV2Schema, legacyClusterSubmissionSchema, clusterRecordSchema, serverIdSchema, experimentQuestionSchema, needsExperimentAttention } from '../src/cluster-protocol.ts'
 import type { ClusterRecord, ExperimentId, ExperimentServerId } from '../src/cluster-protocol.ts'
+import { experimentIdSchema } from '../src/cluster-protocol.ts'
+import { inventory, placement } from './fixtures.ts'
 
 const queues: ClusterQueue[] = []
 afterEach(async () => { await Promise.all(queues.splice(0).map(queue => queue.close())) })
 
 function submission(ids: ExperimentServerId[]) {
+  const experimentId = experimentIdSchema.parse(randomUUID())
   const node = (id: ExperimentServerId) => ({ server: { id, name: id, host: 'gpu.example', username: 'trainer', sshPort: 22,
-    remotePort: 43019, remoteRoot: '/experiment', authMode: 'password', trainingAddress: '10.0.0.1' },
+    remotePort: 43019, remoteRoot: '/experiment', authMode: 'password', trainingAddress: '10.0.0.1', storagePlacement: placement(id, experimentId, '/experiment') },
   devicePaths: ['/dev/nvidia0'], backendPath: '/usr/bin/bwrap', hiddenPaths: ['/experiment/secrets'], gpuInfo: 'GPU 0' })
-  return clusterSubmissionSchema.parse({ protocol: 2, experimentId: randomUUID(), deploymentId: 'a'.repeat(64),
+  return clusterSubmissionSchema.parse({ protocol: 3, experimentId, deploymentId: 'a'.repeat(64), inventories: ids.map(serverId => ({ serverId, inventory: inventory('/experiment') })),
     objective: 'one joint training',
-    coordinator: node(ids[0]!).server, nodes: ids.map(node), inputs: [], createdAt: 1, strategy: { mode: 'automatic', coordinator: 'single-agent' }, versions: { dsh: '0.2.0-rc.2', extension: '0.2.0', harness: 'a'.repeat(64), data: [] } })
+    coordinator: node(ids[0]!).server, nodes: ids.map(node), inputs: [], createdAt: 1, strategy: { mode: 'automatic', coordinator: 'single-agent' }, versions: { dsh: '0.2.0-rc.2', extension: '0.1.1', harness: 'a'.repeat(64), data: [] } })
 }
 
 function fixture(records = new Map<ExperimentId, ClusterRecord>()) {
@@ -61,7 +64,6 @@ it('persists one answer across concurrent retries and resumes the same allocatio
   const f = await pendingQuestion()
   const before = f.queue.get(f.input.experimentId)!
   await f.queue.openQuestion(f.input.experimentId, f.question)
-  expect(needsExperimentAttention(f.queue.get(f.input.experimentId)!)).toBe(true)
   expect(needsExperimentAttention(f.queue.get(f.input.experimentId)!)).toBe(true)
   const [first, retry] = await Promise.all([f.queue.answerQuestion(f.input.experimentId, f.reply), f.queue.answerQuestion(f.input.experimentId, f.reply)])
   expect(first.revision).toBe(retry.revision)
@@ -134,11 +136,15 @@ it('deduplicates lost replies and refuses reused identities with changed require
   expect(f.records.size).toBe(1)
 })
 
-it('reads v1 limits and retry identity without promoting old pending work to unlimited execution', async () => {
+it.each([1, 2] as const)('preserves generation %s bytes and versions without starting old pending work', async protocol => {
   const base = submission([serverIdSchema.parse(randomUUID())])
-  const legacy = legacyClusterSubmissionSchema.parse({ ...base, protocol: 1,
+  const legacyData = JSON.parse(JSON.stringify(base))
+  delete legacyData.inventories; delete legacyData.coordinator.storagePlacement
+  for (const node of legacyData.nodes) delete node.server.storagePlacement
+  const legacy = protocol === 1 ? legacyClusterSubmissionSchema.parse({ ...legacyData, protocol,
     strategy: { ...base.strategy, budget: { maxRuntimeSeconds: 3600, maxCommands: 100, maxGoalRounds: 100, maxServiceSeconds: 86400 } },
-    versions: { ...base.versions, extension: '0.1.0' } })
+    versions: { ...base.versions, extension: '0.1.0' } }) : clusterSubmissionV2Schema.parse({ ...legacyData, protocol,
+    versions: { ...base.versions, extension: '0.2.0' } })
   const bytes = JSON.stringify(legacy)
   expect(JSON.stringify(clusterSubmissionSchema.parse(JSON.parse(bytes)))).toBe(bytes)
   const record = clusterRecordSchema.parse({ submission: legacy, payloadHash: createHash('sha256').update(bytes).digest('hex'),
@@ -150,7 +156,7 @@ it('reads v1 limits and retry identity without promoting old pending work to unl
   expect(f.started.size).toBe(0)
   expect(f.queue.get(legacy.experimentId)?.submission).toEqual(legacy)
   expect(f.queue.get(legacy.experimentId)?.payloadHash).toBe(record.payloadHash)
-  await expect(f.queue.submit({ ...legacy, experimentId: randomUUID() })).rejects.toThrow('protocol 2')
+  await expect(f.queue.submit({ ...legacy, experimentId: randomUUID() })).rejects.toThrow('protocol 3')
 })
 
 it('records cancellation arriving before admission and never starts a later retry', async () => {
@@ -209,7 +215,6 @@ it('prepares semi-automatic plans without reserving nodes and confirms the displ
   expect(f.queue.get(first.experimentId)).toMatchObject({ state: 'awaiting-approval', resourcesReleased: true, planningSessionId: 'planning-first' })
   expect(f.queue.get(second.experimentId)?.approval?.by).toBe('policy')
   await expect(f.queue.approve(first.experimentId, 2)).rejects.toThrow('plan changed')
-  await f.queue.approve(first.experimentId, 1)
   await f.queue.approve(first.experimentId, 1)
   expect(f.queue.waitingFor(first.experimentId)).toEqual(ids)
   expect(f.started.has(first.experimentId)).toBe(false)

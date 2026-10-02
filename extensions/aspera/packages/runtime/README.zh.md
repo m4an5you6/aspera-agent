@@ -26,9 +26,9 @@ kind: "package-bundle"
 
 派发提供方安装固定发布版本，以私有状态目录调用 `setupWorkerProfile`，再启动 `aspera-worker` profile。其 bundle 为已发布 DSH base 之上的 [worker.patch.yml](worker.patch.yml)。[正式 worker 检查](../../scripts/test-worker.mjs) 无需模型密钥即可验证该入口，Linux 节点执行需要完成 [GPU 验收](../../docs/verification.zh.md#gpu-acceptance)。
 
-通过角色配置选择 `coordinator`、`node`、`planner` 或 `agent`，根目录、token 路径、发布及实验身份由部署提供。Config 限制轮询、清理、文件数量、字节块及 HTTPS 文档域名和大小；准确值及默认值见 [Config](src/index.ts) 和 patch。启动常驻节点 profile 前配置设备、隔离程序及隐藏路径。
+通过角色配置选择 `coordinator`、`node`、`planner` 或 `agent`。部署固定控制根目录、令牌、发布和实验 ID。[Config](src/index.ts) 配置轮询、清理、网络探测时限、文件／字节限制及文档访问。[网络探测](src/network-probes.ts) 不分配 GPU，通过接收端身份检查连通性，超时、取消及关闭时清理监听器。节点先隐藏控制目录及其他已登记实验根目录，再绑定当前工作目录。
 
-普通命令在取消清理后不能继续运行。协议第 `2` 代的命令和服务没有总时长或总命令数上限，旧资源分配保留原发布限额。登记的服务具有独立进程身份，保留完整实验资源，并在执行 Agent 完成后继续运行。端口已占用时拒绝启动，成功要求受管进程保持存活且 HTTP 接口通过健康检查。服务观察不会重新启动失败进程。
+普通命令不能脱离取消清理。协议 `3` 不限制任务总时长或命令数量，旧分配保留原限制。[存储准备](scripts/storage.mjs) 检查 Linux 挂载、空间、归属和写入能力；未知持久性保持未知。实验 profile 和日志位于所选存储，队列状态及凭据保留在私有目录。缓存／环境变量使用可写工作目录。登记服务保留整组资源，必须通过实际 HTTP 健康检查，失败后不自动重启。[推理网关](src/inference-gateway.ts) 管理显式映射的对外监听和私有服务密钥，详见[服务记录与访问](../../docs/state-and-api.zh.md#logs-outputs-and-services)。节点 profile 设置 `serviceRequestTimeoutMs`（300000）限制上游空闲时间，`serviceRequestBytes`（16777216）限制请求体大小。
 
 `goalContinuationWindow` 是部署设置，默认 `128` 轮；worker patch 通过 `DSH_CLUSTER_GOAL_WINDOW` 配置。续行插件在有限窗口耗尽前通过公开 `Goal.edit` 延长同一 Goal。每次延长都记入日志，并非用户任务预算。连接、探测和模型单次操作超时、循环保护、沙箱和取消仍然生效。
 

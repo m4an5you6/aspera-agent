@@ -37,7 +37,7 @@ export async function command(file, args, cwd, env = {}, timeoutMs = 180000) {
 }
 
 /** Start an installed dsh profile and join its process on cleanup. */
-export async function launchProfile(release, home, profile, env = {}) {
+export async function launchProfile(release, home, profile, env = {}, startupTimeoutMs = 60000) {
   const manifestPath = resolve(home, 'profiles', profile, 'package.json')
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
   manifest.dependencies['@deepseek-ai/dsh-host-directory-picker-browse'] = '0.2.0-rc.2'
@@ -59,15 +59,16 @@ export async function launchProfile(release, home, profile, env = {}) {
     child.kill('SIGTERM')
     try { await exited } finally { clearTimeout(timer) }
   }
-  const deadline = Date.now() + 60000
+  const deadline = Date.now() + startupTimeoutMs
   while (Date.now() < deadline) {
+    // oxlint-disable-next-line no-control-regex -- CLI color output may terminate the URL with the ANSI escape character.
     const url = /http:\/\/127\.0\.0\.1:\d+\/\?token=[A-Za-z0-9_-]+(?=[\r\n\s\x1b])/.exec(output)?.[0]
     if (url !== undefined) return { url, close, output: () => output }
     if (child.exitCode !== null) throw new Error('Profile stopped during startup: ' + output.slice(-6000))
     await delay(100)
   }
   await close()
-  throw new Error('Profile startup timed out: ' + output.slice(-6000))
+  throw new Error(`Profile startup timed out after ${startupTimeoutMs} ms: ` + output.slice(-6000))
 }
 
 /** Dismiss the release notice and open the independent management page. */

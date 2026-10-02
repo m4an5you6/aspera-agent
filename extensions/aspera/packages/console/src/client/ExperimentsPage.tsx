@@ -6,7 +6,8 @@ import {
   Button, Checkbox, IconChevronDownOutlineRegular, IconGoalOutlineRegular, IconPaperclipOutlineRegular,
   IconPlusOutlineRegular, IconRefreshOutlineRegular, Input, Menu, Tag, Modal,
 } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { FleetExperiment, ClusterServer, FleetServerInput } from '@aspera/dispatch/types'
+import type { FleetExperiment, ServerSettings, FleetServerInput } from '@aspera/dispatch/types'
+import type { InferenceService, ServiceAccessInfo } from '@aspera/experiments/types'
 import type { InjectFace, PropsLocale, PropsRuntime, TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import type { ExperimentsController } from './controller.ts'
 import css from './ExperimentsPage.module.css'
@@ -77,7 +78,7 @@ export function ExperimentsPage({ controller, useExperiments, t }: PageProps) {
           {rows.length === 0 ? <div className={css.emptyState}><IconGoalOutlineRegular size={28} /><h2>{state.experiments.length === 0 ? t('empty') : t('noMatches')}</h2><p>{t('newHint')}</p></div> : <div className={css.tableWrap}><table className={css.table}>
             <thead><tr><th>{t('goal')}</th><th>{t('status')}</th><th>{t('servers')}</th><th>{t('updated')}</th></tr></thead>
             <tbody>{rows.map(row => <tr key={row.request.experimentId}>
-              <td><button className={css.rowLink} onClick={() => { controller.select(row.request.experimentId) }}>{row.request.objective}</button><small>{row.latest?.progress?.phase ?? (row.receipt !== undefined ? t('handoverShort') : t(row.state))}</small></td>
+              <td><button className={css.rowLink} onClick={() => { controller.select(row.request.experimentId) }}>{row.request.objective}</button><small>{row.latest?.progress?.phase ?? (row.receipt !== undefined ? t('handoverShort') : t(row.state === 'preparing' && row.preparation !== undefined ? row.preparation.stage : row.state))}</small></td>
               <td><Tag tone={row.latest !== undefined && needsExperimentAttention(row.latest) ? 'warning' : 'neutral'}>{t(row.latest?.state ?? row.state)}</Tag></td>
               <td>{row.servers.map(server => server.name).join(' · ')}</td><td><time>{new Date(row.latest?.updatedAt ?? row.createdAt).toLocaleString()}</time></td>
             </tr>)}</tbody></table></div>}
@@ -89,27 +90,34 @@ export function ExperimentsPage({ controller, useExperiments, t }: PageProps) {
 type Snapshot = ReturnType<ExperimentsController['store']['getSnapshot']>
 
 function Servers({ controller, t, state }: ViewProps & { state: Snapshot }) {
-  const [editing, setEditing] = useState<ClusterServer | 'new' | undefined>()
+  const [editing, setEditing] = useState<ServerSettings | 'new' | undefined>()
   return <section className={css.list}>
     <div className={css.sectionHeading}><p className={css.hint}>{t('coordinatorHint')}</p>
       <Button variant="outline" icon={<IconPlusOutlineRegular />} onClick={() => { setEditing('new') }}>{t('addServer')}</Button></div>
-    <Modal open={editing !== undefined} onClose={() => { setEditing(undefined) }} title={editing === 'new' ? t('addServer') : t('editServer')} closeLabel={t('discard')} backdropBlur={false} className={css.serverModal}>
+    <Modal open={editing !== undefined} onClose={() => { setEditing(undefined) }} title={editing === 'new' ? t('addServer') : t('editServer')} closeLabel={t('discard')} backdropBlur={false} className={css.serverModal} contentClassName={css.serverModalContent}>
       {editing !== undefined && <ServerForm key={editing === 'new' ? 'new' : editing.id} controller={controller} t={t}
         server={editing === 'new' ? undefined : editing} done={() => { setEditing(undefined) }} />}
     </Modal>
     {state.registry.servers.map((server) => {
-      const probe = state.probes[server.id]
+      const probe = state.probes[server.id] ?? state.registry.probes?.[server.id]
       const allocated = new Set<string>(state.experiments.filter(row => row.latest?.resourcesReleased === false
         && row.servers.some(node => node.id === server.id)).map(row => row.request.experimentId))
       for (const id of probe?.allocations ?? []) if (!state.experiments.some(row => row.request.experimentId === id)) allocated.add(id)
       return <article key={server.id} className={css.card}>
         <div className={css.cardHeading}><h2>{server.name}</h2>{server.id === state.registry.coordinatorId && <Tag tone="info">{t('coordinator')}</Tag>}</div>
         <p className={css.hint}>{server.username}@{server.host}:{server.sshPort}</p>
+        {server.inferenceMapping !== undefined && <p className={css.hint}>{t('externalInferenceUrl')}: {server.inferenceMapping.url} · {t('mappedPort')}: {server.inferenceMapping.port}</p>}
         {state.probeErrors[server.id] !== undefined ? <p role="alert" className={css.error}>{state.probeErrors[server.id]}</p>
-          : state.probes[server.id] === undefined && <p className={css.hint}>{t('connectionUnchecked')}</p>}
+          : probe === undefined && <p className={css.hint}>{t('connectionUnchecked')}</p>}
         <div className={css.actions}><Tag tone={allocated.size > 0 ? 'warning' : 'neutral'}>{t('allocations', { count: allocated.size })}</Tag>
           {probe !== undefined && <Tag tone="success">{t('connectionReady')}</Tag>}</div>
         {probe !== undefined && <pre className={css.log}>{probe.gpuInfo}</pre>}
+        {probe !== undefined && <details className={css.inventory}><summary>{t('storageInventory')}</summary>
+          <p className={css.hint}>{t('observedAt', { time: new Date(probe.inventory.observedAt).toLocaleString() })}</p>
+          <ul>{probe.inventory.candidates.map(candidate => <li key={candidate.id}><code>{candidate.directory}</code>
+            <span>{t('availableBytes', { size: candidate.availableBytes.toLocaleString() })} · {t(candidate.writable ? 'writable' : 'readOnly')} · {t(candidate.persistence)}</span></li>)}</ul>
+          <p>{t('trainingAddress')}: {probe.inventory.addresses.map(value => value.address).join(' · ') || t('noNetworkAddress')}</p>
+        </details>}
         <div className={css.actions}>
           <Button variant="outline" onClick={() => { setEditing(server) }}>{t('edit')}</Button>
           <Button variant="outline" onClick={() => { void controller.probe(server.id).catch((error: unknown) => { controller.report(error) }) }}>{t('test')}</Button>
@@ -119,8 +127,10 @@ function Servers({ controller, t, state }: ViewProps & { state: Snapshot }) {
   </section>
 }
 
-function ServerForm({ controller, t, server, done }: ViewProps & { server: ClusterServer | undefined; done: () => void }) {
+function ServerForm({ controller, t, server, done }: ViewProps & { server: ServerSettings | undefined; done: () => void }) {
   const [busy, setBusy] = useState(false)
+  const [storageMode, setStorageMode] = useState<'auto' | 'manual'>(server?.storagePreference?.mode ?? (server?.remoteRoot === undefined ? 'auto' : 'manual'))
+  const [externalUrl, setExternalUrl] = useState(server?.inferenceMapping?.url ?? '')
   const pending = useRef(false)
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -129,9 +139,11 @@ function ServerForm({ controller, t, server, done }: ViewProps & { server: Clust
     const field = (name: string) => { const value = data.get(name); return typeof value === 'string' ? value : '' }
     const value: FleetServerInput = { id: server?.id ?? controller.newId(), name: field('name'), host: field('host'),
       username: field('username'), sshPort: Number(field('sshPort')), remotePort: Number(field('remotePort')),
-      remoteRoot: field('remoteRoot'), authMode: 'password',
+      authMode: 'password', storagePreference: storageMode === 'manual' ? { mode: 'manual', directory: field('remoteRoot').trim() } : { mode: 'auto' },
+      ...(server?.remoteRoot === undefined ? {} : { remoteRoot: server.remoteRoot }),
       ...(server?.passwordRef === undefined ? {} : { passwordRef: server.passwordRef }),
       ...(server?.knownHostsFile === undefined ? {} : { knownHostsFile: server.knownHostsFile }),
+      ...(externalUrl.trim() === '' ? {} : { inferenceMapping: { url: externalUrl.trim(), port: Number(field('inferencePort')) } }),
       ...(field('trainingAddress') === '' ? {} : { trainingAddress: field('trainingAddress') }) }
     pending.current = true; setBusy(true)
     try { await controller.saveServer(value, field('password')); done() }
@@ -145,11 +157,21 @@ function ServerForm({ controller, t, server, done }: ViewProps & { server: Clust
     <label>{t('username')}<Input name="username" autoComplete="username" defaultValue={server?.username} required /></label>
     <label>{t('password')}<Input name="password" type="password" autoComplete="new-password" required={server?.authMode !== 'password'} /></label>
     <label>{t('sshPort')}<Input name="sshPort" type="number" min={1} max={65535} defaultValue={server?.sshPort ?? 22} required /></label>
-    <label>{t('remotePort')}<Input name="remotePort" type="number" min={1} max={65534} defaultValue={server?.remotePort ?? controller.initialControlPort()} required /></label>
-    <label>{t('remoteRoot')}<Input name="remoteRoot" defaultValue={server?.remoteRoot} required /></label>
-    <label>{t('trainingAddress')}<Input name="trainingAddress" defaultValue={server?.trainingAddress} /></label>
     </div>
-    <div className={css.hints}><p>{t('passwordHint')}</p><p>{t('networkHint')}</p></div>
+    <details className={css.advanced} open={server?.inferenceMapping !== undefined || undefined}><summary>{t('publicInferenceSettings')}</summary>
+      <div className={css.fields}>
+        <label>{t('externalInferenceUrl')}<Input name="inferenceUrl" type="url" placeholder="https://…" value={externalUrl} onChange={event => { setExternalUrl(event.target.value) }} /></label>
+        <label>{t('mappedPort')}<Input name="inferencePort" type="number" min={1} max={65535} defaultValue={server?.inferenceMapping?.port} required={externalUrl.trim() !== ''} disabled={externalUrl.trim() === ''} /></label>
+      </div><p className={css.hint}>{t('publicInferenceHint')}</p>
+    </details>
+    <details className={css.advanced}><summary>{t('advancedSettings')}</summary><div className={css.fields}>
+    <div className={css.field}><span>{t('storageLocation')}</span><Selection label={t('storageLocation')} value={storageMode}
+      options={[{ value: 'auto', label: t('automaticStorage') }, { value: 'manual', label: t('manualStorage') }]} onChange={setStorageMode} /></div>
+    {storageMode === 'manual' && <label>{t('remoteRoot')}<Input name="remoteRoot" defaultValue={server?.storagePreference?.mode === 'manual' ? server.storagePreference.directory : server?.remoteRoot} required /></label>}
+    <label>{t('remotePort')}<Input name="remotePort" type="number" min={1} max={65534} defaultValue={server?.remotePort ?? controller.initialControlPort()} required /></label>
+    <label>{t('trainingAddress')}<Input name="trainingAddress" placeholder={t('networkPlaceholder')} defaultValue={server?.trainingAddress} /></label>
+    </div><p className={css.hint}>{t('controlPortHint')}</p><p className={css.hint}>{t('networkHint')}</p></details>
+    <div className={css.hints}><p>{t('passwordHint')}</p><p>{t('storageHint')}</p></div>
     <div className={css.actions}>
       <Button type="submit" variant="primary" disabled={busy}>{busy ? t('busy') : t('save')}</Button>
       <Button variant="ghost" disabled={busy} onClick={done}>{t('discard')}</Button>
@@ -175,7 +197,7 @@ function Selection<Value extends string>({ label, value, options, onChange, disa
 }
 
 function NewExperiment({ controller, t, servers, state, draft, onSubmitted }: ViewProps & {
-  servers: ClusterServer[]
+  servers: ServerSettings[]
   state: Snapshot
   draft: FleetExperiment | undefined
   onSubmitted: () => void
@@ -245,9 +267,11 @@ function ExperimentDetail({ controller, t, row, state,
   return <article className={css.detail}>
     <h2>{row.request.objective}</h2><p role="status"><Tag>{t(status)}</Tag></p>
     {row.receipt !== undefined && <p className={css.handover}>{row.receipt.handover}</p>}
+    {row.preparation !== undefined && row.receipt === undefined && <p role="status" className={css.hint}>{t(row.preparation.stage)}</p>}
     <div className={css.actions}>
       <Button variant="outline" onClick={onClone}>{t('clone')}</Button>
       <Button variant="outline" disabled={ended} onClick={() => { void controller.cancel(id).catch((error: unknown) => { controller.report(error) }) }}>{t('cancel')}</Button>
+      {row.state === 'failed' && row.preparation !== undefined && row.receipt === undefined && <Button variant="outline" onClick={() => { void controller.retry(id).catch((error: unknown) => { controller.report(error) }) }}>{t('retryPreparation')}</Button>}
     </div>
     <nav className={css.actions}>{(['overview', 'conversation', 'logs', 'files', 'services'] as const).map(key =>
       <Button key={key} variant={tab === key ? 'primary' : 'ghost'} onClick={() => { setTab(key) }}>{t(key)}</Button>)}</nav>
@@ -273,6 +297,17 @@ function ExperimentDetail({ controller, t, row, state,
       {row.latest?.executions.length !== 0 && row.latest !== undefined && <><dt>{t('actualVersions')}</dt><dd><pre className={css.log}>{JSON.stringify(row.latest.executions, null, 2)}</pre></dd></>}
       {row.receipt !== undefined && <><dt>{t('receipt')}</dt><dd><details><summary>{t('receipt')}</summary><pre className={css.log}>{JSON.stringify(row.receipt, null, 2)}</pre></details></dd></>}
     </dl>}
+    {tab === 'overview' && (row.preparation?.placements.length ?? 0) > 0 && <section className={css.list} aria-label={t('resolvedStorage')}>
+      <h3>{t('resolvedStorage')}</h3>{row.preparation?.placements.map(placement => {
+        const server = [row.coordinator, ...row.servers].find(value => value.id === placement.serverId)
+        return <article key={placement.serverId} className={css.card}><h3>{server?.name}</h3>
+          <dl className={css.facts}><dt>{t('workspaceDirectory')}</dt><dd><code>{placement.workspaceRoot}</code></dd>
+            <dt>{t('controlDirectory')}</dt><dd><code>{placement.controlRoot}</code></dd>
+            <dt>{t('storageLocation')}</dt><dd>{placement.candidate.directory} · {t('availableBytes', { size: placement.candidate.availableBytes.toLocaleString() })} · {t(placement.candidate.persistence)}</dd>
+            <dt>{t('selectionReason')}</dt><dd>{placement.reason}</dd>
+            <dt>{t('trainingAddress')}</dt><dd>{server?.trainingAddress ?? t('networkUnused')}</dd></dl>
+        </article>
+      })}</section>}
     {tab === 'logs' && <div className={css.field}><span>{t('selectNode')}</span><Selection label={t('selectNode')} value={nodeId}
       options={row.servers.map(server => ({ value: server.id, label: server.name }))} onChange={setNodeId} /></div>}
     {(tab === 'logs' || tab === 'conversation') && <section aria-label={t(tab)}>
@@ -314,6 +349,8 @@ function Services({ controller, t, row }: ViewProps & { row: FleetExperiment }) 
     {(row.latest?.services ?? []).map(service => <article key={service.id} className={css.card}>
       <h3>{row.request.objective}</h3><p>{row.servers.find(server => server.id === service.serverId)?.name} · {t(service.state)}</p>
       <p>{t('modelArtifact')}: {service.modelPath}</p><p>{service.id} · 127.0.0.1:{service.port}</p>
+      {service.modelName !== undefined && <p>{t('servedModel')}: {service.modelName}</p>}
+      {service.external !== undefined && <PublicService key={service.id} controller={controller} t={t} service={service} />}
       {service.detail !== undefined && <p role="alert">{service.detail}</p>}
       <details><summary>{t('execution')}</summary><pre className={css.log}>{service.command}</pre></details>
       <div className={css.fields}>
@@ -328,5 +365,30 @@ function Services({ controller, t, row }: ViewProps & { row: FleetExperiment }) 
       </div>
     </article>)}
     {response !== undefined && <pre className={css.log}>{response}</pre>}
+  </section>
+}
+
+function PublicService({ controller, t, service }: ViewProps & { service: InferenceService }) {
+  const [access, setAccess] = useState<ServiceAccessInfo>()
+  const [busy, setBusy] = useState(false)
+  const external = service.external
+  if (external === undefined) return null
+  const show = async () => {
+    setBusy(true)
+    try { setAccess(await controller.serviceAccessInfo(service.experimentId, service.id)) }
+    catch (error) { controller.report(error) }
+    finally { setBusy(false) }
+  }
+  const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'"
+  return <section className={css.list} aria-label={t('publicInferenceSettings')}>
+    <p>{t('externalInferenceUrl')}: <code>{external.url}</code> · {t('mappedPort')}: {external.port}</p>
+    <div className={css.actions}><Tag tone={external.state === 'reachable' ? 'success' : external.state === 'unreachable' ? 'warning' : 'neutral'}>{t(`external-${external.state}`)}</Tag>
+      {external.checkedAt !== undefined && <time>{new Date(external.checkedAt).toLocaleString()}</time>}</div>
+    <p className={css.hint}>{t('externalCheckHint')}</p>
+    {external.detail !== undefined && <p role="alert" className={css.error}>{external.detail}</p>}
+    {!service.released && external.state !== 'stopped' && <>
+      <Button variant="outline" disabled={busy} onClick={() => { if (access !== undefined) setAccess(undefined); else void show() }}>{access === undefined ? t('showServiceAccess') : t('hideServiceAccess')}</Button>
+      {access !== undefined && <><p className={css.hint}>{t('serviceKeyHint')}</p><pre className={css.log}>{`curl ${quote(access.url.replace(/\/$/, '') + service.healthPath)} -H ${quote('Authorization: Bearer ' + access.token)}`}</pre></>}
+    </>}
   </section>
 }

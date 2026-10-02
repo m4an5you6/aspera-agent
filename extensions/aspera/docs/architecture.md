@@ -42,6 +42,10 @@ flowchart TB
     Browser[Web browser] --> Page
     Page --> Remote[Typed Remote: RPC + streams]
     Remote --> Fleet[Aspera dispatch: fleet / credentials / Sessions]
+    Fleet --> Inventory[Read-only SSH: mounts / space / interfaces]
+    Inventory --> Selection[Restricted Agent: candidate ID + reason]
+    Selection --> Placement[Persist placement before directory creation]
+    Placement --> Network[Mutual node identity and network checks]
   end
   subgraph Coordinator[First server: durable coordinator]
     Queue[Aspera experiments: queue / plans / resource groups]
@@ -50,7 +54,7 @@ flowchart TB
     Queue --> Planner
     Queue --> Executor
   end
-  Fleet -- SSH: pinned release / inputs / credentials --> Queue
+  Network -- SSH: pinned release / inputs / credentials --> Queue
   Queue -- receipt / state / logs / files --> Remote
   subgraph Nodes[Selected Linux GPU nodes]
     NodeA[Node A control profile] --> RunA[Isolated environment / managed commands]
@@ -58,6 +62,8 @@ flowchart TB
     RunA --> Frameworks[Megatron / MS-SWIFT / Unsloth]
     RunB --> Frameworks
     RunA --> Service[Registered inference services]
+    External[Platform HTTPS URL] --> Gateway[Authenticated inference gateway]
+    Gateway --> Service
   end
   Executor -- SSH tunnel + private HTTP --> NodeA
   Executor -- SSH tunnel + private HTTP --> NodeB
@@ -78,6 +84,9 @@ sequenceDiagram
   User->>UI: Submit Goal and server group
   UI->>Fleet: Create independent experiment
   Fleet-->>UI: Preparing; another Goal can be submitted
+  Fleet->>Node: Read mounts, space and network interfaces over SSH
+  Fleet->>Fleet: Agent selects candidate; persist paths and reason
+  Fleet->>Node: Create owned directories; deploy; verify mutual network
   Fleet->>Queue: Fixed release, inputs and private credentials
   Queue->>Queue: Validate and persist admission
   Queue-->>Fleet: Full handover receipt
@@ -90,6 +99,7 @@ sequenceDiagram
     Fleet->>Queue: Persist confirmation
   end
   Queue->>Queue: FIFO; allocate the entire free server group
+  Queue->>Node: Recheck selected mounts, free space and network
   Queue->>Agent: Start independent execution Session + Goal
   Agent->>Node: Prepare experiment environment; run scoped commands
   Node-->>Queue: Logs, metrics, artifacts and service health
@@ -110,9 +120,9 @@ sequenceDiagram
 <a id="execution-and-ownership"></a>
 ## Execution and ownership
 
-The management Host fixes a request and transfers a content-addressed release, input digests and private credentials. The coordinator validates the materials before persisting acceptance. Preparation Agents use private per-experiment profiles without node command tools. Approval makes a task eligible for allocation; all selected nodes are assigned together before communication and input checks.
+The management Host records read-only SSH inventory, then a restricted dispatch Agent selects an observed candidate ID and reason. Manual paths take precedence; sufficiently large system disks are allowed. Selection is saved before owned-directory creation. Mount identity, ownership, writes and space are checked again during preparation, transfer and startup. Short-lived mutual network proofs bind node and experiment identities before admission and are repeated after queue allocation. Failure stops joint startup without reducing the node group.
 
-Execution Agents are separate profile processes. Their tools call authenticated node controls that own durable allocation and command identities. Each node exposes only its granted devices, hides control credentials and state, mounts the experiment workspace writable, and mounts the remaining filesystem read-only. Network access is shared for dependency downloads and training communication; this is not network isolation. Framework environments are created inside the writable experiment directory.
+Control state, queues and credentials remain under the login user’s fixed private control directory. Releases and per-experiment inputs, Agent homes, logs, caches, environments, temporary files and artifacts use the selected disk. Node tools expose granted devices, hide the control directory and registered experiment storage roots, and bind only the current workspace writable. Framework cache/environment variables point into that workspace. Network access remains shared for downloads and training; it is not network isolation.
 
 Registered inference processes belong to node controls rather than the execution Agent. Ending the Goal or disconnecting the browser leaves services alive and the full allocation occupied. Coordinator restart resumes service observation; ambiguous training or node-process identity becomes interrupted and retains unconfirmed allocations. Cancellation only frees a group after every node confirms cleanup.
 

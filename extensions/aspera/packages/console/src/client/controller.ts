@@ -2,11 +2,12 @@ import type {} from '@aspera/dispatch/remote'
 import type {} from '@deepseek-ai/dsh-api-gateway/client'
 /** Independent experiment selection, incremental reads, and browser actions. */
 import type { Context } from '@deepseek-ai/cordis'
-import type { ClusterFile, ClusterServer, FleetExperiment, FleetRegistry, FleetServerInput } from '@aspera/dispatch/types'
+import type { ClusterFile, ServerSettings, ServerProbe, FleetExperiment, FleetRegistry, FleetServerInput } from '@aspera/dispatch/types'
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import { randomUUID } from '@deepseek-ai/dsh-util-crypto'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import type { Config } from '../config.ts'
+import type { ServiceAccessInfo } from '@aspera/experiments/types'
 
 function unwrap<T>(result: RemoteResult<T>): T {
   if (!result.ok) throw new Error(result.error.message)
@@ -26,7 +27,7 @@ export interface ExperimentsSnapshot {
   registry: FleetRegistry
   experiments: FleetExperiment[]
   selectedId: string | null
-  probes: Record<string, { gpuInfo: string; allocations: string[] }>
+  probes: Record<string, ServerProbe>
   probeErrors: Record<string, string>
   streams: Record<string, ExperimentStream>
   files: ClusterFile[]
@@ -49,6 +50,11 @@ export class ExperimentsController {
 
   /** @returns profile-configured initial node control port; the coordinator uses the following port. */
   initialControlPort(): number { return this.config.defaultControlPort }
+
+  /** @param id - experiment. @param serviceId - public service. @returns a service key only after an operator asks to view calling information. */
+  async serviceAccessInfo(id: string, serviceId: string): Promise<ServiceAccessInfo> {
+    return unwrap(await this.remote.serviceAccessInfo(id, serviceId))
+  }
 
   /** Apply a validated reconnect snapshot without moving local log cursors. @param snapshot - current durable records. */
   receive(snapshot: import('@aspera/dispatch/types').FleetSnapshot): void {
@@ -121,7 +127,7 @@ export class ExperimentsController {
     this.patch({ experiments: experiments.sort((a, b) => b.createdAt - a.createdAt) })
   }
 
-  private async readStream(row: FleetExperiment, kind: 'events' | 'log' | 'agent-log', server?: ClusterServer): Promise<void> {
+  private async readStream(row: FleetExperiment, kind: 'events' | 'log' | 'agent-log', server?: ServerSettings): Promise<void> {
     if (this.isDisposed()) return
     const key = `${row.request.experimentId}/${server?.id ?? kind}`
     const previous = this.store.getSnapshot().streams[key] ?? { text: '', reset: false, offset: 0 }
@@ -236,6 +242,8 @@ export class ExperimentsController {
    * @param id - experiment whose cancellation is recorded remotely.
    */
   async cancel(id: string): Promise<void> { this.replace(unwrap(await this.remote.cancelExperiment(id))) }
+  /** Resume a failed preparation. @param id - immutable experiment identity. */
+  async retry(id: string): Promise<void> { this.replace(unwrap(await this.remote.retryPreparation(id))) }
 
   /**
    * Request a private streaming download address.

@@ -9,7 +9,7 @@ import { createRequire } from 'node:module'
  * @param options - compiled application, sealed runtime and owned output directories.
  * @returns after the unpacked Windows application has been written.
  */
-export async function buildWindowsDesktop({ application, sealed, output }) {
+export async function buildWindowsDesktop({ application, sealed, output, buildInfo }) {
   const require = createRequire(resolve(application, 'package.json'))
   const { build, Platform, Arch } = require('electron-builder')
   assert.ok(existsSync(sealed), 'The frozen runtime archive is missing')
@@ -17,8 +17,8 @@ export async function buildWindowsDesktop({ application, sealed, output }) {
   assert.ok(existsSync(resolve(unpacked, 'node_modules/pnpm/bin/pnpm.cjs')), 'The frozen package manager is missing')
   await build({ projectDir: application, targets: Platform.WINDOWS.createTarget(['dir'], Arch.x64), publish: 'never',
     config: { appId: 'org.aspera.desktop', productName: 'Aspera', electronVersion: '44.0.0', asar: false, npmRebuild: false,
-      directories: { output }, files: ['lib/**/*.js', 'lib/preload.cjs', 'resources/icon.png', 'resources/badges/*.png', 'package.json', 'LICENSE'],
-      extraResources: [{ from: sealed, to: 'runtime.asar' }],
+      directories: { output }, artifactName: 'Aspera-${version}-win.${ext}', files: ['lib/**/*.js', 'lib/preload.cjs', 'resources/icon.png', 'resources/badges/*.png', 'package.json', 'LICENSE'],
+      extraResources: [{ from: sealed, to: 'runtime.asar' }, { from: buildInfo, to: 'build-info.json' }],
       afterPack(context) {
         const directory = resolve(context.appOutDir)
         assert.ok(directory.startsWith(resolve(output) + sep), 'Desktop output is outside its owned directory')

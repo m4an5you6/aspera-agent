@@ -15,12 +15,12 @@ import { defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain'
 import type { Domain } from '@deepseek-ai/dsh-storage-domain'
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import type {} from '@deepseek-ai/dsh-agent-default-model'
 import {
   CLUSTER_HANDOVER, clusterAgentModelSchema, clusterChunkSchema, clusterFileHash, clusterFileSchema, clusterRecordSchema, clusterServerSchema,
-  clusterSubmissionSchema, clusterSubmissionV2Schema, experimentIdSchema, serverIdSchema, budgetSchema, answerExperimentQuestionSchema,
+  clusterSubmissionSchema, clusterSubmissionV2Schema, clusterSubmissionV3Schema, experimentIdSchema, serverIdSchema, budgetSchema, answerExperimentQuestionSchema,
+  serverSettingsSchema, legacyClusterServerSchema, serverInventorySchema, storagePlacementSchema, inspectServerStorage, prepareServerStorage, verifyServerStorage, serviceAccessInfoSchema,
 } from '@aspera/runtime'
-import type { ClusterChunk, ClusterFile, ClusterPrivate, ClusterRecord, ClusterServer, ExperimentId, ExperimentServerId } from '@aspera/runtime'
+import type { ClusterChunk, ClusterFile, ClusterPrivate, ClusterRecord, ClusterServer, ExperimentId, ExperimentServerId, ServerSettings, ServerProbe } from '@aspera/runtime'
 import { copy, remote, request, shellQuote } from './transport.ts'
 import { installPrivateFile } from './deploy.ts'
 import type { DeploymentConfig } from './deploy.ts'
@@ -28,17 +28,21 @@ import { snapshotSource } from './snapshot.ts'
 import { sshPasswordRef } from './ssh-account.ts'
 import { pinnedTargetSchema } from './deployment-settings.ts'
 import { delegateClusterLogin, describeClusterNode, ensureClusterRole, prepareClusterServer } from './cluster-deploy.ts'
-import type { FleetCreateRequest, FleetExperiment, FleetRegistry, FleetServerInput } from './types.ts'
+import type { FleetCreateRequest, FleetExperiment, FleetRegistry, FleetServerInput, PinnedDeployment } from './types.ts'
 import type { AnswerExperimentQuestion } from '@aspera/experiments'
+import { StorageSelection } from './storage-selection.ts'
+import { resolveTrainingNetwork } from './network-selection.ts'
 
-const registrySchema = z.object({ coordinatorId: serverIdSchema.optional(), servers: z.array(clusterServerSchema) })
+const storedServerSchema = z.union([serverSettingsSchema, legacyClusterServerSchema])
+const registrySchema = z.object({ coordinatorId: serverIdSchema.optional(), servers: z.array(storedServerSchema),
+  probes: z.record(z.string(), z.object({ gpuInfo: z.string(), allocations: z.array(z.string()), inventory: serverInventorySchema })).optional() })
 const requestSchema = z.object({ experimentId: experimentIdSchema, objective: z.string().trim().min(1).max(20_000),
   serverIds: z.array(serverIdSchema).min(1).max(32), files: z.array(z.string()).max(128).default([]),
   uploads: z.array(z.object({ name: clusterSubmissionV2Schema.shape.inputs.element.shape.name, size: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER) }).strict()).max(128).default([]), mode: z.enum(['semi', 'automatic']),
 }).strict().refine(value => new Set(value.serverIds).size === value.serverIds.length, 'duplicate server selection')
   .refine(value => new Set(value.uploads.map(file => file.name)).size === value.uploads.length, 'duplicate attachment name')
 const localSchema = z.object({
-  request: z.union([requestSchema, requestSchema.safeExtend({ budget: budgetSchema })]), coordinator: clusterServerSchema, servers: z.array(clusterServerSchema),
+  request: z.union([requestSchema, requestSchema.safeExtend({ budget: budgetSchema })]), coordinator: storedServerSchema, servers: z.array(storedServerSchema),
   coordinatorTarget: pinnedTargetSchema, targets: z.array(pinnedTargetSchema),
   agentModel: clusterAgentModelSchema,
   createdAt: z.number().int(), state: z.enum(['staging', 'preparing', 'submitted', 'failed', 'cancelled']), detail: z.string().optional(),
@@ -47,8 +51,11 @@ const localSchema = z.object({
   submission: clusterSubmissionSchema.optional(), receipt: clusterRecordSchema.optional(), latest: clusterRecordSchema.optional(),
   handoverRecorded: z.boolean().default(false),
   waitingFor: z.array(serverIdSchema).default([]),
+  preparation: z.object({ protocol: z.literal(3), stage: z.enum(['inspecting', 'selecting-storage', 'preparing-storage', 'deploying', 'checking-network', 'transferring', 'submitting']),
+    inventories: z.array(z.object({ serverId: serverIdSchema, inventory: serverInventorySchema })), placements: z.array(storagePlacementSchema),
+    inputs: clusterSubmissionV2Schema.shape.inputs.optional() }).optional(),
 })
-const storeSpec = defineDomain({ name: 'aspera_fleet', version: 2, compatibleVersions: [1], layout: 'per-record', tables: {
+const storeSpec = defineDomain({ name: 'aspera_fleet', version: 3, compatibleVersions: [1, 2], layout: 'per-record', tables: {
   registry: domainTable<string, FleetRegistry>(registrySchema),
   experiments: domainTable<ExperimentId, FleetExperiment>(localSchema),
 } })
@@ -65,10 +72,14 @@ export interface FleetDriver {
   remote: typeof remote
   copy: typeof copy
   request: typeof request
+  inspectServerStorage: typeof inspectServerStorage
+  prepareServerStorage: typeof prepareServerStorage
+  verifyServerStorage: typeof verifyServerStorage
+  resolveTrainingNetwork: typeof resolveTrainingNetwork
 }
 
 const productionDriver: FleetDriver = { snapshotSource, prepareClusterServer, ensureClusterRole, describeClusterNode,
-  delegateClusterLogin, installPrivateFile, remote, copy, request }
+  delegateClusterLogin, installPrivateFile, remote, copy, request, inspectServerStorage, prepareServerStorage, verifyServerStorage, resolveTrainingNetwork }
 
 class CoordinatorRequestError extends Error {
   constructor(readonly status: number, message: string) { super(message) }
@@ -86,7 +97,7 @@ export class ExperimentFleet {
   private readonly uploadRoot = resolve(resolveDshHome(), 'aspera-inputs')
 
   private constructor(private readonly ctx: Context, private readonly store: Store,
-    private readonly deployment: (server: ClusterServer) => DeploymentConfig, private readonly driver: FleetDriver) {}
+    private readonly deployment: (server: ServerSettings) => PinnedDeployment, private readonly driver: FleetDriver) {}
 
   /**
    * Open durable records and reconcile interrupted local preparation.
@@ -95,7 +106,7 @@ export class ExperimentFleet {
    * @param driver - release and transport provider; the default uses password SSH.
    * @returns effect-owned fleet service.
    */
-  static async open(ctx: Context, deployment: (server: ClusterServer) => DeploymentConfig, driver: FleetDriver = productionDriver): Promise<ExperimentFleet> {
+  static async open(ctx: Context, deployment: (server: ServerSettings) => PinnedDeployment, driver: FleetDriver = productionDriver): Promise<ExperimentFleet> {
     const store = await ctx.storage.domain.open(storeSpec)
     const fleet = new ExperimentFleet(ctx, store, deployment, driver)
     ctx.effect(() => () => fleet.close(), 'experiment fleet: local preparations')
@@ -143,13 +154,17 @@ export class ExperimentFleet {
    * @returns persisted registry; the first server remains coordinator.
    */
   saveServer(raw: FleetServerInput): Promise<FleetRegistry> {
-    const server = clusterServerSchema.parse(raw)
+    const server = serverSettingsSchema.omit({ storagePlacement: true }).parse(raw)
+    if (server.remoteRoot === undefined && server.storagePreference === undefined) server.storagePreference = { mode: 'auto' }
     if (server.authMode !== 'password' || server.identityFile !== undefined) throw new Error('Aspera server configuration supports password login only')
+    if (server.inferenceMapping !== undefined && [server.remotePort, server.remotePort + 1, server.sshPort].includes(server.inferenceMapping.port)) {
+      throw new Error('Mapped inference port must differ from the SSH and internal control ports')
+    }
     return this.serial(async () => {
       const registry = this.servers()
       const previous = registry.servers.find(other => other.id === server.id)
       if (server.id === registry.coordinatorId && previous !== undefined
-        && (previous.host !== server.host || previous.sshPort !== server.sshPort
+        && (previous.host !== server.host || previous.sshPort !== server.sshPort || previous.username !== server.username
           || previous.remoteRoot !== server.remoteRoot || previous.remotePort !== server.remotePort)) {
         throw new Error('the coordinator address and state directory are fixed; automatic coordinator relocation is not supported')
       }
@@ -158,7 +173,8 @@ export class ExperimentFleet {
       }
       const servers = registry.servers.some(other => other.id === server.id)
         ? registry.servers.map(other => other.id === server.id ? server : other) : [...registry.servers, server]
-      const next = { coordinatorId: registry.coordinatorId ?? server.id, servers }
+      const probes = { ...registry.probes }; delete probes[server.id]
+      const next = { coordinatorId: registry.coordinatorId ?? server.id, servers, probes }
       await this.store.table('registry').put('servers', next)
       return next
     })
@@ -183,14 +199,14 @@ export class ExperimentFleet {
     })
   }
 
-  private async password(server: ClusterServer): Promise<string | undefined> {
+  private async password(server: ServerSettings): Promise<string | undefined> {
     if (server.authMode !== 'password') return undefined
     const value = await this.ctx.credentials.resolve(sshPasswordRef(server))
     if (value === undefined) throw new Error(`SSH password is missing for ${server.name}`)
     return value.value
   }
 
-  private async token(server: ClusterServer, role: 'coordinator' | 'node'): Promise<string> {
+  private async token(server: ServerSettings, role: 'coordinator' | 'node'): Promise<string> {
     const ref = credentialRef(`ASPERA_CLUSTER_${role.toUpperCase()}_${server.id.replaceAll('-', '_')}`)
     let pending = this.tokens.get(ref)
     if (pending === undefined) {
@@ -212,12 +228,18 @@ export class ExperimentFleet {
    * @param id - configured server.
    * @returns GPU inventory and allocation visibility.
    */
-  async probe(id: ExperimentServerId): Promise<{ gpuInfo: string; allocations: string[] }> {
+  async probe(id: ExperimentServerId): Promise<ServerProbe> {
     const server = this.servers().servers.find(server => server.id === id)
     if (server === undefined) throw new Error('server not found')
     const target = this.deployment(server)
     const password = await this.password(server)
-    const gpuInfo = await this.driver.remote(target, 'nvidia-smi -L', undefined, password)
+    const directory = server.storagePreference?.mode === 'manual' ? server.storagePreference.directory
+      : server.storagePreference === undefined ? server.remoteRoot : undefined
+    const observations = await Promise.allSettled([this.driver.inspectServerStorage(target, directory, password),
+      this.driver.remote(target, 'nvidia-smi -L', undefined, password)])
+    if (observations[0].status === 'rejected') throw observations[0].reason
+    const inventory = observations[0].value
+    const gpuInfo = observations[1].status === 'fulfilled' ? observations[1].value : `GPU check failed: ${String(observations[1].reason)}`
     let allocations: string[] = []
     try {
       const health = await this.driver.request(target, await this.token(server, 'node'), '/aspera/v1/health', 'GET', undefined, undefined, password)
@@ -225,7 +247,13 @@ export class ExperimentFleet {
         allocations = z.object({ node: z.object({ allocations: z.array(z.string()) }) }).parse(health.value).node.allocations
       }
     } catch (error) { this.ctx.logger.debug(`experiment node has no ready control process: ${String(error)}`) }
-    return { gpuInfo, allocations }
+    const result = { gpuInfo, allocations, inventory }
+    await this.serial(async () => {
+      const registry = this.servers()
+      if (JSON.stringify(registry.servers.find(value => value.id === id)) !== JSON.stringify(server)) return
+      await this.store.table('registry').put('servers', { ...registry, probes: { ...registry.probes, [id]: result } })
+    })
+    return result
   }
 
   /**
@@ -302,7 +330,7 @@ export class ExperimentFleet {
         if (server === undefined) throw new Error('selected server is no longer configured')
         return server
       })
-      const pinned = new Map<ExperimentServerId, ClusterServer>()
+      const pinned = new Map<ExperimentServerId, ServerSettings>()
       for (const server of [coordinator, ...selected]) {
         if (pinned.has(server.id)) continue
         const password = await this.password(server)
@@ -320,6 +348,7 @@ export class ExperimentFleet {
         targets: servers.map(server => pinnedTargetSchema.parse(this.deployment(server))), createdAt: Date.now(),
         agentModel: { ...this.ctx.agentDefaultModel.currentSelection() },
         state: input.uploads.length > 0 ? 'staging' : 'preparing', sessionId, waitingFor: [], handoverRecorded: false,
+        preparation: { protocol: 3, stage: 'inspecting', inventories: [], placements: [] },
         ...(sourceGoal === undefined ? {} : { sourceGoal }) }
       await this.store.table('experiments').put(input.experimentId, record)
       if (record.state === 'preparing') this.beginPreparation(input.experimentId)
@@ -347,6 +376,25 @@ export class ExperimentFleet {
     const done = Promise.resolve().then(() => this.prepare(id, abort.signal))
     void done.catch((error: unknown) => { this.ctx.logger.error(`Aspera preparation cleanup failed: ${String(error)}`) })
     this.preparing.set(id, { abort, done })
+  }
+
+  /** Resume an interrupted v3 preparation using its saved servers, inputs and directories.
+   * @param id - existing experiment. @returns its current preparation or reconciled receipt.
+   */
+  async retry(id: ExperimentId): Promise<FleetExperiment> {
+    if (this.get(id).submission !== undefined) return this.refresh(id)
+    return this.serial(async () => {
+      const current = this.get(id)
+      if (this.closing) throw new Error('Experiment dispatch is stopping')
+      if (this.preparing.has(id) || current.state === 'submitted') return current
+      if (current.preparation === undefined) throw new Error('Copy this legacy preparation to a new experiment')
+      if (current.state !== 'failed') throw new Error('Only interrupted or failed preparation can be retried')
+      const next = { ...current, state: 'preparing' as const }
+      delete next.detail
+      await this.store.table('experiments').put(id, next)
+      this.beginPreparation(id)
+      return next
+    })
   }
 
   /** Commit staged attachments before deploying. @param id - staging experiment. @returns durable preparation record. */
@@ -382,66 +430,165 @@ export class ExperimentFleet {
     return this.call(this.get(id), 'access-service', { experimentId: id, serviceId, path, method, body }, signal)
   }
 
+  /** Read a service-only credential on explicit operator request; never persists it in a receipt.
+   * @param id - owning experiment. @param serviceId - registered public service. @returns private calling information.
+   */
+  async serviceAccessInfo(id: ExperimentId, serviceId: string): Promise<import('@aspera/experiments').ServiceAccessInfo> {
+    return serviceAccessInfoSchema.parse(await this.call(this.get(id), 'service-access-info', { experimentId: id, serviceId }))
+  }
+
   private async prepare(id: ExperimentId, signal: AbortSignal): Promise<void> {
     let source: Awaited<ReturnType<typeof snapshotSource>> | undefined
     try {
       let record = this.get(id)
-      const target = record.coordinatorTarget
+      if (record.preparation === undefined) throw new Error('Legacy preparation retains its original layout; copy it to a new experiment')
+      const pendingTarget = record.coordinatorTarget
       const selection = record.agentModel
-      const handle = await this.ctx.agents.create({ sessionId: SessionId(record.sessionId), meta: { cwd: target.localRepo },
-        agentOptions: { provider: selection.provider, model: selection.model } })
+      const storage = new StorageSelection()
+      const options = { agentOptions: { ...selection },
+        setup: async (ctx: Context, agent: Agent) => { storage.install(ctx, agent) } }
+      const storedSession = await this.ctx.sessionPersistence.stat(SessionId(record.sessionId), { signal })
+      if (storedSession === undefined && record.goalId !== undefined) throw new Error('The recorded dispatch Session is missing; copy to a new experiment')
+      const handle = storedSession === undefined
+        ? await this.ctx.agents.create({ sessionId: SessionId(record.sessionId), meta: { cwd: pendingTarget.localRepo }, ...options })
+        : await this.ctx.agents.resume({ resumeSessionId: SessionId(record.sessionId), ...options })
       this.handles.set(id, handle)
       signal.throwIfAborted()
-      const goal = this.ctx.goals.create(handle.agent, { objective: record.request.objective })
+      const goal = this.ctx.goals.get(handle.agent) ?? (record.goalId === undefined
+        ? this.ctx.goals.create(handle.agent, { objective: record.request.objective }) : undefined)
+      if (goal === undefined || (record.goalId !== undefined && (goal.id !== record.goalId || goal.revision !== record.goalRevision))) {
+        throw new Error('Dispatch Goal changed; copy the requirements to a new experiment')
+      }
       this.ctx.goals.disarm(handle.agent)
+      await this.ctx.sessionPersistence.flush()
       record = await this.serial(async () => {
         signal.throwIfAborted()
         const next = { ...this.get(id), goalId: goal.id, goalRevision: goal.revision }
         await this.store.table('experiments').put(id, next)
         return next
       })
-      await this.ctx.sessionPersistence.flush()
-      source = await this.driver.snapshotSource(target.localRepo, target.toolTimeoutMs, signal)
+      source = await this.driver.snapshotSource(pendingTarget.localRepo, pendingTarget.toolTimeoutMs, signal)
       const snapshot = source
+      const preparation = record.preparation
+      if (preparation === undefined) throw new Error('Storage preparation is missing')
+      if (preparation.placements.some(placement => !placement.releaseRoot.endsWith('/' + snapshot.digest))) {
+        throw new Error('The saved release is unavailable in this installation; restore that build or copy to a new experiment')
+      }
+      const files = record.request.files.map(path => this.localInput(path, pendingTarget.dataRoots))
+      for (const file of record.request.uploads) files.push(resolve(this.uploadRoot, id, file.name))
+      const inputs: { name: string; sha256: string }[] = []
+      for (const file of files) {
+        const name = basename(file)
+        if (inputs.some(input => input.name === name)) throw new Error('Input file names must be unique')
+        inputs.push({ name, sha256: await clusterFileHash(file) })
+      }
+      if (preparation.inputs !== undefined && JSON.stringify(preparation.inputs) !== JSON.stringify(inputs)) {
+        throw new Error('Experiment inputs changed after preparation; copy to a new experiment')
+      }
+      record = await this.preparationStage(id, preparation.stage, { inputs })
+      const unique = [...new Map([record.coordinator, ...record.servers].map(server => [server.id, server])).values()]
+      const targetFor = (server: ServerSettings): PinnedDeployment => {
+        if (server.id === record.coordinator.id) return record.coordinatorTarget
+        const index = record.servers.findIndex(value => value.id === server.id)
+        const target = record.targets[index]
+        if (target === undefined) throw new Error('Selected server has no pinned preparation settings')
+        return target
+      }
+      let inventories = record.preparation?.inventories ?? []
+      if (inventories.length === 0) {
+        const observations = await Promise.allSettled(unique.map(async server => {
+          const directory = server.storagePreference?.mode === 'manual' ? server.storagePreference.directory
+            : server.storagePreference === undefined ? server.remoteRoot : undefined
+          return { serverId: server.id, inventory: await this.driver.inspectServerStorage(targetFor(server), directory, await this.password(server), signal) }
+        }))
+        inventories = observations.map(result => { if (result.status === 'rejected') throw result.reason; return result.value })
+        record = await this.preparationStage(id, 'selecting-storage', { inventories })
+      }
+      let placements = record.preparation?.placements ?? []
+      if (placements.length === 0) {
+        if (pendingTarget.minimumFreeBytes === undefined) throw new Error('Storage reserve is absent from the pinned deployment policy')
+        placements = await storage.run(handle.agent, id, snapshot.digest, unique.map(server => {
+          const observed = inventories.find(value => value.serverId === server.id)
+          if (observed === undefined) throw new Error('Server inventory is missing')
+          return { server, inventory: observed.inventory }
+        }), pendingTarget.minimumFreeBytes, signal)
+        await this.ctx.sessionPersistence.flush()
+        record = await this.preparationStage(id, 'preparing-storage', { placements })
+      }
+      const resolvedServer = (server: ServerSettings): ClusterServer => {
+        const placement = placements.find(value => value.serverId === server.id)
+        if (placement === undefined) throw new Error('Storage selection is incomplete')
+        const { storagePreference: _preference, ...connection } = server
+        return clusterServerSchema.parse({ ...connection, remoteRoot: placement.controlRoot, storagePlacement: placement })
+      }
+      const resolvedCoordinator = resolvedServer(record.coordinator)
+      const resolvedNodes = record.servers.map(resolvedServer)
+      record = await this.serial(async () => {
+        signal.throwIfAborted()
+        const current = this.get(id)
+        const next = { ...current, coordinator: resolvedCoordinator, servers: resolvedNodes,
+          coordinatorTarget: { ...current.coordinatorTarget, remoteRoot: resolvedCoordinator.remoteRoot, storagePlacement: resolvedCoordinator.storagePlacement },
+          targets: current.targets.map((target, index) => ({ ...target, remoteRoot: resolvedNodes[index].remoteRoot, storagePlacement: resolvedNodes[index].storagePlacement })) }
+        await this.store.table('experiments').put(id, next)
+        return next
+      })
+      const target = this.resolvedTarget(record.coordinatorTarget)
       const coordinatorPassword = await this.password(record.coordinator)
       const coordinatorToken = await this.token(record.coordinator, 'coordinator')
       const preparedCoordinator = await this.onServer(record.coordinator.id, async () => {
+        const placement = resolvedCoordinator.storagePlacement
+        if (placement === undefined) throw new Error('Coordinator storage is missing')
+        await this.driver.prepareServerStorage(target, placement, coordinatorPassword, signal)
+        await this.preparationStage(id, 'deploying')
         const prepared = await this.driver.prepareClusterServer(target, snapshot, coordinatorPassword, signal)
         await this.driver.ensureClusterRole(target, prepared, 'coordinator', coordinatorToken, coordinatorPassword, signal)
         return prepared
       })
-      const preparedNodes = await Promise.allSettled(record.servers.map((server, index) => this.onServer(server.id, async () => {
-        const nodeTarget = record.targets[index]
-        if (nodeTarget === undefined) throw new Error('selected server has no pinned deployment settings')
+      const preparedNodes = await Promise.allSettled(resolvedNodes.map((server, index) => this.onServer(server.id, async () => {
+        const pendingNode = record.targets[index]
+        if (pendingNode === undefined) throw new Error('selected server has no pinned deployment settings')
+        const nodeTarget = this.resolvedTarget(pendingNode)
         const password = await this.password(server)
+        if (server.storagePlacement === undefined) throw new Error('Node storage is missing')
+        await this.driver.prepareServerStorage(nodeTarget, server.storagePlacement, password, signal)
         const prepared = server.id === record.coordinator.id ? preparedCoordinator : await this.driver.prepareClusterServer(nodeTarget,
           snapshot, password, signal)
         await this.driver.ensureClusterRole(nodeTarget, prepared, 'node', await this.token(server, 'node'), password, signal)
         return this.driver.describeClusterNode(server, prepared, nodeTarget, password, signal)
       })))
-      const nodes = preparedNodes.map((result) => {
+      let nodes = preparedNodes.map((result) => {
         if (result.status === 'rejected') throw result.reason
         return result.value
       })
-      const inputs: { name: string; sha256: string }[] = []
-      const files = record.request.files.map(path => this.localInput(path, target.dataRoots))
-      for (const file of record.request.uploads) {
-        files.push(resolve(this.uploadRoot, id, file.name))
-      }
-      const incoming = `${target.remoteRoot}/runs/${id}/inputs`
+      await this.preparationStage(id, 'checking-network')
+      nodes = await this.driver.resolveTrainingNetwork(id, await Promise.all(nodes.map(async (node, index) => {
+        const observed = inventories.find(value => value.serverId === node.server.id)
+        if (observed === undefined) throw new Error('Node network inventory is missing')
+        return { node, target: this.resolvedTarget(record.targets[index]), inventory: observed.inventory,
+          password: await this.password(node.server), token: await this.token(node.server, 'node') }
+      })), signal)
+      const coordinator = nodes.find(node => node.server.id === resolvedCoordinator.id)?.server ?? resolvedCoordinator
+      record = await this.serial(async () => {
+        const next = { ...this.get(id), coordinator, servers: nodes.map(node => node.server) }
+        await this.store.table('experiments').put(id, next); return next
+      })
+      await this.preparationStage(id, 'transferring')
+      const placement = resolvedCoordinator.storagePlacement
+      if (placement === undefined) throw new Error('Coordinator storage is missing')
+      await this.driver.verifyServerStorage(target, placement, coordinatorPassword, signal, files.reduce((total, file) => total + statSync(file).size, 0))
+      const incoming = `${placement.runRoot}/inputs`
       await this.driver.remote(target, `umask 077; mkdir -p ${shellQuote(incoming)}`, signal, coordinatorPassword)
       for (const file of files) {
         const name = basename(file)
-        if (inputs.some(input => input.name === name)) throw new Error('input file names must be unique')
         const sha256 = await clusterFileHash(file)
+        if (inputs.find(input => input.name === name)?.sha256 !== sha256) throw new Error('Input changed during preparation')
         await this.driver.copy(target, file, `${incoming}/${name}`, signal, coordinatorPassword)
-        inputs.push({ name, sha256 })
       }
-      if (record.request.budget !== undefined) throw new Error('Legacy preparation cannot be converted to protocol 2; copy it to a new experiment')
-      const submission = clusterSubmissionV2Schema.parse({ protocol: 2, experimentId: id, deploymentId: snapshot.digest,
-        objective: record.request.objective, coordinator: record.coordinator, nodes, inputs, createdAt: record.createdAt,
+      if (record.request.budget !== undefined) throw new Error('Legacy preparation cannot be converted to protocol 3; copy it to a new experiment')
+      const submission = clusterSubmissionV3Schema.parse({ protocol: 3, experimentId: id, deploymentId: snapshot.digest,
+        objective: record.request.objective, coordinator, nodes, inputs, inventories, createdAt: record.createdAt,
         strategy: { mode: record.request.mode, coordinator: 'single-agent' },
-        versions: { dsh: '0.2.0-rc.2', extension: '0.2.0', harness: snapshot.digest, data: inputs.map(input => input.sha256) } })
+        versions: { dsh: '0.2.0-rc.2', extension: '0.1.1', harness: snapshot.digest, data: inputs.map(input => input.sha256) } })
       const modelCredentialFile = `${target.remoteRoot}/secrets/${id}-model.json`
       const credentials: Record<string, string> = {}
       for (const name of target.agentCredentialRefs) {
@@ -450,7 +597,7 @@ export class ExperimentFleet {
         credentials[name] = credential.value
       }
       await this.driver.installPrivateFile(target, modelCredentialFile, JSON.stringify({ version: 1, refs: credentials }), signal, coordinatorPassword)
-      const connections = await Promise.all(record.servers.map(async server => ({ serverId: server.id,
+      const connections = await Promise.all(nodes.map(async ({ server }) => ({ serverId: server.id,
         token: await this.token(server, 'node'),
         ...(server.authMode === 'password' ? { password: await this.password(server) } : {}),
         ...await this.driver.delegateClusterLogin(target, server, id, coordinatorPassword, signal),
@@ -464,6 +611,7 @@ export class ExperimentFleet {
         return next
       })
       signal.throwIfAborted()
+      await this.preparationStage(id, 'submitting')
       let receipt: ClusterRecord
       try { receipt = clusterRecordSchema.parse(await this.call(record, 'submit', submission)) }
       catch (error) { signal.throwIfAborted(); void error; receipt = clusterRecordSchema.parse(await this.call(record,
@@ -472,13 +620,28 @@ export class ExperimentFleet {
     } catch (error) {
       const current = this.get(id)
       if (current.receipt === undefined) await this.store.table('experiments').put(id, { ...current,
-        state: signal.aborted && current.submission === undefined ? 'cancelled' : 'failed', detail: String(error) })
+        state: signal.aborted && !this.closing && current.submission === undefined ? 'cancelled' : 'failed', detail: String(error) })
     } finally {
       source?.dispose()
       const handle = this.handles.get(id)
       this.handles.delete(id)
       try { await handle?.dispose() } finally { this.preparing.delete(id) }
     }
+  }
+
+  private resolvedTarget(target: PinnedDeployment): DeploymentConfig {
+    if (target.remoteRoot === undefined) throw new Error('Server directories have not been resolved')
+    return { ...target, remoteRoot: target.remoteRoot }
+  }
+
+  private preparationStage(id: ExperimentId, stage: NonNullable<FleetExperiment['preparation']>['stage'],
+    patch: Partial<Pick<NonNullable<FleetExperiment['preparation']>, 'inventories' | 'placements' | 'inputs'>> = {}): Promise<FleetExperiment> {
+    return this.serial(async () => {
+      const current = this.get(id)
+      if (current.preparation === undefined || current.state === 'cancelled') throw new Error('Preparation is unavailable or cancelled')
+      const next = { ...current, preparation: { ...current.preparation, ...patch, stage } }
+      await this.store.table('experiments').put(id, next); return next
+    })
   }
 
   private localInput(path: string, roots: readonly string[]): string {
@@ -537,7 +700,7 @@ export class ExperimentFleet {
   private async call(record: FleetExperiment, operation: string, body: unknown, signal?: AbortSignal): Promise<unknown> {
     const target = record.coordinatorTarget
     const response = await this.driver.request({ ...target, remotePort: target.remotePort + 1 }, await this.token(record.coordinator, 'coordinator'),
-      `/aspera/v${record.submission?.protocol ?? 2}/${operation}`, 'POST', body, signal, await this.password(record.coordinator))
+      `/aspera/v${record.submission?.protocol ?? 3}/${operation}`, 'POST', body, signal, await this.password(record.coordinator))
     if (response.status !== 200) {
       const error = z.object({ error: z.string() }).safeParse(response.value)
       throw new CoordinatorRequestError(response.status, error.success ? error.data.error : `coordinator returned HTTP ${response.status}`)

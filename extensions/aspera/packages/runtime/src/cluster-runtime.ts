@@ -5,6 +5,8 @@ import { resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { setupWorkerProfile } from './profiles.ts'
 import type { Context } from '@deepseek-ai/cordis'
+import { serverRunRoot, serverReleaseRoot } from './storage.ts'
+import { networkProofSchema } from './network-probes.ts'
 import { z } from 'zod'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-subprocess'
@@ -55,6 +57,13 @@ export function readClusterPrivate(root: string, id: ExperimentId): ClusterPriva
   return value
 }
 
+/** Resolve coordinator artifacts through the saved private submission.
+ * @param root - control-state directory. @param id - experiment. @returns pinned run directory.
+ */
+export function clusterRunRoot(root: string, id: ExperimentId): string {
+  return serverRunRoot(readClusterPrivate(root, id).submission.coordinator, id)
+}
+
 /**
  * Send an authenticated operation to an assigned node.
  * @param runtime - saved credentials.
@@ -71,7 +80,7 @@ export async function clusterNodeRequest(runtime: ClusterPrivate, serverId: Expe
   if (node === undefined || connection === undefined) throw new Error('server is outside this experiment allocation')
   const result = await request({ ...node.server, knownHostsFile: connection.knownHostsFile,
     ...(connection.identityFile === undefined ? {} : { identityFile: connection.identityFile }),
-    toolTimeoutMs: runtime.toolTimeoutMs }, connection.token, `/aspera/v1/node/${operation}`, 'POST',
+    toolTimeoutMs: runtime.toolTimeoutMs }, connection.token, `/aspera/v${runtime.submission.protocol}/node/${operation}`, 'POST',
   { ...body, experimentId: runtime.submission.experimentId }, signal, connection.password)
   if (result.status !== 200) {
     const error = z.object({ error: z.string() }).safeParse(result.value)
@@ -100,8 +109,7 @@ export async function clusterFileHash(path: string): Promise<string> {
 export async function validateClusterAdmission(config: ClusterRuntimeConfig, submission: ClusterSubmission): Promise<ClusterPrivate> {
   const runtime = readClusterPrivate(config.root, submission.experimentId)
   if (JSON.stringify(runtime.submission) !== JSON.stringify(submission)) throw new Error('private settings differ from submitted requirements')
-  if (!existsSync(resolve(config.root, 'releases', submission.deploymentId,
-    '.ready'))) throw new Error('experiment source release is not ready')
+  if (!existsSync(resolve(serverReleaseRoot(submission.coordinator, submission.deploymentId), '.ready'))) throw new Error('experiment source release is not ready')
   if (!existsSync(runtime.modelCredentialFile)) throw new Error('experiment model credentials have not been transferred')
   for (const node of submission.nodes) {
     const connection = runtime.connections.find(connection => connection.serverId === node.server.id)
@@ -110,7 +118,7 @@ export async function validateClusterAdmission(config: ClusterRuntimeConfig, sub
     if (node.server.authMode === 'key' && (connection.identityFile === undefined || !existsSync(connection.identityFile))) throw new Error('node identity file is missing')
   }
   for (const input of submission.inputs) {
-    if (await clusterFileHash(resolve(config.root, 'runs', submission.experimentId, 'inputs', input.name)) !== input.sha256) throw new Error(`input digest mismatch: ${input.name}`)
+    if (await clusterFileHash(resolve(serverRunRoot(submission.coordinator, submission.experimentId), 'inputs', input.name)) !== input.sha256) throw new Error(`input digest mismatch: ${input.name}`)
   }
   return runtime
 }
@@ -120,26 +128,33 @@ async function prepareNodes(config: ClusterRuntimeConfig, runtime: ClusterPrivat
   const submission = runtime.submission
   const allocated = await Promise.allSettled(submission.nodes.map(node => clusterNodeRequest(runtime, node.server.id, 'allocate', {
     deploymentId: submission.deploymentId, node,
-    ...(submission.protocol === 1 ? { budget: submission.strategy.budget, deadline } : { protocol: 2 }),
+    ...(submission.protocol === 1 ? { budget: submission.strategy.budget, deadline } : { protocol: submission.protocol }),
   }, signal)))
   for (const result of allocated) if (result.status === 'rejected') throw result.reason
   if (submission.nodes.length > 1) {
     for (const node of submission.nodes) {
       if (node.server.trainingAddress === undefined) throw new Error(`Training address is required for ${node.server.name}; configure node-to-node networking before joint execution.`)
     }
-    const listening = await Promise.allSettled(submission.nodes.map(async node => ({ node,
-      port: z.object({ port: z.number().int() }).parse(await clusterNodeRequest(runtime, node.server.id, 'listen', {}, signal)).port })))
-    const listeners = listening.map((result) => { if (result.status === 'rejected') throw result.reason; return result.value })
-    const connected = await Promise.allSettled(listeners.flatMap(peer => submission.nodes
-      .filter(node => node.server.id !== peer.node.server.id).map(node =>
-        clusterNodeRequest(runtime, node.server.id, 'connect', { host: peer.node.server.trainingAddress, port: peer.port }, signal))))
-    for (const result of connected) if (result.status === 'rejected') throw result.reason
+    try {
+      const listening = await Promise.allSettled(submission.nodes.map(async node => ({ node,
+        proof: networkProofSchema.parse(await clusterNodeRequest(runtime, node.server.id, 'probe-network-start', { serverId: node.server.id }, signal)) })))
+      const listeners = listening.map(result => { if (result.status === 'rejected') throw result.reason; return result.value })
+      const connected = await Promise.allSettled(listeners.flatMap(peer => submission.nodes
+        .filter(node => node.server.id !== peer.node.server.id).map(node =>
+          clusterNodeRequest(runtime, node.server.id, 'probe-network-connect', { host: peer.node.server.trainingAddress, proof: peer.proof }, signal)
+            .then(value => z.object({ connected: z.literal(true) }).parse(value)))))
+      for (const result of connected) if (result.status === 'rejected') throw result.reason
+    } finally {
+      const closed = await Promise.allSettled(submission.nodes.map(node => clusterNodeRequest(runtime, node.server.id, 'probe-network-stop')))
+      // oxlint-disable-next-line no-unsafe-finally -- A failed cleanup must prevent training even after successful connectivity checks.
+      for (const result of closed) if (result.status === 'rejected') throw new Error(`Network probe cleanup failed: ${String(result.reason)}`)
+    }
   }
   for (const node of submission.nodes) {
     for (const input of submission.inputs) {
       let offset = 0
-      const path = resolve(config.root, 'runs', submission.experimentId, 'inputs', input.name)
-      do {
+      const path = resolve(serverRunRoot(submission.coordinator, submission.experimentId), 'inputs', input.name)
+      for (;;) {
         const chunk = readClusterChunk(path, offset, undefined, config.chunkBytes)
         const result = z.object({ nextOffset: z.number().int() }).parse(await clusterNodeRequest(runtime, node.server.id, 'input', {
           path: `inputs/${input.name}`, offset, data: chunk.data,
@@ -147,7 +162,7 @@ async function prepareNodes(config: ClusterRuntimeConfig, runtime: ClusterPrivat
         if (result.nextOffset !== chunk.nextOffset) throw new Error('input transfer returned a different cursor')
         offset = chunk.nextOffset
         if (chunk.eof) break
-      } while (true)
+      }
       await clusterNodeRequest(runtime, node.server.id, 'verify-input', { name: input.name, sha256: input.sha256 }, signal)
     }
   }
@@ -174,7 +189,7 @@ export async function clusterCommandStatuses(
  */
 export function writeClusterReceipt(root: string, id: ExperimentId, value: object,
   name: 'started.json' | 'outcome.json' | 'execution.json' | 'planning-started.json' | 'planning-outcome.json' | 'plan.json' | 'approved-plan.json' | 'progress.json'): void {
-  const path = resolve(root, 'runs', id, name)
+  const path = resolve(clusterRunRoot(root, id), name)
   writeFileSync(`${path}.incoming`, JSON.stringify(value), { mode: 0o600 })
   renameSync(`${path}.incoming`, path)
 }
@@ -187,9 +202,9 @@ export class RemoteClusterExecutor implements ClusterExecutor {
 
   /** @param record - submitted task. @param signal - cancellation. @returns durable read-only plan. */
   async prepare(record: ClusterRecord, signal: AbortSignal): Promise<{ plan: ExperimentPlan; sessionId: string }> {
-    if (record.submission.protocol !== 2) throw new Error('Legacy experiments must execute on their original release')
+    if (record.submission.protocol !== 3) throw new Error('Legacy experiments must execute on their original release')
     await this.agent(record, signal, true)
-    const root = resolve(this.config.root, 'runs', record.submission.experimentId)
+    const root = serverRunRoot(record.submission.coordinator, record.submission.experimentId)
     const outcome = z.object({ state: z.enum(['completed', 'blocked', 'failed']), detail: z.string().optional() }).parse(JSON.parse(readFileSync(resolve(root, 'planning-outcome.json'), 'utf8')))
     if (outcome.state !== 'completed') throw new Error(outcome.detail ?? 'Agent could not prepare a plan within the assigned constraints')
     return z.object({ plan: planSchema, sessionId: z.string() }).parse(JSON.parse(readFileSync(resolve(root, 'plan.json'), 'utf8')))
@@ -199,7 +214,7 @@ export class RemoteClusterExecutor implements ClusterExecutor {
   async reconcile(record: ClusterRecord): Promise<boolean> {
     const runtime = readClusterPrivate(this.config.root, record.submission.experimentId)
     const results = await Promise.allSettled(runtime.submission.nodes.map(node => clusterNodeRequest(runtime, node.server.id, 'release')))
-    const path = resolve(this.config.root, 'runs', record.submission.experimentId, 'execution.json')
+    const path = resolve(serverRunRoot(record.submission.coordinator, record.submission.experimentId), 'execution.json')
     const confirmed = !existsSync(path) || z.object({ cleanupConfirmed: z.boolean() }).parse(JSON.parse(readFileSync(path, 'utf8'))).cleanupConfirmed
     return confirmed && results.every(result => result.status === 'fulfilled' && z.object({ released: z.boolean() }).parse(result.value).released)
   }
@@ -213,13 +228,13 @@ export class RemoteClusterExecutor implements ClusterExecutor {
   async run(record: ClusterRecord, signal: AbortSignal, started: (sessionId: string, goalId: string) => Promise<void>, update: Update): Promise<ClusterOutcome> {
     if (record.plan === undefined || record.approval?.planRevision !== record.plan.revision) throw new Error('execution requires the exact approved plan')
     const runtime = await validateClusterAdmission(this.config, record.submission)
-    if (record.submission.protocol !== 2) throw new Error('Legacy experiments must execute on their original release')
+    if (record.submission.protocol !== 3) throw new Error('Legacy experiments must execute on their original release')
     const lifetime = signal
     try {
       await prepareNodes(this.config, runtime, lifetime)
       writeClusterReceipt(this.config.root, record.submission.experimentId, record.plan, 'approved-plan.json')
       await this.agent(record, lifetime, false, started, update)
-      const path = resolve(this.config.root, 'runs', record.submission.experimentId, 'outcome.json')
+      const path = resolve(serverRunRoot(record.submission.coordinator, record.submission.experimentId), 'outcome.json')
       const outcome = z.object({ state: z.enum(['completed', 'blocked', 'failed', 'serving']), detail: z.string().optional() }).parse(JSON.parse(readFileSync(path, 'utf8')))
       if (outcome.state === 'serving') return await this.monitorServices(record, signal, update)
       return { ...outcome, resourcesReleased: await this.reconcile(record) }
@@ -257,11 +272,11 @@ export class RemoteClusterExecutor implements ClusterExecutor {
     started?: (sessionId: string, goalId: string) => Promise<void>, update?: Update): Promise<void> {
     const submission = record.submission
     const runtime = await validateClusterAdmission(this.config, submission)
-    const runRoot = resolve(this.config.root, 'runs', submission.experimentId)
+    const runRoot = serverRunRoot(submission.coordinator, submission.experimentId)
     const workspace = resolve(runRoot, 'agent-workspace')
     mkdirSync(workspace, { recursive: true, mode: 0o700 })
-    const home = resolve(this.config.root, 'state', 'experiments', submission.experimentId, planning ? 'plan' : 'execution')
-    const release = resolve(this.config.root, 'releases', submission.deploymentId)
+    const home = resolve(runRoot, 'agent-homes', planning ? 'plan' : 'execution')
+    const release = serverReleaseRoot(submission.coordinator, submission.deploymentId)
     // Profiles are installed before launching; no mutable checkout or CLI argv escape is used.
     await setupWorkerProfile(home, release)
     if (!planning) writeClusterReceipt(this.config.root, submission.experimentId, { cleanupConfirmed: false }, 'execution.json')

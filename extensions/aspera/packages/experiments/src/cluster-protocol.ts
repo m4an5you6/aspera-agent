@@ -54,21 +54,35 @@ export const legacyClusterServerSchema = z.object({
   knownHostsFile: z.string().optional(),
 }).strict()
 /** Resolved deployment address; v3 directories accompany the immutable submission. */
+const internalAddressSchema = z.union([z.ipv4(), z.ipv6(), z.string().max(253).regex(/^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\.?$/)])
+/** User-owned HTTPS forwarding address and its container or server listener port. */
+export const inferenceMappingSchema = z.object({
+  url: z.string().trim().url().max(2048).refine(value => {
+    const url = new URL(value)
+    return (url.protocol === 'https:' || (url.protocol === 'http:' && ['127.0.0.1', '[::1]', 'localhost'].includes(url.hostname)))
+      && !url.username && !url.password && !url.search && !url.hash
+  }, 'Use an HTTPS base URL without credentials, query or fragment (HTTP is allowed for localhost tests only)'),
+  port: z.number().int().min(1).max(65535),
+}).strict()
+/** Optional public inference mapping, frozen with each experiment. */
+export type InferenceMapping = z.infer<typeof inferenceMappingSchema>
 export const clusterServerSchema = legacyClusterServerSchema.extend({
-  remoteRoot: remotePathSchema, storagePlacement: storagePlacementSchema.optional(),
+  remoteRoot: remotePathSchema, storagePlacement: storagePlacementSchema.optional(), trainingAddress: internalAddressSchema.optional(),
+  inferenceMapping: inferenceMappingSchema.optional(),
 })
 /** Resolved server definition; credentials are resolved separately. */
 export type ClusterServer = z.infer<typeof clusterServerSchema>
 /** Registry preferences can be saved before the first SSH connection. Legacy roots retain their layout. */
 export const serverSettingsSchema = legacyClusterServerSchema.partial({ remoteRoot: true }).extend({
-  remoteRoot: remotePathSchema.optional(), storagePreference: storagePreferenceSchema.optional(),
-  storagePlacement: storagePlacementSchema.optional(),
+  remoteRoot: remotePathSchema.refine(value => value !== '/').optional(), storagePreference: storagePreferenceSchema.optional(),
+  storagePlacement: storagePlacementSchema.optional(), trainingAddress: internalAddressSchema.optional(),
+  inferenceMapping: inferenceMappingSchema.optional(),
 })
 /** User configuration, distinct from a resolved deployment. */
 export type ServerSettings = z.infer<typeof serverSettingsSchema>
 
 /** CUDA and sandbox facts checked during server preparation. */
-const legacyClusterNodeSchema = z.object({
+export const legacyClusterNodeSchema = z.object({
   server: legacyClusterServerSchema,
   devicePaths: z.array(z.string().regex(/^\/dev\/nvidia[a-zA-Z0-9_/-]*$/)).min(1),
   backendPath: z.string().startsWith('/'),
@@ -88,6 +102,7 @@ const legacySubmissionObject = z.object({
   objective: z.string().trim().min(1).max(20_000),
   coordinator: legacyClusterServerSchema,
   nodes: z.array(legacyClusterNodeSchema).min(1).max(32),
+  // oxlint-disable-next-line no-control-regex -- The frozen v1 input-name reader rejects NUL bytes.
   inputs: z.array(z.object({ name: z.string().min(1).max(255).refine(name => !/[\\/\u0000]/.test(name) && name !== '.' && name !== '..'), sha256: deploymentIdSchema })).max(128),
   createdAt: z.number().int(),
   strategy: strategySchema.extend({ budget: budgetSchema }),
@@ -110,8 +125,12 @@ export const clusterSubmissionV3Schema = legacySubmissionObject.extend({ protoco
   strategy: strategySchema, versions: versionsSchema,
   inventories: z.array(z.object({ serverId: serverIdSchema, inventory: serverInventorySchema }).strict()).min(1).max(33),
 }).refine(value => new Set(value.nodes.map(node => node.server.id)).size === value.nodes.length
+  && new Set(value.inventories.map(item => item.serverId)).size === value.inventories.length
+  && value.inventories.length === new Set([value.coordinator.id, ...value.nodes.map(node => node.server.id)]).size
   && [value.coordinator, ...value.nodes.map(node => node.server)].every(server => server.storagePlacement.experimentId === value.experimentId
-    && server.storagePlacement.releaseRoot.endsWith('/' + value.deploymentId)), 'Directory assignments must match the experiment and release')
+    && server.storagePlacement.releaseRoot.endsWith('/' + value.deploymentId)
+    && value.inventories.some(item => item.serverId === server.id && item.inventory.candidates.some(candidate =>
+      JSON.stringify(candidate) === JSON.stringify(server.storagePlacement.candidate)))), 'Directory assignments must match the experiment, release and observed inventory')
 /** Released generations retain their original field order and version values. */
 export const clusterSubmissionSchema = z.discriminatedUnion('protocol', [legacyClusterSubmissionSchema, clusterSubmissionV2Schema, clusterSubmissionV3Schema])
 /** Immutable request shared by the dispatcher and remote coordinator. */
@@ -144,6 +163,15 @@ export const executionEntrySchema = z.object({
 }).strict()
 /** Structured metrics supplement the raw per-node log. */
 export const progressSchema = z.object({ phase: z.string().max(200), metrics: z.record(z.string(), z.number()), updatedAt: z.number().int() }).strict()
+/** External reachability is independent from process and local HTTP health. */
+export const serviceExposureSchema = inferenceMappingSchema.extend({
+  state: z.enum(['unchecked', 'reachable', 'unreachable', 'stopped']),
+  checkedAt: z.number().int().optional(), detail: z.string().optional(),
+}).strict()
+/** Explicit operator-only response; never included in experiment records or Agent results. */
+export const serviceAccessInfoSchema = z.object({ url: z.string(), token: z.string().min(32), modelName: z.string().optional() }).strict()
+/** Operator-requested calling information containing a service-only credential. */
+export type ServiceAccessInfo = z.infer<typeof serviceAccessInfoSchema>
 /** Public facts about a registered process; node credentials never appear here. */
 export const serviceSchema = z.object({
   id: serviceIdSchema, experimentId: experimentIdSchema, serverId: serverIdSchema,
@@ -152,6 +180,7 @@ export const serviceSchema = z.object({
   state: z.enum(['starting', 'healthy', 'unhealthy', 'stopping', 'stopped', 'failed', 'interrupted']),
   createdAt: z.number().int(), updatedAt: z.number().int(), deadline: z.number().int().optional(),
   released: z.boolean(), detail: z.string().optional(),
+  modelName: z.string().min(1).max(200).optional(), external: serviceExposureSchema.optional(),
 }).strict()
 /** Inference service state with an experiment-owned lifetime. */
 export type InferenceService = z.infer<typeof serviceSchema>

@@ -1,6 +1,9 @@
 {
   "dispatchGoalPhases": ["active", "complete"],
   "handover": ["本机派发完成，远端实验已接管"],
+  "inference": { "mapped": true, "external": "reachable", "modelName": "cpu-fixture", "stopped": "stopped" },
+  "storageTools": ["inspect_server_storage", "select_experiment_storage"],
+  "storage": [{ "layout": "separated", "systemVolume": false, "persistence": "unknown" }],
   "receiptStates": [
     { "goal": "CPU failure experiment", "handover": "本机派发完成，远端实验已接管", "state": "failed" },
     { "goal": "CPU semi experiment", "handover": "本机派发完成，远端实验已接管", "state": "completed" },

@@ -45,7 +45,7 @@
         deploymentId: !!js process.env.DSH_EXPERIMENT_DEPLOYMENT_ID
         experimentId: !!js process.env.DSH_CLUSTER_EXPERIMENT
         backendPath: !!js process.env.DSH_EXPERIMENT_BWRAP
-        hiddenPaths: !!js (process.env.DSH_EXPERIMENT_HIDDEN_PATHS || '').split(',').filter(Boolean)
+        hiddenPaths: !!js JSON.parse(process.env.DSH_EXPERIMENT_HIDDEN_PATHS_JSON || JSON.stringify((process.env.DSH_EXPERIMENT_HIDDEN_PATHS || '').split(',').filter(Boolean)))
         devicePaths: !!js (process.env.DSH_EXPERIMENT_DEVICES || '').split(',').filter(Boolean)
         chunkBytes: !!js Number(process.env.DSH_CLUSTER_CHUNK_BYTES || 65536)
         fileLimit: !!js Number(process.env.DSH_CLUSTER_FILE_LIMIT || 1000)

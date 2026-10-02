@@ -1,5 +1,5 @@
 /** A node owns one experiment allocation and confined process ranges independently of SSH connections. */
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readSync, statSync } from 'node:fs'
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readSync, statSync, readdirSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { createServer, connect } from 'node:net'
 import type { AddressInfo, Server } from 'node:net'
@@ -8,15 +8,20 @@ import type {} from '@deepseek-ai/dsh-sandbox'
 import type { SubprocessHandle } from '@deepseek-ai/dsh-subprocess'
 import { defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain'
 import { z } from 'zod'
-import { budgetSchema, clusterCommandResultSchema, clusterCommandSchema, clusterNodeSchema, deploymentIdSchema, experimentIdSchema, serviceSchema, serviceIdSchema } from '@aspera/experiments'
-import type { ClusterCommandResult, ExperimentId, InferenceService } from '@aspera/experiments'
+import { budgetSchema, clusterCommandResultSchema, clusterCommandSchema, clusterNodeSchema, legacyClusterNodeSchema, deploymentIdSchema, experimentIdSchema, serviceSchema, serviceIdSchema } from '@aspera/experiments'
+import type { ClusterCommandResult, ClusterNode, ExperimentId, InferenceService } from '@aspera/experiments'
 import { clusterFiles, clusterPath, readClusterChunk } from '@aspera/experiments'
 import { clusterFileHash } from './cluster-runtime.ts'
+import { serverRunRoot } from './storage.ts'
+import { verifyStorage } from '../scripts/storage.mjs'
+import { NetworkProbes } from './network-probes.ts'
+import { openInferenceGateway } from './inference-gateway.ts'
+import type { InferenceGateway } from './inference-gateway.ts'
 
 const allocationObject = z.object({ experimentId: experimentIdSchema, deploymentId: deploymentIdSchema,
-  node: clusterNodeSchema, protocol: z.literal(2).optional(), budget: budgetSchema.optional(), deadline: z.number().int().optional(), released: z.boolean(), releasing: z.boolean().default(false), bootId: z.string() }).strict()
+  node: z.union([clusterNodeSchema, legacyClusterNodeSchema]).transform((node): ClusterNode => node), protocol: z.union([z.literal(2), z.literal(3)]).optional(), budget: budgetSchema.optional(), deadline: z.number().int().optional(), released: z.boolean(), releasing: z.boolean().default(false), bootId: z.string() }).strict()
 const allocationPolicy = (value: Pick<z.infer<typeof allocationObject>, 'protocol' | 'budget' | 'deadline'>) =>
-  value.protocol === 2 ? value.budget === undefined && value.deadline === undefined : value.budget !== undefined && value.deadline !== undefined
+  value.protocol === 2 || value.protocol === 3 ? value.budget === undefined && value.deadline === undefined : value.budget !== undefined && value.deadline !== undefined
 const allocationSchema = allocationObject.refine(allocationPolicy, 'allocation execution policy is incomplete')
 const allocationRequestSchema = allocationObject.omit({ released: true, releasing: true, bootId: true }).refine(allocationPolicy, 'allocation execution policy is incomplete')
 const commandSchema = clusterCommandResultSchema.extend({ experimentId: experimentIdSchema, command: z.string() })
@@ -24,7 +29,7 @@ function commandView(row: z.infer<typeof commandSchema>): ClusterCommandResult {
   return { commandId: row.commandId, state: row.state, exitCode: row.exitCode, released: row.released,
     ...(row.detail === undefined ? {} : { detail: row.detail }) }
 }
-const storeSpec = defineDomain({ name: 'aspera_node', version: 2, compatibleVersions: [1], layout: 'per-record', tables: {
+const storeSpec = defineDomain({ name: 'aspera_node', version: 3, compatibleVersions: [1, 2], layout: 'per-record', tables: {
   allocations: domainTable<ExperimentId, z.infer<typeof allocationSchema>>(allocationSchema),
   commands: domainTable<string, z.infer<typeof commandSchema>>(commandSchema),
   services: domainTable<string, InferenceService>(serviceSchema),
@@ -39,7 +44,10 @@ export interface ClusterNodeConfig {
   chunkBytes: number
   fileLimit: number
   cleanupTimeoutMs: number
+  serviceRequestTimeoutMs: number
+  serviceRequestBytes: number
   devicePaths: readonly string[]
+  networkProbeLifetimeMs?: number
 }
 
 /**
@@ -54,19 +62,33 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
   const allocations = store.table('allocations')
   const commands = store.table('commands')
   const services = store.table('services')
+  const gateways = new Map<string, InferenceGateway>()
+  const stopGateway = async (id: string) => {
+    const gateway = gateways.get(id)
+    if (gateway !== undefined) { await gateway.close(); gateways.delete(id) }
+  }
+  const stoppedExposure = (service: InferenceService) => service.external === undefined ? {} : {
+    external: { ...service.external, state: 'stopped' as const, checkedAt: Date.now(), detail: undefined },
+  }
   const handles = new Map<string, SubprocessHandle>()
   const settlements = new Map<string, Promise<void>>()
   let chain: Promise<void> = Promise.resolve()
   let closing = false
   const netServers = new Map<ExperimentId, Server>()
+  const network = new NetworkProbes(config.networkProbeLifetimeMs ?? config.cleanupTimeoutMs, config.cleanupTimeoutMs)
   const deadlines = new Map<string, ReturnType<typeof setTimeout>>()
   const serial = <T>(operation: () => Promise<T>): Promise<T> => {
     const pending = chain.then(operation)
     chain = pending.then(() => {}, () => {})
     return pending
   }
-  const workspace = (id: ExperimentId) => resolve(config.root, 'runs', id, 'workspace')
-  const logPath = (id: ExperimentId) => resolve(config.root, 'runs', id, 'node.log')
+  const runRoot = (id: ExperimentId) => {
+    const saved = allocations.get(id)
+    if (saved === undefined) throw new Error('Experiment has no saved directory assignment')
+    return serverRunRoot(saved.node.server, id)
+  }
+  const workspace = (id: ExperimentId) => resolve(runRoot(id), 'workspace')
+  const logPath = (id: ExperimentId) => resolve(runRoot(id), 'node.log')
   const allocation = (id: ExperimentId) => {
     const saved = allocations.get(id)
     if (saved === undefined || saved.released || saved.releasing || saved.bootId !== config.bootId) throw new Error('node allocation is unavailable or interrupted')
@@ -85,7 +107,9 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
       await commands.put(key, { ...current, ...patch })
       for (const [serviceId, service] of services.entries()) {
         if (`${service.experimentId}/${service.commandId}` !== key) continue
+        await stopGateway(serviceId)
         await services.put(serviceId, { ...service, updatedAt: Date.now(), released: patch.released === true,
+          ...stoppedExposure(service),
           state: service.state === 'stopping' && patch.released ? 'stopped' : 'failed',
           detail: service.state === 'stopping' && patch.released ? undefined : 'Inference process exited; it is not restarted automatically.' })
       }
@@ -95,7 +119,9 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
   }
   ctx.effect(() => async () => {
     closing = true
+    await network.close()
     await chain
+    await Promise.all([...gateways.keys()].map(stopGateway))
     for (const handle of handles.values()) handle.terminate()
     for (const timer of deadlines.values()) clearTimeout(timer)
     await Promise.all([...netServers.values()].map(server => new Promise<void>((done) => { server.close(() => { done() }) })))
@@ -105,12 +131,22 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
   }, 'experiment node: processes and allocation records')
 
   return async (operation: string, raw: unknown): Promise<unknown> => {
+    if (operation.startsWith('probe-network-')) return network.request(operation, raw)
     if (operation === 'health') return { allocations: [...allocations.entries()].filter(([, row]) => !row.released).map(([id]) => id) }
     const input = z.object({ experimentId: experimentIdSchema }).loose().parse(raw)
     const id = input.experimentId
     if (operation === 'allocate') return serial(async () => {
       if (closing) throw new Error('node is stopping')
+
       const request = allocationRequestSchema.parse(raw)
+      if (request.protocol === 3) {
+        const placement = request.node.server.storagePlacement
+        if (placement === undefined) throw new Error('Protocol 3 requires a saved storage assignment')
+        if (placement.serverId !== request.node.server.id || placement.experimentId !== id || !placement.releaseRoot.endsWith('/' + request.deploymentId)) {
+          throw new Error('Storage assignment belongs to another node, experiment or release')
+        }
+        verifyStorage(placement)
+      }
       const previous = allocations.get(id)
       if (previous !== undefined) {
         if (previous.deploymentId !== request.deploymentId || JSON.stringify(previous.node) !== JSON.stringify(request.node)
@@ -122,7 +158,7 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
       if (request.node.server.remoteRoot !== config.root) throw new Error('node root does not match the configured deployment')
       if (request.node.backendPath !== config.backendPath) throw new Error('sandbox backend differs from node policy')
       if (config.hiddenPaths.some(path => !request.node.hiddenPaths.includes(path))) throw new Error('private directories differ from node policy')
-      mkdirSync(workspace(id), { recursive: true, mode: 0o700 })
+      mkdirSync(resolve(serverRunRoot(request.node.server, id), 'workspace'), { recursive: true, mode: 0o700 })
       if (request.node.devicePaths.some(path => !config.devicePaths.includes(path))) throw new Error('node request exceeds its granted GPU devices')
       await allocations.put(id, { ...request, released: false, releasing: false, bootId: config.bootId })
       return { allocated: true }
@@ -134,8 +170,10 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
         const next = { ...current, releasing: true }
         await allocations.put(id, next)
         for (const [serviceId, service] of services.entries()) {
-          if (service.experimentId === id && !service.released) await services.put(serviceId,
-            { ...service, state: 'stopping', updatedAt: Date.now() })
+          if (service.experimentId === id && !service.released) {
+            await stopGateway(serviceId)
+            await services.put(serviceId, { ...service, ...stoppedExposure(service), state: 'stopping', updatedAt: Date.now() })
+          }
         }
         return next
       })
@@ -183,7 +221,7 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
           await serial(async () => {
             const current = services.get(key)
             if (current === undefined || current.released || !['starting', 'healthy', 'unhealthy'].includes(current.state)) return
-            await services.put(key, { ...current, state: 'interrupted', detail: 'Service process identity cannot be verified after node restart.', updatedAt: Date.now() })
+            await services.put(key, { ...current, ...stoppedExposure(current), state: 'interrupted', detail: 'Service process identity cannot be verified after node restart.', updatedAt: Date.now() })
           })
           continue
         }
@@ -197,14 +235,24 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
           state = response.ok ? 'healthy' : 'unhealthy'
           await response.body?.cancel()
         } catch (error) { ctx.logger.debug(`Aspera service health: ${String(error)}`) }
+        const gateway = gateways.get(key)
+        const external = gateway === undefined ? service.external : await gateway.probe()
         await serial(async () => {
           const current = services.get(key)
           if (current === undefined || current.released || !['starting', 'healthy', 'unhealthy'].includes(current.state)
             || !handles.has(`${id}/${current.commandId}`) || allocations.get(id)?.releasing) return
-          await services.put(key, { ...current, state, updatedAt: Date.now() })
+          await services.put(key, { ...current, state, ...(external === undefined ? {} : { external }), updatedAt: Date.now() })
         })
       }
       return [...services.entries()].filter(([, row]) => row.experimentId === id).map(([, row]) => row)
+    }
+    if (operation === 'service-access-info') {
+      const request = z.object({ serviceId: serviceIdSchema }).parse(raw)
+      const service = services.get(request.serviceId)
+      const gateway = gateways.get(request.serviceId)
+      allocation(id)
+      if (service?.experimentId !== id || service.released || gateway === undefined) throw new Error('Public service is not active in this experiment')
+      return gateway.access()
     }
     if (operation === 'stop-service') {
       const request = z.object({ serviceId: serviceIdSchema }).parse(raw)
@@ -244,6 +292,8 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
       const request = z.object({ path: z.string(), data: z.string(), offset: z.number().int().nonnegative() }).parse(raw)
       const bytes = Buffer.from(request.data, 'base64')
       if (bytes.length > config.chunkBytes) throw new Error('input chunk exceeds the configured limit')
+      const placement = allocation(id).node.server.storagePlacement
+      if (placement !== undefined) verifyStorage(placement, bytes.length)
       mkdirSync(resolve(workspace(id), 'inputs'), { recursive: true })
       if (!request.path.startsWith('inputs/')) throw new Error('inputs must be stored under inputs/')
       const path = clusterPath(workspace(id), request.path)
@@ -291,13 +341,21 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
       return { connected: true }
     }
     if (operation === 'register-service') return serial(async () => {
-      const request = serviceSchema.omit({ serverId: true, commandId: true, state: true, createdAt: true, updatedAt: true, released: true, detail: true, deadline: true }).parse(raw)
+      const { publish, ...request } = serviceSchema.omit({ serverId: true, commandId: true, state: true, createdAt: true, updatedAt: true, released: true, detail: true, deadline: true, external: true })
+        .extend({ publish: z.boolean().optional() }).parse(raw)
       const current = allocation(id)
+      if (request.healthPath.startsWith('//') || /[\\\r\n#]/.test(request.healthPath)) throw new Error('Health check requires a relative HTTP path')
+      const mapping = publish === true ? current.node.server.inferenceMapping : undefined
+      if (publish === true && mapping === undefined) throw new Error('This experiment has no saved external inference mapping for the node')
+      if (mapping !== undefined && [request.port, current.node.server.remotePort, current.node.server.remotePort + 1, current.node.server.sshPort].includes(mapping.port)) {
+        throw new Error('Mapped inference port must differ from the model, SSH and control ports')
+      }
       clusterPath(workspace(id), request.modelPath)
       const previous = services.get(request.id)
       if (previous !== undefined) {
         if (previous.experimentId !== id || previous.command !== request.command || previous.port !== request.port
-          || previous.modelPath !== request.modelPath || previous.healthPath !== request.healthPath) throw new Error('service id is bound to different content')
+          || previous.modelPath !== request.modelPath || previous.healthPath !== request.healthPath || previous.modelName !== request.modelName
+          || (previous.external !== undefined) !== (mapping !== undefined)) throw new Error('service id is bound to different content')
         return previous
       }
       if ([...services.entries()].some(([, service]) => !service.released && service.port === request.port)) throw new Error('service port belongs to another managed process')
@@ -309,10 +367,18 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
       await new Promise<void>((done, reject) => { probe.close(error => { if (error !== undefined) reject(error); else done() }) })
       const service: InferenceService = { ...request, experimentId: id, serverId: current.node.server.id, commandId: `service-${request.id}`,
         state: 'starting', createdAt: Date.now(), updatedAt: Date.now(),
+        ...(mapping === undefined ? {} : { external: { ...mapping, state: 'unchecked' } }),
         ...(current.budget === undefined ? {} : { deadline: Date.now() + current.budget.maxServiceSeconds * 1000 }), released: false }
       await services.put(service.id, service)
-      try { await launchOwned(id, { commandId: service.commandId, command: service.command }, service.deadline) }
-      catch (error) { await services.put(service.id, { ...service, state: 'failed', released: commands.get(`${id}/${service.commandId}`)?.released ?? true, detail: String(error) }); throw error }
+      try {
+        if (mapping !== undefined) gateways.set(service.id, await openInferenceGateway(service, {
+          root: config.root, healthTimeoutMs: config.cleanupTimeoutMs, requestTimeoutMs: config.serviceRequestTimeoutMs, requestBytes: config.serviceRequestBytes,
+        }, () => !closing && handles.has(`${id}/${service.commandId}`) && allocations.get(id)?.releasing === false))
+        await launchOwned(id, { commandId: service.commandId, command: service.command }, service.deadline)
+      } catch (error) {
+        await stopGateway(service.id)
+        await services.put(service.id, { ...service, ...stoppedExposure(service), state: 'failed', released: commands.get(`${id}/${service.commandId}`)?.released ?? true, detail: String(error) }); throw error
+      }
       return service
     })
     if (operation === 'run') return launch(id, { commandId: input.commandId, command: input.command })
@@ -328,7 +394,8 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
       const handle = handles.get(key)
       if (handle === undefined) return { done: undefined }
       if (current.state !== 'stopping') {
-        await services.put(current.id, { ...current, state: 'stopping', updatedAt: Date.now() })
+        await stopGateway(current.id)
+        await services.put(current.id, { ...current, ...stoppedExposure(current), state: 'stopping', updatedAt: Date.now() })
         handle.terminate()
       }
       return { done: settlements.get(key) }
@@ -371,6 +438,7 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
       if (closing) throw new Error('node is stopping')
       if (current.deadline !== undefined && current.deadline <= Date.now() && serviceDeadline === undefined) throw new Error('experiment runtime budget expired')
       if (current.budget !== undefined && [...commands.entries()].filter(([, row]) => row.experimentId === id).length >= current.budget.maxCommands) throw new Error('node command budget exhausted')
+      if (current.node.server.storagePlacement !== undefined) verifyStorage(current.node.server.storagePlacement)
       const row = { ...request, experimentId: id, state: 'starting' as const, exitCode: null, released: false }
       await commands.put(key, row)
       let handle: SubprocessHandle
@@ -379,7 +447,18 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
           '--unshare-uts', '--die-with-parent', '--new-session', '--dev', '/dev', '--proc', '/proc', '--tmpfs', '/tmp', '--clearenv',
           '--setenv', 'PATH', '/usr/local/bin:/usr/bin:/bin', '--setenv', 'HOME', workspace(id), '--setenv', 'PYTHONUNBUFFERED', '1']
         for (const path of current.node.devicePaths) argv.push('--dev-bind', path, path)
-        for (const path of new Set([...config.hiddenPaths, ...current.node.hiddenPaths, resolve(config.root, 'runs'), resolve(config.root, 'secrets'), resolve(config.root, 'state')])) argv.push('--tmpfs', path)
+        const hidden = [...config.hiddenPaths, ...current.node.hiddenPaths, config.root]
+        const storageRoots = resolve(config.root, 'state', 'storage-roots')
+        if (existsSync(storageRoots)) for (const name of readdirSync(storageRoots)) {
+          const owner = z.object({ namespaceRoot: z.string() }).parse(JSON.parse(readFileSync(resolve(storageRoots, name, '.aspera-owner.json'), 'utf8')))
+          hidden.push(owner.namespaceRoot)
+        }
+        const roots = [...new Set(hidden)].sort((a, b) => a.length - b.length)
+        for (const path of roots.filter(path => !roots.some(parent => path !== parent && path.startsWith(parent + '/')))) argv.push('--tmpfs', path)
+        for (const [name, value] of Object.entries({ XDG_CACHE_HOME: resolve(workspace(id), 'cache'), HF_HOME: resolve(workspace(id), 'cache', 'huggingface'),
+          PIP_CACHE_DIR: resolve(workspace(id), 'cache', 'pip'), UV_CACHE_DIR: resolve(workspace(id), 'cache', 'uv'),
+          TORCH_HOME: resolve(workspace(id), 'cache', 'torch'), UV_PROJECT_ENVIRONMENT: resolve(workspace(id), 'env'),
+          CONDA_PKGS_DIRS: resolve(workspace(id), 'cache', 'conda'), CONDA_ENVS_PATH: resolve(workspace(id), 'envs'), TMPDIR: resolve(workspace(id), 'tmp') })) argv.push('--setenv', name, value)
         argv.push('--bind', workspace(id), workspace(id), '--chdir', workspace(id), '--', 'bash', '-c', request.command)
         handle = ctx.subprocess.spawn({ argv, cwd: workspace(id),
           env: { HOME: workspace(id), PYTHONUNBUFFERED: '1' }, graceMs: config.cleanupTimeoutMs,

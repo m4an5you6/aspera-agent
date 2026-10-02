@@ -1,6 +1,6 @@
 {
   "name": "@aspera/desktop",
-  "version": "0.2.0",
+  "version": "0.1.1",
   "description": "Independent Aspera desktop application over a pinned DSH profile",
   "private": true,
   "license": "MIT",

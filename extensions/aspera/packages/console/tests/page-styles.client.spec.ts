@@ -13,7 +13,7 @@ it('assigns the shared text and heading fonts when the containing document has n
 })
 
 it('keeps form placement rules off the shared checkbox label', () => {
-  expect(css).not.toMatch(/\.form\s+label\s*[,\{]/)
+  expect(css).not.toMatch(/\.form\s+label\s*[,{]/)
   expect(css).toMatch(/\.form\s*>\s*label/)
   expect(css).toMatch(/\.fields\s*>\s*label/)
 })

@@ -12,10 +12,11 @@ import { ClusterQueue } from '@aspera/experiments'
 import { createClusterNode } from './cluster-node.ts'
 import { runClusterAgent } from './cluster-agent.ts'
 import { readClusterChunk } from '@aspera/experiments'
-import { clusterNodeRequest, readClusterPrivate, RemoteClusterExecutor, validateClusterAdmission } from './cluster-runtime.ts'
+import { clusterNodeRequest, readClusterPrivate, RemoteClusterExecutor, validateClusterAdmission, clusterRunRoot } from './cluster-runtime.ts'
+import { serverRunRoot } from './storage.ts'
 import type { ClusterRuntimeConfig } from './cluster-runtime.ts'
 
-const storeSpec = defineDomain({ name: 'aspera_queue', version: 2, compatibleVersions: [1], layout: 'per-record',
+const storeSpec = defineDomain({ name: 'aspera_queue', version: 3, compatibleVersions: [1, 2], layout: 'per-record',
   tables: { experiments: domainTable<ExperimentId, ClusterRecord>(clusterRecordSchema) } })
 
 /** Worker-profile role settings. */
@@ -27,6 +28,9 @@ export interface ClusterRoleConfig extends ClusterRuntimeConfig {
   hiddenPaths: string[]
   devicePaths: string[]
   experimentId?: string
+  networkProbeLifetimeMs: number
+  serviceRequestTimeoutMs: number
+  serviceRequestBytes: number
 }
 
 /**
@@ -44,7 +48,7 @@ export async function applyClusterRole(ctx: Context, config: ClusterRoleConfig):
       await runClusterAgent(ctx, config, id, config.role === 'planner')
     })().catch((error: unknown) => {
         ctx.logger.error(String(error))
-        writeFileSync(resolve(config.root, 'runs', id, config.role === 'planner' ? 'planning-outcome.json' : 'outcome.json'), JSON.stringify({ state: 'failed', detail: String(error) }), { mode: 0o600 })
+        writeFileSync(resolve(clusterRunRoot(config.root, id), config.role === 'planner' ? 'planning-outcome.json' : 'outcome.json'), JSON.stringify({ state: 'failed', detail: String(error) }), { mode: 0o600 })
         process.kill(process.pid, 'SIGTERM')
       })
     return
@@ -62,7 +66,7 @@ export async function applyClusterRole(ctx: Context, config: ClusterRoleConfig):
     await queue.recover()
   }
   const refuseOrphan = (id: ExperimentId) => {
-    const run = resolve(config.root, 'runs', id)
+    const run = clusterRunRoot(config.root, id)
     if (['started.json', 'outcome.json', 'execution.json', 'planning-started.json'].some(name => existsSync(resolve(run, name)))) throw new Error('experiment execution evidence exists without its queue record; it requires operator reconciliation')
   }
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: '/aspera', handler: async (req, res) => {
@@ -75,10 +79,10 @@ export async function applyClusterRole(ctx: Context, config: ClusterRoleConfig):
     if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) { respond(401, { error: 'unauthorized' }); return }
     try {
       const requestedPath = new URL(req.url ?? '/', 'http://localhost').pathname
-      if (!/^\/aspera\/v[12]\//.test(requestedPath)) { respond(404, { error: 'unsupported control protocol' }); return }
-      const path = requestedPath.replace('/aspera/v2/', '/aspera/v1/')
+      if (!/^\/aspera\/v[123]\//.test(requestedPath)) { respond(404, { error: 'unsupported control protocol' }); return }
+      const path = requestedPath.replace(/^\/aspera\/v[23]\//, '/aspera/v1/')
       if (req.method === 'GET' && path === '/aspera/v1/health') {
-        respond(200, { protocol: 2, role: config.role, deploymentId: config.deploymentId,
+        respond(200, { protocol: 3, role: config.role, deploymentId: config.deploymentId, features: ['public-inference-v1'],
           ...(node === undefined ? {} : { node: await node('health', {}) }) })
         return
       }
@@ -139,18 +143,18 @@ export async function applyClusterRole(ctx: Context, config: ClusterRoleConfig):
         const approved = z.object({ revision: z.number().int().positive() }).parse(body)
         respond(200, await queue.approve(input.experimentId, approved.revision)); return
       }
-      if (path === '/aspera/v1/stop-service' || path === '/aspera/v1/access-service') {
+      if (path === '/aspera/v1/stop-service' || path === '/aspera/v1/access-service' || path === '/aspera/v1/service-access-info') {
         const request = z.object({ serviceId: z.string().uuid() }).parse(body)
         const service = record.services.find(service => service.id === request.serviceId)
         if (service === undefined) throw new Error('service does not belong to this experiment')
         respond(200, await clusterNodeRequest(readClusterPrivate(config.root, input.experimentId), service.serverId,
-          path.endsWith('stop-service') ? 'stop-service' : 'access-service', input)); return
+          path.slice('/aspera/v1/'.length), input)); return
       }
       if (path === '/aspera/v1/status') { respond(200, { record, waitingFor: queue.waitingFor(input.experimentId) }); return }
       const operation = path.slice('/aspera/v1/'.length)
       if (operation === 'events' || operation === 'agent-log') {
         const cursor = z.object({ offset: z.number().int().nonnegative(), generation: z.string().optional() }).parse(body)
-        respond(200, readClusterChunk(resolve(config.root, 'runs', input.experimentId,
+        respond(200, readClusterChunk(resolve(serverRunRoot(record.submission.coordinator, input.experimentId),
           operation === 'events' ? 'events.jsonl' : 'agent.log'),
         cursor.offset, cursor.generation, config.chunkBytes))
         return

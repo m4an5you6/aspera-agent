@@ -3,14 +3,19 @@ const budget = { maxRuntimeSeconds: 3600, maxServiceSeconds: 3600, maxCommands: 
 const deadline = Date.now() + 3600000
 /** Node ownership tests use isolated files and explicitly settled managed-process doubles. */
 import { randomUUID } from 'node:crypto'
-import { mkdtempSync, rmSync, mkdirSync } from 'node:fs'
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { createServer } from 'node:net'
+import { createServer as createHttpServer } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
 import { afterEach, expect, it, vi } from 'vitest'
 import { createClusterNode } from '../src/cluster-node.ts'
 import { clusterNodeSchema, experimentIdSchema } from '@aspera/experiments'
+import type { StoragePlacement } from '@aspera/experiments'
+import { placement } from '../../experiments/tests/fixtures.ts'
+import { verifyStorage } from '../scripts/storage.mjs'
+vi.mock('../scripts/storage.mjs', () => ({ verifyStorage: vi.fn((value: StoragePlacement) => value.candidate) }))
 const cleanup: (() => Promise<void>)[] = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
 async function loopbackPort(hold = false): Promise<number> {
@@ -46,7 +51,8 @@ async function fixture() {
   }, close: async () => {} }) } }, subprocess: { spawn }, sandbox: { confine },
   effect: (setup: () => () => Promise<void>) => { disposers.push(setup()) }, logger: { error: vi.fn(), debug: vi.fn() },
   })
-  const config = { root, backendPath: '/usr/bin/bwrap', hiddenPaths: [], bootId: 'boot-1', chunkBytes: 1024, fileLimit: 10, cleanupTimeoutMs: 1000, devicePaths: ['/dev/nvidia0'] }
+  const config = { root, backendPath: '/usr/bin/bwrap', hiddenPaths: [], bootId: 'boot-1', chunkBytes: 1024, fileLimit: 10, cleanupTimeoutMs: 1000,
+    serviceRequestTimeoutMs: 1000, serviceRequestBytes: 1024, devicePaths: ['/dev/nvidia0'] }
   const handler = await createClusterNode(ctx, config)
   const node = clusterNodeSchema.parse({ server: { id: randomUUID(), name: 'node', username: 'trainer', host: 'gpu', sshPort: 22,
     remotePort: 43019, remoteRoot: root, authMode: 'password' }, devicePaths: ['/dev/nvidia0'],
@@ -73,7 +79,7 @@ it('deduplicates commands and keeps the node allocated until cancellation settle
   f.handles[0]!.settle()
   expect(await stopping).toEqual({ released: true })
   expect(await f.handler('allocate', { experimentId: another, deploymentId: 'a'.repeat(64), budget, deadline, node: f.node })).toEqual({ allocated: true })
-  expect(f.spawn.mock.calls[0]![0]).toMatchObject({ argv: expect.arrayContaining([f.node.backendPath, '--clearenv', '--dev-bind', '/dev/nvidia0', resolve(f.config.root, 'secrets')]) })
+  expect(f.spawn.mock.calls[0]![0]).toMatchObject({ argv: expect.arrayContaining([f.node.backendPath, '--clearenv', '--dev-bind', '/dev/nvidia0', f.config.root]) })
 
 })
 
@@ -87,6 +93,27 @@ it('runs beyond the released command limit without creating aggregate timers in 
   expect(f.spawn).toHaveBeenCalledTimes(105)
   expect(f.handles.every(handle => handle.terminate.mock.calls.length === 0)).toBe(true)
   expect(f.spawn.mock.calls.every(([spec]) => spec.argv[0] === '/usr/bin/bwrap' && spec.argv.includes('--dev-bind'))).toBe(true)
+})
+
+it('binds v3 storage to its node, experiment and release and confines caches to the saved workspace', async () => {
+  const f = await fixture(); const id = experimentIdSchema.parse(randomUUID())
+  const storage = placement(f.node.server.id, id, f.config.root)
+  const node = { ...f.node, server: { ...f.node.server, storagePlacement: storage } }
+  const request = { experimentId: id, deploymentId: 'a'.repeat(64), protocol: 3, node }
+  await expect(f.handler('allocate', { ...request, experimentId: randomUUID() })).rejects.toThrow('another node, experiment or release')
+  await expect(f.handler('allocate', { ...request, deploymentId: 'b'.repeat(64) })).rejects.toThrow('another node, experiment or release')
+  await f.handler('allocate', request)
+  const registry = resolve(f.config.root, 'state/storage-roots/another-root')
+  mkdirSync(registry, { recursive: true })
+  writeFileSync(resolve(registry, '.aspera-owner.json'), JSON.stringify({ namespaceRoot: '/other-owned-storage' }))
+  await f.handler('run', { experimentId: id, commandId: 'storage', command: 'python train.py' })
+  expect(verifyStorage).toHaveBeenCalledWith(storage)
+  const argv = f.spawn.mock.calls[0]![0].argv
+  expect(argv.join('\n')).toContain('--tmpfs\n' + f.config.root)
+  expect(argv.join('\n')).toContain('--tmpfs\n/other-owned-storage')
+  expect(argv.slice(argv.indexOf('--bind'), argv.indexOf('--bind') + 3)).toEqual(['--bind', resolve(storage.workspaceRoot), resolve(storage.workspaceRoot)])
+  expect(argv.join('\n')).toContain('HF_HOME\n' + resolve(storage.workspaceRoot, 'cache/huggingface'))
+  expect(argv.join('\n')).toContain('UV_PROJECT_ENVIRONMENT\n' + resolve(storage.workspaceRoot, 'env'))
 })
 
 it('refuses an allocation that omits the policy discriminator as well as the legacy limits', async () => {
@@ -121,7 +148,6 @@ it('refuses excess GPU grants and verifies staged input content before execution
     devicePaths: ['/dev/nvidia1'] } })).rejects.toThrow('granted GPU')
   await f.handler('allocate', { experimentId: id, deploymentId: 'a'.repeat(64), budget, deadline, node: f.node })
   const input = { experimentId: id, path: 'inputs/data.txt', offset: 0, data: Buffer.from('abc').toString('base64') }
-  expect(await f.handler('input', input)).toEqual({ nextOffset: 3 })
   expect(await f.handler('input', input)).toEqual({ nextOffset: 3 })
   await expect(f.handler('input', { ...input, data: Buffer.from('xyz').toString('base64') })).rejects.toThrow('different bytes')
   await expect(f.handler('verify-input', { experimentId: id, name: 'data.txt', sha256: 'b'.repeat(64) })).rejects.toThrow('digest mismatch')
@@ -162,6 +188,34 @@ it('deduplicates service launches and ignores an old health reply after confirme
     expect(f.spawn).toHaveBeenCalledOnce()
     await expect(f.handler('register-service', { ...request, command: 'different' })).rejects.toThrow('different content')
   } finally { reply.resolve(new Response()); fetchMock.mockRestore() }
+})
+
+it('publishes only a saved mapping, returns credentials only on explicit access, and closes public access before cancellation settles', async () => {
+  const f = await fixture(); const id = experimentIdSchema.parse(randomUUID())
+  const publicPort = await loopbackPort()
+  const modelPort = await loopbackPort()
+  const mapping = { url: `http://127.0.0.1:${publicPort}`, port: publicPort }
+  await f.handler('allocate', { experimentId: id, deploymentId: 'a'.repeat(64), protocol: 2,
+    node: { ...f.node, server: { ...f.node.server, inferenceMapping: mapping } } })
+  const request = { experimentId: id, id: randomUUID(), command: 'python serve.py', modelPath: 'model', port: modelPort, healthPath: '/health', publish: true }
+  await expect(f.handler('register-service', { ...request, external: { ...mapping, state: 'reachable' } })).rejects.toThrow()
+  await expect(f.handler('register-service', { ...request, port: publicPort })).rejects.toThrow('must differ')
+  const registered = await f.handler('register-service', request)
+  expect(registered).toMatchObject({ external: { ...mapping, state: 'unchecked' } })
+  const backend = createHttpServer((_req, res) => { res.end('ok') })
+  await new Promise<void>((done, reject) => { backend.once('error', reject); backend.listen(modelPort, '127.0.0.1', done) })
+  cleanup.push(() => new Promise<void>(done => { backend.closeAllConnections(); backend.close(() => { done() }) }))
+  const access = await f.handler('service-access-info', { experimentId: id, serviceId: request.id })
+  expect(access).toMatchObject({ url: mapping.url, token: expect.any(String) })
+  expect(await f.handler('services', { experimentId: id })).toMatchObject([{ state: 'healthy', external: { state: 'reachable' } }])
+  expect(JSON.stringify(registered)).not.toContain('token')
+  expect((await fetch(mapping.url)).status).toBe(401)
+  const stopping = f.handler('stop-service', { experimentId: id, serviceId: request.id })
+  await vi.waitFor(() => { expect(f.handles[0]!.terminate).toHaveBeenCalledOnce() })
+  await expect(fetch(mapping.url)).rejects.toThrow()
+  await expect(f.handler('service-access-info', { experimentId: id, serviceId: request.id })).rejects.toThrow('not active')
+  f.handles[0]!.settle()
+  expect(await stopping).toMatchObject({ state: 'stopped', released: true, external: { state: 'stopped' } })
 })
 
 it('holds an unverified service after node restart and never restarts its command', async () => {

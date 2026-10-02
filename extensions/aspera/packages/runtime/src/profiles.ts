@@ -12,7 +12,7 @@ export async function setupWorkerProfile(home: string, release: string): Promise
   const modules = resolve(profile, 'node_modules')
   if (!existsSync(modules)) symlinkSync(resolve(release, 'node_modules'), modules, process.platform === 'win32' ? 'junction' : 'dir')
   writeFileSync(resolve(profile, 'package.json'), JSON.stringify({ name: 'aspera-worker-profile', private: true,
-    dependencies: { '@aspera/runtime': '0.2.0', '@deepseek-ai/dsh-base': '0.2.0-rc.2' },
+    dependencies: { '@aspera/runtime': '0.1.1', '@deepseek-ai/dsh-base': '0.2.0-rc.2' },
     dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@aspera/runtime'] } } }, null, 2) + '\n', { mode: 0o600 })
   if (!existsSync(resolve(profile, 'cordis.patch.yml'))) writeFileSync(resolve(profile, 'cordis.patch.yml'), '[]\n', { mode: 0o600 })
 }

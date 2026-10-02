@@ -33,7 +33,9 @@ pnpm run test:desktop:api
 pnpm run test:desktop
 ```
 
-Unit tests use private state directories, managed-process doubles and OS-assigned network ports. They cover joint allocation/FIFO, restart ambiguity, immutable retry identity, server pins, edited Goal refusal, cancellation races, input size/digest checks, password transport, file confinement, download cancellation, UTF-8 cursors and service stop/health races. The symlink-escape fixture runs on Linux/macOS and skips on Windows.
+Lint uses the extension's own configuration and checks both TypeScript sources and maintenance scripts.
+
+Unit tests use private state directories, managed-process doubles and OS-assigned ports. Coverage includes data/system disks, unknown durability, manual paths, write/space refusal, mount changes, directory ownership, preparation retry, immutable IDs, Goal revision checks, multi-interface selection, one-way failures, wrong receiver proofs and listener cleanup. Queue, input, file, cursor and service races remain covered. The symlink-escape fixture runs on Linux/macOS and skips on Windows.
 
 `test:api` launches the production management profile with its real dispatch adapter and checks authenticated server and experiment reads against a version-1 registry. `test:desktop:api` uses the existing unpacked application, an upgraded profile and a Unicode state path outside the checkout. It verifies the same server API and saves a server through the real form. Neither check creates a release ZIP or substitutes the dispatch adapter.
 
@@ -41,7 +43,7 @@ Unit tests use private state directories, managed-process doubles and OS-assigne
 
 `test:control` launches the production coordinator and a planning worker with a real storage domain. It verifies real persisted questions, no new model calls during pause, concurrent identical replies, conflict and post-cancel refusal, same-Goal resumption, and authenticated admission, complete handover, a resource-free durable plan across coordinator restart, identical retry after staged-input removal, changed-content refusal, orphaned execution refusal and cancellation. The [question Session snapshot](../scripts/fixtures/control.snapshot.json) records the saved question, answer, original tool result and Goal transitions. Fake node inventory is used only because the plan waits for approval; no GPU command is launched.
 
-`test:web` uses the real published Web composition and generated ordinary/streaming Remotes with an explicit CPU deployment provider. It exercises password forms, attachments, independent Goals, plan confirmation, parallel/shared queues, handover text and [dispatch snapshot](../scripts/fixtures/session.snapshot.json), reconnect/rotation, conversation separation, output download, actual private HTTP service access, browser disconnect, stop, unexpected exit, cancellation and error display, together with question cards, attention counts, disconnect persistence and same-experiment continuation. The service itself is a separate `dsh` profile process. Screenshots are written to `.artifacts/`.
+`test:web` uses published Web composition and generated Remotes with an explicit CPU provider. It checks SSH-only server saving, model-free connection inventory, logged Agent storage choice, saved paths and plan confirmation, attachments, independent Goals, queues, handover and the [dispatch snapshot](../scripts/fixtures/session.snapshot.json). It also covers reconnect/rotation, conversation separation, downloads, actual profile-hosted HTTP services, disconnect, stop, failure, cancellation and persisted questions. Public-inference cases exercise the real authenticated gateway, streaming responses, identity mismatch, cancelled listeners, optional form fields and operator-only calling information. Screenshots are written to `.artifacts/`.
 
 `test:installed` packages built release files, installs frozen production dependencies outside the checkout, typechecks a NodeNext consumer, repackages from that installed layout, and launches its official profile. It verifies client declarations, sidebar registration, username/password fields and live Remote snapshots. Tests require an installed browser and a populated pnpm store; production dispatch requires access to the configured package registry.
 
@@ -56,7 +58,7 @@ The [desktop guide](../apps/desktop/README.md#build-and-verify) owns packaged El
 
 No GPU server is available for this delivery. A GPU operator performs the following acceptance with two mutually reachable Linux nodes, trusted SSH host keys and private passwords already stored in the management profile.
 
-1. Probe both nodes and verify bubblewrap refuses outside writes/private credential reads while the granted CUDA devices execute a short computation.
+1. Probe both nodes, verify the selected mount and cloud-volume persistence with the provider, and test saved paths after unmount/remount. Check bidirectional internal communication and bubblewrap refusal of outside writes, control credentials and other experiment reads while granted CUDA devices execute a short computation.
 2. Dispatch separate-node tasks, a shared-node queued task and one joint task. Confirm stable ranks, actual collective communication and a short version-pinned training run; inspect recorded scripts, environments, parameters and measured outputs.
 3. Disconnect and then shut down the management machine after receipt. Verify the remote coordinator admits queued work, executes it and records its outcome without the management host.
 4. Load the resulting training artifact into a registered loopback inference service. Confirm a real prediction, health, retained server occupation, stop cleanup and queued-task progression.

@@ -35,7 +35,8 @@
 .summary dd { margin: 0 0 10px; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 .summary p { color: var(--dsw-alias-label-secondary); }
 .formFooter { display: flex; gap: 16px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
-.serverModal { width: 680px; max-width: calc(100vw - 48px); font: var(--dsw-font-xs-13); }
+.serverModal { width: 680px; max-width: calc(100vw - 48px); max-height: 100%; font: var(--dsw-font-xs-13); }
+.serverModalContent { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
 .question { border-color: var(--dsw-alias-state-business-primary); }
 .question fieldset { display: flex; flex-direction: column; gap: 12px; border: 0; padding: 0; margin: 0; min-width: 0; }
 .question legend { margin-bottom: 12px; font: var(--dsw-font-s-strong-14); }
@@ -212,6 +213,12 @@ button.card:focus-visible {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 16px 24px;
 }
+
+.advanced, .inventory { min-width: 0; }
+.advanced > summary, .inventory > summary { cursor: pointer; color: var(--dsw-alias-label-secondary); padding-block: 8px; }
+.advanced[open] > .fields { margin: 12px 0; }
+.inventory ul { display: grid; gap: 10px; padding-left: 20px; }
+.inventory li > span { display: block; color: var(--dsw-alias-label-secondary); }
 
 .form > label,
 .fields > label,

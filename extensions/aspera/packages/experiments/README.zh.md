@@ -38,7 +38,7 @@ kind: "package-library"
 <details>
 <summary>实现细节</summary>
 
-[cluster-protocol.ts](src/cluster-protocol.ts) 声明解析及持久字段；[cluster-queue.ts](src/cluster-queue.ts) 管理持久状态转换及异步提供方生命周期；[cluster-files.ts](src/cluster-files.ts) 限制路径并读取有界原始字节。资源约束通过接收及读取路径和行为测试执行，本库不发布仅检查服务存在的独立 invariant 安装器。
+[cluster-protocol.ts](src/cluster-protocol.ts) 冻结第 1／2 代读取定义并声明第 3 代提交；[storage-protocol.ts](src/storage-protocol.ts) 分开定义偏好、SSH 证据及实际目录。[cluster-queue.ts](src/cluster-queue.ts) 管理持久状态转换和提供者生命周期。[cluster-files.ts](src/cluster-files.ts) 限制读取范围及大小。接收时检查实验／节点／发布归属与资源分配，不发布单独的存在性 invariant。
 
 </details>
 

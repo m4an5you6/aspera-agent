@@ -7,7 +7,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
-import { clusterRecordSchema, clusterServerSchema } from '@aspera/runtime'
+import { clusterRecordSchema, clusterServerSchema, inspectServerStorage, prepareServerStorage } from '@aspera/runtime'
 import type { ClusterSubmission } from '@aspera/runtime'
 import { ExperimentFleet } from '../src/fleet.ts'
 import type { FleetExperiment } from '../src/types.ts'
@@ -15,7 +15,16 @@ import { request } from '../src/transport.ts'
 import { snapshotSource } from '../src/snapshot.ts'
 import { prepareClusterServer } from '../src/cluster-deploy.ts'
 import { installPrivateFile } from '../src/deploy.ts'
+import { inventory } from '../../experiments/tests/fixtures.ts'
+import type { NetworkParticipant } from '../src/network-selection.ts'
 
+vi.mock('../../runtime/src/storage.ts', async importOriginal => ({
+  ...await importOriginal<typeof import('../../runtime/src/storage.ts')>(),
+  inspectServerStorage: vi.fn(async (_target, directory) => inventory(directory)),
+  prepareServerStorage: vi.fn(async (_target, placement) => placement.candidate),
+  verifyServerStorage: vi.fn(async (_target, placement) => placement.candidate),
+}))
+vi.mock('../src/network-selection.ts', () => ({ resolveTrainingNetwork: vi.fn(async (_id: string, participants: NetworkParticipant[]) => participants.map(participant => participant.node)) }))
 vi.mock('../src/transport.ts', () => ({ request: vi.fn(), remote: vi.fn(async () => ''), copy: vi.fn(),
   shellQuote: (value: string) => value }))
 vi.mock('../src/deploy.ts', () => ({ installPrivateFile: vi.fn() }))
@@ -80,7 +89,7 @@ async function fixture() {
     const agent = makeAgent(sessionId); saved.set(sessionId, agent); live.set(sessionId, agent); return handle(agent)
   }, resume, get: (id: string) => live.get(id) },
   goals: { create: (agent: ReturnType<typeof makeAgent>) => agent.goal, get: (agent: ReturnType<typeof makeAgent>) => agent.goal,
-    complete, disarm: () => {} }, sessionPersistence: { flush: vi.fn(async () => {}) },
+    complete, disarm: () => {} }, sessionPersistence: { flush: vi.fn(async () => {}), stat: async (id: string) => saved.has(id) ? { revision: 1 } : undefined },
   credentials: { resolve: async () => ({ value: 'test-only-secret' }), set: vi.fn() },
   agentDefaultModel: { currentSelection: () => ({ provider: 'test', model: 'test-model' }) },
   effect: () => {}, on: () => () => {}, logger: { error: vi.fn(), debug: vi.fn() },
@@ -88,7 +97,7 @@ async function fixture() {
   let localRepo = '/original-source'
   const deployment = (server: Parameters<Parameters<typeof ExperimentFleet.open>[1]>[0]) => ({ ...server, localRepo,
     dataRoots: [], allowedSystemPackages: [], tokenRef: 'TOKEN', agentCredentialRefs: [], controlPollIntervalMs: 1000,
-    toolTimeoutMs: 30000 })
+    toolTimeoutMs: 30000, minimumFreeBytes: 1024 })
   const open = async () => { const fleet = await ExperimentFleet.open(ctx,
     deployment); fleets.push(fleet); return fleet }
   const fleet = await open()
@@ -105,6 +114,24 @@ async function fixture() {
     setRepo: (value: string) => { localRepo = value } }
 }
 
+it('pins public inference mappings and rejects control-port collisions before preparing', async () => {
+  const f = await fixture()
+  const mapping = { url: 'https://inference.example.test:8443', port: 17000 }
+  await f.fleet.saveServer({ ...f.b, inferenceMapping: mapping })
+  const barrier = Promise.withResolvers<Awaited<ReturnType<typeof snapshotSource>>>()
+  vi.mocked(snapshotSource).mockReturnValue(barrier.promise)
+  const row = await f.fleet.create({ experimentId: randomUUID(), objective: 'serve a model', serverIds: [f.b.id], mode: 'semi' })
+  await f.fleet.saveServer({ ...f.b, inferenceMapping: { url: 'https://replacement.test', port: 18000 } })
+  expect(row.servers[0]!.inferenceMapping).toEqual(mapping)
+  expect(row.targets[0]!.inferenceMapping).toEqual(mapping)
+  expect(() => f.fleet.saveServer({ ...f.b, inferenceMapping: { ...mapping, port: f.b.remotePort } })).toThrow('control ports')
+  barrier.resolve({ directory: '/source', digest: 'a'.repeat(64), archiveHash: 'b'.repeat(64), archive: '/snapshot.tar', dispose: () => {} })
+  await vi.waitFor(() => {
+    const submission = f.records.get(row.request.experimentId)?.submission
+    expect(submission?.protocol === 3 && submission.nodes[0]?.server.inferenceMapping).toEqual(mapping)
+  })
+})
+
 it('submits consecutive Goals independently and pins server and source settings before preparation', async () => {
   const f = await fixture()
   const barrier = Promise.withResolvers<Awaited<ReturnType<typeof snapshotSource>>>()
@@ -119,6 +146,7 @@ it('submits consecutive Goals independently and pins server and source settings 
   expect(vi.mocked(prepareClusterServer).mock.calls.map(([target]) => target.host)).not.toContain('replacement-host')
   expect(vi.mocked(snapshotSource).mock.calls.map(([root]) => root)).toEqual(['/original-source', '/original-source'])
   expect(f.fleet.servers().coordinatorId).toBe(f.a.id)
+  await expect(f.fleet.saveServer({ ...f.a, username: 'another-user' })).rejects.toThrow('coordinator address')
   expect(f.fleet.list().map(row => row.receipt?.handover)).toEqual(['本机派发完成，远端实验已接管', '本机派发完成，远端实验已接管'])
 })
 
@@ -150,8 +178,8 @@ it('recovers a lost handover reply after reload and records the full receipt onc
   const restored = await f.open()
   await Promise.all([restored.refresh(row.request.experimentId), restored.refresh(row.request.experimentId)])
   expect(f.resume).toHaveBeenCalledOnce()
-  expect(f.saved.get(row.sessionId)!.session.append).toHaveBeenCalledOnce()
-  const notice: unknown = f.saved.get(row.sessionId)!.session.append.mock.calls[0]![1]
+  expect(f.saved.get(row.sessionId)!.session.append).toHaveBeenCalledTimes(2)
+  const notice: unknown = f.saved.get(row.sessionId)!.session.append.mock.calls.at(-1)![1]
   expect(notice).toMatchObject({ content: [{ type: 'text', text: `本机派发完成，远端实验已接管\n${JSON.stringify(accepted)}` }] })
   expect(restored.list()[0]).toMatchObject({ handoverRecorded: true, receipt: accepted, latest: { state: 'queued' } })
 })
@@ -226,6 +254,7 @@ it('retries an unreceived admission with the original identity and server snapsh
   const f = await fixture()
   vi.mocked(request).mockRejectedValue(new Error('connection lost before admission'))
   const row = await f.fleet.create({ experimentId: randomUUID(), objective: 'lost admission', serverIds: [f.b.id], mode: 'automatic' })
+
   await vi.waitFor(() => { expect(f.fleet.list()[0]?.state).toBe('failed') })
   const pinned = f.records.get(row.request.experimentId)!.submission!
   await f.fleet.saveServer({ ...f.b, host: 'changed-settings' })
@@ -236,4 +265,45 @@ it('retries an unreceived admission with the original identity and server snapsh
   expect(result.receipt?.submission).toEqual(pinned)
   expect(result.receipt?.submission.nodes[0]?.server.host).toBe('gpu-b')
   expect(result.handoverRecorded).toBe(true)
+})
+
+it('resumes a failed directory creation with the same experiment, release, Session and saved paths', async () => {
+  const f = await fixture()
+  vi.mocked(prepareServerStorage).mockRejectedValueOnce(new Error('temporary disk failure'))
+  const row = await f.fleet.create({ experimentId: randomUUID(), objective: 'retry preparation', serverIds: [f.b.id], mode: 'automatic' })
+  await vi.waitFor(() => { expect(f.records.get(row.request.experimentId)?.state).toBe('failed'); expect(f.live.size).toBe(0) })
+  const saved = f.records.get(row.request.experimentId)!
+  await f.fleet.saveServer({ ...f.b, host: 'different-host', remoteRoot: '/different-root' })
+  await f.fleet.close()
+  const resumed = await f.open()
+  await Promise.all([resumed.retry(row.request.experimentId), resumed.retry(row.request.experimentId)])
+  await vi.waitFor(() => { expect(resumed.list()[0]?.handoverRecorded).toBe(true) })
+  expect(resumed.list()[0]?.preparation?.placements).toEqual(saved.preparation?.placements)
+  expect(resumed.list()[0]?.sessionId).toBe(saved.sessionId)
+  expect(resumed.list()[0]?.goalId).toBe(saved.goalId)
+  expect(inspectServerStorage).toHaveBeenCalledTimes(2)
+  expect(vi.mocked(prepareServerStorage).mock.calls.some(([target]) => target.host === 'different-host')).toBe(false)
+})
+
+it('refuses a different release during preparation retry instead of moving the experiment', async () => {
+  const f = await fixture()
+  vi.mocked(prepareServerStorage).mockRejectedValueOnce(new Error('temporary disk failure'))
+  const row = await f.fleet.create({ experimentId: randomUUID(), objective: 'fixed build', serverIds: [f.a.id], mode: 'automatic' })
+  await vi.waitFor(() => { expect(f.records.get(row.request.experimentId)?.state).toBe('failed'); expect(f.live.size).toBe(0) })
+  vi.mocked(snapshotSource).mockResolvedValue({ digest: 'c'.repeat(64), archive: '/snapshot.tar', dispose() {} } as Awaited<ReturnType<typeof snapshotSource>>)
+  await f.fleet.retry(row.request.experimentId)
+  await vi.waitFor(() => { expect(f.records.get(row.request.experimentId)?.detail).toContain('saved release') })
+  expect(prepareServerStorage).toHaveBeenCalledOnce()
+})
+
+it('saves SSH-only settings and probes disks without creating a dispatch Agent', async () => {
+  const f = await fixture()
+  await f.fleet.saveServer({ id: randomUUID(), name: 'auto', host: 'new-host', sshPort: 22, username: 'trainer', remotePort: 43019, authMode: 'password' })
+  const server = f.fleet.servers().servers.at(-1)!
+  expect(server).toMatchObject({ storagePreference: { mode: 'auto' } })
+  expect(inspectServerStorage).not.toHaveBeenCalled()
+  const result = await f.fleet.probe(server.id)
+  expect(result.inventory.candidates).not.toHaveLength(0)
+  expect(f.saved.size).toBe(0)
+  expect(snapshotSource).not.toHaveBeenCalled()
 })

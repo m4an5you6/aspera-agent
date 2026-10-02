@@ -1,6 +1,6 @@
 /** Test-only CPU provider: real DSH Sessions, durable scheduling, Web Remotes and profile-launched services. */
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, appendFileSync, copyFileSync, writeFileSync, readFileSync, existsSync } from 'node:fs'
+import { mkdirSync, appendFileSync, copyFileSync, writeFileSync, readFileSync, existsSync, renameSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain'
@@ -10,14 +10,17 @@ import { ClusterQueue, clusterRecordSchema, clusterFiles, clusterPath, readClust
 import { AsperaRemote, Config as AdapterConfig } from '@aspera/dispatch'
 import { ExperimentFleet } from '@aspera/dispatch/fleet'
 import { ExperimentDownloads } from '@aspera/dispatch/downloads'
+import { inventory, installStorageReplay } from './storage.mjs'
+import { openInferenceGateway } from '../../packages/runtime/lib/inference-gateway.js'
 
-export const inject = ['storage', 'storageDomain', 'agents', 'goals', 'credentials', 'agentDefaultModel', 'sessionPersistence', 'subprocess', 'webServer']
+export const inject = ['storage', 'storageDomain', 'agents', 'goals', 'credentials', 'agentDefaultModel', 'sessionPersistence', 'subprocess', 'webServer', 'llm']
 
 export async function apply(ctx, config) {
   if (config.role === 'service') {
     ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/health', handler: (_req, res) => { res.end('healthy') } }))
     ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/', handler: (_req, res) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ prediction: 'CPU fixture response' })) } }))
-    writeFileSync(config.ready, JSON.stringify({ port: ctx.webServer.port }))
+    writeFileSync(config.ready + '.incoming', JSON.stringify({ port: ctx.webServer.port }))
+    renameSync(config.ready + '.incoming', config.ready)
     return
   }
   const root = config.root
@@ -28,6 +31,8 @@ export async function apply(ctx, config) {
   const store = await ctx.storage.domain.open(spec)
   const children = new Map()
   const events = []
+  const storageCalls = []
+  installStorageReplay(ctx, storageCalls)
   ctx.on('session/event', (session, event) => {
     const match = /^aspera-(dispatch|fixture-plan|fixture-execution)-(.+)$/.exec(session.id)
     if (match === null) return
@@ -54,10 +59,11 @@ export async function apply(ctx, config) {
   async function stop(id) {
     const owned = children.get(id)
     if (owned === undefined) return true
-    owned.stopping = true; owned.handle.terminate()
+    owned.stopping = true; await owned.gateway?.close(); owned.handle.terminate()
     await owned.handle.done.catch(() => {})
     const released = await owned.handle.waitForExit(AbortSignal.timeout(10000))
-    owned.service = { ...owned.service, state: released ? 'stopped' : 'interrupted', released, updatedAt: Date.now() }
+    owned.service = { ...owned.service, state: released ? 'stopped' : 'interrupted', released, updatedAt: Date.now(),
+      ...(owned.service?.external === undefined ? {} : { external: { ...owned.service.external, state: 'stopped' } }) }
     return released
   }
 
@@ -102,20 +108,30 @@ export async function apply(ctx, config) {
       let exited = false
       void handle.done.then(() => { exited = true }, () => { exited = true })
       try {
-        const deadline = Date.now() + 30000
+        const startedAt = Date.now()
+        const deadline = startedAt + config.profileStartupMs
         while (!existsSync(ready) && !exited && !signal.aborted && Date.now() < deadline) await delay(50)
         if (!existsSync(ready)) throw new Error('CPU profile did not start: ' + (existsSync(runPath(id, 'agent.log')) ? readFileSync(runPath(id, 'agent.log'), 'utf8') : 'no output'))
+        ctx.logger.info(`CPU fixture profile ready after ${Date.now() - startedAt} ms`)
         const port = JSON.parse(readFileSync(ready, 'utf8')).port
         owned.service = { id: randomUUID(), experimentId: id, serverId: record.submission.nodes[0].server.id,
           commandId: 'fixture-service', command: 'dsh --profile cpu-service', modelPath: 'result.txt', port, healthPath: '/health',
           state: 'healthy', createdAt: Date.now(), updatedAt: Date.now(), released: false }
         assertHealth(await fetch(`http://127.0.0.1:${port}/health`))
+        const mapping = record.submission.nodes[0].server.inferenceMapping
+        if (mapping !== undefined) {
+          owned.service = { ...owned.service, modelName: 'cpu-fixture', external: { ...mapping, state: 'unchecked' } }
+          owned.gateway = await openInferenceGateway(owned.service, { root, healthTimeoutMs: 3000, requestTimeoutMs: 5000, requestBytes: 65536 }, () => !exited && !owned.stopping)
+          owned.service.external = await owned.gateway.probe()
+        }
         await update({ state: 'serving', services: [owned.service], progress: { phase: 'serving', metrics: { checks: 1 }, updatedAt: 1 } })
         appendFileSync(runPath(id, 'node.log'), '服务健康\n')
         while (!exited && !signal.aborted) await delay(50)
         await handle.done.catch(() => {})
         const released = await handle.waitForExit(AbortSignal.timeout(10000))
-        owned.service = { ...owned.service, state: owned.stopping ? 'stopped' : 'failed', released, updatedAt: Date.now(), ...(owned.stopping ? {} : { detail: 'CPU fixture exited unexpectedly' }) }
+        await owned.gateway?.close()
+        owned.service = { ...owned.service, state: owned.stopping ? 'stopped' : 'failed', released, updatedAt: Date.now(), ...(owned.stopping ? {} : { detail: 'CPU fixture exited unexpectedly' }),
+          ...(owned.service.external === undefined ? {} : { external: { ...owned.service.external, state: 'stopped' } }) }
         await update({ services: [owned.service] })
         return { state: signal.aborted ? 'cancelled' : owned.stopping ? 'completed' : 'failed', resourcesReleased: released }
       } finally {
@@ -129,6 +145,10 @@ export async function apply(ctx, config) {
   ctx.effect(() => async () => { await queue.close(); await store.close() })
   await queue.recover()
   const driver = {
+    inspectServerStorage: async (target, directory) => inventory(directory ?? '/fixture/data/' + target.host),
+    prepareServerStorage: async (_target, placement) => placement.candidate,
+    verifyServerStorage: async (_target, placement) => placement.candidate,
+    resolveTrainingNetwork: async (_id, participants) => participants.map(value => value.node),
     snapshotSource: async () => ({ directory: root, archive: 'fixture.tar', archiveHash: 'f'.repeat(64), digest: 'f'.repeat(64), dispose() {} }),
     prepareClusterServer: async () => ({ state: 'ready', deploymentId: 'f'.repeat(64), preparationId: 'f'.repeat(64), backend: 'bwrap', backendPath: '/fixture/bwrap', sandboxWriteProbe: 'passed', cudaProbe: 'passed', devicePaths: ['/dev/nvidia_fixture'], hiddenPaths: [], workspaceRoot: '/fixture/workspace' }),
     ensureClusterRole: async () => {},
@@ -160,6 +180,10 @@ export async function apply(ctx, config) {
       const owned = children.get(id)
       if (owned?.service?.id !== body.serviceId) throw new Error('service is outside this experiment')
       if (operation === 'stop-service') { await stop(id); return { status: 200, value: owned.service } }
+      if (operation === 'service-access-info') {
+        if (owned.stopping || owned.gateway === undefined) throw new Error('Public service is not active')
+        return { status: 200, value: owned.gateway.access() }
+      }
       if (operation === 'access-service') {
         const response = await fetch(`http://127.0.0.1:${owned.service.port}${body.path}`)
         return { status: 200, value: { status: response.status, body: await response.text() } }
@@ -168,7 +192,7 @@ export async function apply(ctx, config) {
     },
   }
   const policy = AdapterConfig({ extensionRoot: config.release, agentCredentialRefs: [], pollIntervalMs: 100 })
-  const fleet = await ExperimentFleet.open(ctx, server => ({ ...server, localRepo: config.release, dataRoots: [], allowedSystemPackages: [], agentCredentialRefs: [], tokenRef: 'FIXTURE', toolTimeoutMs: 30000, controlPollIntervalMs: 100 }), driver)
+  const fleet = await ExperimentFleet.open(ctx, server => ({ ...server, localRepo: config.release, dataRoots: [], allowedSystemPackages: [], agentCredentialRefs: [], tokenRef: 'FIXTURE', toolTimeoutMs: 30000, controlPollIntervalMs: 100, minimumFreeBytes: policy.minimumFreeBytes }), driver)
   new AsperaRemote(ctx, fleet, new ExperimentDownloads(ctx, fleet, 60000), policy)
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: '/aspera-test', handler: async (req, res) => {
     const url = new URL(req.url, 'http://localhost')
@@ -178,7 +202,7 @@ export async function apply(ctx, config) {
     if (kind === 'rotate') writeFileSync(runPath(id, 'node.log'), '轮转后日志\n')
     if (kind === 'crash') children.get(id)?.handle.terminate()
     res.setHeader('content-type', 'application/json')
-    res.end(JSON.stringify({ experiments: fleet.list(), queue: queue.list(), events }))
+    res.end(JSON.stringify({ experiments: fleet.list(), queue: queue.list(), events, storageCalls }))
   } }))
 }
 

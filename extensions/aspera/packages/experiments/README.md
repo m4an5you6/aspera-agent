@@ -38,7 +38,7 @@ Questions and replies are serialized with queue mutations. Persist an open quest
 <details>
 <summary>Implementation internals</summary>
 
-[cluster-protocol.ts](src/cluster-protocol.ts) declares parser and persistence fields; [cluster-queue.ts](src/cluster-queue.ts) owns durable state transitions and asynchronous provider lifetimes. [cluster-files.ts](src/cluster-files.ts) confines paths and reads bounded raw bytes. Resource invariants are enforced by these admission/read paths and behavior tests; the library publishes no separate presence-only invariant installer.
+[cluster-protocol.ts](src/cluster-protocol.ts) freezes generation-1/2 readers and defines generation-3 submissions; [storage-protocol.ts](src/storage-protocol.ts) separates preferences, SSH evidence and resolved placements. [cluster-queue.ts](src/cluster-queue.ts) owns durable transitions and provider lifetimes. [cluster-files.ts](src/cluster-files.ts) confines bounded reads. Admission checks experiment/node/release ownership and resource assignments; no separate presence-only invariant is published.
 
 </details>
 

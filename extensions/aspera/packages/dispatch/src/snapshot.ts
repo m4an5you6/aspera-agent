@@ -78,7 +78,7 @@ export async function snapshotSource(root: string, timeoutMs: number, signal?: A
     await run(process.execPath, [pnpmCli, '--dir', source, 'install', '--lockfile-only', '--offline', '--ignore-scripts'], timeoutMs, signal)
     for (const file of ['pnpm-lock.yaml', 'package.json', 'pnpm-workspace.yaml', 'setup.mjs', 'LICENSE']) { digest.update(file + '\0'); digest.update(readFileSync(join(source, file))) }
     const identity = digest.digest('hex')
-    writeFileSync(join(source, 'aspera-release.json'), JSON.stringify({ version: 1, deploymentId: identity, dsh: '0.2.0-rc.2', extension: '0.2.0' }) + '\n')
+    writeFileSync(join(source, 'aspera-release.json'), JSON.stringify({ version: 1, deploymentId: identity, dsh: '0.2.0-rc.2', extension: '0.1.1' }) + '\n')
     await create({ cwd: source, file: archive, portable: true, mtime: new Date(0) }, readdirSync(source))
     const archiveHash = createHash('sha256').update(readFileSync(archive)).digest('hex')
     return { directory, archive, digest: identity, archiveHash, dispose: () => { rmSync(directory, { recursive: true, force: true }) } }

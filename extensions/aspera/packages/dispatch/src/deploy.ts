@@ -1,15 +1,20 @@
 /** Prepare immutable remote sources and validate bwrap plus allocated CUDA devices. */
 import { randomUUID } from 'node:crypto'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { SourceSnapshot } from './snapshot.ts'
-import { copy, remote, request, shellQuote } from './transport.ts'
+import { copy, remote, shellQuote } from './transport.ts'
 import type { Target } from './transport.ts'
+import type { StoragePlacement, InferenceMapping } from '@aspera/experiments'
+import { verifyServerStorage } from '@aspera/runtime'
+import { z } from 'zod'
 
 /** Trusted deployment configuration shared by the dispatch tools. */
 export interface DeploymentConfig extends Target {
   readonly remoteRoot: string
+  readonly storagePlacement?: StoragePlacement
+  readonly inferenceMapping?: InferenceMapping
   readonly localRepo: string
   readonly dataRoots: readonly string[]
   readonly allowedSystemPackages: readonly string[]
@@ -35,9 +40,10 @@ export interface PreparedEnvironment {
 
 function paths(config: DeploymentConfig, digest: string) {
   const root = config.remoteRoot
+  const storage = config.storagePlacement
   return {
-    root, release: `${root}/releases/${digest}`, archive: `${root}/incoming/${digest}.tar`,
-    workspace: `${root}/workspace`, outside: `${root}/probe-outside`,
+    root, release: storage?.releaseRoot ?? `${root}/releases/${digest}`, archive: `${storage?.namespaceRoot ?? root}/incoming/${digest}.tar`,
+    workspace: storage?.workspaceRoot ?? `${root}/workspace`, outside: `${root}/probe-outside`,
     tokenFile: `${root}/secrets/receiver.token`, modelCredentials: `${root}/secrets/model-${digest}.yaml`, state: `${root}/state`,
     logs: `${root}/logs`, tools: `${root}/tools`,
   }
@@ -53,9 +59,16 @@ function paths(config: DeploymentConfig, digest: string) {
 export async function installSource(config: DeploymentConfig, snapshot: SourceSnapshot, signal?: AbortSignal,
   password?: string): Promise<void> {
   const p = paths(config, snapshot.digest)
-  await remote(config, `umask 077; mkdir -p ${[`${p.root}/incoming`, `${p.root}/releases`, p.workspace, p.outside, `${p.root}/secrets`, p.state, p.logs, p.tools].map(shellQuote).join(' ')}; chmod 700 ${[p.root, `${p.root}/incoming`, `${p.root}/releases`, p.workspace, p.outside, `${p.root}/secrets`, p.state, p.logs, p.tools].map(shellQuote).join(' ')}`, signal, password)
+  if (config.storagePlacement !== undefined) await verifyServerStorage(config, config.storagePlacement, password, signal, statSync(snapshot.archive).size)
+  await remote(config, `umask 077; mkdir -p ${[p.archive.slice(0, p.archive.lastIndexOf('/')), p.release.slice(0, p.release.lastIndexOf('/')), p.workspace, p.outside, `${p.root}/secrets`, p.state, p.logs, p.tools].map(shellQuote).join(' ')}`, signal, password)
   await copy(config, snapshot.archive, p.archive, signal, password)
   const script = `set -eu
+umask 077
+export XDG_CACHE_HOME=${shellQuote((config.storagePlacement?.namespaceRoot ?? p.root) + '/cache')}
+export npm_config_cache="$XDG_CACHE_HOME/npm"
+export COREPACK_HOME="$XDG_CACHE_HOME/corepack"
+export TMPDIR=${shellQuote(p.workspace + '/tmp')}
+mkdir -p "$XDG_CACHE_HOME" "$TMPDIR"
 test "$(sha256sum ${shellQuote(p.archive)} | cut -d ' ' -f 1)" = ${shellQuote(snapshot.archiveHash)}
 if [ -e ${shellQuote(p.release)} ] && [ ! -f ${shellQuote(p.release + '/.ready')} ]; then
   echo 'existing release directory is incomplete' >&2; exit 1
@@ -67,9 +80,9 @@ if [ ! -f ${shellQuote(p.release + '/.ready')} ]; then
   tar -xf ${shellQuote(p.archive)} -C "$stage"
   cd "$stage"
   if command -v pnpm >/dev/null 2>&1; then
-    pnpm install --frozen-lockfile --prod
+    pnpm install --frozen-lockfile --prod --store-dir "$XDG_CACHE_HOME/pnpm"
   elif command -v corepack >/dev/null 2>&1; then
-    corepack pnpm install --frozen-lockfile --prod
+    corepack pnpm install --frozen-lockfile --prod --store-dir "$XDG_CACHE_HOME/pnpm"
   else
     echo 'pnpm and corepack are unavailable' >&2; exit 1
   fi
@@ -109,8 +122,9 @@ fi
 "$bwrap_bin" --ro-bind / / --dev /dev --unshare-pid --proc /proc --die-with-parent -- true
 devices=''
 gpu_count=0
-private_paths=${shellQuote(p.root + '/secrets,' + p.state)}
-if [ -d "$HOME/.ssh" ]; then private_paths="$private_paths,$HOME/.ssh"; fi
+private_paths=${shellQuote(p.root + '/secrets\n' + p.state)}
+if [ -d "$HOME/.ssh" ]; then private_paths="$private_paths
+$HOME/.ssh"; fi
 for dev in /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools /dev/nvidia-modeset /dev/nvidia-caps/nvidia-cap*; do
   if [ -c "$dev" ]; then
     case "$dev" in /dev/nvidia[0-9]*) gpu_count=$((gpu_count + 1));; esac
@@ -121,6 +135,8 @@ test "$gpu_count" -ge 1 || { echo 'no allocated NVIDIA character device' >&2; ex
 set -- --ro-bind / / --dev /dev --unshare-pid --proc /proc --die-with-parent --tmpfs /tmp --bind "$workspace" "$workspace"
 old_ifs="$IFS"; IFS=,
 for dev in $devices; do set -- "$@" --dev-bind "$dev" "$dev"; done
+IFS='
+'
 for path in $private_paths; do set -- "$@" --tmpfs "$path"; done
 IFS="$old_ifs"
 secret_probe=${shellQuote(p.root + '/secrets/probe-private')}
@@ -130,7 +146,8 @@ trap 'rm -f -- "$secret_probe"' EXIT
 "$bwrap_bin" "$@" -- test ! -e "$secret_probe"
 "$bwrap_bin" "$@" -- nvidia-smi -L
 "$bwrap_bin" "$@" -- python3 ${shellQuote(p.release + '/node_modules/@aspera/runtime/scripts/probe-gpu.py')}
-printf 'DSH_DEVICES=%s\\nDSH_BWRAP=%s\\nDSH_HIDDEN=%s\\n' "$devices" "$bwrap_bin" "$private_paths"`
+printf 'DSH_DEVICES=%s\\nDSH_BWRAP=%s\\n' "$devices" "$bwrap_bin"
+node --input-type=module -e 'console.log("DSH_HIDDEN=" + JSON.stringify(process.argv[1].split("\\n")))' "$private_paths"`
   const output = await remote(config, script, signal, password)
   const match = /^DSH_DEVICES=(.+)$/m.exec(output)
   const backend = /^DSH_BWRAP=(.+)$/m.exec(output)
@@ -140,7 +157,7 @@ printf 'DSH_DEVICES=%s\\nDSH_BWRAP=%s\\nDSH_HIDDEN=%s\\n' "$devices" "$bwrap_bin
   }
   return {
     state: 'ready', deploymentId: digest, preparationId: digest, backend: 'bwrap',
-    backendPath: backend[1], devicePaths: match[1].split(','), hiddenPaths: hidden[1].split(','), workspaceRoot: p.workspace,
+    backendPath: backend[1], devicePaths: match[1].split(','), hiddenPaths: z.array(z.string()).parse(JSON.parse(hidden[1])), workspaceRoot: p.workspace,
     sandboxWriteProbe: 'passed', cudaProbe: 'passed',
   }
 }

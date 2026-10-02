@@ -10,18 +10,19 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { setupWorkerProfile } from '@aspera/runtime'
 import { clusterSubmissionSchema } from '@aspera/experiments'
 import { removeTestDirectory } from './test-app.mjs'
+import { resolvedFixture } from './fixtures/storage.mjs'
 
 const release = resolve(import.meta.dirname, '..')
 mkdirSync(resolve(release, '.artifacts'), { recursive: true })
 const directory = mkdtempSync(resolve(release, '.artifacts/control-test-'))
 const root = process.platform === 'win32' ? directory.slice(2).replaceAll('\\', '/') : directory
 const id = randomUUID(); const serverId = randomUUID(); const deploymentId = 'a'.repeat(64); const token = 'b'.repeat(64)
-const server = { id: serverId, name: 'CPU admission fixture', host: 'fixture.test', sshPort: 22, username: 'trainer', remotePort: 43019, remoteRoot: root, authMode: 'password' }
-const submission = clusterSubmissionSchema.parse({ protocol: 2, experimentId: id, deploymentId, objective: 'Plan only, awaiting confirmation', coordinator: server,
+const { server, inventory } = resolvedFixture({ id: serverId, name: 'CPU admission fixture', host: 'fixture.test', sshPort: 22, username: 'trainer', remotePort: 43019, remoteRoot: root, authMode: 'password' }, id, deploymentId)
+const submission = clusterSubmissionSchema.parse({ protocol: 3, experimentId: id, deploymentId, inventories: [{ serverId, inventory }], objective: 'Plan only, awaiting confirmation', coordinator: server,
   nodes: [{ server, devicePaths: ['/dev/nvidia_fixture'], backendPath: '/fixture/bwrap', hiddenPaths: [], gpuInfo: 'CPU fixture; no GPU validation' }],
   inputs: [{ name: 'data.txt', sha256: createHash('sha256').update('dataset row\n').digest('hex') }], createdAt: 1,
   strategy: { mode: 'semi', coordinator: 'single-agent' },
-  versions: { dsh: '0.2.0-rc.2', extension: '0.2.0', harness: deploymentId, data: [] } })
+  versions: { dsh: '0.2.0-rc.2', extension: '0.1.1', harness: deploymentId, data: [] } })
 const run = resolve(directory, 'runs', id)
 const modelFile = resolve(directory, 'secrets/model.json'); const knownHosts = resolve(directory, 'secrets/known_hosts')
 const ready = resolve(directory, 'ready.json'); const home = resolve(directory, 'state/coordinator-home')
@@ -35,7 +36,7 @@ writeFileSync(resolve(directory, 'secrets/coordinator.token'), token)
 writeFileSync(resolve(directory, 'secrets', id + '.json'), JSON.stringify({ submission,
   connections: [{ serverId, password: 'not-model-visible', token, knownHostsFile: knownHosts }], modelCredentialFile: modelFile,
   toolTimeoutMs: 1000, agentModel: { provider: 'deepseek', model: 'deepseek-chat' } }))
-const planHome = resolve(directory, 'state/experiments', id, 'plan')
+const planHome = resolve(run, 'agent-homes', 'plan')
 await setupWorkerProfile(planHome, resolve(directory, 'releases', deploymentId))
 writeFileSync(resolve(planHome, 'profiles/aspera-worker/cordis.patch.yml'), JSON.stringify([{ insert: [{ id: 'keyless-plan-replay',
   name: pathToFileURL(resolve(release, 'scripts/fixtures/worker.mjs')).href,
@@ -140,10 +141,15 @@ try {
   assert.equal(duplicate.value.planningSessionId, planned.value.record.planningSessionId)
   assert.equal((await control.request('submit', { ...submission, objective: 'Changed objective' })).status, 400)
   const orphan = randomUUID(); mkdirSync(resolve(directory, 'runs', orphan))
+  const orphanSubmission = { ...submission, experimentId: orphan,
+    coordinator: resolvedFixture(submission.coordinator, orphan, deploymentId).server,
+    nodes: submission.nodes.map(node => ({ ...node, server: resolvedFixture(node.server, orphan, deploymentId).server })) }
+  writeFileSync(resolve(directory, 'secrets', orphan + '.json'), JSON.stringify({
+    ...JSON.parse(readFileSync(resolve(directory, 'secrets', id + '.json'), 'utf8')), submission: orphanSubmission }))
   writeFileSync(resolve(directory, 'runs', orphan, 'started.json'), JSON.stringify({ sessionId: 'unknown', goalId: 'unknown' }))
-  const refused = await control.request('submit', { ...submission, experimentId: orphan })
+  const refused = await control.request('submit', orphanSubmission)
   assert.equal(refused.status, 400); assert.match(refused.value.error, /operator reconciliation/)
-  const refusedCancel = await control.request('cancel', { experimentId: orphan, submission: { ...submission, experimentId: orphan } })
+  const refusedCancel = await control.request('cancel', { experimentId: orphan, submission: orphanSubmission })
   assert.equal(refusedCancel.status, 400); assert.match(refusedCancel.value.error, /operator reconciliation/)
   assert.equal((await control.request('cancel', { experimentId: id })).value.state, 'cancelled')
   assert.equal((await control.request('answer-question', reply)).status, 400)

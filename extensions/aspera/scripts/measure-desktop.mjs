@@ -1,10 +1,11 @@
 /** Measure the packaged desktop's visible startup and inspect the reported UI regressions. */
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { _electron as electron, expect } from '@playwright/test'
 import { removeTestDirectory } from './test-app.mjs'
+import { desktopOutput } from './desktop-output.mjs'
 
 const root = resolve(import.meta.dirname, '..'); const artifacts = resolve(root, '.artifacts')
 mkdirSync(artifacts, { recursive: true })
@@ -19,8 +20,7 @@ try {
       ASPERA_HOME: resolve(directory, String(run), 'home'), DEEPSEEK_API_KEY: 'desktop-startup-fixture' }
     delete environment.ELECTRON_RUN_AS_NODE
     const started = performance.now()
-    const version = JSON.parse(readFileSync(resolve(root, 'apps/desktop/package.json'), 'utf8')).version
-    const executablePath = process.env.ASPERA_DESKTOP_EXECUTABLE || resolve(artifacts, `desktop-${version}/win-unpacked/Aspera.exe`)
+    const executablePath = process.env.ASPERA_DESKTOP_EXECUTABLE || resolve(desktopOutput(root), 'win-unpacked/Aspera.exe')
     application = await electron.launch({ executablePath, env: environment, timeout: 60000 })
     const page = await application.firstWindow()
     const windowMs = performance.now() - started

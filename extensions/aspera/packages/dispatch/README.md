@@ -26,7 +26,7 @@ Submit multiple independent Goals, stage inputs and transfer complete experiment
 
 The [workspace startup](../../README.md#start-the-management-page) creates an `aspera` profile over published DSH base/Web bundles and this package's [cordis.patch.yml](cordis.patch.yml). It mounts the adapter and management page. Built artifacts can be installed without the Harness source checkout; [installed verification](../../scripts/test-installed.mjs) exercises the same profile and public declarations.
 
-`extensionRoot` is the installed release or independent build root. `dataRoots` explicitly permits local source inputs; browser attachments are staged separately. `agentCredentialRefs` identifies model secrets to transfer. Operation, polling and download expiry settings are validated [Config](src/index.ts) fields. `ASPERA_DATA_ROOTS` supplies a JSON array and `ASPERA_MODEL_CREDENTIAL_REFS` a comma-separated list in the shipped patch.
+`extensionRoot` selects the fixed release, `dataRoots` allows local input files, and `agentCredentialRefs` names private model credentials. `minimumFreeBytes` configures the storage reserve (default 1 GiB), captured per experiment. Operation, polling and download settings are validated [Config](src/index.ts) fields; the shipped patch reads `ASPERA_DATA_ROOTS` and `ASPERA_MODEL_CREDENTIAL_REFS`. Connection checks do not call a model or create remote directories.
 
 Servers use password login with a separate username. The first saved server is the fixed coordinator; its address, control port and root cannot be changed while it owns state. Repeated SSH addresses/ports are refused. Ordinary server edits do not change pinned experiments. The node uses its configured control port, and the coordinator uses the following port.
 
@@ -40,7 +40,7 @@ Servers use password login with a separate username. The first saved server is t
 <details>
 <summary>Implementation internals</summary>
 
-[fleet.ts](src/fleet.ts) owns registry records, Goal identity comparisons and receipt publication. [snapshot.ts](src/snapshot.ts) packs built files with frozen published dependencies; [cluster-deploy.ts](src/cluster-deploy.ts) preserves existing controls and private remote login files. [downloads.ts](src/downloads.ts) aborts disconnected reads. [ssh-account.ts](src/ssh-account.ts) resolves account-scoped password references. Runtime resource assertions are performed by the scheduler/node provider; this adapter publishes no service-presence invariant entry.
+[fleet.ts](src/fleet.ts) owns registry, preparation, Goal checks and complete receipts. [storage-selection.ts](src/storage-selection.ts) exposes only inventory and candidate-selection tools; [network-selection.ts](src/network-selection.ts) validates peer reachability and joins cleanup. [snapshot.ts](src/snapshot.ts) packages fixed releases; [cluster-deploy.ts](src/cluster-deploy.ts) retains active controls and private credentials. [downloads.ts](src/downloads.ts) aborts disconnected reads. Owned relationships are checked in preparation and runtime operations; no service-presence invariant is published.
 
 </details>
 
@@ -63,7 +63,7 @@ Dispatch tools list non-secret servers, submit an explicit server group and read
 
 - Public server configuration supports passwords only; there is no password/key priority selection.
 - Host keys must already be trusted in `known_hosts`; an unknown or changed key fails.
-- Released version-1 records remain readable; legacy pending work cannot be resumed by the new release.
+- Released generation-1/2 records remain readable without rewriting hashes; old unfinished preparations use Copy as new experiment.
 - Incompatible control upgrades wait for existing tasks and controls to finish.
 
 ### Dev Note

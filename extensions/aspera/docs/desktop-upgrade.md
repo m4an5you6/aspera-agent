@@ -4,7 +4,7 @@ English | [中文](desktop-upgrade.zh.md)
 
 ## Summary
 
-Desktop 0.2 uses the existing Harness home and retains external plugin management. Fully quit the old application, keep the complete new application directory together and run `win-unpacked/Aspera.exe`. Builds produce the application directory without a ZIP.
+Aspera `0.1.1` retains the existing Harness home and external plugin management. Fully quit the old application, use the complete new application directory and run `win-unpacked/Aspera.exe`. Each build has a distinct identifier and SHA-256 in `aspera-desktop-build.json`; `resources/build-info.json` travels with the application. Application numbering does not rewrite historical `0.2.0` receipts or change the desktop profile ownership marker.
 
 ## Contents
 

@@ -23,10 +23,13 @@ export const Config: z<Config> = z.object({
   chunkBytes: z.number().step(1).min(1024).max(65536).default(65536),
   fileLimit: z.number().step(1).min(1).default(1000),
   cleanupTimeoutMs: z.number().step(1).min(1000).default(30000),
+  serviceRequestTimeoutMs: z.number().step(1).min(1000).default(300000),
+  serviceRequestBytes: z.number().step(1).min(1024).default(16777216),
   pollIntervalMs: z.number().step(1).min(100).default(1000),
   documentationHosts: z.array(z.string()).default(['github.com', 'raw.githubusercontent.com', 'docs.nvidia.com', 'unsloth.ai', 'docs.unsloth.ai', 'swift.readthedocs.io', 'huggingface.co']),
   documentationBytes: z.number().step(1).min(1024).default(1048576),
   goalContinuationWindow: z.number().step(1).min(2).max(10000).default(128),
+  networkProbeLifetimeMs: z.number().step(1).min(1000).default(300000),
 })
 export const inject = ['webServer', 'storage', 'storageDomain', 'subprocess', 'sandbox', 'agents', 'goals', 'credentials', 'agentDefaultModel', 'sessionPersistence', 'agentPresets', 'userQuestions']
 /** @param ctx - worker profile services. @param config - fixed role and operation bounds. */

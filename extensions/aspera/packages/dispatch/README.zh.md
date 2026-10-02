@@ -26,7 +26,7 @@ kind: "package-bundle"
 
 [工程启动](../../README.zh.md#start-the-management-page) 在已发布 DSH base/Web bundle 及本包 [cordis.patch.yml](cordis.patch.yml) 之上建立 `aspera` profile，装配接入层及管理页面。构建产物可以脱离 Harness 源码安装，[独立安装验证](../../scripts/test-installed.mjs) 检查同一 profile 和公开类型声明。
 
-`extensionRoot` 指向已安装版本或独立构建根目录，`dataRoots` 明确允许本地输入来源，浏览器附件单独暂存。`agentCredentialRefs` 指定移交的模型凭据引用。操作、轮询及下载过期时间均为经过验证的 [Config](src/index.ts) 字段。随包 patch 使用 `ASPERA_DATA_ROOTS` 的 JSON 数组和 `ASPERA_MODEL_CREDENTIAL_REFS` 的逗号分隔列表。
+`extensionRoot` 选择固定发布，`dataRoots` 允许读取本地输入文件，`agentCredentialRefs` 指定私有模型凭据。`minimumFreeBytes` 配置保留空间，默认 1 GiB，并随实验固定。操作、轮询和下载设置由 [Config](src/index.ts) 校验；随包配置读取 `ASPERA_DATA_ROOTS` 和 `ASPERA_MODEL_CREDENTIAL_REFS`。检查连接不调用模型或创建远端目录。
 
 服务器使用密码登录和独立用户名。首次保存的服务器固定担任调度主机，在其管理状态期间不能修改地址、控制端口或根目录。拒绝相同的 SSH 地址及端口。普通服务器编辑不会修改已固定的实验。节点使用配置的控制端口，调度服务使用下一端口。
 
@@ -40,7 +40,7 @@ kind: "package-bundle"
 <details>
 <summary>实现细节</summary>
 
-[fleet.ts](src/fleet.ts) 管理登记记录、Goal 身份比较和回执写入；[snapshot.ts](src/snapshot.ts) 打包构建文件及冻结的发布依赖；[cluster-deploy.ts](src/cluster-deploy.ts) 保留运行中的控制服务和私有远端登录文件；[downloads.ts](src/downloads.ts) 中止断线读取；[ssh-account.ts](src/ssh-account.ts) 解析按账号保存的密码引用。运行时资源约束由调度及节点提供方执行，本接入层不发布服务存在检查入口。
+[fleet.ts](src/fleet.ts) 管理登记、准备、Goal 校验和完整回执。[storage-selection.ts](src/storage-selection.ts) 仅提供探测及候选选择工具；[network-selection.ts](src/network-selection.ts) 检查互通并等待清理。[snapshot.ts](src/snapshot.ts) 打包固定发布，[cluster-deploy.ts](src/cluster-deploy.ts) 保留活动控制进程和私有凭据。[downloads.ts](src/downloads.ts) 中止断开的读取。归属关系由准备和运行时操作检查，不发布仅验证服务存在性的 invariant。
 
 </details>
 
@@ -63,7 +63,7 @@ kind: "package-bundle"
 
 - 公开服务器配置只支持密码，不提供密码和密钥的优先选择。
 - 主机密钥必须预先在 `known_hosts` 中被信任，未知或变化的密钥导致失败。
-- 已发布的第 1 代记录保持可读，旧待执行任务不能由新版本恢复。
+- 保留第 1／2 代记录及原摘要；旧版未完成准备通过复制为新实验继续。
 - 不兼容的控制升级需等待原任务及控制服务结束。
 
 ### 开发备注

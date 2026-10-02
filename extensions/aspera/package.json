@@ -20,7 +20,7 @@
     "test:api": "node scripts/test-api.mjs",
     "test:desktop:api": "node scripts/test-desktop-api.mjs",
     "pack": "node scripts/pack.mjs",
-    "lint": "oxlint packages apps scripts",
+    "lint": "oxlint -c .oxlintrc.json packages apps scripts",
     "dsh": "node scripts/dsh.mjs",
     "setup": "node scripts/setup.mjs",
     "start:web": "node scripts/start.mjs",
