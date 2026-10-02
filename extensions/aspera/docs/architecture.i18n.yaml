@@ -1,0 +1,25 @@
+# Bilingual-pair consistency record for architecture.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write extensions/aspera/docs/architecture.md
+/aspera-architecture:
+  en: 0585b9fb22f35198
+  zh: 5fffdde7bc5c6a4d
+/aspera-architecture/summary:
+  en: 5cbe02a129cd73d9
+  zh: 772eeae61daa4f5e
+/aspera-architecture/table-of-contents:
+  en: 103689c027a81007
+  zh: 04ef8b5e60946e0c
+/aspera-architecture/components:
+  en: dcbca97353b4e8b1
+  zh: ea0fe301d1d53691
+/aspera-architecture/architecture-diagrams:
+  en: d585a93d73705d58
+  zh: e1ab319ddc3d6e06
+/aspera-architecture/execution-and-ownership:
+  en: 4948a65df90674db
+  zh: 70bbc850a84dc8e3
+/aspera-architecture/extension-points:
+  en: 59a231ea7758f162
+  zh: 54c28c82eeb79c9a

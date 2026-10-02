@@ -1,0 +1,31 @@
+packages:
+  - packages/*
+  - apps/*
+
+peerDependencyRules:
+  allowedVersions:
+    typescript: '>=5 <7'
+
+# Mirrors the upstream monorepo review: pnpm >= 10 rejects unlisted install scripts.
+allowBuilds:
+  electron: true
+  esbuild: true
+  node-pty: true
+  koffi: true
+  '@deepseek-ai/dsh-subprocess-local': true
+  ssh2: true
+  cpu-features: false
+  '@google/genai': false
+  protobufjs: false
+  node-addon-require-builtin: false
+  electron-winstaller: false
+  msgpackr-extract: false
+
+# Fixed DSH release dependencies are admitted by the reviewed lockfile.
+minimumReleaseAgeExclude:
+  - '@deepseek-ai/*'
+  - '@earendil-works/*'
+  - 'node-addon-*'
+  - '@anthropic-ai/*'
+  - '@openai/codex'
+  - '@trycua/*'

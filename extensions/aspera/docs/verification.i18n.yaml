@@ -1,0 +1,19 @@
+# Bilingual-pair consistency record for verification.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write extensions/aspera/docs/verification.md
+/verification:
+  en: 68dd92dacd828f52
+  zh: 22b5c745b6bbafd3
+/verification/summary:
+  en: 25780c3d32478696
+  zh: 2a689ed2e5523484
+/verification/table-of-contents:
+  en: 520f4b5c2103868e
+  zh: 81cf0ad519a23378
+/verification/local-checks:
+  en: eefff4a65d2e2f04
+  zh: d4a5f0ab44b4a00d
+/verification/gpu-acceptance:
+  en: f86d28dd0c2ab0f3
+  zh: 06fb0386b9c66737

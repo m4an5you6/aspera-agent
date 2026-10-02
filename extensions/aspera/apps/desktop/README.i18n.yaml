@@ -1,0 +1,25 @@
+# Bilingual-pair consistency record for README.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write extensions/aspera/apps/desktop/README.md
+/aspera-desktop:
+  en: c33b4da5c63f772a
+  zh: b22b41865533ff38
+/aspera-desktop/summary:
+  en: 6ed00ccf6376be28
+  zh: 093afc90981d2341
+/aspera-desktop/contents:
+  en: 369510a4bcfa7685
+  zh: 1b2ff1fc541d5726
+/aspera-desktop/run:
+  en: 8db071892e517c2f
+  zh: 9ab208016cba16b6
+/aspera-desktop/build-and-verify:
+  en: e6f570ffac5db565
+  zh: fe096640eb72b011
+/aspera-desktop/implementation:
+  en: 8ecb3f2a153f6113
+  zh: 3d84bbf61164b00d
+/aspera-desktop/limits:
+  en: da0a2e47acf8ce6c
+  zh: 8a5842b466134a7a

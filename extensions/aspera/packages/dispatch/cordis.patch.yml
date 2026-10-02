@@ -1,0 +1,13 @@
+# Installed as the last bundle over the published Web app.
+- insert:
+    - id: aspera-dispatch
+      name: '@aspera/dispatch'
+      config:
+        extensionRoot: !!js process.env.ASPERA_EXTENSION_ROOT
+        dataRoots: !!js JSON.parse(process.env.ASPERA_DATA_ROOTS || '[]')
+        agentCredentialRefs: !!js (process.env.ASPERA_MODEL_CREDENTIAL_REFS || 'DEEPSEEK_API_KEY').split(',').filter(Boolean)
+    - id: aspera-console
+      name: '@aspera/console'
+      config:
+        pollIntervalMs: 3000
+        retainedTextChars: 200000

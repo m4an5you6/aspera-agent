@@ -1,0 +1,34 @@
+# Bilingual-pair consistency record for README.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write extensions/aspera/packages/dispatch/README.md
+/:
+  en: 9f7736eeb559b9e6
+  zh: a9a4e3adffc0d0e3
+/aspera-dispatch:
+  en: 295436db72428fec
+  zh: bdcaa61b3686fd3a
+/aspera-dispatch/summary:
+  en: 2ea0efe7c70c27f8
+  zh: 939a4657c20a81cc
+/aspera-dispatch/table-of-contents:
+  en: b563e4ec4727d0de
+  zh: 55c133137e526dcc
+/aspera-dispatch/use-this-package:
+  en: 1e5f23f108c93508
+  zh: aae36194a8b50058
+/aspera-dispatch/understand-the-implementation:
+  en: 3fe8d61f3651372f
+  zh: 24604458968679d1
+/aspera-dispatch/further-exploration:
+  en: 346f75b47eb508b4
+  zh: 1de6fcef59bc8d98
+/aspera-dispatch/model-experience:
+  en: 29a57ca6941648fe
+  zh: 9e2f676653675a2d
+/aspera-dispatch/known-limitations-and-deferred-work:
+  en: 2ba32d38f2aa8b57
+  zh: 61450c00c13f05d7
+/aspera-dispatch/known-limitations-and-deferred-work/dev-note:
+  en: 0a1253c6f7b5e8b9
+  zh: 9f56528562c7c914

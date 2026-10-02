@@ -1,0 +1,52 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "paths": {
+      "@deepseek-ai/dsh-typert-protocol": [
+        "./types/typert-protocol.d.ts"
+      ],
+      "@aspera/experiments": [
+        "./packages/experiments/src/index.ts"
+      ],
+      "@aspera/experiments/types": [
+        "./packages/experiments/src/types.ts"
+      ],
+      "@aspera/runtime": [
+        "./packages/runtime/src/index.ts"
+      ],
+      "@aspera/runtime/types": [
+        "./packages/runtime/src/types.ts"
+      ],
+      "@aspera/dispatch": [
+        "./packages/dispatch/src/index.ts"
+      ],
+      "@aspera/dispatch/types": [
+        "./packages/dispatch/src/types.ts"
+      ],
+      "@aspera/console": [
+        "./packages/console/src/index.ts"
+      ],
+      "@aspera/console/types": [
+        "./packages/console/src/types.ts"
+      ]
+    }
+  },
+  "files": [],
+  "references": [
+    {
+      "path": "./apps/desktop"
+    },
+    {
+      "path": "./packages/experiments"
+    },
+    {
+      "path": "./packages/runtime"
+    },
+    {
+      "path": "./packages/dispatch"
+    },
+    {
+      "path": "./packages/console/tsconfig.host.json"
+    }
+  ]
+}

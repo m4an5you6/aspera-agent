@@ -12,6 +12,7 @@ pnpm-debug.log
 examples/*/*.jsonl
 .storages/
 .sessions/
+.dsh-home/
 examples/*/.sessions/
 coverage/
 .coverage-times.json

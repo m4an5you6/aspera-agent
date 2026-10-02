@@ -1,0 +1,9 @@
+{
+  "dispatchGoalPhases": ["active", "complete"],
+  "handover": ["本机派发完成，远端实验已接管"],
+  "receiptStates": [
+    { "goal": "CPU failure experiment", "handover": "本机派发完成，远端实验已接管", "state": "failed" },
+    { "goal": "CPU semi experiment", "handover": "本机派发完成，远端实验已接管", "state": "completed" },
+    { "goal": "CPU shared experiment", "handover": "本机派发完成，远端实验已接管", "state": "cancelled" }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "question": {
+    "version": 1,
+    "revision": 1,
+    "stage": "planning",
+    "questions": [
+      {
+        "id": "trial",
+        "question": "How should the ambiguous evaluation split be resolved?",
+        "options": [
+          { "label": "Continue with a measured trial" },
+          { "label": "Stop for a revised experiment" }
+        ]
+      }
+    ]
+  },
+  "savedAnswer": {
+    "answers": [
+      { "id": "trial", "selected": ["Continue with a measured trial"] }
+    ]
+  },
+  "originalToolResult": {
+    "isError": false,
+    "answer": {
+      "answers": [
+        { "id": "trial", "selected": ["Continue with a measured trial"] }
+      ]
+    }
+  },
+  "goalTransitions": [
+    { "operation": "create", "phase": "active" },
+    { "operation": "pause", "phase": "paused" },
+    { "operation": "resume", "phase": "active" },
+    { "operation": "complete", "phase": "complete" }
+  ]
+}

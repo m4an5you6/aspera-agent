@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "composite": false,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "lib": ["es2024", "dom", "dom.iterable"],
+    "paths": {
+      "@aspera/experiments": ["./packages/experiments/src/index.ts"],
+      "@aspera/experiments/types": ["./packages/experiments/src/types.ts"],
+      "@aspera/runtime": ["./packages/runtime/src/index.ts"],
+      "@aspera/runtime/transport": ["./packages/runtime/src/transport.ts"],
+      "@aspera/dispatch/types": ["./packages/dispatch/src/types.ts"]
+    }
+  },
+  "include": ["packages/*/tests/**/*.ts", "apps/*/tests/**/*.ts"]
+}

@@ -142,7 +142,7 @@ export const TRANSLATION_SCOPE_GLOB_EXCLUDES = [
   '**/__pycache__/**',
   '**/.pytest_cache/**',
   'apps/web/dist/**',
-  '.artifacts/**',
+  '**/.artifacts/**',
   'python/sdk-runtime/src/deepseek_harness_runtime/runtime/**',
   'vendor/**',
 ]
@@ -164,6 +164,7 @@ export function isTranslationScopeFile(file: string): boolean {
     || ROOT_PAIRED_DOCUMENT_ARTIFACT.test(file)
     || file.startsWith('.agents/notes/')
     || file.startsWith('docs/')
+    || /^extensions\/[^/]+\/docs\//.test(file)
     || file.startsWith('python/'))
 }
 

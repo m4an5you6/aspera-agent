@@ -1,0 +1,16 @@
+# Bilingual-pair consistency record for desktop-upgrade.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write extensions/aspera/docs/desktop-upgrade.md
+/desktop-upgrade:
+  en: 7959c2d3b465e669
+  zh: 4bbbce61f78f70d6
+/desktop-upgrade/summary:
+  en: 07009121e8b4c9de
+  zh: 33e847a719101c29
+/desktop-upgrade/contents:
+  en: 6d316c012ba9672b
+  zh: f4a5bcc0316b4583
+/desktop-upgrade/profile-changes:
+  en: aefc789f5527f8b1
+  zh: 10aa3e9c7dba6870

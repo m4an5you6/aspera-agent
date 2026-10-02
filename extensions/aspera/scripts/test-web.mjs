@@ -1,0 +1,177 @@
+/** Exercise the real Web composition against the explicitly local CPU test provider. */
+import assert from 'node:assert/strict'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
+import { chromium, expect as baseExpect } from '@playwright/test'
+import { command, launchProfile, openAspera, removeTestDirectory } from './test-app.mjs'
+
+const root = resolve(import.meta.dirname, '..')
+const expect = baseExpect.configure({ timeout: 20000 })
+mkdirSync(resolve(root, '.artifacts'), { recursive: true })
+const directory = mkdtempSync(resolve(root, '.artifacts/web-test-'))
+const home = resolve(directory, 'home')
+await command(process.execPath, ['scripts/setup.mjs'], root, { ASPERA_HOME: home })
+const profile = resolve(home, 'profiles/aspera')
+writeFileSync(resolve(profile, 'cordis.patch.yml'), JSON.stringify([
+  { id: 'aspera-dispatch', disabled: true },
+  { id: 'aspera-console', config: { pollIntervalMs: 500 } },
+  { insert: [{ id: 'aspera-test-fixture', name: pathToFileURL(resolve(root, 'scripts/fixtures/web.mjs')).href,
+    config: { role: 'web', root: resolve(directory, 'remote'), release: root } }] },
+]))
+let app; let browser; let page
+try {
+  app = await launchProfile(root, home, 'aspera')
+  browser = await chromium.launch({ channel: process.env.ASPERA_BROWSER_CHANNEL || 'chrome', headless: true })
+  const context = await browser.newContext({ acceptDownloads: true })
+  const errors = []
+  context.on('page', opened => {
+    opened.on('pageerror', error => { errors.push(error.message); console.error('Browser exception:', error.message) })
+    opened.on('console', message => { if (message.type() === 'error') console.error('Browser:', message.text()) })
+  })
+  page = await context.newPage()
+  await openAspera(page, app.url)
+  await page.getByRole('button', { name: /^(服务器|Servers)$/ }).click()
+  for (const name of ['CPU A', 'CPU B']) {
+    await page.getByRole('button', { name: /^(添加服务器|Add server)$/ }).click()
+    await page.locator('input[name=name]').fill(name)
+    await page.locator('input[name=host]').fill(name === 'CPU A' ? 'cpu-a.test' : 'cpu-b.test')
+    await page.locator('input[name=username]').fill('trainer')
+    await page.locator('input[name=password]').fill('test-fixture-password')
+    await page.locator('input[name=remoteRoot]').fill('/fixture/' + name.at(-1).toLowerCase())
+    await page.getByRole('button', { name: /^(保存服务器|Save server)$/ }).click()
+    await expect(page.getByRole('heading', { name: new RegExp(name) })).toBeVisible()
+  }
+  async function create(goal, server, mode = 'automatic', upload = false) {
+    await page.getByRole('button', { name: /^(新建实验|New experiment)$/ }).click()
+    await page.getByLabel('Goal', { exact: true }).fill(goal)
+    await page.getByRole('checkbox', { name: new RegExp(server) }).check()
+    if (mode === 'semi') await page.getByRole('button', { name: /半自动执行|Semi-automatic/ }).click()
+    if (upload) await page.locator('input[name=uploads]').setInputFiles({ name: 'data.txt', mimeType: 'text/plain', buffer: Buffer.from('dataset') })
+    await page.getByRole('button', { name: /^(提交实验|Submit experiment)$/ }).click()
+    await expect(page.getByRole('heading', { name: goal, exact: true })).toBeVisible()
+    await expect(page.getByText('本机派发完成，远端实验已接管', { exact: true })).toBeVisible()
+  }
+  const control = async (action = 'status', id) => {
+    const response = await page.request.get(new URL(`/aspera-test/${action}${id === undefined ? '' : '?id=' + id}`, app.url).href)
+    assert.equal(response.status(), 200)
+    return response.json()
+  }
+  await create('CPU semi experiment', 'CPU A', 'semi', true)
+  await expect(page.getByRole('button', { name: /^(确认此计划|Confirm this plan)$/ })).toBeVisible()
+  const semi = (await control()).experiments.find(row => row.request.objective === 'CPU semi experiment')
+  assert.equal(semi.latest.resourcesReleased, true)
+  await create('CPU independent experiment', 'CPU B')
+  await expect(page.getByRole('status')).toHaveText(/服务中|Serving/)
+  await page.getByRole('button', { name: /^(返回|Back)$/ }).click()
+  await page.getByRole('button').filter({ has: page.getByText('CPU semi experiment', { exact: true }) }).click()
+  await page.getByRole('button', { name: /^(确认此计划|Confirm this plan)$/ }).click()
+  await expect(page.getByRole('status')).toHaveText(/服务中|Serving/)
+  await create('CPU shared experiment', 'CPU A')
+  await expect(page.getByRole('status')).toHaveText(/排队中|Queued/)
+  await expect(page.getByText(/等待服务器|Waiting for servers/)).toBeVisible()
+  const saved = await control()
+  const first = saved.experiments.find(row => row.request.objective === 'CPU semi experiment')
+  const separate = saved.experiments.find(row => row.request.objective === 'CPU independent experiment')
+  assert.equal(first.latest.state, 'serving')
+  assert.equal(separate.latest.state, 'serving')
+  assert.notEqual(first.latest.sessionId, separate.latest.sessionId)
+  assert.equal(JSON.stringify(saved.experiments).includes('test-fixture-password'), false)
+  await page.getByRole('button', { name: /^(返回|Back)$/ }).click()
+  await page.getByRole('button').filter({ has: page.getByText('CPU semi experiment', { exact: true }) }).click()
+  await page.getByRole('button', { name: /^(节点日志|Node logs)$/ }).click()
+  const log = () => page.getByRole('region', { name: /^(节点日志|Node logs)$/ }).locator('pre').first()
+  await expect(log()).toContainText('服务健康')
+  await context.setOffline(true)
+  await control('append', first.request.experimentId)
+  await context.setOffline(false)
+  await expect(log()).toContainText('断线后继续')
+  await control('rotate', first.request.experimentId)
+  await expect(page.getByText(/日志已轮转|log was rotated/)).toBeVisible()
+  await expect(log()).toContainText('轮转后日志')
+  await page.getByRole('button', { name: /^(执行会话|Execution conversation)$/ }).click()
+  await expect(page.getByText('Prepare a CPU fixture service in the experiment directory.', { exact: true })).toBeVisible()
+  await expect(page.getByText('Run the approved CPU fixture plan.', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: /^(输出文件|Output files)$/ }).click()
+  const downloadEvent = page.waitForEvent('download')
+  await page.getByRole('button', { name: /^(下载|Download)$/ }).click()
+  const downloaded = await downloadEvent
+  assert.equal(readFileSync(await downloaded.path(), 'utf8'), 'local output\n')
+  await page.getByRole('button', { name: /^(推理服务|Inference services)$/ }).last().click()
+  await page.getByRole('button', { name: /^(通过受管理的连接访问|Access through managed connection)$/ }).click()
+  await expect(page.locator('pre').last()).toContainText('CPU fixture response')
+  await page.screenshot({ path: resolve(root, '.artifacts/web-service.png'), fullPage: true })
+  await page.close()
+  page = await context.newPage()
+  await openAspera(page, app.url)
+  await page.getByRole('button').filter({ has: page.getByText('CPU semi experiment', { exact: true }) }).click()
+  await expect(page.getByRole('status')).toHaveText(/服务中|Serving/)
+  await page.getByRole('button', { name: /^(推理服务|Inference services)$/ }).last().click()
+  await page.getByRole('button', { name: /^(停止服务|Stop service)$/ }).click()
+  await expect(page.getByRole('status')).toHaveText(/已完成|Completed/)
+  await page.getByRole('button', { name: /^(返回|Back)$/ }).click()
+  await page.getByRole('button').filter({ has: page.getByText('CPU shared experiment', { exact: true }) }).click()
+  await expect(page.getByRole('status')).toHaveText(/服务中|Serving/)
+  await page.getByRole('button', { name: /^(取消实验|Cancel experiment)$/ }).click()
+  await expect(page.getByRole('status')).toHaveText(/已取消|Cancelled/)
+  await page.getByRole('button', { name: /^(返回|Back)$/ }).click()
+  await page.getByRole('button').filter({ has: page.getByText('CPU independent experiment', { exact: true }) }).click()
+  await control('crash', separate.request.experimentId)
+  await expect(page.getByRole('status')).toHaveText(/失败|Failed/)
+  await page.getByRole('button', { name: /^(推理服务|Inference services)$/ }).last().click()
+  await expect(page.getByText('CPU fixture exited unexpectedly', { exact: true })).toBeVisible()
+  const crashed = (await control()).experiments.find(row => row.request.experimentId === separate.request.experimentId)
+  assert.equal(crashed.latest.services.length, 1)
+  assert.equal(crashed.latest.services[0].state, 'failed')
+  assert.equal(crashed.latest.services[0].released, true)
+  await create('CPU failure experiment', 'CPU A')
+  await expect(page.getByRole('alert')).toContainText('CPU fixture dependency failed')
+  await page.screenshot({ path: resolve(root, '.artifacts/web-error.png'), fullPage: true })
+  await create('CPU operator question', 'CPU A', 'semi')
+  await page.getByRole('button', { name: /^(确认此计划|Confirm this plan)$/ }).click()
+  const questionCard = () => page.getByRole('region', { name: /需要你的决定|Your decision is needed/ })
+  await expect(questionCard()).toBeVisible()
+  await expect(page.getByLabel(/1 个实验待处理|1 experiments need attention/)).toBeVisible()
+  const waiting = (await control()).experiments.find(row => row.request.objective === 'CPU operator question')
+  await page.screenshot({ path: resolve(root, '.artifacts/web-question.png'), fullPage: true })
+  await page.close(); page = await context.newPage()
+  await openAspera(page, app.url)
+  await page.getByRole('button', { name: /待处理|Needs attention/ }).click()
+  await page.getByRole('button', { name: 'CPU operator question', exact: true }).click()
+  await expect(questionCard()).toBeVisible()
+  await expect(page.getByLabel(/1 个实验待处理|1 experiments need attention/)).toBeVisible()
+  await questionCard().getByRole('checkbox', { name: 'Use the held-out split' }).check()
+  await questionCard().getByRole('textbox').fill('Keep the specified data and server group.')
+  await questionCard().getByRole('button', { name: /回复并继续|Save reply and continue/ }).click()
+  await expect(questionCard()).toHaveCount(0)
+  await expect(page.getByLabel(/1 个实验待处理|1 experiments need attention/)).toHaveCount(0)
+  await expect(page.getByRole('status').first()).toHaveText(/服务中|Serving/)
+  const answered = (await control()).experiments.find(row => row.request.experimentId === waiting.request.experimentId)
+  assert.equal(answered.latest.sessionId, waiting.latest.sessionId)
+  assert.equal(answered.latest.goalId, waiting.latest.goalId)
+  assert.equal(answered.latest.questions[0].state, 'answered')
+  await page.getByRole('button', { name: /^(取消实验|Cancel experiment)$/ }).click()
+  await expect(page.getByRole('status').first()).toHaveText(/已取消|Cancelled/)
+  const final = await control()
+  const dispatchEvents = final.events.filter(item => item.sessionId === first.sessionId)
+  const snapshot = {
+    dispatchGoalPhases: dispatchEvents.filter(item => item.event.type === 'goal/change').map(item => item.event.data.goal?.phase),
+    handover: dispatchEvents.filter(item => item.event.type === 'user/message').map(item => item.event.data.content[0].text.split('\n')[0]),
+    receiptStates: final.experiments.filter(row => ['CPU semi experiment', 'CPU shared experiment', 'CPU failure experiment'].includes(row.request.objective))
+      .sort((a, b) => a.request.objective.localeCompare(b.request.objective)).map(row => ({ goal: row.request.objective, handover: row.receipt.handover, state: row.latest.state })),
+  }
+  const expected = JSON.parse(readFileSync(resolve(root, 'scripts/fixtures/session.snapshot.json'), 'utf8'))
+  assert.deepEqual(snapshot, expected)
+  assert.deepEqual(errors, [])
+  console.log('Real Web: servers/passwords, attachments, independent Goals, plan confirmation, parallelism/queue, handover Session snapshot, UTF-8/reconnect/rotation, download, service access/survival/stop/unexpected exit, cancellation and errors passed.')
+} catch (error) {
+  if (page !== undefined && !page.isClosed()) {
+    await page.screenshot({ path: resolve(root, '.artifacts/web-failure.png'), fullPage: true })
+    console.error((await page.locator('body').innerText()).slice(-5000))
+  }
+  console.error('Web test profile tail: ' + (app?.output() ?? '').replace(/token=[A-Za-z0-9_-]+/g, 'token=<redacted>').slice(-7000))
+  throw error
+} finally {
+  await browser?.close(); await app?.close()
+  removeTestDirectory(directory, resolve(root, '.artifacts'))
+}
