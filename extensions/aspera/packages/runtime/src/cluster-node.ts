@@ -17,11 +17,12 @@ import { verifyStorage } from '../scripts/storage.mjs'
 import { NetworkProbes } from './network-probes.ts'
 import { openInferenceGateway } from './inference-gateway.ts'
 import type { InferenceGateway } from './inference-gateway.ts'
+import { processLogRequestSchema } from '@aspera/experiments'
 
 const allocationObject = z.object({ experimentId: experimentIdSchema, deploymentId: deploymentIdSchema,
-  node: z.union([clusterNodeSchema, legacyClusterNodeSchema]).transform((node): ClusterNode => node), protocol: z.union([z.literal(2), z.literal(3)]).optional(), budget: budgetSchema.optional(), deadline: z.number().int().optional(), released: z.boolean(), releasing: z.boolean().default(false), bootId: z.string() }).strict()
+  node: z.union([clusterNodeSchema, legacyClusterNodeSchema]).transform((node): ClusterNode => node), protocol: z.union([z.literal(2), z.literal(3), z.literal(4)]).optional(), budget: budgetSchema.optional(), deadline: z.number().int().optional(), released: z.boolean(), releasing: z.boolean().default(false), bootId: z.string() }).strict()
 const allocationPolicy = (value: Pick<z.infer<typeof allocationObject>, 'protocol' | 'budget' | 'deadline'>) =>
-  value.protocol === 2 || value.protocol === 3 ? value.budget === undefined && value.deadline === undefined : value.budget !== undefined && value.deadline !== undefined
+  value.protocol === 2 || value.protocol === 3 || value.protocol === 4 ? value.budget === undefined && value.deadline === undefined : value.budget !== undefined && value.deadline !== undefined
 const allocationSchema = allocationObject.refine(allocationPolicy, 'allocation execution policy is incomplete')
 const allocationRequestSchema = allocationObject.omit({ released: true, releasing: true, bootId: true }).refine(allocationPolicy, 'allocation execution policy is incomplete')
 const commandSchema = clusterCommandResultSchema.extend({ experimentId: experimentIdSchema, command: z.string() })
@@ -29,7 +30,7 @@ function commandView(row: z.infer<typeof commandSchema>): ClusterCommandResult {
   return { commandId: row.commandId, state: row.state, exitCode: row.exitCode, released: row.released,
     ...(row.detail === undefined ? {} : { detail: row.detail }) }
 }
-const storeSpec = defineDomain({ name: 'aspera_node', version: 3, compatibleVersions: [1, 2], layout: 'per-record', tables: {
+const storeSpec = defineDomain({ name: 'aspera_node', version: 4, compatibleVersions: [1, 2, 3], layout: 'per-record', tables: {
   allocations: domainTable<ExperimentId, z.infer<typeof allocationSchema>>(allocationSchema),
   commands: domainTable<string, z.infer<typeof commandSchema>>(commandSchema),
   services: domainTable<string, InferenceService>(serviceSchema),
@@ -89,6 +90,7 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
   }
   const workspace = (id: ExperimentId) => resolve(runRoot(id), 'workspace')
   const logPath = (id: ExperimentId) => resolve(runRoot(id), 'node.log')
+  const processLogPath = (id: ExperimentId, commandId: string, stream: 'stdout' | 'stderr') => resolve(runRoot(id), 'process-logs', commandId, `${stream}.log`)
   const allocation = (id: ExperimentId) => {
     const saved = allocations.get(id)
     if (saved === undefined || saved.released || saved.releasing || saved.bootId !== config.bootId) throw new Error('node allocation is unavailable or interrupted')
@@ -139,7 +141,7 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
       if (closing) throw new Error('node is stopping')
 
       const request = allocationRequestSchema.parse(raw)
-      if (request.protocol === 3) {
+      if (request.protocol === 3 || request.protocol === 4) {
         const placement = request.node.server.storagePlacement
         if (placement === undefined) throw new Error('Protocol 3 requires a saved storage assignment')
         if (placement.serverId !== request.node.server.id || placement.experimentId !== id || !placement.releaseRoot.endsWith('/' + request.deploymentId)) {
@@ -205,6 +207,24 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
     if (operation === 'files') {
       const saved = allocations.get(id)
       return saved === undefined ? { files: [], truncated: false } : clusterFiles(workspace(id), saved.node.server.id, config.fileLimit)
+    }
+    if (operation === 'processes') {
+      const saved = allocations.get(id)
+      if (saved === undefined) return []
+      return [...commands.entries()].filter(([, row]) => row.experimentId === id).map(([, row]) => ({
+        ...commandView(row), experimentId: id, serverId: saved.node.server.id, command: row.command,
+        streams: (['stdout', 'stderr'] as const).filter(stream => existsSync(processLogPath(id, row.commandId, stream))) }))
+    }
+    if (operation === 'process-log') {
+      const request = processLogRequestSchema.parse(raw)
+      const saved = allocations.get(id)
+      if (saved?.node.server.id !== request.serverId || commands.get(`${id}/${request.commandId}`) === undefined) throw new Error('Process log belongs to another experiment or node')
+      const cursor = request.cursor
+      if (cursor !== undefined && (cursor.experimentId !== id || cursor.serverId !== request.serverId || cursor.commandId !== request.commandId || cursor.stream !== request.stream)) throw new Error('Log cursor belongs to another experiment, node, process or stream')
+      const path = processLogPath(id, request.commandId, request.stream)
+      const chunk = readClusterChunk(path, cursor?.offset ?? 0, cursor?.generation, config.chunkBytes)
+      return { chunk, missing: chunk.generation === '', cursor: { experimentId: id, serverId: request.serverId,
+        commandId: request.commandId, stream: request.stream, generation: chunk.generation, offset: chunk.nextOffset } }
     }
     if (operation === 'log' || operation === 'file') {
       const request = z.object({ offset: z.number().int().nonnegative(), generation: z.string().optional(),
@@ -443,6 +463,8 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
       await commands.put(key, row)
       let handle: SubprocessHandle
       try {
+        mkdirSync(resolve(runRoot(id), 'process-logs', request.commandId), { recursive: true, mode: 0o700 })
+        for (const stream of ['stdout', 'stderr'] as const) appendFileSync(processLogPath(id, request.commandId, stream), '', { mode: 0o600 })
         const argv = [current.node.backendPath, '--ro-bind', '/', '/', '--unshare-user', '--unshare-pid', '--unshare-ipc',
           '--unshare-uts', '--die-with-parent', '--new-session', '--dev', '/dev', '--proc', '/proc', '--tmpfs', '/tmp', '--clearenv',
           '--setenv', 'PATH', '/usr/local/bin:/usr/bin:/bin', '--setenv', 'HOME', workspace(id), '--setenv', 'PYTHONUNBUFFERED', '1']
@@ -470,13 +492,16 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
       handles.set(key, handle)
       const deadline = serviceDeadline ?? current.deadline
       if (deadline !== undefined) deadlines.set(key, setTimeout(() => { handle.terminate() }, Math.min(Math.max(1, deadline - Date.now()), 2_147_483_647)))
-      const append = (chunk: Buffer | string) => {
-        try { appendFileSync(logPath(id), chunk, { mode: 0o600 }) }
+      const append = (chunk: Buffer | string, stream?: 'stdout' | 'stderr') => {
+        try {
+          appendFileSync(logPath(id), chunk, { mode: 0o600 })
+          if (stream !== undefined) appendFileSync(processLogPath(id, request.commandId, stream), chunk, { mode: 0o600 })
+        }
         catch (error) { ctx.logger.error(`experiment log failed: ${String(error)}`); handle.terminate() }
       }
       append(`\n[${request.commandId}]\n`)
-      handle.stdout?.on('data', append)
-      handle.stderr?.on('data', append)
+      handle.stdout?.on('data', (chunk: Buffer) => { append(chunk, 'stdout') })
+      handle.stderr?.on('data', (chunk: Buffer) => { append(chunk, 'stderr') })
       const settled = finish(key, handle).catch((error: unknown) => { ctx.logger.error(`experiment node: ${String(error)}`) })
         .finally(() => { settlements.delete(key) })
       settlements.set(key, settled)

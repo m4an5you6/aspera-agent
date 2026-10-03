@@ -1,0 +1,35 @@
+--- a/lib/client.js
++++ b/lib/client.js
+@@ -1914,6 +1914,9 @@
+ 					this.syncDefinitions();
+ 				};
+ 			}
++			invoke(id, context) {
++				this.registry.invoke(id, context);
++			}
+ 			observeFixedInput(listener) {
+ 				this.fixedListeners.add(listener);
+ 				return () => {
+--- a/lib/types/client/index.d.ts
++++ b/lib/types/client/index.d.ts
+@@ -30,6 +30,7 @@
+     constructor(ctx: Context);
+     register(command: Parameters<Shortcuts['register']>[0]): () => void;
+     registerFixed(command: Parameters<Shortcuts['registerFixed']>[0]): () => void;
++    invoke(id: Parameters<Shortcuts['invoke']>[0], context: Parameters<Shortcuts['invoke']>[1]): void;
+     observeFixedInput(listener: (input: ShortcutFixedInput) => void): () => void;
+     private fixedInput;
+     describeBinding(binding: Parameters<Shortcuts['describeBinding']>[0]): ReturnType<Shortcuts['describeBinding']>;
+--- a/lib/types/client/types.d.ts
++++ b/lib/types/client/types.d.ts
+@@ -88,6 +88,10 @@
+ }
+ /** Feature-facing keyboard registry. */
+ export interface Shortcuts {
++    /** Invoke a registered command through the same context checks as a native menu.
++     * @param id - registered command identity. @param context - current input and modal ownership.
++     */
++    invoke(id: ShortcutCommandId, context: ShortcutContext): void;
+     readonly runtime: ShortcutRuntime;
+     readonly platform: ShortcutPlatform;
+     readonly catalog: ObservableSnapshot<readonly ShortcutCatalogEntry[]>;

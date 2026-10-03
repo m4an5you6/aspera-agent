@@ -24,7 +24,7 @@ kind: "package-reference"
 <a id="use-this-package"></a>
 ## 使用本包
 
-派发 bundle 在独立[管理 profile](../../README.zh.md#start-the-management-page) 中注册本插件。包声明将 `./client` 投影到 Web 客户端，使用独立 Host/客户端编译程序和公开客户端声明。不修改对话路由、上游页面或自定义事件白名单。
+派发 bundle 在独立[管理 profile](../../README.zh.md#start-the-management-page) 中注册本插件。包声明将 `./client` 投影到 Web 客户端，使用独立 Host/客户端编译程序和公开客户端声明。固定版本的侧栏及设置命令补丁由 [Aspera 接入层](../../docs/architecture.zh.md#components)维护。
 
 [Config](src/config.ts) 配置页面轮询、保留文本长度及新服务器表单的初始控制端口。文本长度只限制展示的末尾内容，不限制远端文件。[AsperaRemote](../dispatch/src/index.ts) 提供操作默认值和已验证状态，类型化的中英文字典负责所有产品标签。
 
@@ -38,6 +38,8 @@ kind: "package-reference"
 
 <a id="understand-the-implementation"></a>
 ## 了解实现
+
+官方侧栏包含可折叠的 Aspera 分组，不显示小箭头。齿轮打开 Aspera 模型设置，配置入口调用官方 DSH 设置命令。三个阶段的模型选择复用已有提供商账户。Agent 记录默认展示轨迹，事件与详情独立滚动；运行监控区分节点及进程输出流，提供有界跟随、暂停和搜索。关闭提醒按实验、待办类型及版本保存，新待办再次显示，共用的待处理数量不受影响。
 
 <details>
 <summary>实现细节</summary>

@@ -10,6 +10,8 @@ import { setupWorkerProfile } from '@aspera/runtime'
 import { clusterSubmissionSchema } from '@aspera/experiments'
 import { removeTestDirectory } from './test-app.mjs'
 import { resolvedFixture } from './fixtures/storage.mjs'
+import { fixtureModelSnapshots, fixtureSelections } from './fixtures/models.mjs'
+const modelFixture = fixtureModelSnapshots()
 
 const release = resolve(import.meta.dirname, '..')
 mkdirSync(resolve(release, '.artifacts'), { recursive: true })
@@ -17,7 +19,7 @@ const directory = mkdtempSync(resolve(release, '.artifacts/worker-test-'))
 const root = process.platform === 'win32' ? directory.slice(2).replaceAll('\\', '/') : directory
 const generation = randomUUID(); const id = randomUUID(); const serverId = randomUUID()
 const { server, inventory } = resolvedFixture({ id: serverId, name: 'Local replay', host: 'fixture.test', sshPort: 22, username: 'trainer', remotePort: 43019, remoteRoot: root, authMode: 'password' }, id, 'a'.repeat(64))
-const submission = clusterSubmissionSchema.parse({ protocol: 3, experimentId: id, deploymentId: 'a'.repeat(64), inventories: [{ serverId, inventory }], objective: 'Prepare a version-specific experiment',
+const submission = clusterSubmissionSchema.parse({ protocol: 4, name: 'CPU fixture', models: modelFixture.models, experimentId: id, deploymentId: 'a'.repeat(64), inventories: [{ serverId, inventory }], objective: 'Prepare a version-specific experiment',
   coordinator: server, nodes: [{ server, devicePaths: ['/dev/nvidia_fixture'], backendPath: '/fixture/bwrap', hiddenPaths: [], gpuInfo: 'Replay; no GPU' }],
   inputs: [{ name: 'data.txt', sha256: createHash('sha256').update('dataset row\n').digest('hex') }], createdAt: 1, strategy: { mode: 'automatic', coordinator: 'single-agent' },
   versions: { dsh: '0.2.0-rc.2', extension: '0.1.1', harness: 'a'.repeat(64), data: [] } })
@@ -28,10 +30,10 @@ mkdirSync(resolve(run, 'agent-workspace'), { recursive: true })
 mkdirSync(resolve(run, 'inputs'), { recursive: true })
 writeFileSync(resolve(run, 'inputs/data.txt'), 'dataset row\n')
 const modelFile = resolve(directory, 'secrets/model.json')
-writeFileSync(modelFile, JSON.stringify({ version: 1, refs: {} }))
+writeFileSync(modelFile, JSON.stringify({ version: 1, refs: modelFixture.refs }))
 writeFileSync(resolve(directory, 'state/coordinator.generation'), generation)
 writeFileSync(resolve(directory, 'secrets', id + '.json'), JSON.stringify({ submission, connections: [{ serverId, password: 'not-model-visible', token: 'b'.repeat(32), knownHostsFile: '/fixture/known_hosts' }],
-  modelCredentialFile: modelFile, toolTimeoutMs: 1000, agentModel: { provider: 'deepseek', model: 'deepseek-chat' } }))
+  modelCredentialFile: modelFile, toolTimeoutMs: 1000, agentModel: fixtureSelections.preparation }))
 writeFileSync(resolve(run, 'approved-plan.json'), JSON.stringify({ revision: 1, summary: 'Approved local replay', steps: ['Record a version', 'Report unavailable GPU'], frameworks: [], createdAt: 1 }))
 const snapshots = []
 try {

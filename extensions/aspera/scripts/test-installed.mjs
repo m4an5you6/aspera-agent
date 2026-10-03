@@ -43,7 +43,7 @@ try {
   console.log('Starting the independently installed profile')
   app = await launchProfile(installRoot, home, 'aspera', {}, 180000)
   console.log(`Installed profile ready in ${Math.round(performance.now() - startup)} ms`)
-  browser = await chromium.launch({ channel: process.env.ASPERA_BROWSER_CHANNEL || 'chrome', headless: true })
+  browser = await chromium.launch({ ...(process.env.ASPERA_BROWSER_EXECUTABLE ? { executablePath: process.env.ASPERA_BROWSER_EXECUTABLE } : { channel: process.env.ASPERA_BROWSER_CHANNEL || 'chrome' }), headless: true })
   const page = await browser.newPage()
   const errors = []
   page.on('pageerror', error => errors.push(error.message))

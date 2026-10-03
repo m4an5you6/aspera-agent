@@ -3,7 +3,7 @@ const budget = { maxRuntimeSeconds: 3600, maxServiceSeconds: 3600, maxCommands: 
 const deadline = Date.now() + 3600000
 /** Node ownership tests use isolated files and explicitly settled managed-process doubles. */
 import { randomUUID } from 'node:crypto'
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, renameSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { createServer } from 'node:net'
@@ -11,7 +11,7 @@ import { createServer as createHttpServer } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
 import { afterEach, expect, it, vi } from 'vitest'
 import { createClusterNode } from '../src/cluster-node.ts'
-import { clusterNodeSchema, experimentIdSchema } from '@aspera/experiments'
+import { clusterNodeSchema, experimentIdSchema, processLogPageSchema, experimentProcessSchema } from '@aspera/experiments'
 import type { StoragePlacement } from '@aspera/experiments'
 import { placement } from '../../experiments/tests/fixtures.ts'
 import { verifyStorage } from '../scripts/storage.mjs'
@@ -81,6 +81,31 @@ it('deduplicates commands and keeps the node allocated until cancellation settle
   expect(await f.handler('allocate', { experimentId: another, deploymentId: 'a'.repeat(64), budget, deadline, node: f.node })).toEqual({ allocated: true })
   expect(f.spawn.mock.calls[0]![0]).toMatchObject({ argv: expect.arrayContaining([f.node.backendPath, '--clearenv', '--dev-bind', '/dev/nvidia0', f.config.root]) })
 
+})
+
+it('separates command output streams and refuses a cursor for a different source', async () => {
+  const f = await fixture(); const id = experimentIdSchema.parse(randomUUID())
+  await f.handler('allocate', { experimentId: id, deploymentId: 'a'.repeat(64), budget, deadline, node: f.node })
+  for (const commandId of ['train', 'evaluate']) await f.handler('run', { experimentId: id, commandId, command: 'python trial.py' })
+  f.handles[0]!.stdout.write('step 1\n'); f.handles[0]!.stderr.write('warning\n'); f.handles[1]!.stdout.write('score\n')
+  const processes = experimentProcessSchema.array().parse(await f.handler('processes', { experimentId: id }))
+  expect(processes.map(row => row.commandId)).toEqual(['train', 'evaluate'])
+  expect(processes[0]?.streams).toEqual(['stdout', 'stderr'])
+  const request = { experimentId: id, serverId: f.node.server.id, commandId: 'train', stream: 'stdout' as const }
+  const first = processLogPageSchema.parse(await f.handler('process-log', request))
+  expect(Buffer.from(first.chunk.data, 'base64').toString()).toBe('step 1\n')
+  f.handles[0]!.stdout.write('step 2\n')
+  const next = processLogPageSchema.parse(await f.handler('process-log', { ...request, cursor: first.cursor }))
+  expect(Buffer.from(next.chunk.data, 'base64').toString()).toBe('step 2\n')
+  for (const patch of [{ stream: 'stderr' }, { commandId: 'evaluate' }, { serverId: randomUUID() }, { experimentId: randomUUID() }]) {
+    await expect(f.handler('process-log', { ...request, ...patch, cursor: first.cursor })).rejects.toThrow(/another experiment/)
+  }
+  const file = resolve(f.config.root, 'runs', id, 'process-logs/train/stdout.log')
+  renameSync(file, file + '.old'); writeFileSync(file, 'rotated\n')
+  const rotated = processLogPageSchema.parse(await f.handler('process-log', { ...request, cursor: next.cursor }))
+  expect(rotated.chunk.reset).toBe(true); expect(Buffer.from(rotated.chunk.data, 'base64').toString()).toBe('rotated\n')
+  rmSync(file)
+  expect(processLogPageSchema.parse(await f.handler('process-log', request)).missing).toBe(true)
 })
 
 it('runs beyond the released command limit without creating aggregate timers in v2', async () => {

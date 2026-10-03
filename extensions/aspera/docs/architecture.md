@@ -26,6 +26,8 @@ Aspera owns experimental work outside the Harness source tree. Published DSH sup
 | `@aspera/console` | Sidebar page, forms, record stream and per-source log cursors | Published Web slots, locale dictionaries and Remote descriptors |
 | `@aspera/desktop` | Independent window, tray and local profile lifecycle | Electron and a published `dsh` profile |
 
+The adapter retains two version-checked published-package patches: an additive sidebar group slot and forwarding of the existing settings command. The official shell, conversations and plugin manager stay in DSH. Private provider snapshots feed isolated preparation/planning/execution scopes; public records expose only their model summaries.
+
 Host programs compile against installed package declarations. The Typert shim in [types/typert-protocol.d.ts](../types/typert-protocol.d.ts) belongs only to the generator program and exposes the registration metadata its analysis needs. Browser wrapping in [tsdown.config.ts](../packages/console/tsdown.config.ts) contains Cordis-compatible CommonJS module loading and CSS insertion; the compiled public client declarations remain separate from the JavaScript bundle.
 
 -----
@@ -42,6 +44,10 @@ flowchart TB
     Browser[Web browser] --> Page
     Page --> Remote[Typed Remote: RPC + streams]
     Remote --> Fleet[Aspera dispatch: fleet / credentials / Sessions]
+    Fleet --> Models[Private snapshots: preparation / planning / execution]
+    Models --> Selection
+    Models --> Planner
+    Models --> Executor
     Fleet --> Inventory[Read-only SSH: mounts / space / interfaces]
     Inventory --> Selection[Restricted Agent: candidate ID + reason]
     Selection --> Placement[Persist placement before directory creation]

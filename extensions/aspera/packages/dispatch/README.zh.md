@@ -37,6 +37,8 @@ kind: "package-bundle"
 <a id="understand-the-implementation"></a>
 ## 了解实现
 
+模型提交通过 DSH 提供商目录解析三个显式选择。[models.ts](src/models.ts) 保存私有 API 设置和独立凭据引用，重试读取这些快照。DeepSeek 及支持的 pi-ai 密钥接口使用固定适配器。保留历史 `agentCredentialRefs` 配置的读取；第 4 代仅移交已接收阶段快照引用的凭据。
+
 <details>
 <summary>实现细节</summary>
 
@@ -63,7 +65,7 @@ kind: "package-bundle"
 
 - 公开服务器配置只支持密码，不提供密码和密钥的优先选择。
 - 主机密钥必须预先在 `known_hosts` 中被信任，未知或变化的密钥导致失败。
-- 保留第 1／2 代记录及原摘要；旧版未完成准备通过复制为新实验继续。
+- 保留第 1～3 代记录及原摘要；旧版未完成准备通过复制为新实验继续。
 - 不兼容的控制升级需等待原任务及控制服务结束。
 
 ### 开发备注

@@ -35,10 +35,12 @@ kind: "package-library"
 <a id="understand-the-implementation"></a>
 ## 了解实现
 
+第 4 代固定简短实验名称及三个阶段的模型配置摘要，保留第 1～3 代读取定义。[records.ts](src/records.ts) 定义实验／阶段／Session 分页以及节点／进程／输出流游标。首次等待计划确认时保持资源释放，确认后才整组分配。
+
 <details>
 <summary>实现细节</summary>
 
-[cluster-protocol.ts](src/cluster-protocol.ts) 冻结第 1／2 代读取定义并声明第 3 代提交；[storage-protocol.ts](src/storage-protocol.ts) 分开定义偏好、SSH 证据及实际目录。[cluster-queue.ts](src/cluster-queue.ts) 管理持久状态转换和提供者生命周期。[cluster-files.ts](src/cluster-files.ts) 限制读取范围及大小。接收时检查实验／节点／发布归属与资源分配，不发布单独的存在性 invariant。
+[cluster-protocol.ts](src/cluster-protocol.ts) 冻结第 1～3 代读取定义并声明第 4 代提交；[storage-protocol.ts](src/storage-protocol.ts) 分开定义偏好、SSH 证据及实际目录。[cluster-queue.ts](src/cluster-queue.ts) 管理持久状态转换和提供者生命周期。[cluster-files.ts](src/cluster-files.ts) 限制读取范围及大小。接收时检查实验／节点／发布归属与资源分配，不发布单独的存在性 invariant。
 
 </details>
 

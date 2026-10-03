@@ -202,7 +202,7 @@ export class RemoteClusterExecutor implements ClusterExecutor {
 
   /** @param record - submitted task. @param signal - cancellation. @returns durable read-only plan. */
   async prepare(record: ClusterRecord, signal: AbortSignal): Promise<{ plan: ExperimentPlan; sessionId: string }> {
-    if (record.submission.protocol !== 3) throw new Error('Legacy experiments must execute on their original release')
+    if (record.submission.protocol !== 4) throw new Error('Legacy experiments must execute on their original release')
     await this.agent(record, signal, true)
     const root = serverRunRoot(record.submission.coordinator, record.submission.experimentId)
     const outcome = z.object({ state: z.enum(['completed', 'blocked', 'failed']), detail: z.string().optional() }).parse(JSON.parse(readFileSync(resolve(root, 'planning-outcome.json'), 'utf8')))
@@ -228,7 +228,7 @@ export class RemoteClusterExecutor implements ClusterExecutor {
   async run(record: ClusterRecord, signal: AbortSignal, started: (sessionId: string, goalId: string) => Promise<void>, update: Update): Promise<ClusterOutcome> {
     if (record.plan === undefined || record.approval?.planRevision !== record.plan.revision) throw new Error('execution requires the exact approved plan')
     const runtime = await validateClusterAdmission(this.config, record.submission)
-    if (record.submission.protocol !== 3) throw new Error('Legacy experiments must execute on their original release')
+    if (record.submission.protocol !== 4) throw new Error('Legacy experiments must execute on their original release')
     const lifetime = signal
     try {
       await prepareNodes(this.config, runtime, lifetime)

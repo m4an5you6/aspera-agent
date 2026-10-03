@@ -13,11 +13,12 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain'
 import type { Domain } from '@deepseek-ai/dsh-storage-domain'
+import { installModelSelection } from '@deepseek-ai/dsh-agent'
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import {
   CLUSTER_HANDOVER, clusterAgentModelSchema, clusterChunkSchema, clusterFileHash, clusterFileSchema, clusterRecordSchema, clusterServerSchema,
-  clusterSubmissionSchema, clusterSubmissionV2Schema, clusterSubmissionV3Schema, experimentIdSchema, serverIdSchema, budgetSchema, answerExperimentQuestionSchema,
+  clusterSubmissionSchema, clusterSubmissionV2Schema, clusterSubmissionV4Schema, experimentIdSchema, serverIdSchema, budgetSchema, answerExperimentQuestionSchema,
   serverSettingsSchema, legacyClusterServerSchema, serverInventorySchema, storagePlacementSchema, inspectServerStorage, prepareServerStorage, verifyServerStorage, serviceAccessInfoSchema,
 } from '@aspera/runtime'
 import type { ClusterChunk, ClusterFile, ClusterPrivate, ClusterRecord, ClusterServer, ExperimentId, ExperimentServerId, ServerSettings, ServerProbe } from '@aspera/runtime'
@@ -29,33 +30,40 @@ import { sshPasswordRef } from './ssh-account.ts'
 import { pinnedTargetSchema } from './deployment-settings.ts'
 import { delegateClusterLogin, describeClusterNode, ensureClusterRole, prepareClusterServer } from './cluster-deploy.ts'
 import type { FleetCreateRequest, FleetExperiment, FleetRegistry, FleetServerInput, PinnedDeployment } from './types.ts'
-import type { AnswerExperimentQuestion } from '@aspera/experiments'
+import type { AnswerExperimentQuestion, ExperimentModels } from '@aspera/experiments'
 import { StorageSelection } from './storage-selection.ts'
 import { resolveTrainingNetwork } from './network-selection.ts'
+import { captureExperimentModels } from './models.ts'
+import { experimentModelSnapshotsSchema, experimentModelsSchema, experimentPhases } from '@aspera/experiments'
+import { openPhaseModelContext, privateModelConfigurationSchema } from '@aspera/runtime'
+import { agentRecordRequestSchema, agentRecordPageSchema, projectAgentRecord, experimentProcessSchema, processLogRequestSchema, processLogPageSchema } from '@aspera/experiments'
+import type { AgentRecordRequest, AgentRecordPage, ExperimentProcess, ProcessLogRequest, ProcessLogPage } from '@aspera/experiments'
 
 const storedServerSchema = z.union([serverSettingsSchema, legacyClusterServerSchema])
 const registrySchema = z.object({ coordinatorId: serverIdSchema.optional(), servers: z.array(storedServerSchema),
   probes: z.record(z.string(), z.object({ gpuInfo: z.string(), allocations: z.array(z.string()), inventory: serverInventorySchema })).optional() })
-const requestSchema = z.object({ experimentId: experimentIdSchema, objective: z.string().trim().min(1).max(20_000),
+const legacyRequestSchema = z.object({ experimentId: experimentIdSchema, objective: z.string().trim().min(1).max(20_000),
   serverIds: z.array(serverIdSchema).min(1).max(32), files: z.array(z.string()).max(128).default([]),
   uploads: z.array(z.object({ name: clusterSubmissionV2Schema.shape.inputs.element.shape.name, size: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER) }).strict()).max(128).default([]), mode: z.enum(['semi', 'automatic']),
 }).strict().refine(value => new Set(value.serverIds).size === value.serverIds.length, 'duplicate server selection')
   .refine(value => new Set(value.uploads.map(file => file.name)).size === value.uploads.length, 'duplicate attachment name')
+const requestSchema = legacyRequestSchema.safeExtend({ name: z.string().trim().min(1).max(120).optional(), models: experimentModelsSchema.optional() })
 const localSchema = z.object({
-  request: z.union([requestSchema, requestSchema.safeExtend({ budget: budgetSchema })]), coordinator: storedServerSchema, servers: z.array(storedServerSchema),
+  request: z.union([requestSchema, legacyRequestSchema.safeExtend({ budget: budgetSchema })]), coordinator: storedServerSchema, servers: z.array(storedServerSchema),
   coordinatorTarget: pinnedTargetSchema, targets: z.array(pinnedTargetSchema),
   agentModel: clusterAgentModelSchema,
+  models: experimentModelSnapshotsSchema.optional(),
   createdAt: z.number().int(), state: z.enum(['staging', 'preparing', 'submitted', 'failed', 'cancelled']), detail: z.string().optional(),
   sessionId: z.string(), goalId: z.string().optional(), goalRevision: z.number().optional(),
   sourceGoal: z.object({ sessionId: z.string(), id: z.string(), revision: z.number().int() }).optional(),
   submission: clusterSubmissionSchema.optional(), receipt: clusterRecordSchema.optional(), latest: clusterRecordSchema.optional(),
   handoverRecorded: z.boolean().default(false),
   waitingFor: z.array(serverIdSchema).default([]),
-  preparation: z.object({ protocol: z.literal(3), stage: z.enum(['inspecting', 'selecting-storage', 'preparing-storage', 'deploying', 'checking-network', 'transferring', 'submitting']),
+  preparation: z.object({ protocol: z.union([z.literal(3), z.literal(4)]), stage: z.enum(['inspecting', 'selecting-storage', 'preparing-storage', 'deploying', 'checking-network', 'transferring', 'submitting']),
     inventories: z.array(z.object({ serverId: serverIdSchema, inventory: serverInventorySchema })), placements: z.array(storagePlacementSchema),
     inputs: clusterSubmissionV2Schema.shape.inputs.optional() }).optional(),
 })
-const storeSpec = defineDomain({ name: 'aspera_fleet', version: 3, compatibleVersions: [1, 2], layout: 'per-record', tables: {
+const storeSpec = defineDomain({ name: 'aspera_fleet', version: 4, compatibleVersions: [1, 2, 3], layout: 'per-record', tables: {
   registry: domainTable<string, FleetRegistry>(registrySchema),
   experiments: domainTable<ExperimentId, FleetExperiment>(localSchema),
 } })
@@ -325,6 +333,8 @@ export class ExperimentFleet {
       const registry = this.servers()
       const coordinator = registry.servers.find(server => server.id === registry.coordinatorId)
       if (coordinator === undefined) throw new Error('configure the coordinator server before submitting an experiment')
+      if (input.models === undefined) throw new Error('Select preparation, planning and execution models before submitting')
+      const models = await captureExperimentModels(this.ctx, input.experimentId, input.models)
       const selected = input.serverIds.map((id) => {
         const server = registry.servers.find(server => server.id === id)
         if (server === undefined) throw new Error('selected server is no longer configured')
@@ -346,9 +356,10 @@ export class ExperimentFleet {
       const record: FleetExperiment = { request: input, coordinator: pinnedCoordinator, servers,
         coordinatorTarget: pinnedTargetSchema.parse(this.deployment(pinnedCoordinator)),
         targets: servers.map(server => pinnedTargetSchema.parse(this.deployment(server))), createdAt: Date.now(),
-        agentModel: { ...this.ctx.agentDefaultModel.currentSelection() },
+        agentModel: { provider: models.preparation.provider, model: models.preparation.model,
+          ...(models.preparation.reasoningEffort === undefined ? {} : { reasoningEffort: models.preparation.reasoningEffort }) }, models,
         state: input.uploads.length > 0 ? 'staging' : 'preparing', sessionId, waitingFor: [], handoverRecorded: false,
-        preparation: { protocol: 3, stage: 'inspecting', inventories: [], placements: [] },
+        preparation: { protocol: 4, stage: 'inspecting', inventories: [], placements: [] },
         ...(sourceGoal === undefined ? {} : { sourceGoal }) }
       await this.store.table('experiments').put(input.experimentId, record)
       if (record.state === 'preparing') this.beginPreparation(input.experimentId)
@@ -362,12 +373,15 @@ export class ExperimentFleet {
    * @param objective - authorized requirements.
    * @param serverIds - explicitly selected participants.
    * @param files - admitted local data files.
+   * @param mode - plan confirmation policy.
+   * @param models - explicit phase model selections.
+   * @param name - optional short experiment label.
    * @returns independent experiment, deduplicated by the caller's Goal revision.
    */
-  async createForGoal(agent: Agent, objective: string, serverIds: string[], files: string[], mode: FleetCreateRequest['mode']): Promise<FleetExperiment> {
+  async createForGoal(agent: Agent, objective: string, serverIds: string[], files: string[], mode: FleetCreateRequest['mode'], models: ExperimentModels, name?: string): Promise<FleetExperiment> {
     const goal = this.ctx.goals.get(agent)
     if (goal === undefined || goal.phase === 'complete') throw new Error('cluster dispatch requires an active local Goal')
-    return this.create({ experimentId: randomUUID(), objective, serverIds, files, mode }, { sessionId: agent.id, id: goal.id,
+    return this.create({ experimentId: randomUUID(), objective, serverIds, files, mode, models, ...(name === undefined ? {} : { name }) }, { sessionId: agent.id, id: goal.id,
       revision: goal.revision })
   }
 
@@ -378,7 +392,7 @@ export class ExperimentFleet {
     this.preparing.set(id, { abort, done })
   }
 
-  /** Resume an interrupted v3 preparation using its saved servers, inputs and directories.
+  /** Resume an interrupted v4 preparation using its saved model configuration, servers, inputs and directories.
    * @param id - existing experiment. @returns its current preparation or reconciled receipt.
    */
   async retry(id: ExperimentId): Promise<FleetExperiment> {
@@ -387,7 +401,7 @@ export class ExperimentFleet {
       const current = this.get(id)
       if (this.closing) throw new Error('Experiment dispatch is stopping')
       if (this.preparing.has(id) || current.state === 'submitted') return current
-      if (current.preparation === undefined) throw new Error('Copy this legacy preparation to a new experiment')
+      if (current.preparation?.protocol !== 4 || current.models === undefined) throw new Error('Copy this legacy preparation to a new experiment')
       if (current.state !== 'failed') throw new Error('Only interrupted or failed preparation can be retried')
       const next = { ...current, state: 'preparing' as const }
       delete next.detail
@@ -439,19 +453,21 @@ export class ExperimentFleet {
 
   private async prepare(id: ExperimentId, signal: AbortSignal): Promise<void> {
     let source: Awaited<ReturnType<typeof snapshotSource>> | undefined
+    let modelScope: Awaited<ReturnType<typeof openPhaseModelContext>> | undefined
     try {
       let record = this.get(id)
-      if (record.preparation === undefined) throw new Error('Legacy preparation retains its original layout; copy it to a new experiment')
+      if (record.preparation?.protocol !== 4 || record.models === undefined) throw new Error('Legacy preparation retains its original model settings; copy it to a new experiment')
       const pendingTarget = record.coordinatorTarget
       const selection = record.agentModel
+      modelScope = await openPhaseModelContext(this.ctx, record.models.preparation)
       const storage = new StorageSelection()
       const options = { agentOptions: { ...selection },
-        setup: async (ctx: Context, agent: Agent) => { storage.install(ctx, agent) } }
+        setup: async (ctx: Context, agent: Agent) => { installModelSelection(ctx, { current: selection, assembled: undefined }); storage.install(ctx, agent) } }
       const storedSession = await this.ctx.sessionPersistence.stat(SessionId(record.sessionId), { signal })
       if (storedSession === undefined && record.goalId !== undefined) throw new Error('The recorded dispatch Session is missing; copy to a new experiment')
       const handle = storedSession === undefined
-        ? await this.ctx.agents.create({ sessionId: SessionId(record.sessionId), meta: { cwd: pendingTarget.localRepo }, ...options })
-        : await this.ctx.agents.resume({ resumeSessionId: SessionId(record.sessionId), ...options })
+        ? await modelScope.context.agents.create({ sessionId: SessionId(record.sessionId), meta: { cwd: pendingTarget.localRepo }, ...options })
+        : await modelScope.context.agents.resume({ resumeSessionId: SessionId(record.sessionId), ...options })
       this.handles.set(id, handle)
       signal.throwIfAborted()
       const goal = this.ctx.goals.get(handle.agent) ?? (record.goalId === undefined
@@ -584,17 +600,23 @@ export class ExperimentFleet {
         if (inputs.find(input => input.name === name)?.sha256 !== sha256) throw new Error('Input changed during preparation')
         await this.driver.copy(target, file, `${incoming}/${name}`, signal, coordinatorPassword)
       }
-      if (record.request.budget !== undefined) throw new Error('Legacy preparation cannot be converted to protocol 3; copy it to a new experiment')
-      const submission = clusterSubmissionV3Schema.parse({ protocol: 3, experimentId: id, deploymentId: snapshot.digest,
+      if (record.request.budget !== undefined || record.models === undefined) throw new Error('Legacy preparation cannot be converted to protocol 4; copy it to a new experiment')
+      const submission = clusterSubmissionV4Schema.parse({ protocol: 4, experimentId: id, deploymentId: snapshot.digest,
+        name: record.request.name ?? record.request.objective.split('\n')[0]?.slice(0, 120) ?? 'Experiment', models: record.models,
         objective: record.request.objective, coordinator, nodes, inputs, inventories, createdAt: record.createdAt,
         strategy: { mode: record.request.mode, coordinator: 'single-agent' },
         versions: { dsh: '0.2.0-rc.2', extension: '0.1.1', harness: snapshot.digest, data: inputs.map(input => input.sha256) } })
       const modelCredentialFile = `${target.remoteRoot}/secrets/${id}-model.json`
       const credentials: Record<string, string> = {}
-      for (const name of target.agentCredentialRefs) {
-        const credential = await this.ctx.credentials.resolve(credentialRef(name))
-        if (credential === undefined) throw new Error(`model credential ${name} is not configured`)
-        credentials[name] = credential.value
+      for (const phase of experimentPhases) {
+        const name = record.models[phase].configurationRef
+        const configuration = await this.ctx.credentials.resolve(credentialRef(name))
+        if (configuration === undefined) throw new Error(`${phase}: model configuration snapshot is missing`)
+        const saved = privateModelConfigurationSchema.parse(JSON.parse(configuration.value))
+        const key = await this.ctx.credentials.resolve(credentialRef(saved.keyRef))
+        if (key === undefined) throw new Error(`${phase}: model credential snapshot is missing`)
+        credentials[name] = configuration.value
+        credentials[saved.keyRef] = key.value
       }
       await this.driver.installPrivateFile(target, modelCredentialFile, JSON.stringify({ version: 1, refs: credentials }), signal, coordinatorPassword)
       const connections = await Promise.all(nodes.map(async ({ server }) => ({ serverId: server.id,
@@ -620,12 +642,12 @@ export class ExperimentFleet {
     } catch (error) {
       const current = this.get(id)
       if (current.receipt === undefined) await this.store.table('experiments').put(id, { ...current,
-        state: signal.aborted && !this.closing && current.submission === undefined ? 'cancelled' : 'failed', detail: String(error) })
+        state: signal.aborted && !this.closing && current.submission === undefined ? 'cancelled' : 'failed', detail: `preparation: ${String(error)}` })
     } finally {
       source?.dispose()
       const handle = this.handles.get(id)
       this.handles.delete(id)
-      try { await handle?.dispose() } finally { this.preparing.delete(id) }
+      try { await handle?.dispose() } finally { await modelScope?.dispose(); this.preparing.delete(id) }
     }
   }
 
@@ -700,7 +722,7 @@ export class ExperimentFleet {
   private async call(record: FleetExperiment, operation: string, body: unknown, signal?: AbortSignal): Promise<unknown> {
     const target = record.coordinatorTarget
     const response = await this.driver.request({ ...target, remotePort: target.remotePort + 1 }, await this.token(record.coordinator, 'coordinator'),
-      `/aspera/v${record.submission?.protocol ?? 3}/${operation}`, 'POST', body, signal, await this.password(record.coordinator))
+      `/aspera/v${record.submission?.protocol ?? 4}/${operation}`, 'POST', body, signal, await this.password(record.coordinator))
     if (response.status !== 200) {
       const error = z.object({ error: z.string() }).safeParse(response.value)
       throw new CoordinatorRequestError(response.status, error.success ? error.data.error : `coordinator returned HTTP ${response.status}`)
@@ -785,6 +807,51 @@ export class ExperimentFleet {
   async files(id: ExperimentId, serverId: ExperimentServerId): Promise<{ files: ClusterFile[]; truncated: boolean }> {
     return z.object({ files: z.array(clusterFileSchema), truncated: z.boolean() }).parse(await this.call(this.get(id),
       'files', { experimentId: id, serverId }))
+  }
+
+  /** Read only the requested experiment's own phase Session.
+   * @param raw - phase and source-bound cursor. @returns real events, never synthesized history.
+   */
+  async records(raw: AgentRecordRequest): Promise<AgentRecordPage> {
+    const input = agentRecordRequestSchema.parse(raw)
+    const record = this.get(input.experimentId)
+    if (input.phase !== 'preparation') {
+      if (record.submission === undefined || record.submission.protocol !== 4) return { records: [], hasMore: false, missing: true, reset: false }
+      return agentRecordPageSchema.parse(await this.call(record, 'records', input))
+    }
+    const cursor = input.cursor
+    if (cursor !== undefined && (cursor.experimentId !== input.experimentId || cursor.phase !== input.phase || cursor.sessionId !== record.sessionId)) throw new Error('Agent cursor belongs to another experiment, phase or Session')
+    const id = SessionId(record.sessionId)
+    if (await this.ctx.sessionPersistence.stat(id) === undefined) return { records: [], hasMore: false, missing: true, reset: false }
+    const handle = await this.ctx.sessionPersistence.open(id, 'read')
+    try {
+      const start = input.beforeSeq === undefined ? cursor?.nextSeq ?? 0 : Math.max(0, input.beforeSeq - input.limit)
+      const events = (await handle.read(start, input.limit + 1)).events
+      const records: AgentRecordPage['records'] = []; let characters = 0
+      for (const event of events) {
+        if (records.length >= input.limit || characters >= 65536 || (input.beforeSeq !== undefined && event.seq >= input.beforeSeq)) break
+        const row = projectAgentRecord(event, { experimentId: input.experimentId, phase: input.phase, sessionId: record.sessionId }, 65536 - characters)
+        records.push(row); characters += row.data.length
+      }
+      return { records, cursor: { experimentId: input.experimentId, phase: input.phase, sessionId: record.sessionId,
+        nextSeq: (records.at(-1)?.seq ?? start - 1) + 1 }, hasMore: events.length > records.length, missing: false, reset: false }
+    } finally { await handle.close() }
+  }
+
+  /** @param id - experiment. @param serverId - assigned node. @returns managed process directory. */
+  async processes(id: ExperimentId, serverId: ExperimentServerId): Promise<ExperimentProcess[]> {
+    const record = this.get(id)
+    if (!record.servers.some(server => server.id === serverId)) throw new Error('Node belongs to another experiment')
+    if (record.submission?.protocol !== 4) return []
+    return z.array(experimentProcessSchema).parse(await this.call(record, 'processes', { experimentId: id, serverId }))
+  }
+
+  /** @param raw - immutable process source and cursor. @returns bounded stdout or stderr bytes. */
+  async processLog(raw: ProcessLogRequest): Promise<ProcessLogPage> {
+    const request = processLogRequestSchema.parse(raw)
+    const record = this.get(request.experimentId)
+    if (!record.servers.some(server => server.id === request.serverId)) throw new Error('Node belongs to another experiment')
+    return processLogPageSchema.parse(await this.call(record, 'process-log', request))
   }
 
   /**

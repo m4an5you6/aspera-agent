@@ -20,7 +20,7 @@ export interface NetworkParticipant {
 export async function resolveTrainingNetwork(id: ExperimentId, participants: NetworkParticipant[], signal: AbortSignal): Promise<ClusterNode[]> {
   if (participants.length === 1) return participants.map(value => value.node)
   const call = async (peer: NetworkParticipant, operation: string, body: object, lifetime?: AbortSignal) => {
-    const result = await request(peer.target, peer.token, `/aspera/v3/node/${operation}`, 'POST', { experimentId: id, ...body }, lifetime, peer.password)
+    const result = await request(peer.target, peer.token, `/aspera/v4/node/${operation}`, 'POST', { experimentId: id, ...body }, lifetime, peer.password)
     if (result.status !== 200) throw new Error(`${peer.node.server.name}: ${JSON.stringify(result.value)}`)
     return result.value
   }

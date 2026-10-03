@@ -80,6 +80,9 @@ export async function openAspera(page, url) {
   const later = page.getByText(/^(稍后配置|Configure later)$/, { exact: true })
   await later.waitFor({ timeout: 5000 }).catch(() => {})
   if (await later.isVisible()) { await later.click(); await later.waitFor({ state: 'hidden', timeout: 15000 }) }
-  await page.getByRole('button', { name: 'Aspera', exact: true }).click()
-  await page.getByRole('heading', { name: 'Aspera', exact: true }).waitFor()
+  const group = page.getByRole('button', { name: 'Aspera', exact: true })
+  await group.waitFor()
+  if (await group.getAttribute('aria-expanded') !== 'true') await group.click()
+  await page.getByRole('button', { name: /^(实验|Experiments)$/ }).click()
+  await page.getByRole('heading', { name: /^(实验|Experiments)$/, exact: true }).waitFor()
 }

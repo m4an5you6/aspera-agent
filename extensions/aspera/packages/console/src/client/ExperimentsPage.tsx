@@ -11,8 +11,11 @@ import type { InferenceService, ServiceAccessInfo } from '@aspera/experiments/ty
 import type { InjectFace, PropsLocale, PropsRuntime, TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import type { ExperimentsController } from './controller.ts'
 import css from './ExperimentsPage.module.css'
-import { experimentConversation } from './conversation.ts'
-import { experimentAttentionCount, attentionLabel } from './attention.ts'
+import { AgentRecords } from './AgentRecords.tsx'
+import { RuntimeMonitor } from './RuntimeMonitor.tsx'
+import { ModelFields, modelsReady } from './ModelFields.tsx'
+import type { ExperimentModels } from '@aspera/experiments/types'
+import { experimentAttentionCount, attentionLabel, experimentTodos } from './attention.ts'
 import { ExperimentQuestionCard } from './QuestionCard.tsx'
 
 /** Actions and observable state owned by the plugin controller. */
@@ -21,7 +24,9 @@ export interface ExperimentsInjected {
   hooks: { experiments: ExperimentsController['store'] }
 }
 
-type PageProps = InjectFace<ExperimentsInjected> & PropsLocale<'experiments'>
+/** Composed page props supplied by the DSH slot renderer. */
+export type ExperimentsPageProps = InjectFace<ExperimentsInjected> & PropsLocale<'experiments'>
+type PageProps = ExperimentsPageProps
 type ViewProps = { controller: ExperimentsController; t: TranslateNS<'experiments'> }
 
 /**
@@ -40,7 +45,9 @@ export function ExperimentsIcon({ size, useExperiments, t }: PropsRuntime<'sideb
  */
 export function ExperimentsPage({ controller, useExperiments, t }: PageProps) {
   const state = useExperiments(value => value)
-  const [view, setView] = useState<'list' | 'servers' | 'new' | 'services'>('list')
+  const view = state.view
+  const setView = (value: Snapshot['view']) => { controller.navigate(value) }
+  const todos = experimentTodos(state.experiments).filter(todo => !state.preferences.dismissed.includes(todo.key))
   const [draft, setDraft] = useState<FleetExperiment | undefined>()
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState<'all' | 'pending' | 'running' | 'queued' | 'completed' | 'failed'>('all')
@@ -48,29 +55,28 @@ export function ExperimentsPage({ controller, useExperiments, t }: PageProps) {
   const rows = state.experiments.filter(row => {
     const status = row.latest?.state ?? row.state
     const matches = filter === 'all' || (filter === 'pending' ? row.latest !== undefined && needsExperimentAttention(row.latest) : status === filter)
-    return matches && `${row.request.objective} ${row.request.experimentId} ${row.servers.map(server => server.name).join(' ')}`.toLocaleLowerCase().includes(search.toLocaleLowerCase())
+    return matches && `${row.request.name ?? ''} ${row.request.objective} ${row.request.experimentId} ${row.servers.map(server => server.name).join(' ')}`.toLocaleLowerCase().includes(search.toLocaleLowerCase())
   })
   useEffect(() => { controller.setVisible(true); return () => { controller.setVisible(false) } }, [controller])
   const detail = state.experiments.find(row => row.request.experimentId === state.selectedId)
   const act = (operation: () => Promise<unknown>) => { void operation().catch((error: unknown) => { controller.report(error) }) }
   return <section className={css.page}>
-    <header className={css.header}>
-      <div className={css.heading}><h1>{t('title')}</h1><p>{t('introduction')}</p></div>
+    {detail === undefined && <header className={css.header}>
+      <div className={css.heading}><h1>{t(view === 'list' ? 'experiments' : view === 'new' ? 'newExperiment' : view)}</h1><p>{t('introduction')}</p></div>
       <div className={css.actions}>
         <Button variant="ghost" onClick={() => { controller.select(null); setView('list'); setFilter('pending') }}>{t('pending')}{pendingCount > 0 && <span className={css.count}>{attentionLabel(pendingCount)}</span>}</Button>
-        <Button variant="outline" onClick={() => { controller.select(null); setView('servers') }}>{t('servers')}</Button>
-        <Button variant="outline" onClick={() => { controller.select(null); setView('services') }}>{t('services')}</Button>
         <Button variant="primary" icon={<IconPlusOutlineRegular />} onClick={() => { controller.select(null); setDraft(undefined); setView('new') }}>{t('newExperiment')}</Button>
         <Button variant="ghost" icon={<IconRefreshOutlineRegular />} onClick={() => { act(() => controller.refresh()) }}>{t('refresh')}</Button>
       </div>
-    </header>
+    </header>}
     {state.error !== null && <p role="alert" className={css.error}>{t('error')}: {state.error}</p>}
     <div className={css.content}>
+    {view === 'list' && detail === undefined && todos.length > 0 && <aside className={css.todoBanner} role="status"><div><span>{t('todoHint', { count: new Set(todos.map(todo => todo.experimentId)).size })}</span><small>{t('todoResourceHint')}</small></div><Button variant="outline" size="sm" onClick={() => { const todo = todos[0]; if (todo !== undefined) controller.select(todo.experimentId) }}>{t('viewTodo')}</Button><button className={css.todoClose} aria-label={t('dismissTodo')} onClick={() => { controller.dismissTodos() }}>×</button></aside>}
     {(view !== 'list' || detail !== undefined) && <div className={css.actions}><Button variant="ghost" size="sm" onClick={() => { controller.select(null); setView('list') }}>{t('back')}</Button></div>}
     {view === 'services' ? <section className={css.list}><p className={css.hint}>{t('serviceHint')}</p>{state.experiments.every(row => !row.latest?.services.length) && <p className={css.empty}>{t('serviceEmpty')}</p>}{state.experiments.map(row => <Services key={row.request.experimentId} controller={controller} t={t} row={row} />)}</section> : view === 'servers' ? <Servers controller={controller} t={t} state={state} />
       : view === 'new' ? <NewExperiment key={draft?.request.experimentId ?? 'new'} controller={controller} t={t}
-        servers={state.registry.servers} state={state} draft={draft} onSubmitted={() => { setView('list') }} />
-        : detail !== undefined ? <ExperimentDetail controller={controller} t={t} row={detail} state={state} onClone={() => {
+        servers={state.registry.servers} state={state} draft={draft} />
+        : detail !== undefined ? <ExperimentDetail key={detail.request.experimentId} controller={controller} t={t} row={detail} state={state} onClone={() => {
           controller.select(null); setDraft(detail); setView('new')
         }} /> : <div className={css.list}>
           <div className={css.listTools}><Input aria-label={t('search')} placeholder={t('search')} value={search} onChange={event => { setSearch(event.target.value) }} />
@@ -78,7 +84,7 @@ export function ExperimentsPage({ controller, useExperiments, t }: PageProps) {
           {rows.length === 0 ? <div className={css.emptyState}><IconGoalOutlineRegular size={28} /><h2>{state.experiments.length === 0 ? t('empty') : t('noMatches')}</h2><p>{t('newHint')}</p></div> : <div className={css.tableWrap}><table className={css.table}>
             <thead><tr><th>{t('goal')}</th><th>{t('status')}</th><th>{t('servers')}</th><th>{t('updated')}</th></tr></thead>
             <tbody>{rows.map(row => <tr key={row.request.experimentId}>
-              <td><button className={css.rowLink} onClick={() => { controller.select(row.request.experimentId) }}>{row.request.objective}</button><small>{row.latest?.progress?.phase ?? (row.receipt !== undefined ? t('handoverShort') : t(row.state === 'preparing' && row.preparation !== undefined ? row.preparation.stage : row.state))}</small></td>
+              <td><button className={css.rowLink} onClick={() => { controller.select(row.request.experimentId) }}>{row.request.name ?? (row.submission?.protocol === 4 ? row.submission.name : row.request.objective.split('\n')[0])}</button><small>{row.latest?.progress?.phase ?? (row.receipt !== undefined ? t('handoverShort') : t(row.state === 'preparing' && row.preparation !== undefined ? row.preparation.stage : row.state))}</small></td>
               <td><Tag tone={row.latest !== undefined && needsExperimentAttention(row.latest) ? 'warning' : 'neutral'}>{t(row.latest?.state ?? row.state)}</Tag></td>
               <td>{row.servers.map(server => server.name).join(' · ')}</td><td><time>{new Date(row.latest?.updatedAt ?? row.createdAt).toLocaleString()}</time></td>
             </tr>)}</tbody></table></div>}
@@ -196,13 +202,16 @@ function Selection<Value extends string>({ label, value, options, onChange, disa
     </Button>} />
 }
 
-function NewExperiment({ controller, t, servers, state, draft, onSubmitted }: ViewProps & {
+function NewExperiment({ controller, t, servers, state, draft }: ViewProps & {
   servers: ServerSettings[]
   state: Snapshot
   draft: FleetExperiment | undefined
-  onSubmitted: () => void
 }) {
   const [objective, setObjective] = useState(draft?.request.objective ?? '')
+  const [name, setName] = useState(draft?.request.name ?? '')
+  const [models, setModels] = useState<ExperimentModels | undefined>(draft?.request.models ?? state.preferences.models)
+  useEffect(() => { void controller.loadModels() }, [controller])
+  useEffect(() => { const current = state.modelDirectory?.current; if (models === undefined && current !== undefined) setModels({ preparation: current, planning: current, execution: current }) }, [state.modelDirectory, models])
   const [ids, setIds] = useState<string[]>(draft?.servers.map(server => server.id)
     .filter(id => servers.some(server => server.id === id)) ?? [])
   const [mode, setMode] = useState<'semi' | 'automatic'>(draft?.request.mode ?? 'automatic')
@@ -219,14 +228,17 @@ function NewExperiment({ controller, t, servers, state, draft, onSubmitted }: Vi
     const paths = data.get('paths')
     const files = (typeof paths === 'string' ? paths : '').split(/\r?\n/).map(value => value.trim()).filter(Boolean)
     const uploads = data.getAll('uploads').filter((value): value is File => value instanceof File && value.name !== '')
-    try { await controller.create(objective, ids, files, uploads, id.current, mode); onSubmitted() }
+    try { await controller.create(objective, ids, files, uploads, id.current, mode, name, models) }
     catch (error) { controller.report(error) }
     finally { pending.current = false; setBusy(false) }
   }
   return <form className={`${css.form} ${css.newForm}`} onSubmit={(event) => { void submit(event) }}>
     <div className={css.formMain}><section className={css.formSection}><h2><span>01</span>{t('goal')}</h2>
+    <label className={css.field}>{t('shortName')}<Input aria-label={t('shortName')} placeholder={t('shortNameHint')} value={name} maxLength={120} required disabled={busy} onChange={event => { setName(event.target.value) }} /></label>
     <label className={css.field}><textarea aria-label={t('goal')} value={objective} onChange={(event) => { setObjective(event.target.value) }} placeholder={t('goalHint')} rows={6} required disabled={busy} /></label>
     <p className={css.hint}>{t('goalConstraintHint')}</p></section>
+    {state.modelsLoading && <p role="status">{t('loading')}</p>}{state.modelsError !== null && <details><summary>{t('chooseModelsHint')}</summary>{state.modelsError}</details>}
+    <ModelFields t={t} models={models} directory={state.modelDirectory} change={setModels} manage={() => { controller.modelSettings(true) }} disabled={busy} />
     <section className={css.formSection}><h2><span>02</span>{t('selectServers')}</h2><p className={css.hint}>{t('selectHint')}</p>
     <fieldset disabled={busy} className={css.serverOptions}>
       <legend className={css.srOnly}>{t('selectServers')}</legend>
@@ -251,87 +263,68 @@ function NewExperiment({ controller, t, servers, state, draft, onSubmitted }: Vi
         <span>{t(value)}</span><small>{t(value === 'automatic' ? 'automaticHint' : 'semiHint')}</small>
       </Button>)}
     </div><p className={css.hint}>{t('noBudgetHint')}</p></section>
-    <div className={css.formFooter}><span className={css.hint}>{t('handoverHint')}</span><Button type="submit" variant="primary" disabled={busy || ids.length === 0 || objective.trim() === ''}>{busy ? t('submitting') : t('submit')}</Button></div>
-    </div><aside className={css.summary}><h3>{t('summary')}</h3><dl><dt>{t('goal')}</dt><dd>{objective || t('goalHint')}</dd><dt>{t('servers')}</dt><dd>{servers.filter(server => ids.includes(server.id)).map(server => server.name).join(' · ') || t('noSelection')}</dd><dt>{t('attachments')}</dt><dd>{uploadNames.join(' · ') || t('noFilesSelected')}</dd><dt>{t('automation')}</dt><dd>{t(mode)}</dd></dl><p>{t('agentModelHint')}</p></aside>
+    <div className={css.formFooter}><span className={css.hint}>{t('handoverHint')}</span><Button type="submit" variant="primary" disabled={busy || ids.length === 0 || objective.trim() === '' || name.trim() === '' || !modelsReady(models, state.modelDirectory)}>{busy ? t('submitting') : t('submit')}</Button></div>
+    </div><aside className={css.summary}><h3>{t('summary')}</h3><dl><dt>{t('goal')}</dt><dd>{objective || t('goalHint')}</dd><dt>{t('servers')}</dt><dd>{servers.filter(server => ids.includes(server.id)).map(server => server.name).join(' · ') || t('noSelection')}</dd><dt>{t('attachments')}</dt><dd>{uploadNames.join(' · ') || t('noFilesSelected')}</dd><dt>{t('automation')}</dt><dd>{t(mode)}</dd></dl><p>{t('agentModelHint')}</p>{models !== undefined && <dl>{(['preparation', 'planning', 'execution'] as const).map(phase => <div key={phase}><dt>{t(`${phase}Model`)}</dt><dd>{models[phase].provider} · {models[phase].model}</dd></div>)}</dl>}</aside>
   </form>
 }
 
-function ExperimentDetail({ controller, t, row, state,
-  onClone }: ViewProps & { row: FleetExperiment; state: Snapshot; onClone: () => void }) {
-  const [tab, setTab] = useState<'overview' | 'conversation' | 'logs' | 'files' | 'services'>('overview')
-  const [nodeId, setNodeId] = useState<string>(row.servers[0]?.id ?? '')
+function ExperimentDetail({ controller, t, row, state, onClone }: ViewProps & { row: FleetExperiment; state: Snapshot; onClone: () => void }) {
+  const [tab, setTab] = useState<'overview' | 'agentRecords' | 'monitoring' | 'files' | 'services'>('overview')
+  const [logDestination, setLogDestination] = useState<{ serverId: string; commandId: string }>()
   const status = row.latest?.state ?? row.state
   const id = row.request.experimentId
-  const source = state.streams[`${id}/${tab === 'conversation' ? 'events' : nodeId}`]
   const ended = ['completed', 'failed', 'blocked', 'cancelled', 'interrupted'].includes(status) && row.latest?.resourcesReleased !== false
-  return <article className={css.detail}>
-    <h2>{row.request.objective}</h2><p role="status"><Tag>{t(status)}</Tag></p>
-    {row.receipt !== undefined && <p className={css.handover}>{row.receipt.handover}</p>}
-    {row.preparation !== undefined && row.receipt === undefined && <p role="status" className={css.hint}>{t(row.preparation.stage)}</p>}
-    <div className={css.actions}>
-      <Button variant="outline" onClick={onClone}>{t('clone')}</Button>
-      <Button variant="outline" disabled={ended} onClick={() => { void controller.cancel(id).catch((error: unknown) => { controller.report(error) }) }}>{t('cancel')}</Button>
-      {row.state === 'failed' && row.preparation !== undefined && row.receipt === undefined && <Button variant="outline" onClick={() => { void controller.retry(id).catch((error: unknown) => { controller.report(error) }) }}>{t('retryPreparation')}</Button>}
-    </div>
-    <nav className={css.actions}>{(['overview', 'conversation', 'logs', 'files', 'services'] as const).map(key =>
-      <Button key={key} variant={tab === key ? 'primary' : 'ghost'} onClick={() => { setTab(key) }}>{t(key)}</Button>)}</nav>
-    {(row.latest?.detail ?? row.detail) !== undefined && <p role="alert" className={css.error}>{row.latest?.detail ?? row.detail}</p>}
-    {row.waitingFor.length > 0 && <p>{t('waiting',
-      { servers: row.servers.filter(server => row.waitingFor.includes(server.id)).map(server => server.name).join(', ') })}</p>}
-    {row.latest?.resourcesReleased === false && ['failed', 'blocked', 'interrupted', 'cancelling'].includes(status) && <p>{t('held')}</p>}
-    {row.latest?.questions?.filter(question => question.state === 'open').map(question => <ExperimentQuestionCard key={question.questionId} controller={controller} t={t} question={question}
-      records={state.streams[`${id}/events`]?.text.split('\n').filter(line => line.includes(question.sessionId)).join('\n') ?? ''} />)}
-    {row.latest?.questions?.some(question => question.state === 'answered') && <p role="status" className={css.hint}>{t('replySaved')}</p>}
-    {row.latest?.plan !== undefined && <section aria-label={t('plan')}>
-      <h3>{t('plan')}</h3><p>{row.latest.plan.summary}</p><ol>{row.latest.plan.steps.map((step, index) => <li key={index}>{step}</li>)}</ol>
-      {row.latest.plan.frameworks.map(framework => <p key={framework.name}>{framework.name} {framework.version} · <a href={framework.documentation} target="_blank" rel="noreferrer">{framework.documentation}</a></p>)}
-      {status === 'awaiting-approval' && <><p>{t('planHint')}</p><Button variant="primary" onClick={() => { void controller.approve(id, row.latest!.plan!.revision).catch(error => { controller.report(error) }) }}>{t('approve')}</Button></>}
-    </section>}
-    {row.latest?.progress !== undefined && <section><h3>{t('progress')}</h3><p>{row.latest.progress.phase}</p><div className={css.metrics}>{Object.entries(row.latest.progress.metrics).map(([name, value]) => <div key={name}><span>{name}</span><strong>{value.toLocaleString()}</strong></div>)}</div><p className={css.hint}>{t('latestMetrics', { time: new Date(row.latest.progress.updatedAt).toLocaleString() })}</p></section>}
-    {tab === 'services' && <Services controller={controller} t={t} row={row} />}
-    {tab === 'overview' && <dl className={css.facts}>
-      <dt>{t('experimentId')}</dt><dd>{id}</dd><dt>{t('servers')}</dt><dd>{row.servers.map(server => server.name).join(', ')}</dd>
-      <dt>{t('dispatchSession')}</dt><dd>{row.sessionId}</dd><dt>{t('executionSession')}</dt><dd>{row.latest?.sessionId ?? t('sessionEmpty')}</dd>
-      <dt>{t('sourceVersion')}</dt><dd>{row.submission?.deploymentId ?? t('preparing')}</dd>
-      {row.submission?.protocol === 1 && <><dt>{t('legacyLimits')}</dt><dd><pre className={css.log}>{JSON.stringify(row.submission.strategy.budget, null, 2)}</pre></dd></>}
-      {row.latest?.executions.length !== 0 && row.latest !== undefined && <><dt>{t('actualVersions')}</dt><dd><pre className={css.log}>{JSON.stringify(row.latest.executions, null, 2)}</pre></dd></>}
-      {row.receipt !== undefined && <><dt>{t('receipt')}</dt><dd><details><summary>{t('receipt')}</summary><pre className={css.log}>{JSON.stringify(row.receipt, null, 2)}</pre></details></dd></>}
-    </dl>}
-    {tab === 'overview' && (row.preparation?.placements.length ?? 0) > 0 && <section className={css.list} aria-label={t('resolvedStorage')}>
-      <h3>{t('resolvedStorage')}</h3>{row.preparation?.placements.map(placement => {
+  const title = row.request.name ?? (row.submission?.protocol === 4 ? row.submission.name : row.request.objective.split('\n')[0]?.slice(0, 120))
+  const act = (operation: () => Promise<unknown>) => { void operation().catch(error => { controller.report(error) }) }
+  return <article className={`${css.detail} ${tab === 'agentRecords' || tab === 'monitoring' ? css.readerDetail : ''}`}>
+    <header className={css.detailHeader}><div className={css.detailHeading}><div className={css.titleLine}><h2 title={title}>{title}</h2><span role="status"><Tag tone={status === 'failed' ? 'warning' : 'neutral'}>{t(status)}</Tag></span></div>
+      <p className={css.hint}>{row.servers.map(server => server.name).join(' · ')} · {new Date(row.createdAt).toLocaleString()}</p></div>
+      <div className={css.actions}><Button variant="ghost" size="sm" onClick={onClone}>{t('clone')}</Button><Button variant="ghost" size="sm" onClick={() => { act(() => controller.refresh()) }}>{t('refresh')}</Button>
+        <Button variant="outline" size="sm" disabled={ended} onClick={() => { act(() => controller.cancel(id)) }}>{t('cancel')}</Button></div>
+    </header>
+    <nav className={css.detailTabs}>{(['overview', 'agentRecords', 'monitoring', 'files', 'services'] as const).map(key => <button key={key} aria-current={tab === key ? 'page' : undefined} onClick={() => { setTab(key) }}>{t(key)}</button>)}</nav>
+    {tab === 'agentRecords' && <AgentRecords row={row} controller={controller} t={t} onLog={(serverId, commandId) => { setLogDestination({ serverId, commandId }); setTab('monitoring') }} />}
+    {tab === 'monitoring' && <RuntimeMonitor row={row} controller={controller} t={t} aggregate={state.streams} {...(logDestination === undefined ? {} : { destination: logDestination })} />}
+    {tab === 'overview' && <div className={css.overview}>
+      <section className={css.stageCard}><span className={css.hint}>{t('latestStage')}</span><h3>{row.latest?.progress?.phase ?? (row.receipt === undefined && row.preparation !== undefined ? t(row.preparation.stage) : t(status))}</h3>
+        {row.receipt !== undefined && <p className={css.handover}>{row.receipt.handover}</p>}
+        {row.waitingFor.length > 0 && <p>{t('waiting', { servers: row.servers.filter(server => row.waitingFor.includes(server.id)).map(server => server.name).join(', ') })}</p>}
+        {row.latest?.resourcesReleased === false && ['failed', 'blocked', 'interrupted', 'cancelling'].includes(status) && <p>{t('held')}</p>}
+      </section>
+      {(row.latest?.detail ?? row.detail) !== undefined && <section className={css.errorCard} role="alert"><div><h3>{t('failedHint')}</h3><details><summary>{t('lastError')}</summary><pre>{row.latest?.detail ?? row.detail}</pre></details></div>
+        {row.state === 'failed' && row.preparation?.protocol === 4 && row.receipt === undefined && <Button variant="outline" onClick={() => { act(() => controller.retry(id)) }}>{t('retryPreparation')}</Button>}</section>}
+      {row.latest?.questions?.filter(question => question.state === 'open').map(question => <ExperimentQuestionCard key={question.questionId} controller={controller} t={t} question={question}
+        records={state.streams[`${id}/events`]?.text.split('\n').filter(line => line.includes(question.sessionId)).join('\n') ?? ''} />)}
+      {row.latest?.questions?.some(question => question.state === 'answered') && <p className={css.hint}>{t('replySaved')}</p>}
+      <details className={css.goalDisclosure}><summary>{t('fullGoal')}</summary><div className={css.prewrap}>{row.request.objective}</div></details>
+      {row.latest?.plan !== undefined && <section className={css.planCard} aria-label={t('plan')}><div className={css.sectionHeading}><h3>{t('plan')}</h3><Tag>#{row.latest.plan.revision}</Tag></div><p className={css.prewrap}>{row.latest.plan.summary}</p>
+        <ol>{row.latest.plan.steps.map((step, index) => <li key={index}>{step}</li>)}</ol>
+        {row.latest.plan.frameworks.map(framework => <p key={framework.name}><a href={framework.documentation} target="_blank" rel="noreferrer">{framework.name} {framework.version}</a></p>)}
+        {status === 'awaiting-approval' && <div className={css.sectionHeading}><p className={css.hint}>{t('todoResourceHint')}</p><Button variant="primary" onClick={() => { act(() => controller.approve(id, row.latest!.plan!.revision)) }}>{t('approve')}</Button></div>}
+      </section>}
+      {row.models !== undefined && <section><h3>{t('agentModels')}</h3><div className={css.modelFields}>{(['preparation', 'planning', 'execution'] as const).map(phase => <div className={css.modelField} key={phase}><span className={css.hint}>{t(`${phase}Model`)}</span><span>{row.models?.[phase].model}</span><small className={css.hint}>{row.models?.[phase].provider}</small></div>)}</div></section>}
+      {row.latest?.progress !== undefined && <section><h3>{t('progress')}</h3><div className={css.metrics}>{Object.entries(row.latest.progress.metrics).map(([name, value]) => <div key={name}><span>{name}</span><strong>{value.toLocaleString()}</strong></div>)}</div><p className={css.hint}>{t('latestMetrics', { time: new Date(row.latest.progress.updatedAt).toLocaleString() })}</p></section>}
+      {(row.preparation?.placements.length ?? 0) > 0 && <section className={css.list} aria-label={t('resolvedStorage')}><h3>{t('resolvedStorage')}</h3>{row.preparation?.placements.map(placement => {
         const server = [row.coordinator, ...row.servers].find(value => value.id === placement.serverId)
-        return <article key={placement.serverId} className={css.card}><h3>{server?.name}</h3>
-          <dl className={css.facts}><dt>{t('workspaceDirectory')}</dt><dd><code>{placement.workspaceRoot}</code></dd>
-            <dt>{t('controlDirectory')}</dt><dd><code>{placement.controlRoot}</code></dd>
-            <dt>{t('storageLocation')}</dt><dd>{placement.candidate.directory} · {t('availableBytes', { size: placement.candidate.availableBytes.toLocaleString() })} · {t(placement.candidate.persistence)}</dd>
-            <dt>{t('selectionReason')}</dt><dd>{placement.reason}</dd>
-            <dt>{t('trainingAddress')}</dt><dd>{server?.trainingAddress ?? t('networkUnused')}</dd></dl>
-        </article>
+        return <article key={placement.serverId} className={css.card}><h3>{server?.name}</h3><dl className={css.facts}><dt>{t('workspaceDirectory')}</dt><dd><code>{placement.workspaceRoot}</code></dd>
+          <dt>{t('storageLocation')}</dt><dd>{placement.candidate.directory} · {t('availableBytes', { size: placement.candidate.availableBytes.toLocaleString() })} · {t(placement.candidate.persistence)}</dd>
+          <dt>{t('selectionReason')}</dt><dd>{placement.reason}</dd><dt>{t('trainingAddress')}</dt><dd>{server?.trainingAddress ?? t('networkUnused')}</dd></dl></article>
       })}</section>}
-    {tab === 'logs' && <div className={css.field}><span>{t('selectNode')}</span><Selection label={t('selectNode')} value={nodeId}
-      options={row.servers.map(server => ({ value: server.id, label: server.name }))} onChange={setNodeId} /></div>}
-    {(tab === 'logs' || tab === 'conversation') && <section aria-label={t(tab)}>
-      {source?.generation === '' && <p>{t('logMissing')}</p>}
-      {source?.reset === true && <p>{t('logReset')}</p>}
-      {tab === 'conversation' ? <section>
-        {experimentConversation(source?.text ?? '').map(message => <article key={message.seq}>
-          <h3>{t(message.role)}</h3><pre className={css.log}>{message.text}</pre>
-        </article>)}
-        {!source?.text && <p>{t('sessionEmpty')}</p>}
-        <details><summary>{t('sessionRecords')}</summary><pre className={css.log}>{source?.text}</pre></details>
-      </section> : <pre className={css.log}>{source?.text || t('noOutput')}</pre>}
-      {tab === 'logs' && <details><summary>{t('execution')}</summary><pre className={css.log}>{state.streams[`${id}/agent-log`]?.text || t('noOutput')}</pre></details>}
-    </section>}
-    {tab === 'files' && <section aria-label={t('files')}>
-      {state.filesTruncated && <p>{t('fileTruncated')}</p>}
-      {state.files.length === 0 && <p>{t('noOutput')}</p>}
+      <details className={css.technical}><summary>{t('technicalDetails')}</summary><dl className={css.facts}>
+        <dt>{t('experimentId')}</dt><dd>{id}</dd><dt>{t('dispatchSession')}</dt><dd>{row.sessionId}</dd><dt>{t('planning')}</dt><dd>{row.latest?.planningSessionId ?? '—'}</dd>
+        <dt>{t('executionSession')}</dt><dd>{row.latest?.sessionId ?? t('sessionEmpty')}</dd><dt>{t('sourceVersion')}</dt><dd>{row.submission?.deploymentId ?? t('preparing')}</dd></dl>
+        {row.receipt !== undefined && <details><summary>{t('receipt')}</summary><pre className={css.log}>{JSON.stringify(row.receipt, null, 2)}</pre></details>}
+        {(row.latest?.executions.length ?? 0) > 0 && <details><summary>{t('actualVersions')}</summary><pre className={css.log}>{JSON.stringify(row.latest?.executions, null, 2)}</pre></details>}
+        {row.submission?.protocol === 1 && <details><summary>{t('legacyLimits')}</summary><pre className={css.log}>{JSON.stringify(row.submission.strategy.budget, null, 2)}</pre></details>}
+      </details>
+    </div>}
+    {tab === 'services' && <div className={css.overview}>{(row.latest?.services.length ?? 0) === 0 && <p className={css.empty}>{t('serviceEmpty')}</p>}<Services controller={controller} t={t} row={row} /></div>}
+    {tab === 'files' && <section className={css.overview} aria-label={t('files')}>
+      {state.filesTruncated && <p>{t('fileTruncated')}</p>}{state.files.length === 0 && <p className={css.empty}>{t('noOutput')}</p>}
       {state.files.map(file => <div key={`${file.serverId}/${file.path}`} className={css.file}>
-        <span>{row.servers.find(server => server.id === file.serverId)?.name}: {file.path}</span><small>{t('bytes',
-          { size: file.size })}</small>
-        <time>{new Date(file.modifiedAt).toLocaleString()}</time>
-        <Button variant="outline" onClick={() => { void controller.download(id, file).then((url) => {
-          const anchor = document.createElement('a'); anchor.href = url; anchor.download = file.path.slice(file.path.lastIndexOf('/') + 1); anchor.click()
-        }).catch((error: unknown) => { controller.report(error) }) }}>{t('download')}</Button>
+        <div><span>{file.path.slice(file.path.lastIndexOf('/') + 1)}</span><small>{row.servers.find(server => server.id === file.serverId)?.name} · {file.path}</small></div>
+        <small>{t('bytes', { size: file.size })}</small><time>{new Date(file.modifiedAt).toLocaleString()}</time>
+        <Button variant="outline" size="sm" onClick={() => { act(async () => { const url = await controller.download(id, file); const anchor = document.createElement('a'); anchor.href = url; anchor.download = file.path.slice(file.path.lastIndexOf('/') + 1); anchor.click() }) }}>{t('download')}</Button>
       </div>)}
     </section>}
   </article>
@@ -347,7 +340,7 @@ function Services({ controller, t, row }: ViewProps & { row: FleetExperiment }) 
   return <section className={css.list}>
     {blocked.length > 0 && <p>{t('serviceBlocks', { goals: blocked.map(task => task.request.objective).join(' · ') })}</p>}
     {(row.latest?.services ?? []).map(service => <article key={service.id} className={css.card}>
-      <h3>{row.request.objective}</h3><p>{row.servers.find(server => server.id === service.serverId)?.name} · {t(service.state)}</p>
+      <h3>{row.request.name ?? row.request.objective.split('\n')[0]}</h3><p>{row.servers.find(server => server.id === service.serverId)?.name} · {t(service.state)}</p>
       <p>{t('modelArtifact')}: {service.modelPath}</p><p>{service.id} · 127.0.0.1:{service.port}</p>
       {service.modelName !== undefined && <p>{t('servedModel')}: {service.modelName}</p>}
       {service.external !== undefined && <PublicService key={service.id} controller={controller} t={t} service={service} />}

@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict'
 import { writeFileSync, renameSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
+import { fixtureProvider } from './models.mjs'
 import { ToolCallId, HarnessError } from '@deepseek-ai/dsh-llm'
 
 export const inject = ['llm', 'webServer', 'userQuestions']
@@ -37,9 +38,10 @@ export function apply(ctx, config) {
     return next()
   }, { global: true })
   ctx.on('llm/stream', async function* (options, next) {
-    if (options.provider !== 'deepseek' || !options.messages.some(message => JSON.stringify(message).includes(config.id))) {
+    if (options.provider !== fixtureProvider || !options.messages.some(message => JSON.stringify(message).includes(config.id))) {
       yield* next(); return
     }
+    assert.equal(options.model, config.planning ? 'qwen-planning' : 'qwen-execution')
     // Replay intentionally supplies the response without contacting a model provider.
     observed.tools = (options.tools ?? []).map(tool => tool.name).sort()
     assert.deepEqual(observed.tools, expected)

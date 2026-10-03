@@ -35,7 +35,7 @@ export function installExperimentQuestions(ctx: Context, host: Context, agent: A
   }
   ctx.on('user-questions/request', async (request, next) => {
     if (request.agent !== undefined && request.agent !== agent) return next()
-    if (runtime.submission.protocol !== 3 || runtime.submission.strategy.mode !== 'semi') throw new UserQuestionError('Automatic experiments decide within constraints or report a blocker; human waiting is disabled.', 'ASPERA_UNATTENDED')
+    if (runtime.submission.protocol !== 4 || runtime.submission.strategy.mode !== 'semi') throw new UserQuestionError('Automatic experiments decide within constraints or report a blocker; human waiting is disabled.', 'ASPERA_UNATTENDED')
     if (request.agent !== agent || request.wait === undefined || !calls.has(request.wait.callId)) throw new UserQuestionError('An experiment question requires its logged tool invocation.', 'ASPERA_UNBOUND_QUESTION')
     const signal = request.signal === undefined ? lifetime.signal : AbortSignal.any([lifetime.signal, request.signal])
     try {
@@ -78,7 +78,7 @@ export function installExperimentQuestions(ctx: Context, host: Context, agent: A
       throw error
     }
   })
-  if (runtime.submission.protocol !== 3 || runtime.submission.strategy.mode !== 'semi') return
+  if (runtime.submission.protocol !== 4 || runtime.submission.strategy.mode !== 'semi') return
   ctx.effect(() => ctx.tools.register(defineTool({ name: 'ask_user_question',
     description: 'Pause this experiment for an operator decision only when autonomous investigation cannot resolve it. Replies cannot authorize new permissions or change the specified model, data, training method or server group; those require a new experiment.',
     parameters: { questions: { type: 'array', required: true, items: { type: 'object', additionalProperties: false, properties: {

@@ -28,7 +28,7 @@ The dispatch provider installs the fixed release, calls `setupWorkerProfile` wit
 
 Choose `coordinator`, `node`, `planner` or `agent` through role configuration. Deployment fixes the control root, token, release and experiment IDs. [Config](src/index.ts) bounds polling, cleanup, network probe lifetime, file/byte limits and documentation access. [Network probes](src/network-probes.ts) check receiver identities without allocating GPUs; timeout, cancellation and shutdown clean their listeners. The node masks the control directory and other registered experiment roots before binding the current workspace.
 
-Ordinary commands cannot outlive cancellation cleanup. Protocol `3` has no aggregate lifetime or command-count cap; old allocations retain their limits. [Storage preparation](scripts/storage.mjs) checks Linux mounts, capacity, ownership and write access; unknown persistence stays unknown. Profiles and logs live on selected experiment storage, while queue state and credentials remain private. Cache/environment variables use the writable workspace. Registered services retain the full allocation, require live HTTP health and never restart automatically. [Inference gateways](src/inference-gateway.ts) own explicitly mapped public listeners and private service credentials; see [service records and access](../../docs/state-and-api.md#logs-outputs-and-services). `serviceRequestTimeoutMs` (300000) limits upstream idle time and `serviceRequestBytes` (16777216) bounds request bodies; both are node profile settings.
+Ordinary commands cannot outlive cancellation cleanup. Protocol `4` has no aggregate lifetime or command-count cap; old allocations retain their limits. [Storage preparation](scripts/storage.mjs) checks Linux mounts, capacity, ownership and write access; unknown persistence stays unknown. Profiles and logs live on selected experiment storage, while queue state and credentials remain private. Cache/environment variables use the writable workspace. Registered services retain the full allocation, require live HTTP health and never restart automatically. [Inference gateways](src/inference-gateway.ts) own explicitly mapped public listeners and private service credentials; see [service records and access](../../docs/state-and-api.md#logs-outputs-and-services). `serviceRequestTimeoutMs` (300000) limits upstream idle time and `serviceRequestBytes` (16777216) bounds request bodies; both are node profile settings.
 
 `goalContinuationWindow` is a deployment setting, defaulting to `128` rounds; `DSH_CLUSTER_GOAL_WINDOW` configures it in the worker patch. The continuation plugin extends the same Goal through public `Goal.edit` before its finite window is exhausted. Each extension is logged; it is not a user task budget. Connection, probe and model-operation timeouts, loop guards, confinement and cancellation remain active.
 
@@ -36,6 +36,8 @@ Ordinary commands cannot outlive cancellation cleanup. Protocol `3` has no aggre
 
 <a id="understand-the-implementation"></a>
 ## Understand the implementation
+
+[phase-model.ts](src/phase-model.ts) mounts a separate LLM service and the selected pinned provider for each phase. It verifies the saved configuration digest and private credential before creating an Agent, and disposes the provider after its Agent. [records.ts](src/records.ts) pages real phase events; node commands write separate stdout/stderr files in addition to the node overview log.
 
 <details>
 <summary>Implementation internals</summary>
@@ -64,7 +66,7 @@ Global tools are masked in the Agent scope and plugin-manager layers are disable
 ## Known Limitations and Deferred Work
 
 - Production execution requires Linux bubblewrap and NVIDIA devices; network access is shared rather than isolated.
-- Worker provider configuration must exist in the pinned profile; selecting a model does not transfer arbitrary provider plugins or settings.
+- Provider transfer supports DeepSeek and pi-ai key APIs. OAuth grants, cloud identity chains and arbitrary provider plugins require separate integration.
 - Ambiguous node restarts require operator reconciliation; no force release or automatic training restart is provided.
 - Multi-Agent algorithms and an RSI optimization pipeline are separate extensions.
 

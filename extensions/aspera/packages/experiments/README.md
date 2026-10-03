@@ -35,10 +35,12 @@ Questions and replies are serialized with queue mutations. Persist an open quest
 <a id="understand-the-implementation"></a>
 ## Understand the implementation
 
+Generation 4 freezes the short experiment name and three model configuration summaries while retaining generation-1–3 readers. [records.ts](src/records.ts) defines experiment/phase/Session paging and node/process/stream cursors. The initial plan confirmation keeps resources released; whole-group allocation starts after approval.
+
 <details>
 <summary>Implementation internals</summary>
 
-[cluster-protocol.ts](src/cluster-protocol.ts) freezes generation-1/2 readers and defines generation-3 submissions; [storage-protocol.ts](src/storage-protocol.ts) separates preferences, SSH evidence and resolved placements. [cluster-queue.ts](src/cluster-queue.ts) owns durable transitions and provider lifetimes. [cluster-files.ts](src/cluster-files.ts) confines bounded reads. Admission checks experiment/node/release ownership and resource assignments; no separate presence-only invariant is published.
+[cluster-protocol.ts](src/cluster-protocol.ts) freezes generation-1–3 readers and defines generation-4 submissions; [storage-protocol.ts](src/storage-protocol.ts) separates preferences, SSH evidence and resolved placements. [cluster-queue.ts](src/cluster-queue.ts) owns durable transitions and provider lifetimes. [cluster-files.ts](src/cluster-files.ts) confines bounded reads. Admission checks experiment/node/release ownership and resource assignments; no separate presence-only invariant is published.
 
 </details>
 

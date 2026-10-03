@@ -17,6 +17,8 @@ import { prepareClusterServer } from '../src/cluster-deploy.ts'
 import { installPrivateFile } from '../src/deploy.ts'
 import { inventory } from '../../experiments/tests/fixtures.ts'
 import type { NetworkParticipant } from '../src/network-selection.ts'
+import { modelSelections } from '../../experiments/tests/fixtures.ts'
+vi.mock('../../runtime/src/phase-model.ts', async importOriginal => ({ ...await importOriginal<typeof import('../../runtime/src/phase-model.ts')>(), openPhaseModelContext: vi.fn(async (context: Context) => ({ context, dispose: async () => {} })) }))
 
 vi.mock('../../runtime/src/storage.ts', async importOriginal => ({
   ...await importOriginal<typeof import('../../runtime/src/storage.ts')>(),
@@ -80,6 +82,7 @@ async function fixture() {
     live.set(resumeSessionId, agent)
     return handle(agent)
   })
+  const secrets = new Map<string, string>([['TEST_API_KEY', 'test-only-secret']])
   const ctx = fromAny<Context, object>({ storage: { domain: { open: async () => ({ table: (name: string) => {
     let table = tables.get(name); if (table === undefined) { table = new Map(); tables.set(name, table) }
     return { get: (id: string) => table.get(id), entries: () => table.entries(),
@@ -90,7 +93,9 @@ async function fixture() {
   }, resume, get: (id: string) => live.get(id) },
   goals: { create: (agent: ReturnType<typeof makeAgent>) => agent.goal, get: (agent: ReturnType<typeof makeAgent>) => agent.goal,
     complete, disarm: () => {} }, sessionPersistence: { flush: vi.fn(async () => {}), stat: async (id: string) => saved.has(id) ? { revision: 1 } : undefined },
-  credentials: { resolve: async () => ({ value: 'test-only-secret' }), set: vi.fn() },
+  credentials: { resolve: async (ref: string) => ({ value: secrets.get(ref) ?? 'test-only-secret' }), set: vi.fn(async (ref: string, value: string) => { secrets.set(ref, value) }) },
+  settings: { describe: () => [{ ns: 'models', value: { providers: { test: { api: 'openai-completions', baseURL: 'http://127.0.0.1:9/v1', apiKeyEnv: 'TEST_API_KEY', models: [{ id: 'test-model' }] } } } }] },
+  llm: { listConfigurableProviders: () => [{ provider: 'test', settingsNs: 'models', settingsPath: ['providers', 'test'] }], listModels: async () => [{ id: 'test-model' }], resolveModelInfo: async () => ({ reasoning: { efforts: [{ id: 'high' }, { id: 'low' }] } }) },
   agentDefaultModel: { currentSelection: () => ({ provider: 'test', model: 'test-model' }) },
   effect: () => {}, on: () => () => {}, logger: { error: vi.fn(), debug: vi.fn() },
   })
@@ -120,7 +125,7 @@ it('pins public inference mappings and rejects control-port collisions before pr
   await f.fleet.saveServer({ ...f.b, inferenceMapping: mapping })
   const barrier = Promise.withResolvers<Awaited<ReturnType<typeof snapshotSource>>>()
   vi.mocked(snapshotSource).mockReturnValue(barrier.promise)
-  const row = await f.fleet.create({ experimentId: randomUUID(), objective: 'serve a model', serverIds: [f.b.id], mode: 'semi' })
+  const row = await f.fleet.create({ models: modelSelections, experimentId: randomUUID(), objective: 'serve a model', serverIds: [f.b.id], mode: 'semi' })
   await f.fleet.saveServer({ ...f.b, inferenceMapping: { url: 'https://replacement.test', port: 18000 } })
   expect(row.servers[0]!.inferenceMapping).toEqual(mapping)
   expect(row.targets[0]!.inferenceMapping).toEqual(mapping)
@@ -128,7 +133,7 @@ it('pins public inference mappings and rejects control-port collisions before pr
   barrier.resolve({ directory: '/source', digest: 'a'.repeat(64), archiveHash: 'b'.repeat(64), archive: '/snapshot.tar', dispose: () => {} })
   await vi.waitFor(() => {
     const submission = f.records.get(row.request.experimentId)?.submission
-    expect(submission?.protocol === 3 && submission.nodes[0]?.server.inferenceMapping).toEqual(mapping)
+    expect(submission?.protocol === 4 && submission.nodes[0]?.server.inferenceMapping).toEqual(mapping)
   })
 })
 
@@ -136,8 +141,8 @@ it('submits consecutive Goals independently and pins server and source settings 
   const f = await fixture()
   const barrier = Promise.withResolvers<Awaited<ReturnType<typeof snapshotSource>>>()
   vi.mocked(snapshotSource).mockReturnValue(barrier.promise)
-  const first = await f.fleet.create({ experimentId: randomUUID(), objective: 'train one', serverIds: [f.a.id, f.b.id], mode: 'automatic' })
-  const second = await f.fleet.create({ experimentId: randomUUID(), objective: 'train two', serverIds: [f.b.id], mode: 'automatic' })
+  const first = await f.fleet.create({ models: modelSelections, experimentId: randomUUID(), objective: 'train one', serverIds: [f.a.id, f.b.id], mode: 'automatic' })
+  const second = await f.fleet.create({ models: modelSelections, experimentId: randomUUID(), objective: 'train two', serverIds: [f.b.id], mode: 'automatic' })
   await f.fleet.saveServer({ ...f.b, host: 'replacement-host' }); f.setRepo('/replacement-source')
   expect(f.fleet.list()).toHaveLength(2)
   expect(first.sessionId).not.toBe(second.sessionId)
@@ -156,7 +161,7 @@ it('keeps the selected reasoning effort when model settings change during prepar
   vi.spyOn(f.ctx.agentDefaultModel, 'currentSelection').mockReturnValue(selection)
   const barrier = Promise.withResolvers<Awaited<ReturnType<typeof snapshotSource>>>()
   vi.mocked(snapshotSource).mockReturnValue(barrier.promise)
-  const row = await f.fleet.create({ experimentId: randomUUID(), objective: 'train with fixed effort', serverIds: [f.a.id], mode: 'automatic' })
+  const row = await f.fleet.create({ models: { preparation: selection, planning: selection, execution: selection }, experimentId: randomUUID(), objective: 'train with fixed effort', serverIds: [f.a.id], mode: 'automatic' })
   selection.reasoningEffort = ReasoningEffortId('low')
   barrier.resolve({ digest: 'a'.repeat(64), archive: '/snapshot.tar', dispose: () => {} } as Awaited<ReturnType<typeof snapshotSource>>)
   await vi.waitFor(() => { expect(f.fleet.list()[0]!.handoverRecorded).toBe(true) })
@@ -172,7 +177,7 @@ it('recovers a lost handover reply after reload and records the full receipt onc
     if (route.endsWith('/submit')) { accepted = receipt(body as ClusterSubmission); throw new Error('reply lost') }
     return { status: 200, value: { record: accepted, waitingFor: [] } }
   })
-  const row = await f.fleet.create({ experimentId: randomUUID(), objective: 'queued training', serverIds: [f.a.id], mode: 'automatic' as const })
+  const row = await f.fleet.create({ models: modelSelections, experimentId: randomUUID(), objective: 'queued training', serverIds: [f.a.id], mode: 'automatic' as const })
   await vi.waitFor(() => { expect(f.records.get(row.request.experimentId)?.state).toBe('failed') })
   await f.fleet.close()
   const restored = await f.open()
@@ -192,8 +197,8 @@ it('deduplicates a caller Goal revision and leaves an edited Goal open when its 
     if (route.endsWith('/submit')) { const result = receipt(body as ClusterSubmission); await barrier.promise; return { status: 200, value: result } }
     throw new Error('unexpected request')
   })
-  const first = await f.fleet.createForGoal(fromAny<Agent, typeof caller>(caller), 'original goal', [f.a.id], [], 'automatic')
-  const duplicate = await f.fleet.createForGoal(fromAny<Agent, typeof caller>(caller), 'original goal', [f.a.id], [], 'automatic')
+  const first = await f.fleet.createForGoal(fromAny<Agent, typeof caller>(caller), 'original goal', [f.a.id], [], 'automatic', modelSelections)
+  const duplicate = await f.fleet.createForGoal(fromAny<Agent, typeof caller>(caller), 'original goal', [f.a.id], [], 'automatic', modelSelections)
   expect(duplicate.request.experimentId).toBe(first.request.experimentId)
   caller.goal.revision++
   barrier.resolve({ status: 200, value: {} })
@@ -210,14 +215,14 @@ it('rejects conflicting duplicates and keeps the coordinator identity fixed', as
   }
   await expect(f.fleet.saveServer({ ...f.a, host: 'new-coordinator' })).rejects.toThrow('fixed')
   await expect(f.fleet.removeServer(f.a.id)).rejects.toThrow('coordinator')
-  const input = { experimentId: randomUUID(), objective: 'one', serverIds: [f.a.id], mode: 'automatic' as const }
+  const input = { models: modelSelections, experimentId: randomUUID(), objective: 'one', serverIds: [f.a.id], mode: 'automatic' as const }
   await f.fleet.create(input)
   await expect(f.fleet.create({ ...input, objective: 'two' })).rejects.toThrow('different requirements')
 })
 
 it('retains cancellation when an older refresh response arrives later', async () => {
   const f = await fixture()
-  const row = await f.fleet.create({ experimentId: randomUUID(), objective: 'train', serverIds: [f.a.id], mode: 'automatic' as const })
+  const row = await f.fleet.create({ models: modelSelections, experimentId: randomUUID(), objective: 'train', serverIds: [f.a.id], mode: 'automatic' as const })
   await vi.waitFor(() => { expect(f.records.get(row.request.experimentId)?.handoverRecorded).toBe(true) })
   const accepted = f.records.get(row.request.experimentId)!.receipt!
   const delayed = Promise.withResolvers<Awaited<ReturnType<typeof request>>>()
@@ -238,7 +243,7 @@ it('initializes a fresh extension registry without binding historical experiment
 
 it('rejects partial or oversized attachments and retains cancellation during input commit', async () => {
   const f = await fixture()
-  const row = await f.fleet.create({ experimentId: randomUUID(), objective: 'with input', serverIds: [f.a.id], mode: 'semi',
+  const row = await f.fleet.create({ models: modelSelections, experimentId: randomUUID(), objective: 'with input', serverIds: [f.a.id], mode: 'semi',
     uploads: [{ name: 'data.txt', size: 6 }] })
   expect(row.state).toBe('staging')
   f.fleet.upload(row.request.experimentId, 'data.txt', 0, Buffer.from('abc').toString('base64'))
@@ -253,7 +258,7 @@ it('rejects partial or oversized attachments and retains cancellation during inp
 it('retries an unreceived admission with the original identity and server snapshot on refresh', async () => {
   const f = await fixture()
   vi.mocked(request).mockRejectedValue(new Error('connection lost before admission'))
-  const row = await f.fleet.create({ experimentId: randomUUID(), objective: 'lost admission', serverIds: [f.b.id], mode: 'automatic' })
+  const row = await f.fleet.create({ models: modelSelections, experimentId: randomUUID(), objective: 'lost admission', serverIds: [f.b.id], mode: 'automatic' })
 
   await vi.waitFor(() => { expect(f.fleet.list()[0]?.state).toBe('failed') })
   const pinned = f.records.get(row.request.experimentId)!.submission!
@@ -270,7 +275,7 @@ it('retries an unreceived admission with the original identity and server snapsh
 it('resumes a failed directory creation with the same experiment, release, Session and saved paths', async () => {
   const f = await fixture()
   vi.mocked(prepareServerStorage).mockRejectedValueOnce(new Error('temporary disk failure'))
-  const row = await f.fleet.create({ experimentId: randomUUID(), objective: 'retry preparation', serverIds: [f.b.id], mode: 'automatic' })
+  const row = await f.fleet.create({ models: modelSelections, experimentId: randomUUID(), objective: 'retry preparation', serverIds: [f.b.id], mode: 'automatic' })
   await vi.waitFor(() => { expect(f.records.get(row.request.experimentId)?.state).toBe('failed'); expect(f.live.size).toBe(0) })
   const saved = f.records.get(row.request.experimentId)!
   await f.fleet.saveServer({ ...f.b, host: 'different-host', remoteRoot: '/different-root' })
@@ -288,7 +293,7 @@ it('resumes a failed directory creation with the same experiment, release, Sessi
 it('refuses a different release during preparation retry instead of moving the experiment', async () => {
   const f = await fixture()
   vi.mocked(prepareServerStorage).mockRejectedValueOnce(new Error('temporary disk failure'))
-  const row = await f.fleet.create({ experimentId: randomUUID(), objective: 'fixed build', serverIds: [f.a.id], mode: 'automatic' })
+  const row = await f.fleet.create({ models: modelSelections, experimentId: randomUUID(), objective: 'fixed build', serverIds: [f.a.id], mode: 'automatic' })
   await vi.waitFor(() => { expect(f.records.get(row.request.experimentId)?.state).toBe('failed'); expect(f.live.size).toBe(0) })
   vi.mocked(snapshotSource).mockResolvedValue({ digest: 'c'.repeat(64), archive: '/snapshot.tar', dispose() {} } as Awaited<ReturnType<typeof snapshotSource>>)
   await f.fleet.retry(row.request.experimentId)

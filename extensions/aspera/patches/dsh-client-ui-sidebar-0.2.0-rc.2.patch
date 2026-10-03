@@ -1,0 +1,35 @@
+--- a/lib/client.js
++++ b/lib/client.js
+@@ -387,6 +387,7 @@
+ 							renderSlot
+ 						}, id))
+ 					}),
++					renderSlot("sidebar.sections", { wide, expandSidebar: () => { if (collapsed) toggleSidebar(); } }),
+ 					(0, react_jsx_runtime.jsx)("div", {
+ 						className: SidebarRoot_module_css_default.regionArea,
+ 						children: renderSlot("sidebar.workspaces", {
+@@ -504,6 +505,7 @@
+ 						kind: "list",
+ 						scope: "root"
+ 					},
++					"sidebar.sections": { kind: "list", scope: "root" },
+ 					"sidebar.workspaces": {
+ 						kind: "single",
+ 						scope: "root"
+--- a/lib/types/client/contract/slots.d.ts
++++ b/lib/types/client/contract/slots.d.ts
+@@ -54,6 +54,7 @@
+          * package's 'sidebar' entry (declaring is claiming); ui-workspace
+          * registers the browser.
+          */
++        'sidebar.sections': { kind: 'list'; scope: 'root'; owner: SidebarSectionOwnerProps; };
+         'sidebar.workspaces': {
+             kind: 'single';
+             scope: 'root';
+@@ -155,5 +156,5 @@
+  * render shares, this package's injected callbacks, and the standard locale
+  * seat. Panel metadata arrives through an injected observable.
+  */
+-export type SidebarRootComponentProps = PropsRuntime<'sidebar'> & PropsRenderSlots<'sidebar.brand.mark' | 'sidebar.brand.name' | 'sidebar.toggle.badge' | 'sidebar.panellist' | 'sidebar.workspaces' | 'sidebar.settings' | 'sidebar.footer.action'> & InjectFace<SidebarRootInjected> & PropsLocale<'sidebar'>;
++export type SidebarRootComponentProps = PropsRuntime<'sidebar'> & PropsRenderSlots<'sidebar.sections' | 'sidebar.brand.mark' | 'sidebar.brand.name' | 'sidebar.toggle.badge' | 'sidebar.panellist' | 'sidebar.workspaces' | 'sidebar.settings' | 'sidebar.footer.action'> & InjectFace<SidebarRootInjected> & PropsLocale<'sidebar'>;
+ //# sourceMappingURL=slots.d.ts.map

@@ -6,8 +6,10 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { setTimeout as delay } from 'node:timers/promises'
 import { randomUUID } from 'node:crypto'
 import { isAbsolute } from 'node:path'
-import { experimentIdSchema, serverIdSchema } from '@aspera/experiments'
-import type { ClusterChunk, ClusterFile, ServerSettings, ServerProbe, AnswerExperimentQuestion, ServiceAccessInfo } from '@aspera/experiments/types'
+import { experimentIdSchema, serverIdSchema, experimentModelsSchema } from '@aspera/experiments'
+import type { ClusterChunk, ClusterFile, ServerSettings, ServerProbe, AnswerExperimentQuestion, ServiceAccessInfo, ExperimentModels, ExperimentModelDirectory } from '@aspera/experiments/types'
+import { experimentModelDirectory, validateExperimentModels } from './models.ts'
+import type { AgentRecordRequest, AgentRecordPage, ExperimentProcess, ProcessLogRequest, ProcessLogPage } from '@aspera/experiments/types'
 import { ExperimentFleet } from './fleet.ts'
 import { ExperimentDownloads } from './downloads.ts'
 import { sshPasswordRef } from './ssh-account.ts'
@@ -68,6 +70,21 @@ export class AsperaRemote extends TypertRemoteService {
   /** @returns independent local dispatch records. */
   @Remote
   experiments(): FleetExperiment[] { return this.fleet.list() }
+  /** @returns configured Agent models and credential readiness, without secrets. */
+  @Remote
+  experimentModels(): Promise<ExperimentModelDirectory> { return experimentModelDirectory(this.host) }
+  /** @param models - explicit phase choices. @returns choices after provider and credential validation. */
+  @Remote
+  validateExperimentModels(models: ExperimentModels): Promise<ExperimentModels> { return validateExperimentModels(this.host, models) }
+  /** @param request - phase and Session-bound cursor. @returns real events and the next sequence. */
+  @Remote
+  experimentRecords(request: AgentRecordRequest): Promise<AgentRecordPage> { return this.fleet.records(request) }
+  /** @param id - experiment. @param serverId - assigned node. @returns durable process directory. */
+  @Remote
+  experimentProcesses(id: string, serverId: string): Promise<ExperimentProcess[]> { return this.fleet.processes(experimentIdSchema.parse(id), serverIdSchema.parse(serverId)) }
+  /** @param request - source-bound stdout or stderr cursor. @returns bounded log bytes and continuation. */
+  @Remote
+  experimentProcessLog(request: ProcessLogRequest): Promise<ProcessLogPage> { return this.fleet.processLog(request) }
   /** @param input - immutable Goal, resources and strategy. @returns saved preparation immediately. */
   @Remote
   createExperiment(input: FleetCreateRequest): Promise<FleetExperiment> { return this.fleet.create(input) }
@@ -82,7 +99,7 @@ export class AsperaRemote extends TypertRemoteService {
   /** @param id - experiment. @returns reconciled remote state. */
   @Remote
   refreshExperiment(id: string): Promise<FleetExperiment> { return this.fleet.refresh(experimentIdSchema.parse(id)) }
-  /** @param id - interrupted v3 preparation. @returns resumed preparation with the same identity and directories. */
+  /** @param id - interrupted v4 preparation. @returns resumed preparation with the same identity and directories. */
   @Remote
   retryPreparation(id: string): Promise<FleetExperiment> { return this.fleet.retry(experimentIdSchema.parse(id)) }
   /** @param id - experiment. @param revision - displayed plan revision. @returns queued state. */
@@ -136,7 +153,7 @@ export class AsperaRemote extends TypertRemoteService {
     }
   }
 }
-export const inject = ['storage', 'storageDomain', 'agents', 'goals', 'credentials', 'agentDefaultModel', 'sessionPersistence', 'tools']
+export const inject = ['storage', 'storageDomain', 'agents', 'goals', 'credentials', 'agentDefaultModel', 'sessionPersistence', 'tools', 'llm', 'settings']
 /** Mount the published DSH adapter without changing the Agent loop. @param ctx - Host services. @param config - resolved policy. */
 export async function apply(ctx: Context, config: Config): Promise<void> {
   if (!isAbsolute(config.extensionRoot) || config.dataRoots.some(path => !isAbsolute(path))) throw new Error('Aspera directories must be absolute')
@@ -149,13 +166,18 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const presentCall = (args: object) => ({ card: 'generic' as const, title: 'Aspera experiment', kind: 'other' as const, rawInput: args })
   ctx.effect(() => ctx.tools.register(defineTool({ name: 'list_experiment_servers', description: 'Read configured Aspera servers and their fixed coordinator. No credentials are returned.', parameters: {}, output, presentCall,
     execute: async () => JSON.stringify(fleet.servers()) })))
+  ctx.effect(() => ctx.tools.register(defineTool({ name: 'list_experiment_models', description: 'List configured Agent models, reasoning options and credential readiness. Select a provider and model independently for preparation, planning and execution.', parameters: {}, output, presentCall,
+    execute: async () => JSON.stringify(await experimentModelDirectory(ctx)) })))
   ctx.effect(() => ctx.tools.register(defineTool({ name: 'dispatch_experiment', description: 'Dispatch one independent experiment to explicitly selected servers. They jointly execute the same Goal. Captures this Goal revision; retries reuse it. Semi mode confirms the plan and pauses for unresolved decisions; automatic mode continues within immutable requirements.',
     parameters: { objective: { type: 'string', required: true }, server_ids: { type: 'array', items: { type: 'string' }, required: true },
-      files: { type: 'array', items: { type: 'string' } }, mode: { type: 'string', enum: ['semi', 'automatic'], required: true } },
+      files: { type: 'array', items: { type: 'string' } }, name: { type: 'string', description: 'Short experiment title.' },
+      models_json: { type: 'string', required: true, description: 'JSON object with preparation, planning and execution, each containing provider, model and optional reasoningEffort from list_experiment_models.' },
+      mode: { type: 'string', enum: ['semi', 'automatic'], required: true } },
     output, presentCall, execute: async (args, execution) => {
       const agent = execution.agent
-      const record = agent === undefined || ctx.goals.get(agent) === undefined ? await fleet.create({ experimentId: randomUUID(), objective: args.objective, serverIds: args.server_ids, files: args.files ?? [], mode: args.mode === 'semi' ? 'semi' : 'automatic' })
-        : await fleet.createForGoal(agent, args.objective, args.server_ids, args.files ?? [], args.mode === 'semi' ? 'semi' : 'automatic')
+      const models = experimentModelsSchema.parse(JSON.parse(args.models_json))
+      const record = agent === undefined || ctx.goals.get(agent) === undefined ? await fleet.create({ experimentId: randomUUID(), objective: args.objective, serverIds: args.server_ids, files: args.files ?? [], mode: args.mode === 'semi' ? 'semi' : 'automatic', models, ...(args.name === undefined ? {} : { name: args.name }) })
+        : await fleet.createForGoal(agent, args.objective, args.server_ids, args.files ?? [], args.mode === 'semi' ? 'semi' : 'automatic', models, args.name)
       return JSON.stringify(record)
     } })))
   ctx.effect(() => ctx.tools.register(defineTool({ name: 'get_experiment', description: 'Refresh a saved Aspera experiment, including its plan, handover, queue blockers and services.', parameters: { experiment_id: { type: 'string', required: true } }, output, presentCall,

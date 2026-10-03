@@ -26,7 +26,7 @@ Submit multiple independent Goals, stage inputs and transfer complete experiment
 
 The [workspace startup](../../README.md#start-the-management-page) creates an `aspera` profile over published DSH base/Web bundles and this package's [cordis.patch.yml](cordis.patch.yml). It mounts the adapter and management page. Built artifacts can be installed without the Harness source checkout; [installed verification](../../scripts/test-installed.mjs) exercises the same profile and public declarations.
 
-`extensionRoot` selects the fixed release, `dataRoots` allows local input files, and `agentCredentialRefs` names private model credentials. `minimumFreeBytes` configures the storage reserve (default 1 GiB), captured per experiment. Operation, polling and download settings are validated [Config](src/index.ts) fields; the shipped patch reads `ASPERA_DATA_ROOTS` and `ASPERA_MODEL_CREDENTIAL_REFS`. Connection checks do not call a model or create remote directories.
+`extensionRoot` selects the fixed release, `dataRoots` allows local input files, and phase snapshots identify private model credentials. `minimumFreeBytes` configures the storage reserve (default 1 GiB), captured per experiment. Operation, polling and download settings are validated [Config](src/index.ts) fields; the shipped patch reads `ASPERA_DATA_ROOTS` (the legacy `ASPERA_MODEL_CREDENTIAL_REFS` setting is retained for configuration reads). Connection checks do not call a model or create remote directories.
 
 Servers use password login with a separate username. The first saved server is the fixed coordinator; its address, control port and root cannot be changed while it owns state. Repeated SSH addresses/ports are refused. Ordinary server edits do not change pinned experiments. The node uses its configured control port, and the coordinator uses the following port.
 
@@ -36,6 +36,8 @@ Servers use password login with a separate username. The first saved server is t
 
 <a id="understand-the-implementation"></a>
 ## Understand the implementation
+
+Model admission resolves the three explicit choices through the DSH provider directory. [models.ts](src/models.ts) stores private API settings and independent credential references; retries load those snapshots. DeepSeek and supported pi-ai key routes use pinned adapters. Legacy `agentCredentialRefs` remains a configuration-read field; generation 4 transfers only credentials referenced by the admitted phase snapshots.
 
 <details>
 <summary>Implementation internals</summary>
@@ -63,7 +65,7 @@ Dispatch tools list non-secret servers, submit an explicit server group and read
 
 - Public server configuration supports passwords only; there is no password/key priority selection.
 - Host keys must already be trusted in `known_hosts`; an unknown or changed key fails.
-- Released generation-1/2 records remain readable without rewriting hashes; old unfinished preparations use Copy as new experiment.
+- Released generation-1–3 records remain readable without rewriting hashes; old unfinished preparations use Copy as new experiment.
 - Incompatible control upgrades wait for existing tasks and controls to finish.
 
 ### Dev Note

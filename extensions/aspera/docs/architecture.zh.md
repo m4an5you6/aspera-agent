@@ -26,6 +26,8 @@ Aspera 在 Harness 源码树之外管理实验业务。已发布的 DSH 提供�
 | `@aspera/console` | 侧栏页面、表单、记录流和按来源区分的日志游标 | 已发布的 Web 插槽、本地化字典和 Remote 描述 |
 | `@aspera/desktop` | 独立窗口、托盘和本机 profile 生命周期 | Electron 及已发布的 `dsh` profile |
 
+接入层维护两个固定版本的发布包补丁：增加侧栏分组插槽，以及转发现有设置命令。官方窗口、会话与插件管理仍由 DSH 提供。私有模型配置快照分别供准备、计划和执行作用域使用，公开记录只展示模型摘要。
+
 Host 程序依赖已安装包的类型声明。[types/typert-protocol.d.ts](../types/typert-protocol.d.ts) 中的 Typert 兼容声明只用于生成程序，为分析提供注册元数据。[tsdown.config.ts](../packages/console/tsdown.config.ts) 中的浏览器封装负责兼容 Cordis 的 CommonJS 模块加载及 CSS 插入；公开的客户端类型声明与 JavaScript 打包文件独立生成。
 
 -----
@@ -42,6 +44,10 @@ flowchart TB
     Browser[Web browser] --> Page
     Page --> Remote[Typed Remote: RPC + streams]
     Remote --> Fleet[Aspera dispatch: fleet / credentials / Sessions]
+    Fleet --> Models[Private snapshots: preparation / planning / execution]
+    Models --> Selection
+    Models --> Planner
+    Models --> Executor
     Fleet --> Inventory[Read-only SSH: mounts / space / interfaces]
     Inventory --> Selection[Restricted Agent: candidate ID + reason]
     Selection --> Placement[Persist placement before directory creation]

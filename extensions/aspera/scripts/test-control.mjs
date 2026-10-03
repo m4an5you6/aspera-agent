@@ -11,6 +11,8 @@ import { setupWorkerProfile } from '@aspera/runtime'
 import { clusterSubmissionSchema } from '@aspera/experiments'
 import { removeTestDirectory } from './test-app.mjs'
 import { resolvedFixture } from './fixtures/storage.mjs'
+import { fixtureModelSnapshots, fixtureSelections } from './fixtures/models.mjs'
+const modelFixture = fixtureModelSnapshots()
 
 const release = resolve(import.meta.dirname, '..')
 mkdirSync(resolve(release, '.artifacts'), { recursive: true })
@@ -18,7 +20,7 @@ const directory = mkdtempSync(resolve(release, '.artifacts/control-test-'))
 const root = process.platform === 'win32' ? directory.slice(2).replaceAll('\\', '/') : directory
 const id = randomUUID(); const serverId = randomUUID(); const deploymentId = 'a'.repeat(64); const token = 'b'.repeat(64)
 const { server, inventory } = resolvedFixture({ id: serverId, name: 'CPU admission fixture', host: 'fixture.test', sshPort: 22, username: 'trainer', remotePort: 43019, remoteRoot: root, authMode: 'password' }, id, deploymentId)
-const submission = clusterSubmissionSchema.parse({ protocol: 3, experimentId: id, deploymentId, inventories: [{ serverId, inventory }], objective: 'Plan only, awaiting confirmation', coordinator: server,
+const submission = clusterSubmissionSchema.parse({ protocol: 4, name: 'CPU fixture', models: modelFixture.models, experimentId: id, deploymentId, inventories: [{ serverId, inventory }], objective: 'Plan only, awaiting confirmation', coordinator: server,
   nodes: [{ server, devicePaths: ['/dev/nvidia_fixture'], backendPath: '/fixture/bwrap', hiddenPaths: [], gpuInfo: 'CPU fixture; no GPU validation' }],
   inputs: [{ name: 'data.txt', sha256: createHash('sha256').update('dataset row\n').digest('hex') }], createdAt: 1,
   strategy: { mode: 'semi', coordinator: 'single-agent' },
@@ -31,11 +33,11 @@ mkdirSync(resolve(directory, 'releases', deploymentId), { recursive: true })
 writeFileSync(resolve(directory, 'releases', deploymentId, '.ready'), '')
 symlinkSync(resolve(release, 'node_modules'), resolve(directory, 'releases', deploymentId, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir')
 writeFileSync(resolve(run, 'inputs/data.txt'), 'dataset row\n')
-writeFileSync(modelFile, JSON.stringify({ version: 1, refs: {} })); writeFileSync(knownHosts, '')
+writeFileSync(modelFile, JSON.stringify({ version: 1, refs: modelFixture.refs })); writeFileSync(knownHosts, '')
 writeFileSync(resolve(directory, 'secrets/coordinator.token'), token)
 writeFileSync(resolve(directory, 'secrets', id + '.json'), JSON.stringify({ submission,
   connections: [{ serverId, password: 'not-model-visible', token, knownHostsFile: knownHosts }], modelCredentialFile: modelFile,
-  toolTimeoutMs: 1000, agentModel: { provider: 'deepseek', model: 'deepseek-chat' } }))
+  toolTimeoutMs: 1000, agentModel: fixtureSelections.preparation }))
 const planHome = resolve(run, 'agent-homes', 'plan')
 await setupWorkerProfile(planHome, resolve(directory, 'releases', deploymentId))
 writeFileSync(resolve(planHome, 'profiles/aspera-worker/cordis.patch.yml'), JSON.stringify([{ insert: [{ id: 'keyless-plan-replay',
@@ -56,7 +58,7 @@ async function start() {
   child.stdout.on('data', bytes => { output += bytes }); child.stderr.on('data', bytes => { output += bytes })
   const close = async () => { const timer = setTimeout(() => { child.kill('SIGKILL') }, 10000); child.kill('SIGTERM'); try { await exited } finally { clearTimeout(timer) } }
   try {
-    const deadline = Date.now() + 30000
+    const deadline = Date.now() + 60000
     while (!existsSync(ready)) { if (child.exitCode !== null || Date.now() >= deadline) throw new Error('Control startup failed: ' + output.slice(-4000)); await delay(50) }
     const port = JSON.parse(readFileSync(ready, 'utf8')).port
     while (true) {
@@ -86,7 +88,8 @@ try {
   writeFileSync(privatePath, JSON.stringify(materials))
   const receipt = await control.request('submit', submission)
   assert.equal(receipt.status, 200); assert.equal(receipt.value.handover, '本机派发完成，远端实验已接管')
-  const deadline = Date.now() + 30000; let planned
+  // Planning includes a fresh profile boot; use the profile smoke's 60-second bound.
+  let deadline = Date.now() + 60000; let planned
   while (Date.now() < deadline) {
     planned = await control.request('status', { experimentId: id })
     if (planned.value.record?.state === 'waiting-reply') break
@@ -105,6 +108,7 @@ try {
   const replies = await Promise.all([control.request('answer-question', reply), control.request('answer-question', reply)])
   assert.ok(replies.every(item => item.status === 200))
   assert.equal((await control.request('answer-question', { ...reply, answer: { answers: [{ id: 'trial', selected: ['Stop for a revised experiment'] }] } })).status, 400)
+  deadline = Date.now() + 60000
   while (Date.now() < deadline) {
     planned = await control.request('status', { experimentId: id })
     if (planned.value.record?.state === 'awaiting-approval') break

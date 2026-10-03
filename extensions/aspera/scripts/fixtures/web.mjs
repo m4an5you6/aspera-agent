@@ -6,14 +6,15 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import { ClusterQueue, clusterRecordSchema, clusterFiles, clusterPath, readClusterChunk } from '@aspera/experiments'
+import { ClusterQueue, clusterRecordSchema, clusterFiles, clusterPath, readClusterChunk, processLogRequestSchema } from '@aspera/experiments'
 import { AsperaRemote, Config as AdapterConfig } from '@aspera/dispatch'
 import { ExperimentFleet } from '@aspera/dispatch/fleet'
 import { ExperimentDownloads } from '@aspera/dispatch/downloads'
 import { inventory, installStorageReplay } from './storage.mjs'
+import { readPhaseRecords } from '../../packages/runtime/lib/records.js'
 import { openInferenceGateway } from '../../packages/runtime/lib/inference-gateway.js'
 
-export const inject = ['storage', 'storageDomain', 'agents', 'goals', 'credentials', 'agentDefaultModel', 'sessionPersistence', 'subprocess', 'webServer', 'llm']
+export const inject = ['storage', 'storageDomain', 'agents', 'goals', 'credentials', 'agentDefaultModel', 'sessionPersistence', 'subprocess', 'webServer', 'llm', 'settings']
 
 export async function apply(ctx, config) {
   if (config.role === 'service') {
@@ -21,8 +22,11 @@ export async function apply(ctx, config) {
     ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/', handler: (_req, res) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ prediction: 'CPU fixture response' })) } }))
     writeFileSync(config.ready + '.incoming', JSON.stringify({ port: ctx.webServer.port }))
     renameSync(config.ready + '.incoming', config.ready)
+    process.stdout.write('CPU fixture service ready\n')
+    process.stderr.write('CPU fixture diagnostic stream\n')
     return
   }
+  await ctx.credentials.set('ASPERA_FIXTURE_API_KEY', 'cpu-only-fixture-key')
   const root = config.root
   mkdirSync(root, { recursive: true })
   const path = remote => resolve(root, remote.replace(/^\/+/, ''))
@@ -36,7 +40,7 @@ export async function apply(ctx, config) {
   ctx.on('session/event', (session, event) => {
     const match = /^aspera-(dispatch|fixture-plan|fixture-execution)-(.+)$/.exec(session.id)
     if (match === null) return
-    const id = match[2]; const source = match[1]
+    const id = match[2]; const source = match[1] === 'fixture-plan' ? 'plan' : match[1] === 'fixture-execution' ? 'execution' : match[1]
     const envelope = { sessionId: session.id, source, event }
     events.push(envelope)
     mkdirSync(runPath(id, ''), { recursive: true })
@@ -50,6 +54,7 @@ export async function apply(ctx, config) {
       const goal = ctx.goals.create(handle.agent, { objective: record.submission.objective })
       ctx.goals.disarm(handle.agent)
       handle.agent.session.append('user/message', createUserMessage({ source: { kind: 'aspera', experimentId: record.submission.experimentId }, content: [{ type: 'text', text }] }), { surfaceOp: 'append' })
+      if (role === 'execution') handle.agent.session.append('tool/call', { turn: 0, step: 0, callId: 'cpu-service-call', name: 'run_experiment_command', arguments: JSON.stringify({ server_id: record.submission.nodes[0].server.id, run_id: 'fixture-service', command: 'dsh --profile cpu-service' }) })
       ctx.goals.complete(handle.agent, { id: goal.id, revision: goal.revision })
       await ctx.sessionPersistence.flush()
       return { sessionId, goalId: goal.id }
@@ -99,8 +104,9 @@ export async function apply(ctx, config) {
       ] }]))
       const handle = ctx.subprocess.spawn({ argv: [process.execPath, resolve(config.release, 'node_modules/@deepseek-ai/dsh/lib/bin.js'), '--profile', 'cpu-service'],
         cwd: config.release, env: { DSH_HOME: home, DSH_TELEMETRY_DISABLED: '1' }, graceMs: 3000, stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' } })
-      handle.stdout?.on('data', bytes => { appendFileSync(runPath(id, 'agent.log'), bytes) })
-      handle.stderr?.on('data', bytes => { appendFileSync(runPath(id, 'agent.log'), bytes) })
+      for (const stream of ['stdout', 'stderr']) writeFileSync(runPath(id, `process-${stream}.log`), '')
+      handle.stdout?.on('data', bytes => { appendFileSync(runPath(id, 'agent.log'), bytes); appendFileSync(runPath(id, 'process-stdout.log'), bytes) })
+      handle.stderr?.on('data', bytes => { appendFileSync(runPath(id, 'agent.log'), bytes); appendFileSync(runPath(id, 'process-stderr.log'), bytes) })
       const owned = { handle, stopping: false, service: undefined }
       children.set(id, owned)
       const cancelled = () => { handle.terminate() }
@@ -172,6 +178,14 @@ export async function apply(ctx, config) {
       const record = queue.get(id)
       if (record === undefined) throw new Error('experiment not found')
       if (body.serverId !== undefined && !record.submission.nodes.some(node => node.server.id === body.serverId)) throw new Error('node is outside this experiment')
+      if (operation === 'records') return { status: 200, value: await readPhaseRecords(runPath(id, 'events.jsonl'), body, body.phase === 'planning' ? record.planningSessionId : record.sessionId, 65536) }
+      if (operation === 'processes') return { status: 200, value: children.get(id)?.service === undefined ? [] : [{ experimentId: id, serverId: body.serverId, commandId: 'fixture-service', command: 'dsh --profile cpu-service', state: 'running', released: false, exitCode: null, streams: ['stdout', 'stderr'] }] }
+      if (operation === 'process-log') {
+        const request = processLogRequestSchema.parse(body); const cursor = request.cursor
+        if (request.commandId !== 'fixture-service' || (cursor !== undefined && ['experimentId', 'serverId', 'commandId', 'stream'].some(key => cursor[key] !== request[key]))) throw new Error('CPU log source mismatch')
+        const chunk = readClusterChunk(runPath(id, `process-${request.stream}.log`), cursor?.offset ?? 0, cursor?.generation, 65536)
+        return { status: 200, value: { chunk, missing: chunk.generation === '', cursor: { experimentId: id, serverId: request.serverId, commandId: request.commandId, stream: request.stream, generation: chunk.generation, offset: chunk.nextOffset } } }
+      }
       if (operation === 'files') return { status: 200, value: clusterFiles(runPath(id, 'workspace'), body.serverId, 100) }
       if (['events', 'log', 'agent-log', 'file'].includes(operation)) {
         const file = operation === 'file' ? clusterPath(runPath(id, 'workspace'), body.path) : runPath(id, operation === 'events' ? 'events.jsonl' : operation === 'agent-log' ? 'agent.log' : 'node.log')

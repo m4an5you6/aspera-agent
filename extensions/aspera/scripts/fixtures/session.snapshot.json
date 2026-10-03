@@ -1,12 +1,57 @@
 {
-  "dispatchGoalPhases": ["active", "complete"],
-  "handover": ["本机派发完成，远端实验已接管"],
-  "inference": { "mapped": true, "external": "reachable", "modelName": "cpu-fixture", "stopped": "stopped" },
-  "storageTools": ["inspect_server_storage", "select_experiment_storage"],
-  "storage": [{ "layout": "separated", "systemVolume": false, "persistence": "unknown" }],
+  "dispatchGoalPhases": [
+    "active",
+    "complete"
+  ],
+  "handover": [
+    "本机派发完成，远端实验已接管"
+  ],
+  "inference": {
+    "mapped": true,
+    "external": "reachable",
+    "modelName": "cpu-fixture",
+    "stopped": "stopped"
+  },
+  "storageTools": [
+    "inspect_server_storage",
+    "select_experiment_storage"
+  ],
+  "storage": [
+    {
+      "layout": "separated",
+      "systemVolume": false,
+      "persistence": "unknown"
+    }
+  ],
   "receiptStates": [
-    { "goal": "CPU failure experiment", "handover": "本机派发完成，远端实验已接管", "state": "failed" },
-    { "goal": "CPU semi experiment", "handover": "本机派发完成，远端实验已接管", "state": "completed" },
-    { "goal": "CPU shared experiment", "handover": "本机派发完成，远端实验已接管", "state": "cancelled" }
-  ]
+    {
+      "goal": "CPU failure experiment",
+      "handover": "本机派发完成，远端实验已接管",
+      "state": "failed"
+    },
+    {
+      "goal": "CPU semi experiment",
+      "handover": "本机派发完成，远端实验已接管",
+      "state": "completed"
+    },
+    {
+      "goal": "CPU shared experiment",
+      "handover": "本机派发完成，远端实验已接管",
+      "state": "cancelled"
+    }
+  ],
+  "agentModels": {
+    "preparation": {
+      "provider": "aspera-cpu",
+      "model": "qwen-preparation"
+    },
+    "planning": {
+      "provider": "aspera-cpu",
+      "model": "qwen-planning"
+    },
+    "execution": {
+      "provider": "aspera-cpu",
+      "model": "qwen-execution"
+    }
+  }
 }

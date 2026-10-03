@@ -15,8 +15,10 @@ import { readClusterChunk } from '@aspera/experiments'
 import { clusterNodeRequest, readClusterPrivate, RemoteClusterExecutor, validateClusterAdmission, clusterRunRoot } from './cluster-runtime.ts'
 import { serverRunRoot } from './storage.ts'
 import type { ClusterRuntimeConfig } from './cluster-runtime.ts'
+import { readPhaseRecords } from './records.ts'
+import { agentRecordRequestSchema } from '@aspera/experiments'
 
-const storeSpec = defineDomain({ name: 'aspera_queue', version: 3, compatibleVersions: [1, 2], layout: 'per-record',
+const storeSpec = defineDomain({ name: 'aspera_queue', version: 4, compatibleVersions: [1, 2, 3], layout: 'per-record',
   tables: { experiments: domainTable<ExperimentId, ClusterRecord>(clusterRecordSchema) } })
 
 /** Worker-profile role settings. */
@@ -48,7 +50,7 @@ export async function applyClusterRole(ctx: Context, config: ClusterRoleConfig):
       await runClusterAgent(ctx, config, id, config.role === 'planner')
     })().catch((error: unknown) => {
         ctx.logger.error(String(error))
-        writeFileSync(resolve(clusterRunRoot(config.root, id), config.role === 'planner' ? 'planning-outcome.json' : 'outcome.json'), JSON.stringify({ state: 'failed', detail: String(error) }), { mode: 0o600 })
+        writeFileSync(resolve(clusterRunRoot(config.root, id), config.role === 'planner' ? 'planning-outcome.json' : 'outcome.json'), JSON.stringify({ state: 'failed', detail: `${config.role === 'planner' ? 'planning' : 'execution'}: ${String(error)}` }), { mode: 0o600 })
         process.kill(process.pid, 'SIGTERM')
       })
     return
@@ -79,10 +81,10 @@ export async function applyClusterRole(ctx: Context, config: ClusterRoleConfig):
     if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) { respond(401, { error: 'unauthorized' }); return }
     try {
       const requestedPath = new URL(req.url ?? '/', 'http://localhost').pathname
-      if (!/^\/aspera\/v[123]\//.test(requestedPath)) { respond(404, { error: 'unsupported control protocol' }); return }
-      const path = requestedPath.replace(/^\/aspera\/v[23]\//, '/aspera/v1/')
+      if (!/^\/aspera\/v[1234]\//.test(requestedPath)) { respond(404, { error: 'unsupported control protocol' }); return }
+      const path = requestedPath.replace(/^\/aspera\/v[234]\//, '/aspera/v1/')
       if (req.method === 'GET' && path === '/aspera/v1/health') {
-        respond(200, { protocol: 3, role: config.role, deploymentId: config.deploymentId, features: ['public-inference-v1'],
+        respond(200, { protocol: 4, role: config.role, deploymentId: config.deploymentId, features: ['public-inference-v1'],
           ...(node === undefined ? {} : { node: await node('health', {}) }) })
         return
       }
@@ -152,6 +154,15 @@ export async function applyClusterRole(ctx: Context, config: ClusterRoleConfig):
       }
       if (path === '/aspera/v1/status') { respond(200, { record, waitingFor: queue.waitingFor(input.experimentId) }); return }
       const operation = path.slice('/aspera/v1/'.length)
+      if (operation === 'records') {
+        const request = agentRecordRequestSchema.parse(body)
+        if (request.phase === 'preparation') throw new Error('Preparation records belong to the dispatch Host')
+        const sessionId = request.phase === 'planning' ? record.planningSessionId : record.sessionId
+        const sourceId = sessionId ?? (record.submission.protocol === 4 ? `aspera-${request.phase === 'planning' ? 'plan' : 'execution'}-${input.experimentId}` : undefined)
+        respond(200, sourceId === undefined ? { records: [], hasMore: false, missing: true, reset: false }
+          : await readPhaseRecords(resolve(serverRunRoot(record.submission.coordinator, input.experimentId), 'events.jsonl'), request, sourceId, config.chunkBytes))
+        return
+      }
       if (operation === 'events' || operation === 'agent-log') {
         const cursor = z.object({ offset: z.number().int().nonnegative(), generation: z.string().optional() }).parse(body)
         respond(200, readClusterChunk(resolve(serverRunRoot(record.submission.coordinator, input.experimentId),
@@ -159,7 +170,7 @@ export async function applyClusterRole(ctx: Context, config: ClusterRoleConfig):
         cursor.offset, cursor.generation, config.chunkBytes))
         return
       }
-      if (operation === 'files' || operation === 'file' || operation === 'log') {
+      if (operation === 'files' || operation === 'file' || operation === 'log' || operation === 'processes' || operation === 'process-log') {
         const target = z.object({ serverId: serverIdSchema }).parse(body)
         respond(200, await clusterNodeRequest(readClusterPrivate(config.root, input.experimentId), target.serverId, operation, input))
         return

@@ -39,7 +39,7 @@ export async function ensureClusterRole(target: DeploymentConfig, prepared: Prep
   password: string | undefined, signal: AbortSignal): Promise<void> {
   const control = { ...target, remotePort: target.remotePort + (role === 'coordinator' ? 1 : 0) }
   const compatible = (value: unknown) => {
-    const health = z.object({ protocol: z.literal(3), role: z.literal(role), deploymentId: z.string().regex(/^[a-f0-9]{64}$/), features: z.array(z.string()).optional() }).safeParse(value)
+    const health = z.object({ protocol: z.literal(4), role: z.literal(role), deploymentId: z.string().regex(/^[a-f0-9]{64}$/), features: z.array(z.string()).optional() }).safeParse(value)
     return health.success && health.data.features?.includes('public-inference-v1') === true
   }
   if (control.remotePort > 65535) throw new Error('coordinator port exceeds 65535')

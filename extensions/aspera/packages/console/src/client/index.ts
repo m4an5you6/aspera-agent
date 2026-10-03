@@ -8,12 +8,14 @@ import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
 import type { MainPanelId } from '@deepseek-ai/dsh-client-ui-layout/client'
 import type { Config } from '../config.ts'
 import { ExperimentsController } from './controller.ts'
-import { ExperimentsIcon, ExperimentsPage } from './ExperimentsPage.tsx'
+import { ExperimentsPage } from './ExperimentsPage.tsx'
+import { AsperaSidebar } from './AsperaSidebar.tsx'
+import type { ShortcutCommandId } from '@deepseek-ai/dsh-client-shortcuts/client'
 import { en, zh } from './locales.ts'
 import { experimentAttentionCount } from './attention.ts'
 export { Config } from '../config.ts'
 
-export const inject = ['slots', 'locale', 'remote']
+export const inject = ['slots', 'locale', 'remote', 'layout', 'shortcuts']
 
 /**
  * @param ctx - browser plugin context.
@@ -55,10 +57,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     scope.slots.inject('main', () => scope.slots.register({ name: 'main', key: panel, locale: 'experiments',
       inject: () => ({ controller, hooks: { experiments: controller.store } }),
     }, ExperimentsPage))
-    scope.slots.inject('sidebar.panellist', () => scope.slots.register({ name: 'sidebar.panellist', id: panel, order: 5,
+    scope.slots.inject('sidebar.sections', () => scope.slots.register({ name: 'sidebar.sections', id: panel, order: 5,
       label: () => t('title'), locale: 'experiments',
-      inject: () => ({ controller, hooks: { experiments: controller.store } }),
-    }, ExperimentsIcon))
+      inject: () => ({ controller, hooks: { experiments: controller.store },
+        navigate: (view: 'list' | 'servers' | 'services') => { controller.navigate(view); scope.layout.selectPanel(panel) },
+        manageModels: () => { queueMicrotask(() => { scope.shortcuts.invoke('settings.open' as ShortcutCommandId, { source: 'menu', region: 'page', modal: null, target: null }) }) },
+      }),
+    }, AsperaSidebar))
   })
 }
 

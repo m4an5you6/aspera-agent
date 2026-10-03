@@ -1,6 +1,7 @@
 /** Browser-safe experiment dispatch records. */
 import type { ClusterRecord, ClusterSubmission, ExperimentId, ExperimentServerId, ExperimentBudget, ServerSettings, ServerInventory, StoragePlacement, InferenceMapping } from '@aspera/experiments/types'
 import type { ModelSelection } from '@deepseek-ai/dsh-agent'
+import type { ExperimentModels, ExperimentModelSnapshots } from '@aspera/experiments/types'
 
 declare module '@deepseek-ai/cordis' {
   interface Events {
@@ -33,6 +34,8 @@ export type { ClusterChunk, ClusterFile, ClusterRecord, ClusterServer, ClusterSt
 /** Browser goal and explicit joint participants, before request parsing. */
 export interface FleetCreateRequest {
   experimentId: string
+  name?: string
+  models?: ExperimentModels
   objective: string
   serverIds: string[]
   files?: string[]
@@ -52,13 +55,14 @@ export interface FleetRegistry {
 
 /** Concrete input and execution evidence for one independently dispatched experiment. */
 export interface FleetExperiment {
-  request: { experimentId: ExperimentId; objective: string; serverIds: ExperimentServerId[]; files: string[]; uploads: { name: string; size: number }[]; mode: 'semi' | 'automatic'; budget?: ExperimentBudget }
+  request: { experimentId: ExperimentId; objective: string; serverIds: ExperimentServerId[]; files: string[]; uploads: { name: string; size: number }[]; mode: 'semi' | 'automatic'; budget?: ExperimentBudget; name?: string; models?: ExperimentModels }
   coordinator: ServerSettings
   servers: ServerSettings[]
   coordinatorTarget: PinnedDeployment
   targets: PinnedDeployment[]
   createdAt: number
   agentModel: ModelSelection
+  models?: ExperimentModelSnapshots
   state: 'staging' | 'preparing' | 'submitted' | 'failed' | 'cancelled'
   detail?: string | undefined
   sessionId: string
@@ -70,7 +74,7 @@ export interface FleetExperiment {
   handoverRecorded: boolean
   latest?: ClusterRecord | undefined
   waitingFor: ExperimentServerId[]
-  preparation?: { protocol: 3; stage: 'inspecting' | 'selecting-storage' | 'preparing-storage' | 'deploying' | 'checking-network' | 'transferring' | 'submitting';
+  preparation?: { protocol: 3 | 4; stage: 'inspecting' | 'selecting-storage' | 'preparing-storage' | 'deploying' | 'checking-network' | 'transferring' | 'submitting';
     inventories: { serverId: ExperimentServerId; inventory: ServerInventory }[]; placements: StoragePlacement[];
     inputs?: { name: string; sha256: string }[] }
 }

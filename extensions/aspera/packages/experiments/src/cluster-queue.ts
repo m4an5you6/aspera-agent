@@ -83,7 +83,7 @@ export class ClusterQueue {
   /** Recover queued work while never replaying an ambiguous execution. */
   async recover(): Promise<void> {
     for (const record of this.list()) {
-      if (record.state === 'waiting-reply' || (record.submission.protocol !== 3 && ['preparing', 'queued', 'awaiting-approval'].includes(record.state))) {
+      if (record.state === 'waiting-reply' || (record.submission.protocol !== 4 && ['preparing', 'queued', 'awaiting-approval'].includes(record.state))) {
         await this.save(record, { state: 'interrupted', detail: 'Execution was interrupted; questions expired. Copy the experiment to retry.' })
       }
       if (record.state === 'planning') {
@@ -117,7 +117,7 @@ export class ClusterQueue {
         if (previous.payloadHash !== payloadHash) throw new Error('experiment id is already bound to different requirements')
         return previous
       }
-      if (submission.protocol !== 3) throw new Error('New admission requires protocol 3; legacy experiments retain their original release.')
+      if (submission.protocol !== 4) throw new Error('New admission requires protocol 4; legacy experiments retain their original release.')
       const last = this.list().at(-1)
       const created: ClusterRecord = { submission, payloadHash, sequence: (last?.sequence ?? -1) + 1,
         revision: 1, state: this.executor.prepare === undefined ? 'queued' : 'preparing', resourcesReleased: true,
@@ -221,7 +221,7 @@ export class ClusterQueue {
     const question = experimentQuestionSchema.parse(raw)
     return this.serial(async () => {
       const record = this.required(id)
-      if (record.submission.protocol !== 3 || record.submission.strategy.mode !== 'semi') throw new Error('Human answers are unavailable for this execution policy')
+      if (record.submission.protocol !== 4 || record.submission.strategy.mode !== 'semi') throw new Error('Human answers are unavailable for this execution policy')
       if (!this.active.has(id) || !['planning', 'starting', 'running', 'waiting-reply'].includes(record.state)) throw new Error('Experiment cannot accept a question')
       if (question.experimentId !== id || question.state !== 'open' || question.answer !== undefined || question.answeredAt !== undefined) throw new Error('Invalid new question')
       const sessionId = question.stage === 'planning' ? record.planningSessionId ?? `aspera-plan-${id}` : record.sessionId ?? `aspera-execution-${id}`

@@ -24,7 +24,7 @@ Manage remote experiments in a dedicated page while keeping ordinary conversatio
 <a id="use-this-package"></a>
 ## Use this package
 
-The dispatch bundle mounts this plugin in the independent [management profile](../../README.md#start-the-management-page). Its manifest projects `./client` into the Web client; it has separate Host/client compiler programs and published client declarations. No conversation route, upstream page or custom-event whitelist is patched.
+The dispatch bundle mounts this plugin in the independent [management profile](../../README.md#start-the-management-page). Its manifest projects `./client` into the Web client; it has separate Host/client compiler programs and published client declarations. The pinned sidebar and settings-command patches are owned by the [Aspera adapter](../../docs/architecture.md#components).
 
 [Config](src/config.ts) selects page polling, retained text length and the initial control port for new server forms. Text retention limits apply to displayed tails, not remote files. [AsperaRemote](../dispatch/src/index.ts) supplies operation defaults and validated state; typed English/Chinese dictionaries own all product labels.
 
@@ -38,6 +38,8 @@ The controller refreshes pending state even when Aspera is not open. Sidebar, li
 
 <a id="understand-the-implementation"></a>
 ## Understand the implementation
+
+The official sidebar hosts one collapsible Aspera group without a disclosure arrow. Its gear opens Aspera model settings; the configuration entry invokes the official DSH settings command. Three-phase selection reuses the configured provider accounts. Agent records default to a trajectory with independently scrolling events/details; runtime monitoring separates node/process streams and supports bounded follow, pause and search. Reminder dismissal persists by experiment, decision kind and revision; new decisions reappear without changing the shared attention count.
 
 <details>
 <summary>Implementation internals</summary>

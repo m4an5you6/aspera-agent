@@ -40,3 +40,4 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 export type { AsperaMessageSource } from './messages.ts'
 
 export { setupWorkerProfile } from './profiles.ts'
+export { openPhaseModelContext, privateModelConfigurationSchema } from './phase-model.ts'

@@ -7,6 +7,8 @@ import { createServer } from 'node:net'
 import { chromium, expect as baseExpect } from '@playwright/test'
 import { command, launchProfile, openAspera, removeTestDirectory } from './test-app.mjs'
 
+import { fixtureOptions, fixtureProvider } from './fixtures/models.mjs'
+
 const root = resolve(import.meta.dirname, '..')
 const expect = baseExpect.configure({ timeout: 40000 })
 // Fresh published DSH profiles have measured 128 s cold starts on Windows; readiness still requires the profile's own signal.
@@ -26,13 +28,15 @@ writeFileSync(resolve(profile, 'cordis.patch.yml'), JSON.stringify([
   { id: 'client-hmr', disabled: true },
   { id: 'aspera-dispatch', disabled: true },
   { id: 'aspera-console', config: { pollIntervalMs: 500 } },
+  { id: 'llm-pi-ai', config: { providers: { [fixtureProvider]: fixtureOptions } } },
+  { id: 'agent-default-model', config: { provider: fixtureProvider, model: 'qwen-preparation' } },
   { insert: [{ id: 'aspera-test-fixture', name: pathToFileURL(resolve(root, 'scripts/fixtures/web.mjs')).href,
     config: { role: 'web', root: resolve(directory, 'remote'), release: root, profileStartupMs } }] },
 ]))
 let app; let browser; let page
 try {
   app = await launchProfile(root, home, 'aspera', {}, profileStartupMs)
-  browser = await chromium.launch({ channel: process.env.ASPERA_BROWSER_CHANNEL || 'chrome', headless: true })
+  browser = await chromium.launch({ ...(process.env.ASPERA_BROWSER_EXECUTABLE ? { executablePath: process.env.ASPERA_BROWSER_EXECUTABLE } : { channel: process.env.ASPERA_BROWSER_CHANNEL || 'chrome' }), headless: true })
   const context = await browser.newContext({ acceptDownloads: true })
   const errors = []
   context.on('page', opened => {
@@ -41,6 +45,22 @@ try {
   })
   page = await context.newPage()
   await openAspera(page, app.url)
+  const group = () => page.getByRole('button', { name: 'Aspera', exact: true })
+  await group().click()
+  await expect(page.getByRole('button', { name: /^(服务器|Servers)$/ })).toHaveCount(0)
+  await page.reload()
+  await expect(group()).toHaveAttribute('aria-expanded', 'false')
+  await group().click()
+  await page.getByRole('button', { name: /Aspera 模型设置|Aspera model settings/ }).click()
+  await expect(page.getByRole('dialog')).toContainText(/Aspera 模型设置|Aspera model settings/)
+  await page.getByRole('button', { name: /管理模型 API|Manage model APIs/ }).click()
+  await expect(page.getByRole('dialog')).toContainText(/模型|Models/)
+  await page.keyboard.press('Escape')
+  await page.getByRole('button', { name: /^(插件|Plugins)$/ }).click()
+  await expect(page.getByRole('button', { name: /添加插件|Add plugin/ })).toBeEnabled()
+  await page.getByText(/^(新会话|New session)$/).first().click()
+  await expect(page.getByRole('heading', { name: /^(实验|Experiments)$/ })).toHaveCount(0)
+  await page.getByRole('button', { name: /^(实验|Experiments)$/ }).click()
   await page.getByRole('button', { name: /^(服务器|Servers)$/ }).click()
   for (const name of ['CPU A', 'CPU B']) {
     await page.getByRole('button', { name: /^(添加服务器|Add server)$/ }).click()
@@ -69,8 +89,15 @@ try {
     await expect(page.getByRole('heading', { name: new RegExp(name) })).toBeVisible()
   }
   async function create(goal, server, mode = 'automatic', upload = false) {
+    await page.getByRole('button', { name: /^(实验|Experiments)$/ }).click()
     await page.getByRole('button', { name: /^(新建实验|New experiment)$/ }).click()
+    await page.getByLabel(/^(实验名称|Experiment name)$/).fill(goal)
     await page.getByLabel('Goal', { exact: true }).fill(goal)
+    await expect(page.getByRole('button', { name: /^(准备模型|Preparation model)$/ })).toContainText('CPU Qwen preparation')
+    await page.getByRole('button', { name: /^(计划模型|Planning model)$/ }).click()
+    await page.getByRole('menuitem', { name: /CPU Qwen planning/ }).click()
+    await page.getByRole('button', { name: /^(执行模型|Execution model)$/ }).click()
+    await page.getByRole('menuitem', { name: /CPU Qwen execution/ }).click()
     await page.getByRole('checkbox', { name: new RegExp(server) }).check()
     if (mode === 'semi') await page.getByRole('button', { name: /半自动执行|Semi-automatic/ }).click()
     if (upload) await page.locator('input[name=uploads]').setInputFiles({ name: 'data.txt', mimeType: 'text/plain', buffer: Buffer.from('dataset') })
@@ -92,12 +119,18 @@ try {
   await expect(page.getByRole('button', { name: /^(确认此计划|Confirm this plan)$/ })).toBeVisible()
   const semi = (await control()).experiments.find(row => row.request.objective === 'CPU semi experiment')
   assert.equal(semi.latest.resourcesReleased, true)
-  assert.equal(semi.submission.protocol, 3)
+  assert.equal(semi.submission.protocol, 4)
   assert.equal(semi.submission.versions.extension, '0.1.1')
   assert.deepEqual(semi.submission.nodes[0].server.inferenceMapping, { url: externalUrl, port: mappedPort })
   assert.equal(semi.preparation.placements[0].layout, 'separated')
   assert.equal(semi.preparation.placements[0].candidate.persistence, 'unknown')
   await page.screenshot({ path: resolve(root, '.artifacts/web-storage-plan.png'), fullPage: true })
+  await page.getByRole('button', { name: /^(返回|Back)$/ }).click()
+  await expect(page.getByText(/首次等待计划确认时，不占用训练服务器或 GPU|Initial plan confirmation does not reserve/)).toBeVisible()
+  await page.getByRole('button', { name: /关闭本次提醒|Dismiss this reminder/ }).click()
+  await page.reload(); await openAspera(page, app.url)
+  await expect(page.getByRole('button', { name: /关闭本次提醒|Dismiss this reminder/ })).toHaveCount(0)
+  await expect(page.getByLabel(/1 个实验待处理|1 experiments need attention/)).toBeVisible()
   await create('CPU independent experiment', 'CPU B')
   await expect(page.getByRole('status')).toHaveText(/服务中|Serving/, { timeout: profileStartupMs })
   await page.getByRole('button', { name: /^(返回|Back)$/ }).click()
@@ -116,8 +149,8 @@ try {
   assert.equal(JSON.stringify(saved.experiments).includes('test-fixture-password'), false)
   await page.getByRole('button', { name: /^(返回|Back)$/ }).click()
   await page.getByRole('button').filter({ has: page.getByText('CPU semi experiment', { exact: true }) }).click()
-  await page.getByRole('button', { name: /^(节点日志|Node logs)$/ }).click()
-  const log = () => page.getByRole('region', { name: /^(节点日志|Node logs)$/ }).locator('pre').first()
+  await page.getByRole('button', { name: /^(运行监控|Runtime monitor)$/ }).click()
+  const log = () => page.getByRole('region', { name: /^(运行监控|Runtime monitor)$/ }).locator('pre').first()
   await expect(log()).toContainText('服务健康')
   await context.setOffline(true)
   await control('append', first.request.experimentId)
@@ -126,9 +159,36 @@ try {
   await control('rotate', first.request.experimentId)
   await expect(page.getByText(/日志已轮转|log was rotated/)).toBeVisible()
   await expect(log()).toContainText('轮转后日志')
-  await page.getByRole('button', { name: /^(执行会话|Execution conversation)$/ }).click()
+  await page.getByRole('button', { name: /^(Agent 记录|Agent records)$/ }).click()
+  await page.getByRole('button', { name: /^(计划|Planning)$/ }).click()
+  await page.getByRole('button', { name: /^(对话|Conversation)$/ }).click()
   await expect(page.getByText('Prepare a CPU fixture service in the experiment directory.', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: /^(执行|Execution)$/ }).click()
   await expect(page.getByText('Run the approved CPU fixture plan.', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: /^(轨迹|Trajectory)$/ }).click()
+  await page.getByRole('listitem').filter({ hasText: 'run_experiment_command' }).click()
+  await page.screenshot({ path: resolve(root, '.artifacts/web-agent-trace.png'), fullPage: true })
+  await page.getByRole('button', { name: /^(原始内容|Raw content)$/ }).click()
+  const inspector = page.getByRole('complementary', { name: /事件详情|Event details/ })
+  assert.ok((await inspector.boundingBox()).height >= 230, 'The event inspector must retain readable height')
+  await page.evaluate(() => { document.body.dataset.dsDarkTheme = '' })
+  await page.screenshot({ path: resolve(root, '.artifacts/web-agent-trace-dark.png'), fullPage: true })
+  await page.setViewportSize({ width: 1000, height: 760 })
+  await expect(inspector).toBeInViewport()
+  await page.screenshot({ path: resolve(root, '.artifacts/web-agent-trace-narrow.png'), fullPage: true })
+  await page.evaluate(() => { delete document.body.dataset.dsDarkTheme })
+  await page.setViewportSize({ width: 1280, height: 720 })
+  await inspector.getByRole('button', { name: /^(概览|Overview)$/ }).click()
+  await page.getByRole('button', { name: /查看日志|View logs/ }).click()
+  await expect(page.getByRole('region', { name: /运行监控|Runtime monitor/ })).toBeVisible()
+  const processOutput = page.getByRole('region', { name: /运行监控|Runtime monitor/ }).locator('pre')
+  await expect(processOutput).toContainText('CPU fixture service ready')
+  await page.getByRole('button', { name: /^(暂停跟随|Pause follow)$/ }).click()
+  await page.getByRole('button', { name: /^(节点日志|Node logs)$/ }).click()
+  await page.getByRole('menuitem', { name: 'stderr', exact: true }).click()
+  await expect(processOutput).toContainText('CPU fixture diagnostic stream')
+  await expect(processOutput).not.toContainText('CPU fixture service ready')
+  await page.screenshot({ path: resolve(root, '.artifacts/web-process-log.png'), fullPage: true })
   await page.getByRole('button', { name: /^(输出文件|Output files)$/ }).click()
   const downloadEvent = page.waitForEvent('download')
   await page.getByRole('button', { name: /^(下载|Download)$/ }).click()
@@ -202,6 +262,7 @@ try {
   const final = await control()
   const dispatchEvents = final.events.filter(item => item.sessionId === first.sessionId)
   const snapshot = {
+    agentModels: Object.fromEntries(Object.entries(first.models).map(([phase, model]) => [phase, { provider: model.provider, model: model.model }])),
     dispatchGoalPhases: dispatchEvents.filter(item => item.event.type === 'goal/change').map(item => item.event.data.goal?.phase),
     handover: dispatchEvents.filter(item => item.event.type === 'user/message' && item.event.data.content[0].text.startsWith('本机派发完成')).map(item => item.event.data.content[0].text.split('\n')[0]),
     storageTools: final.storageCalls.filter(item => item.experimentId === first.request.experimentId).map(item => item.name),
@@ -220,6 +281,7 @@ try {
   if (page !== undefined && !page.isClosed()) {
     await page.screenshot({ path: resolve(root, '.artifacts/web-failure.png'), fullPage: true })
     console.error((await page.locator('body').innerText()).slice(-5000))
+    console.error((await page.locator('details').allTextContents()).map(value => value.slice(0, 1000)))
   }
   console.error('Web test profile tail: ' + (app?.output() ?? '').replace(/token=[A-Za-z0-9_-]+/g, 'token=<redacted>').slice(-7000))
   throw error

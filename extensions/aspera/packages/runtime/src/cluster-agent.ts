@@ -22,6 +22,7 @@ import type { ClusterRuntimeConfig, ClusterPrivate } from './cluster-runtime.ts'
 import { installGoalContinuation } from './continuation.ts'
 import { installExperimentQuestions } from './questions.ts'
 import { serverRunRoot } from './storage.ts'
+import { openPhaseModelContext } from './phase-model.ts'
 
 const output = { schema: { type: 'string' as const }, render: (_args: object, value: string) => [{ type: 'text' as const, text: value }] }
 const presentCall = (args: object) => ({ card: 'generic' as const, title: 'Aspera node operation', kind: 'other' as const, rawInput: args })
@@ -117,8 +118,13 @@ export async function runClusterAgent(ctx: Context, config: ClusterRuntimeConfig
       ctx.logger.error(String(error)); writeClusterReceipt(config.root, id, { state: 'failed', detail: String(error) }, planning ? 'planning-outcome.json' : 'outcome.json'); process.kill(process.pid, 'SIGTERM')
     })
   }
-  const selection = runtime.agentModel
-  handle = await ctx.agents.create({ sessionId, meta: { cwd: resolve(root, 'agent-workspace'), agentPreset: 'aspera-single' },
+  if (runtime.submission.protocol !== 4) throw new Error('Legacy experiments must retain their original model runtime')
+  const snapshot = runtime.submission.models[planning ? 'planning' : 'execution']
+  const selection = { provider: snapshot.provider, model: snapshot.model,
+    ...(snapshot.reasoningEffort === undefined ? {} : { reasoningEffort: snapshot.reasoningEffort }) }
+  const modelScope = await openPhaseModelContext(ctx, snapshot)
+  ctx.effect(() => modelScope.dispose, 'Aspera phase provider')
+  handle = await modelScope.context.agents.create({ sessionId, meta: { cwd: resolve(root, 'agent-workspace'), agentPreset: 'aspera-single' },
     agentOptions: { provider: selection.provider, model: selection.model }, setup: async (agentCtx, agent) => {
       await ctx.agentPresets.mount(agentCtx, 'aspera-single')
       installModelSelection(agentCtx, { current: selection, assembled: undefined })
@@ -168,7 +174,7 @@ export async function runClusterAgent(ctx: Context, config: ClusterRuntimeConfig
   ctx.on('agent/error', ({ agent, error }) => {
     if (agent !== handle.agent || settling) return
     if (!(error instanceof HarnessError) || !['RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT', 'EMPTY_RESPONSE'].includes(error.code)) {
-      finish('failed', `Agent failed: ${String(error)}; inspect this experiment Session.`); return
+      finish('failed', `${planning ? 'planning' : 'execution'}: Agent failed: ${String(error)}; inspect this experiment Session.`); return
     }
     void (async () => {
       await agent.whenIdle()
@@ -179,7 +185,7 @@ export async function runClusterAgent(ctx: Context, config: ClusterRuntimeConfig
       await ctx.sessionPersistence.flush()
     })().catch((failure: unknown) => { if (!retryLifetime.signal.aborted) finish('failed', String(failure)) })
   })
-  if (runtime.submission.protocol !== 3) throw new Error('Legacy experiments must retain their original release')
+  if (runtime.submission.protocol !== 4) throw new Error('Legacy experiments must retain their original release')
   installGoalContinuation(ctx, handle.agent, config.goalContinuationWindow)
   const goal = ctx.goals.create(handle.agent, { objective: runtime.submission.objective, maxGoalRounds: config.goalContinuationWindow })
   let approved = ''

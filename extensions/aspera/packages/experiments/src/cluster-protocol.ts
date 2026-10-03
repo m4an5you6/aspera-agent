@@ -5,6 +5,7 @@ import type { Branded } from '@deepseek-ai/dsh-brand'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { remotePathSchema, storagePlacementSchema, storagePreferenceSchema, serverInventorySchema } from './storage-protocol.ts'
+import { experimentModelSnapshotsSchema } from './models.ts'
 
 /** Stable configured server identity, independent of list order and address edits. */
 export type ExperimentServerId = string & Branded<'ExperimentServerId'>
@@ -131,8 +132,15 @@ export const clusterSubmissionV3Schema = legacySubmissionObject.extend({ protoco
     && server.storagePlacement.releaseRoot.endsWith('/' + value.deploymentId)
     && value.inventories.some(item => item.serverId === server.id && item.inventory.candidates.some(candidate =>
       JSON.stringify(candidate) === JSON.stringify(server.storagePlacement.candidate)))), 'Directory assignments must match the experiment, release and observed inventory')
+/** Generation four adds a short name and three immutable Agent model configurations. */
+export const clusterSubmissionV4Schema = z.object({ ...clusterSubmissionV3Schema.shape, protocol: z.literal(4),
+  name: z.string().trim().min(1).max(120), models: experimentModelSnapshotsSchema }).strict().refine(value => {
+  const { name, models, ...prior } = value
+  void name; void models
+  return clusterSubmissionV3Schema.safeParse({ ...prior, protocol: 3 }).success
+}, 'Directory assignments must match the experiment, release and observed inventory')
 /** Released generations retain their original field order and version values. */
-export const clusterSubmissionSchema = z.discriminatedUnion('protocol', [legacyClusterSubmissionSchema, clusterSubmissionV2Schema, clusterSubmissionV3Schema])
+export const clusterSubmissionSchema = z.discriminatedUnion('protocol', [legacyClusterSubmissionSchema, clusterSubmissionV2Schema, clusterSubmissionV3Schema, clusterSubmissionV4Schema])
 /** Immutable request shared by the dispatcher and remote coordinator. */
 export type ClusterSubmission = z.infer<typeof clusterSubmissionSchema>
 

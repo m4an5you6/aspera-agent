@@ -4,7 +4,7 @@ English | [中文](state-and-api.zh.md)
 
 ## Summary
 
-Aspera extension `0.1.1` writes protocol and storage generation `3` and reads released generations `1` and `2` without changing their versions, hashes or limits. Generated DSH Remote methods use the `aspera` namespace; authenticated control traffic uses `/aspera/v3`. Fields and branded IDs are declared in the [protocol](../packages/experiments/src/cluster-protocol.ts), [storage observations](../packages/experiments/src/storage-protocol.ts) and [dispatch types](../packages/dispatch/src/types.ts).
+Aspera extension `0.1.1` writes protocol and storage generation `4` and reads released generations `1`–`3` without changing their versions, hashes or limits. Generated DSH Remote methods use the `aspera` namespace; authenticated control traffic uses `/aspera/v4`. Fields and branded IDs are declared in the [protocol](../packages/experiments/src/cluster-protocol.ts), [storage observations](../packages/experiments/src/storage-protocol.ts) and [dispatch types](../packages/dispatch/src/types.ts).
 
 ## Table of Contents
 
@@ -20,13 +20,15 @@ Aspera extension `0.1.1` writes protocol and storage generation `3` and reads re
 
 | Owner | Domain/version | Durable records |
 | --- | --- | --- |
-| Management Host | `aspera_fleet` / `3` | Server preferences, last SSH inventory, fixed coordinator, saved storage decisions, dispatch requirements and receipts |
-| Remote coordinator | `aspera_queue` / `3` | Admission order, plans, approvals, allocations, execution identities, progress and services |
-| Node control | `aspera_node` / `3` | Node allocation, command identity, cleanup evidence and registered service facts |
+| Management Host | `aspera_fleet` / `4` | Server preferences, last SSH inventory, fixed coordinator, saved storage decisions, dispatch requirements and receipts |
+| Remote coordinator | `aspera_queue` / `4` | Admission order, plans, approvals, allocations, execution identities, progress and services |
+| Node control | `aspera_node` / `4` | Node allocation, command identity, cleanup evidence and registered service facts |
 
-These domains declare version `3` with compatible reads of `1` and `2`. Protocol `1` retains its `0.1.0` extension version and optional limits; protocol `2` retains `0.2.0`. Old pending work stays on its original runtime, and incompatible controllers are replaced only after tasks end and cleanup is confirmed. No DSH Session format or event changes are introduced: inventory, storage selections, handover, questions and replies use existing logged messages/tools and Goal operations.
+These domains declare version `4` with compatible reads of `1`–`3`. Protocol `1` retains its `0.1.0` extension version and optional limits; protocol `2` retains `0.2.0`, and protocol `3` retains `0.1.1`. Old pending work stays on its original runtime, and incompatible controllers are replaced only after tasks end and cleanup is confirmed. No DSH Session format or event changes are introduced: inventory, storage selections, handover, questions and replies use existing logged messages/tools and Goal operations.
 
-Server preferences and resolved deployments are separate. A new request freezes objective, servers, model selection, mode and policy; preparation freezes input hashes, observed mount identities, control/release/workspace paths, selection reasons and verified network addresses. Protocol `3` has no aggregate task budget. Identical UUID/content is an idempotent retry; changed content fails. Interrupted generation-3 preparation resumes its saved paths, while missing Sessions, changed mounts, inputs or releases fail explicitly. Old unfinished preparation must be copied.
+Server preferences and resolved deployments are separate. A new request freezes its short name, objective, servers, three phase model configurations, private credential references, mode and policy; preparation freezes input hashes, observed mount identities, control/release/workspace paths, selection reasons and verified network addresses. Protocol `4` has no aggregate task budget. Identical UUID/content is an idempotent retry; changed content fails. Interrupted generation-4 preparation resumes its saved paths, while missing Sessions, changed mounts, inputs or releases fail explicitly. Old unfinished preparation must be copied.
+
+Phase snapshots record the provider, model, reasoning choice, pinned adapter version and a digest/reference for private API configuration. Only supported key APIs are transferable: official DeepSeek and pi-ai key providers, including OpenAI-compatible Qwen. Unsupported authentication is refused before admission. Each Agent mounts its own provider scope; global settings changes and retries cannot replace it. Keys and raw headers remain outside public records.
 
 The coordinator writes ownership before scheduling. A queue-record loss with retained execution evidence requires operator reconciliation rather than resubmission. After restart, verified drained commands can release a node; any unverified managed range retains it. Inspect and stop uncertain processes on the affected node before repairing its allocation records; the page does not offer a force-release button.
 
@@ -48,7 +50,7 @@ A semi-mode question binds its experiment, Session, tool call and immutable ques
 <a id="api-consumers"></a>
 ## API consumers
 
-Use [AsperaRemote](../packages/dispatch/src/index.ts) and generated `@aspera/dispatch/remote` descriptors. Unary methods cover server/password writes, `probeServer` inventory without model use, input staging, creation, `retryPreparation`, refresh, approval, questions, cancellation, logs, files and services. `watch` streams saved inventories, preparation stages, placements and remote receipts; reconnect starts with current records and retains per-source byte cursors. Agent tools use the same `ExperimentFleet` preparation service.
+Use [AsperaRemote](../packages/dispatch/src/index.ts) and generated `@aspera/dispatch/remote` descriptors. Unary methods cover server/password writes, `probeServer` inventory without model use, input staging, creation, the model directory and submission validation, `retryPreparation`, refresh, approval, questions, cancellation, logs, files and services. `watch` streams saved inventories, preparation stages, placements and remote receipts; reconnect starts with current records and retains per-source byte cursors. Agent tools use the same `ExperimentFleet` preparation service.
 
 `ClusterQueue` consumes a validating `ExperimentTable` and process-owning `ClusterExecutor`. `ExperimentFleet.open` accepts a complete `FleetDriver`; production uses password SSH and host-key verification. A provider owns transfer, probes, credentials and authenticated operations together. CPU test providers are explicit test fixtures and are excluded from release archives.
 
@@ -59,7 +61,7 @@ Control APIs require private bearer credentials and listen on loopback. The Host
 <a id="logs-outputs-and-services"></a>
 ## Logs, outputs and services
 
-Reads identify an experiment, source/node, generation and byte offset. The reply includes raw base64 bytes, the next offset, EOF and a reset flag. Missing or rotated data resets the cursor and is shown explicitly; separate UTF-8 decoders reconstruct node logs. Conversation envelopes include Session ID and source, so equal sequence numbers from planning and execution remain distinct. Incomplete JSONL lines wait for continuation.
+Reads identify an experiment, source/node, generation and byte offset. The reply includes raw base64 bytes, the next offset, EOF and a reset flag. Missing or rotated data resets the cursor and is shown explicitly; separate UTF-8 decoders reconstruct node logs. Agent pages bind experiment, phase, Session and sequence. Preparation reads the local dispatch Session; planning/execution read their saved remote Sessions. Missing historical events are reported explicitly. Process cursors additionally bind node, command and stdout/stderr; tools link to that command. Conversation envelopes retain Session ID and source, so equal sequence numbers remain distinct. Incomplete JSONL lines wait for continuation.
 
 Output APIs list relative paths, node identity, size and modification time. Downloads use one-use expiring tickets and bounded reads; path traversal, symlink escape and a file generation change are rejected. A disconnected download aborts its upstream read. File contents are not synchronized by default.
 

@@ -28,7 +28,7 @@ kind: "package-bundle"
 
 通过角色配置选择 `coordinator`、`node`、`planner` 或 `agent`。部署固定控制根目录、令牌、发布和实验 ID。[Config](src/index.ts) 配置轮询、清理、网络探测时限、文件／字节限制及文档访问。[网络探测](src/network-probes.ts) 不分配 GPU，通过接收端身份检查连通性，超时、取消及关闭时清理监听器。节点先隐藏控制目录及其他已登记实验根目录，再绑定当前工作目录。
 
-普通命令不能脱离取消清理。协议 `3` 不限制任务总时长或命令数量，旧分配保留原限制。[存储准备](scripts/storage.mjs) 检查 Linux 挂载、空间、归属和写入能力；未知持久性保持未知。实验 profile 和日志位于所选存储，队列状态及凭据保留在私有目录。缓存／环境变量使用可写工作目录。登记服务保留整组资源，必须通过实际 HTTP 健康检查，失败后不自动重启。[推理网关](src/inference-gateway.ts) 管理显式映射的对外监听和私有服务密钥，详见[服务记录与访问](../../docs/state-and-api.zh.md#logs-outputs-and-services)。节点 profile 设置 `serviceRequestTimeoutMs`（300000）限制上游空闲时间，`serviceRequestBytes`（16777216）限制请求体大小。
+普通命令不能脱离取消清理。协议 `4` 不限制任务总时长或命令数量，旧分配保留原限制。[存储准备](scripts/storage.mjs) 检查 Linux 挂载、空间、归属和写入能力；未知持久性保持未知。实验 profile 和日志位于所选存储，队列状态及凭据保留在私有目录。缓存／环境变量使用可写工作目录。登记服务保留整组资源，必须通过实际 HTTP 健康检查，失败后不自动重启。[推理网关](src/inference-gateway.ts) 管理显式映射的对外监听和私有服务密钥，详见[服务记录与访问](../../docs/state-and-api.zh.md#logs-outputs-and-services)。节点 profile 设置 `serviceRequestTimeoutMs`（300000）限制上游空闲时间，`serviceRequestBytes`（16777216）限制请求体大小。
 
 `goalContinuationWindow` 是部署设置，默认 `128` 轮；worker patch 通过 `DSH_CLUSTER_GOAL_WINDOW` 配置。续行插件在有限窗口耗尽前通过公开 `Goal.edit` 延长同一 Goal。每次延长都记入日志，并非用户任务预算。连接、探测和模型单次操作超时、循环保护、沙箱和取消仍然生效。
 
@@ -36,6 +36,8 @@ kind: "package-bundle"
 
 <a id="understand-the-implementation"></a>
 ## 了解实现
+
+[phase-model.ts](src/phase-model.ts) 为每个阶段挂载独立 LLM 服务及选定的固定版本提供商，创建 Agent 前校验配置摘要及私有凭据，Agent 结束后释放提供商。[records.ts](src/records.ts) 分页读取真实阶段事件，节点命令在节点总览日志之外分别保存 stdout/stderr 文件。
 
 <details>
 <summary>实现细节</summary>
@@ -64,7 +66,7 @@ Agent 范围屏蔽全局工具并禁用插件管理层。全自动在提问服�
 ## 已知限制和后续工作
 
 - 生产执行需要 Linux bubblewrap 和 NVIDIA 设备，网络共享而非隔离。
-- 固定 worker profile 必须配置所选提供方，选择模型不会移交任意提供方插件或设置。
+- 仅支持已移交的 DeepSeek 或 pi-ai 密钥 API 快照；不支持 OAuth 和依赖环境身份的认证。
 - 节点重启后结果不明时，需要操作人员核对，不提供强制释放或自动重启训练。
 - 多 Agent 算法和 RSI 优化管线由其他扩展实现。
 

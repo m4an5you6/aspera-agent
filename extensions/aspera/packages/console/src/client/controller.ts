@@ -8,6 +8,10 @@ import { randomUUID } from '@deepseek-ai/dsh-util-crypto'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import type { Config } from '../config.ts'
 import type { ServiceAccessInfo } from '@aspera/experiments/types'
+import type { ExperimentModels, ExperimentModelDirectory, AgentRecordRequest, AgentRecordPage, ExperimentProcess, ProcessLogRequest, ProcessLogPage } from '@aspera/experiments/types'
+import { readPreferences, savePreferences } from './preferences.ts'
+import type { AsperaPreferences } from './preferences.ts'
+import { experimentTodos } from './attention.ts'
 
 function unwrap<T>(result: RemoteResult<T>): T {
   if (!result.ok) throw new Error(result.error.message)
@@ -24,6 +28,12 @@ export interface ExperimentStream {
 
 /** Shared panel state survives switching between conversations and experiments. */
 export interface ExperimentsSnapshot {
+  view: 'list' | 'servers' | 'new' | 'services'
+  preferences: AsperaPreferences
+  modelDirectory: ExperimentModelDirectory | null
+  modelsLoading: boolean
+  modelsError: string | null
+  settingsOpen: boolean
   registry: FleetRegistry
   experiments: FleetExperiment[]
   selectedId: string | null
@@ -38,7 +48,8 @@ export interface ExperimentsSnapshot {
 /** The page's RPC lifecycle and cursor ownership. */
 export class ExperimentsController {
   /** Observable page data; execution ownership remains on the Host. */
-  readonly store = createSnapshotStore<ExperimentsSnapshot>({ registry: { servers: [] }, experiments: [], selectedId: null,
+  readonly store = createSnapshotStore<ExperimentsSnapshot>({ view: 'list', preferences: readPreferences(), modelDirectory: null, modelsLoading: false, modelsError: null, settingsOpen: false,
+    registry: { servers: [] }, experiments: [], selectedId: null,
     probes: {}, probeErrors: {}, streams: {}, files: [], filesTruncated: false, error: null })
   private readonly decoders = new Map<string, TextDecoder>()
   private loading: Promise<void> | undefined
@@ -47,6 +58,38 @@ export class ExperimentsController {
   private registryRevision = 0
 
   constructor(private readonly remote: Context['remote']['aspera'], private readonly config: Config) {}
+
+  /** @param view - Aspera sidebar destination. */
+  navigate(view: ExperimentsSnapshot['view']): void { this.patch({ view, selectedId: null }); void this.refresh() }
+  /** Toggle only the Aspera group, retaining the official sidebar's own fold state. */
+  toggleGroup(): void { this.preferences({ collapsed: !this.store.getSnapshot().preferences.collapsed }) }
+  private preferences(update: Partial<AsperaPreferences>): void {
+    const preferences = { ...this.store.getSnapshot().preferences, ...update }
+    savePreferences(preferences); this.patch({ preferences })
+  }
+  /** Dismiss currently visible reminders without answering or changing pending counts. */
+  dismissTodos(): void {
+    const state = this.store.getSnapshot()
+    this.preferences({ dismissed: [...new Set([...state.preferences.dismissed, ...experimentTodos(state.experiments).map(todo => todo.key)])] })
+  }
+  /** @param open - whether the Aspera model summary dialog is open. */
+  modelSettings(open: boolean): void { this.patch({ settingsOpen: open }); if (open) void this.loadModels() }
+  /** Load DSH model names and credential presence; the browser never reads keys. */
+  async loadModels(): Promise<void> {
+    if (this.store.getSnapshot().modelsLoading) return
+    this.patch({ modelsLoading: true, modelsError: null })
+    try { this.patch({ modelDirectory: unwrap(await this.remote.experimentModels()) }) }
+    catch (error) { this.patch({ modelsError: String(error) }) }
+    finally { this.patch({ modelsLoading: false }) }
+  }
+  /** @param request - phase and cursor. @returns a bounded record page. */
+  records(request: AgentRecordRequest): Promise<AgentRecordPage> { return this.remote.experimentRecords(request).then(unwrap) }
+  /** @param id - experiment. @param serverId - node. @returns real managed processes. */
+  processes(id: string, serverId: string): Promise<ExperimentProcess[]> { return this.remote.experimentProcesses(id, serverId).then(unwrap) }
+  /** @param request - process and output stream. @returns resumable bytes. */
+  processLog(request: ProcessLogRequest): Promise<ProcessLogPage> { return this.remote.experimentProcessLog(request).then(unwrap) }
+  /** @returns polling and memory limits shared by record and log views. */
+  displayLimits(): Config { return this.config }
 
   /** @returns profile-configured initial node control port; the coordinator uses the following port. */
   initialControlPort(): number { return this.config.defaultControlPort }
@@ -201,9 +244,13 @@ export class ExperimentsController {
    * @param id - stable id reused for retries.
    */
   async create(objective: string, serverIds: string[], files: string[], uploads: File[], id: string,
-    mode: 'semi' | 'automatic'): Promise<void> {
+    mode: 'semi' | 'automatic', name?: string, models?: ExperimentModels): Promise<void> {
+    if (models === undefined) throw new Error('Select the Agent model for every phase')
+    const validated = unwrap(await this.remote.validateExperimentModels(models))
     const row = unwrap(await this.remote.createExperiment({ experimentId: id, objective, serverIds, files,
-      uploads: uploads.map(file => ({ name: file.name, size: file.size })), mode }))
+      uploads: uploads.map(file => ({ name: file.name, size: file.size })), mode, ...(name === undefined ? {} : { name }), models: validated }))
+    this.preferences({ models: validated })
+    this.patch({ view: 'list' })
     this.replace(row)
     this.select(id)
     if (uploads.length > 0) void this.stageInputs(id, uploads).catch(error => { this.report(error) })

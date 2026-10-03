@@ -68,6 +68,13 @@ export async function snapshotSource(root: string, timeoutMs: number, signal?: A
     const releaseManifest = { name: 'aspera-installed-release', private: true, type: 'module', packageManager: 'pnpm@11.7.0', dependencies }
     writeFileSync(join(source, 'package.json'), JSON.stringify(releaseManifest, null, 2) + '\n')
     copyFileSync(resolve(root, 'pnpm-workspace.yaml'), join(source, 'pnpm-workspace.yaml'))
+    const patchRoot = resolve(root, 'patches')
+    if (!existsSync(patchRoot)) throw new Error('Aspera sidebar compatibility patch is missing')
+    mkdirSync(join(source, 'patches'))
+    for (const patch of readdirSync(patchRoot).sort()) {
+      copyFileSync(join(patchRoot, patch), join(source, 'patches', patch))
+      digest.update(`patches/${patch}\0`); digest.update(readFileSync(join(patchRoot, patch)))
+    }
     appendOverrides(source, overrides)
     writeFileSync(join(source, '.npmrc'), 'registry=https://registry.npmjs.org/\n')
     copyFileSync(existsSync(resolve(root, 'setup.mjs')) ? resolve(root, 'setup.mjs') : resolve(root, 'scripts', 'installed-setup.mjs'), join(source, 'setup.mjs'))

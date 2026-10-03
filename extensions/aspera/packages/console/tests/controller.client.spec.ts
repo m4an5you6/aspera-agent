@@ -1,3 +1,4 @@
+import { modelSelections } from '../../experiments/tests/fixtures.ts'
 import { fromAny } from '@total-typescript/shoehorn'
 const budget = { maxRuntimeSeconds: 3600, maxServiceSeconds: 3600, maxCommands: 100, maxGoalRounds: 100 }
 /** Cursor isolation and late-reply handling at the browser RPC boundary. */
@@ -24,7 +25,7 @@ function record(id: string): FleetExperiment {
 }
 function fixture() {
   const rows = [record('first'), record('second')]
-  const remote = { servers: vi.fn(async () => ok({ servers: [] })), experiments: vi.fn(async () => ok(rows)),
+  const remote = { validateExperimentModels: vi.fn(async () => ok(modelSelections)), servers: vi.fn(async () => ok({ servers: [] })), experiments: vi.fn(async () => ok(rows)),
     refreshExperiment: vi.fn(async (id: string) => ok(rows.find(row => row.request.experimentId === id)!)),
     experimentFiles: vi.fn(async () => ok({ files: [], truncated: false })),
     readExperiment: vi.fn(async (_id: string, _kind: string, offset: number) => ok({ data: '', offset, nextOffset: offset,
@@ -75,7 +76,7 @@ it('does not erase a newly submitted Goal when an older list reply arrives', asy
   remote.experiments.mockReturnValueOnce(reply.promise)
   const loading = controller.refresh()
   try {
-    await controller.create('third', ['node'], [], [], 'third', 'automatic')
+    await controller.create('third', ['node'], [], [], 'third', 'automatic', 'Third', modelSelections)
     reply.resolve(ok([])); await loading
     expect(controller.store.getSnapshot().experiments.map(row => row.request.experimentId)).toEqual(['third'])
   } finally { reply.resolve(ok([])); await loading; controller.dispose() }
@@ -110,4 +111,32 @@ it('refreshes pending receipts off-page without reading logs or artifacts', asyn
     expect(remote.readExperiment).not.toHaveBeenCalled()
     expect(remote.experimentFiles).not.toHaveBeenCalled()
   } finally { controller.dispose() }
+})
+
+
+it('persists dismissed revision reminders and group folding without resolving pending work', async () => {
+  const values = new Map<string, string>()
+  vi.stubGlobal('localStorage', { getItem: (key: string) => values.get(key) ?? null, setItem: (key: string, value: string) => { values.set(key, value) } })
+  const f = fixture()
+  const plan = { revision: 1, summary: 'Review this plan', steps: ['Trial'], frameworks: [], createdAt: 1 }
+  f.rows[0]!.latest = { ...f.rows[0]!.latest!, state: 'awaiting-approval', resourcesReleased: true, plan }
+  const { experimentTodos, experimentAttentionCount } = await import('../src/client/attention.ts')
+  try {
+    await f.controller.refresh(); f.controller.dismissTodos(); f.controller.toggleGroup()
+    expect(experimentAttentionCount(f.controller.store.getSnapshot().experiments)).toBe(1)
+    const restored = fixture()
+    try {
+      restored.rows[0] = f.rows[0]!
+      await restored.controller.refresh()
+      const state = restored.controller.store.getSnapshot()
+      expect(state.preferences.collapsed).toBe(true)
+      expect(experimentTodos(state.experiments).filter(todo => !state.preferences.dismissed.includes(todo.key))).toEqual([])
+      restored.rows[0] = { ...restored.rows[0]!, latest: { ...restored.rows[0]!.latest!, plan: { ...plan, revision: 2 } } }
+      await restored.controller.refresh()
+      expect(experimentTodos(restored.controller.store.getSnapshot().experiments).filter(todo => !state.preferences.dismissed.includes(todo.key))).toHaveLength(1)
+      restored.rows[0] = { ...restored.rows[0]!, latest: { ...restored.rows[0]!.latest!, state: 'queued' } }
+      await restored.controller.refresh()
+      expect(experimentTodos(restored.controller.store.getSnapshot().experiments)).toEqual([])
+    } finally { restored.controller.dispose() }
+  } finally { f.controller.dispose(); vi.unstubAllGlobals() }
 })

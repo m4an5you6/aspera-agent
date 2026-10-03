@@ -63,7 +63,7 @@ try {
   const output = resolve(builds, buildId)
   const buildInfo = resolve(work, 'build-info.json')
   const information = { version: 1, buildId, builtAt: new Date().toISOString(), desktop: desktopVersion,
-    dsh: '0.2.0-rc.2', extension: '0.1.1', protocol: 3, storageGeneration: 3, electron: '44.0.0', platform: 'win32', arch: 'x64',
+    dsh: '0.2.0-rc.2', extension: '0.1.1', protocol: 4, storageGeneration: 4, electron: '44.0.0', platform: 'win32', arch: 'x64',
     remoteDeploymentId: snapshot.digest, signed: false }
   writeFileSync(buildInfo, JSON.stringify(information, null, 2) + '\n')
   console.log('Building the Windows application directory')
