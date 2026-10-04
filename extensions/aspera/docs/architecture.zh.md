@@ -26,7 +26,7 @@ Aspera 在 Harness 源码树之外管理实验业务。已发布的 DSH 提供�
 | `@aspera/console` | 侧栏页面、表单、记录流和按来源区分的日志游标 | 已发布的 Web 插槽、本地化字典和 Remote 描述 |
 | `@aspera/desktop` | 独立窗口、托盘和本机 profile 生命周期 | Electron 及已发布的 `dsh` profile |
 
-接入层维护两个固定版本的发布包补丁：增加侧栏分组插槽，以及转发现有设置命令。官方窗口、会话与插件管理仍由 DSH 提供。私有模型配置快照分别供准备、计划和执行作用域使用，公开记录只展示模型摘要。
+接入层维护两个固定版本的发布包补丁：增加侧栏分组插槽，以及转发现有设置命令。官方窗口、会话与插件管理仍由 DSH 提供。私有模型配置快照供[阶段环境](../packages/runtime/README.zh.md#understand-the-implementation)使用，在准备、计划和执行中将标准 DSH Agent 驱动与其提供商绑定，公开记录只展示模型摘要。
 
 Host 程序依赖已安装包的类型声明。[types/typert-protocol.d.ts](../types/typert-protocol.d.ts) 中的 Typert 兼容声明只用于生成程序，为分析提供注册元数据。[tsdown.config.ts](../packages/console/tsdown.config.ts) 中的浏览器封装负责兼容 Cordis 的 CommonJS 模块加载及 CSS 插入；公开的客户端类型声明与 JavaScript 打包文件独立生成。
 
@@ -44,16 +44,21 @@ flowchart TB
     Browser[Web browser] --> Page
     Page --> Remote[Typed Remote: RPC + streams]
     Remote --> Fleet[Aspera dispatch: fleet / credentials / Sessions]
+    Fleet --> Management[Peer servers / dated checks / deletion journal]
+    Management --> Cleanup[Owned paths only / cleanup receipts / tombstones]
     Fleet --> Models[Private snapshots: preparation / planning / execution]
     Models --> Selection
     Models --> Planner
     Models --> Executor
-    Fleet --> Inventory[Read-only SSH: mounts / space / interfaces]
+    Fleet --> Preparation[Local DSH Agent: inspect / configure / repair]
+    Preparation --> Checks[Provider verification: versions / sandbox availability]
+    Checks --> Inventory[Read-only SSH: mounts / space / interfaces]
     Inventory --> Selection[Restricted Agent: candidate ID + reason]
     Selection --> Placement[Persist placement before directory creation]
-    Placement --> Network[Mutual node identity and network checks]
+    Placement --> Acceptance[Workspace / isolation / credentials / GPU checks]
+    Acceptance --> Network[Mutual node identity and network checks]
   end
-  subgraph Coordinator[First server: durable coordinator]
+  subgraph Coordinator[Selected participant: durable coordinator]
     Queue[Aspera experiments: queue / plans / resource groups]
     Planner[Read-only planning Agent]
     Executor[Independent execution Agent]
@@ -87,9 +92,11 @@ sequenceDiagram
   participant Queue as Remote coordinator
   participant Agent as Planning / execution Agent
   participant Node as Selected GPU nodes
-  User->>UI: Submit Goal and server group
-  UI->>Fleet: Create independent experiment
+  User->>UI: Submit Goal, server group and coordinator
+  UI->>Fleet: Validate coordinator and cross-coordinator overlaps
   Fleet-->>UI: Preparing; another Goal can be submitted
+  Fleet->>Node: Shell-only inspection; Agent configures dependencies
+  Fleet->>Fleet: Persist diagnostics; verify tools and executable paths
   Fleet->>Node: Read mounts, space and network interfaces over SSH
   Fleet->>Fleet: Agent selects candidate; persist paths and reason
   Fleet->>Node: Create owned directories; deploy; verify mutual network
@@ -121,12 +128,14 @@ sequenceDiagram
   Note over Queue,Node: Accepted work continues after the local application quits
 ```
 
+管理 profile 串行校验提交。不同调度主机不能管理使用重叠节点的未结束实验，调度节点按实验固定。首次等待确认仍受此登记限制，但不分配 GPU。节点控制服务独立校验执行独占。结束记录通过持久删除进度及删除标记移除，可选 SSH 清理验证已保存的归属、路径和挂载。
+
 -----
 
 <a id="execution-and-ownership"></a>
 ## 执行与归属
 
-管理 Host 先记录只读 SSH 探测，再由受限派发 Agent 选择候选 ID 并说明理由。手动目录优先，也允许空间充足的系统盘。创建专属目录前保存选择；准备、上传及启动时复查挂载身份、归属、写入能力和空间。接收前通过短时双向通信证明核对节点及实验身份，排队分配后再次检查。失败会停止联合启动，不减少节点组。
+管理 Host 使用所选模型和现有 Session 启动标准 DSH 准备 Agent。仅依赖 Shell 的探测先于依赖 Node 的清单读取。限定服务器的 SSH 工具使用登录账号权限配置依赖，Node 和 pnpm 版本来自发布要求。Host 保存程序路径、节点阶段及诊断，并复验每次修复。同一 Agent 选择实际存储候选并说明理由，手动目录优先，创建目录前保存选择。准备、上传及启动时复查挂载身份、归属、写入能力和空间。沙箱隔离、凭据隐藏、CUDA 和双向网络证明共同决定能否交接；内核或设备权限限制明确阻塞，模型声明不能免除检查。
 
 控制状态、队列和凭据位于登录用户固定的私有控制目录。发布文件及每个实验的输入、Agent 状态、日志、缓存、环境、临时文件和产物使用选中磁盘。节点工具只暴露获准设备，隐藏控制目录与已登记的实验存储根目录，仅将当前工作目录挂载为可写。框架缓存和环境变量指向该目录。网络仍共享以便下载和训练，此处不提供网络隔离。
 

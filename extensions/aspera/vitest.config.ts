@@ -9,6 +9,7 @@ export default defineConfig({
     { find: '@aspera/runtime/types', replacement: source('runtime', 'types.ts') },
     { find: '@aspera/experiments/types', replacement: source('experiments', 'types.ts') },
     { find: '@aspera/dispatch/types', replacement: source('dispatch', 'types.ts') },
+    { find: '@aspera/dispatch/server-usage', replacement: source('dispatch', 'server-usage.ts') },
     { find: '@aspera/experiments', replacement: source('experiments', 'index.ts') },
     { find: '@aspera/runtime', replacement: source('runtime', 'index.ts') },
     { find: '@aspera/dispatch', replacement: source('dispatch', 'index.ts') },

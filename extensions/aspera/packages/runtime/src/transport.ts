@@ -1,8 +1,14 @@
 /** Non-interactive OpenSSH control and short-lived loopback tunnels. */
 import { spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { createServer } from 'node:net'
 import type { AddressInfo } from 'node:net'
-import { passwordCopy, passwordRemote, passwordRequest } from './password-transport.ts'
+import { passwordCopy, passwordResult, passwordRequest } from './password-transport.ts'
+import { RemoteCommandError, SshConnectionError } from './command-result.ts'
+import type { CommandResult, RemoteCommandResult } from './command-result.ts'
+export { RemoteCommandError, SshConnectionError } from './command-result.ts'
+export type { CommandResult, RemoteCommandResult } from './command-result.ts'
+export { prepareSshHostKey } from './ssh-host-keys.ts'
 
 /** Deployment address and SSH identity selected by the trusted profile. */
 export interface Target {
@@ -16,6 +22,8 @@ export interface Target {
   readonly remotePort: number
   /** Configured maximum lifetime of an SSH command or SCP transfer in milliseconds. */
   readonly toolTimeoutMs: number
+  /** Verified executable directories prepended for non-interactive SSH commands. */
+  readonly pathEntries?: readonly string[]
 }
 
 /**
@@ -36,8 +44,16 @@ export function shellQuote(value: string): string {
  * @returns bounded stdout after successful exit.
  */
 export async function run(program: string, args: readonly string[], timeoutMs: number, signal?: AbortSignal): Promise<string> {
+  const result = await runResult(program, args, timeoutMs, signal)
+  if (result.exitCode !== 0 || result.timedOut || result.cancelled) {
+    throw new Error(`${program} ${result.timedOut ? 'timed out' : result.cancelled ? 'was cancelled' : `exited ${result.exitCode}`}: ${result.stderr.slice(-4000)}`)
+  }
+  return result.stdout
+}
+
+async function runResult(program: string, args: readonly string[], timeoutMs: number, signal?: AbortSignal): Promise<CommandResult> {
   signal?.throwIfAborted()
-  const child = spawn(program, [...args], { windowsHide: true, signal, stdio: ['ignore', 'pipe', 'pipe'] })
+  const child = spawn(program, [...args], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
   let output = ''
   let errorOutput = ''
   const limit = 2_000_000
@@ -45,16 +61,20 @@ export async function run(program: string, args: readonly string[], timeoutMs: n
   child.stderr.setEncoding('utf8')
   child.stdout.on('data', (part: string) => { output = (output + part).slice(-limit) })
   child.stderr.on('data', (part: string) => { errorOutput = (errorOutput + part).slice(-limit) })
-  const timer = setTimeout(() => { child.kill() }, timeoutMs)
+  let timedOut = false
+  let cancelled = false
+  const abort = () => { cancelled = true; child.kill() }
+  signal?.addEventListener('abort', abort, { once: true })
+  const timer = setTimeout(() => { timedOut = true; child.kill() }, timeoutMs)
   try {
-    const code = await new Promise<number | null>((resolve, reject) => {
+    const exit = await new Promise<{ exitCode: number | null; signal: string | null }>((resolve, reject) => {
       child.once('error', reject)
-      child.once('close', resolve)
+      child.once('close', (exitCode, exitSignal) => { resolve({ exitCode, signal: exitSignal ?? null }) })
     })
-    if (code !== 0) throw new Error(`${program} exited ${String(code)}: ${errorOutput.slice(-4000)}`)
-    return output
+    return { stdout: output, stderr: errorOutput, ...exit, timedOut, cancelled }
   } finally {
     clearTimeout(timer)
+    signal?.removeEventListener('abort', abort)
   }
 }
 
@@ -81,10 +101,33 @@ export function sshOptions(target: Target): string[] {
  * @param password - operation-scoped password, resolved outside persisted target settings.
  * @returns remote stdout after successful exit.
  */
-export function remote(target: Target, script: string, signal?: AbortSignal, password?: string): Promise<string> {
-  const command = `sh -c ${shellQuote(script)}`
-  if (target.authMode === 'password') return passwordRemote(target, password, command, signal)
-  return run('ssh', [...sshOptions(target), destination(target), command], target.toolTimeoutMs, signal)
+export async function remote(target: Target, script: string, signal?: AbortSignal, password?: string): Promise<string> {
+  const result = await remoteResult(target, script, signal, password)
+  signal?.throwIfAborted()
+  if (result.exitCode !== 0 || result.timedOut || result.cancelled || !result.exitConfirmed) throw new RemoteCommandError(result)
+  return result.stdout
+}
+
+/**
+ * Execute through SSH without discarding nonzero-exit diagnostics.
+ * @param target - saved account and verified executable directories.
+ * @param script - remote POSIX shell program.
+ * @param signal - operation cancellation.
+ * @param password - private operation credential.
+ * @returns captured outcome; connection and authentication failures reject.
+ */
+export async function remoteResult(target: Target, script: string, signal?: AbortSignal, password?: string): Promise<RemoteCommandResult> {
+  const prefix = target.pathEntries?.length ? `export PATH=${shellQuote(target.pathEntries.join(':'))}:"$PATH"\n` : ''
+  const command = `sh -c ${shellQuote(prefix + script)}`
+  if (target.authMode === 'password') return passwordResult(target, password, command, signal)
+  const marker = `ASPERA_EXIT_${randomUUID()}=`
+  const checked = `${command}; status=$?; printf '\\n${marker}%s\\n' "$status" >&2`
+  const result = await runResult('ssh', [...sshOptions(target), destination(target), checked], target.toolTimeoutMs, signal)
+  const receipt = new RegExp(`\\n${marker}(\\d+)\\r?\\n$`).exec(result.stderr)
+  if (receipt !== null) return { ...result, exitCode: Number(receipt[1]), stderr: result.stderr.slice(0, receipt.index), exitConfirmed: true }
+  const unconfirmed = { ...result, exitCode: null, exitConfirmed: false }
+  if (!result.timedOut && !result.cancelled) throw new SshConnectionError(unconfirmed)
+  return unconfirmed
 }
 
 function destination(target: Target): string {

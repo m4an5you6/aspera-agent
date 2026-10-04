@@ -17,12 +17,13 @@
     "guidanceRead": true,
     "inputRead": true,
     "inputBlocked": true,
+    "humanWaitingRejected": true,
+    "adapterRequests": 5,
     "outcome": "completed",
     "goalPhases": [
       "active",
       "complete"
-    ],
-    "humanWaitingRejected": true
+    ]
   },
   {
     "role": "execution",
@@ -51,12 +52,13 @@
     "guidanceRead": true,
     "inputRead": true,
     "inputBlocked": true,
+    "humanWaitingRejected": true,
+    "adapterRequests": 6,
     "outcome": "blocked",
     "goalPhases": [
       "active",
       "blocked"
-    ],
-    "humanWaitingRejected": true
+    ]
   },
   {
     "role": "continuation",
@@ -151,13 +153,13 @@
     "guidanceRead": true,
     "inputRead": true,
     "inputBlocked": true,
+    "humanWaitingRejected": true,
+    "recoverableFailures": 1,
     "outcome": "completed",
     "goalPhases": [
       "active",
       "active",
       "complete"
-    ],
-    "humanWaitingRejected": true,
-    "recoverableFailures": 1
+    ]
   }
 ]

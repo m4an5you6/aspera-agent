@@ -1,11 +1,11 @@
 /** Storage observations use a synthetic Linux mount table over real isolated CPU files. */
 import { randomUUID } from 'node:crypto'
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, existsSync, symlinkSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { experimentIdSchema, serverSettingsSchema } from '@aspera/experiments'
 import { resolveStoragePlacement } from '../src/storage.ts'
-import { inspectStorage, parseMounts, prepareStorage, verifyStorage } from '../scripts/storage.mjs'
+import { inspectStorage, parseMounts, prepareStorage, verifyStorage, cleanupStorage } from '../scripts/storage.mjs'
 
 const fixture = vi.hoisted(() => ({ home: '', mounts: '', available: 10_000_000n }))
 vi.mock('node:os', async importOriginal => ({ ...await importOriginal<typeof import('node:os')>(), homedir: () => fixture.home,
@@ -91,4 +91,55 @@ it('does not accept a candidate omitted from the captured inventory or override 
   expect(() => resolveStoragePlacement(server, experimentIdSchema.parse(randomUUID()), 'a'.repeat(64), { ...observed, candidates: [] }, candidate.id, 'Choice', 1024)).toThrow('inventory')
   const other = observed.candidates.find(value => value.directory === fixture.home)!
   expect(() => resolveStoragePlacement(server, experimentIdSchema.parse(randomUUID()), 'a'.repeat(64), observed, other.id, 'Choice', 1024)).toThrow('explicitly')
+})
+
+
+it('cleans an owned experiment, preserves shared state and originals, and repeats safely', () => {
+  const { placement } = selection()
+  prepareStorage(placement)
+  writeFileSync(resolve(placement.workspaceRoot, 'model.bin'), 'weights')
+  writeFileSync(resolve(placement.namespaceRoot, 'original-data'), 'retain')
+  mkdirSync(placement.releaseRoot, { recursive: true })
+  writeFileSync(resolve(placement.releaseRoot, 'release'), 'retain')
+  const secret = placement.experimentId + '.json'
+  writeFileSync(resolve(placement.controlRoot, 'secrets', secret), 'private')
+  fixture.available = 0n
+  cleanupStorage({ placement, privateNames: [secret] })
+  cleanupStorage({ placement, privateNames: [secret] })
+  expect(existsSync(placement.runRoot)).toBe(false)
+  expect(existsSync(resolve(placement.controlRoot, 'secrets', secret))).toBe(false)
+  expect(readFileSync(resolve(placement.namespaceRoot, 'original-data'), 'utf8')).toBe('retain')
+  expect(readFileSync(resolve(placement.releaseRoot, 'release'), 'utf8')).toBe('retain')
+  expect(existsSync(resolve(placement.controlRoot, 'state'))).toBe(true)
+})
+
+it('rejects mismatched owners, changed mounts and unsafe private paths before deleting files', () => {
+  const { placement } = selection()
+  prepareStorage(placement)
+  writeFileSync(resolve(placement.workspaceRoot, 'keep'), 'present')
+  expect(() => cleanupStorage({ placement, privateNames: ['../credentials'] })).toThrow('belong')
+  fixture.mounts = fixture.mounts.replace('8:2', '8:9')
+  expect(() => cleanupStorage({ placement, privateNames: [] })).toThrow('mount changed')
+  fixture.mounts = fixture.mounts.replace('8:9', '8:2')
+  writeFileSync(resolve(placement.runRoot, '.aspera-owner.json'), '{}')
+  expect(() => cleanupStorage({ placement, privateNames: [] })).toThrow('ownership differs')
+  expect(readFileSync(resolve(placement.workspaceRoot, 'keep'), 'utf8')).toBe('present')
+})
+
+it('does not cross nested bind mounts even when the filesystem device matches', () => {
+  const { placement } = selection()
+  prepareStorage(placement)
+  fixture.mounts += `3 2 8:2 /shared ${placement.workspaceRoot}/cache rw - ext4 /dev/data rw\n`
+  expect(() => cleanupStorage({ placement, privateNames: [] })).toThrow('mounted filesystem')
+  expect(existsSync(placement.runRoot)).toBe(true)
+})
+
+it('unlinks a nested directory link without touching its external target', () => {
+  const { placement } = selection()
+  prepareStorage(placement)
+  const outside = resolve(directory, 'outside')
+  mkdirSync(outside); writeFileSync(resolve(outside, 'retain'), 'original')
+  symlinkSync(outside, resolve(placement.workspaceRoot, 'external'), process.platform === 'win32' ? 'junction' : 'dir')
+  cleanupStorage({ placement, privateNames: [] })
+  expect(readFileSync(resolve(outside, 'retain'), 'utf8')).toBe('original')
 })

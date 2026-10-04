@@ -40,6 +40,8 @@ Generation 4 freezes the short experiment name and three model configuration sum
 <details>
 <summary>Implementation internals</summary>
 
+[environment-protocol.ts](src/environment-protocol.ts) defines credential-free program observations and verified executable paths. Connection probes can report an incomplete environment before Node is installed; consumers handle optional disk inventory independently from SSH reachability.
+
 [cluster-protocol.ts](src/cluster-protocol.ts) freezes generation-1–3 readers and defines generation-4 submissions; [storage-protocol.ts](src/storage-protocol.ts) separates preferences, SSH evidence and resolved placements. [cluster-queue.ts](src/cluster-queue.ts) owns durable transitions and provider lifetimes. [cluster-files.ts](src/cluster-files.ts) confines bounded reads. Admission checks experiment/node/release ownership and resource assignments; no separate presence-only invariant is published.
 
 </details>

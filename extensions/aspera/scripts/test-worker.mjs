@@ -1,4 +1,4 @@
-/** Run the production planning/execution profiles using a keyless replay adapter. */
+/** Run production planning/execution profiles through published adapters and keyless replay. */
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
@@ -11,44 +11,48 @@ import { clusterSubmissionSchema } from '@aspera/experiments'
 import { removeTestDirectory } from './test-app.mjs'
 import { resolvedFixture } from './fixtures/storage.mjs'
 import { fixtureModelSnapshots, fixtureSelections } from './fixtures/models.mjs'
-const modelFixture = fixtureModelSnapshots()
+import { createWorkerApi } from './fixtures/worker-api.mjs'
 
 const release = resolve(import.meta.dirname, '..')
 mkdirSync(resolve(release, '.artifacts'), { recursive: true })
 const directory = mkdtempSync(resolve(release, '.artifacts/worker-test-'))
-const root = process.platform === 'win32' ? directory.slice(2).replaceAll('\\', '/') : directory
-const generation = randomUUID(); const id = randomUUID(); const serverId = randomUUID()
-const { server, inventory } = resolvedFixture({ id: serverId, name: 'Local replay', host: 'fixture.test', sshPort: 22, username: 'trainer', remotePort: 43019, remoteRoot: root, authMode: 'password' }, id, 'a'.repeat(64))
-const submission = clusterSubmissionSchema.parse({ protocol: 4, name: 'CPU fixture', models: modelFixture.models, experimentId: id, deploymentId: 'a'.repeat(64), inventories: [{ serverId, inventory }], objective: 'Prepare a version-specific experiment',
-  coordinator: server, nodes: [{ server, devicePaths: ['/dev/nvidia_fixture'], backendPath: '/fixture/bwrap', hiddenPaths: [], gpuInfo: 'Replay; no GPU' }],
-  inputs: [{ name: 'data.txt', sha256: createHash('sha256').update('dataset row\n').digest('hex') }], createdAt: 1, strategy: { mode: 'automatic', coordinator: 'single-agent' },
-  versions: { dsh: '0.2.0-rc.2', extension: '0.1.1', harness: 'a'.repeat(64), data: [] } })
-const run = resolve(directory, 'runs', id)
-mkdirSync(resolve(directory, 'secrets'), { recursive: true })
-mkdirSync(resolve(directory, 'state'), { recursive: true })
-mkdirSync(resolve(run, 'agent-workspace'), { recursive: true })
-mkdirSync(resolve(run, 'inputs'), { recursive: true })
-writeFileSync(resolve(run, 'inputs/data.txt'), 'dataset row\n')
-const modelFile = resolve(directory, 'secrets/model.json')
-writeFileSync(modelFile, JSON.stringify({ version: 1, refs: modelFixture.refs }))
-writeFileSync(resolve(directory, 'state/coordinator.generation'), generation)
-writeFileSync(resolve(directory, 'secrets', id + '.json'), JSON.stringify({ submission, connections: [{ serverId, password: 'not-model-visible', token: 'b'.repeat(32), knownHostsFile: '/fixture/known_hosts' }],
-  modelCredentialFile: modelFile, toolTimeoutMs: 1000, agentModel: fixtureSelections.preparation }))
-writeFileSync(resolve(run, 'approved-plan.json'), JSON.stringify({ revision: 1, summary: 'Approved local replay', steps: ['Record a version', 'Report unavailable GPU'], frameworks: [], createdAt: 1 }))
-const snapshots = []
+const api = await createWorkerApi()
 try {
-  for (const scenario of [{ planning: true }, { planning: false }, { planning: true, renewRounds: 132 }, { planning: true, transient: true }]) {
+  const modelFixture = fixtureModelSnapshots(api.baseURL)
+  const root = process.platform === 'win32' ? directory.slice(2).replaceAll('\\', '/') : directory
+  const generation = randomUUID(); const id = randomUUID(); const serverId = randomUUID()
+  const { server, inventory } = resolvedFixture({ id: serverId, name: 'Local replay', host: 'fixture.test', sshPort: 22, username: 'trainer', remotePort: 43019, remoteRoot: root, authMode: 'password' }, id, 'a'.repeat(64))
+  const submission = clusterSubmissionSchema.parse({ protocol: 4, name: 'CPU fixture', models: modelFixture.models, experimentId: id, deploymentId: 'a'.repeat(64), inventories: [{ serverId, inventory }], objective: 'Prepare a version-specific experiment',
+    coordinator: server, nodes: [{ server, devicePaths: ['/dev/nvidia_fixture'], backendPath: '/fixture/bwrap', hiddenPaths: [], gpuInfo: 'Replay; no GPU' }],
+    inputs: [{ name: 'data.txt', sha256: createHash('sha256').update('dataset row\n').digest('hex') }], createdAt: 1, strategy: { mode: 'automatic', coordinator: 'single-agent' },
+    versions: { dsh: '0.2.0-rc.2', extension: '0.1.1', harness: 'a'.repeat(64), data: [] } })
+  const run = resolve(directory, 'runs', id)
+  mkdirSync(resolve(directory, 'secrets'), { recursive: true })
+  mkdirSync(resolve(directory, 'state'), { recursive: true })
+  mkdirSync(resolve(run, 'agent-workspace'), { recursive: true })
+  mkdirSync(resolve(run, 'inputs'), { recursive: true })
+  writeFileSync(resolve(run, 'inputs/data.txt'), 'dataset row\n')
+  const modelFile = resolve(directory, 'secrets/model.json')
+  writeFileSync(modelFile, JSON.stringify({ version: 1, refs: modelFixture.refs }))
+  writeFileSync(resolve(directory, 'state/coordinator.generation'), generation)
+  writeFileSync(resolve(directory, 'secrets', id + '.json'), JSON.stringify({ submission, connections: [{ serverId, password: 'not-model-visible', token: 'b'.repeat(32), knownHostsFile: '/fixture/known_hosts' }],
+    modelCredentialFile: modelFile, toolTimeoutMs: 1000, agentModel: fixtureSelections.preparation }))
+  writeFileSync(resolve(run, 'approved-plan.json'), JSON.stringify({ revision: 1, summary: 'Approved local replay', steps: ['Record a version', 'Report unavailable GPU'], frameworks: [], createdAt: 1 }))
+  const snapshots = []
+  for (const scenario of [{ planning: true, http: true }, { planning: false, http: true }, { planning: true, renewRounds: 132 }, { planning: true, transient: true }]) {
     const { planning, renewRounds, transient } = scenario
     const home = resolve(directory, transient ? 'recovery-home' : renewRounds ? 'renew-home' : planning ? 'plan-home' : 'execution-home')
     await setupWorkerProfile(home, release)
     const observed = resolve(directory, transient ? 'recovery-observed.json' : renewRounds ? 'renew-observed.json' : planning ? 'plan-observed.json' : 'execution-observed.json')
+    const config = { id, serverId, observed, ...scenario }
+    const wire = api.begin(config)
     const profile = resolve(home, 'profiles/aspera-worker')
     const manifestPath = resolve(profile, 'package.json')
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
     manifest.dependencies['@deepseek-ai/dsh-llm'] = '0.2.0-rc.2'
     writeFileSync(manifestPath, JSON.stringify(manifest))
     writeFileSync(resolve(profile, 'cordis.patch.yml'), JSON.stringify([{ insert: [{ id: 'keyless-worker-replay',
-      name: pathToFileURL(resolve(release, 'scripts/fixtures/worker.mjs')).href, config: { id, serverId, planning, observed, renewRounds, transient } }] }]))
+      name: pathToFileURL(resolve(release, 'scripts/fixtures/worker.mjs')).href, config }] }]))
     writeFileSync(resolve(run, 'events.jsonl'), '')
     const child = spawn(process.execPath, [resolve(release, 'node_modules/@deepseek-ai/dsh/lib/bin.js'), '--profile', 'aspera-worker'],
       { cwd: release, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, DSH_HOME: home,
@@ -57,14 +61,16 @@ try {
         DSH_EXPERIMENT_MODEL_CREDENTIAL_FILE: modelFile, DSH_EXPERIMENT_PORT: '0', DSH_CLUSTER_GOAL_WINDOW: renewRounds ? '2' : '128', DSH_TELEMETRY_DISABLED: '1', DEEPSEEK_API_KEY: '' } })
     let output = ''; child.stdout.on('data', bytes => { output += bytes }); child.stderr.on('data', bytes => { output += bytes })
     let timedOut = false
-    const timer = setTimeout(() => { timedOut = true; child.kill('SIGTERM') }, renewRounds ? 180000 : 60000)
+    const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL') }, renewRounds ? 180000 : 60000)
     try {
       await once(child, 'exit')
+      if (wire.error) throw wire.error
       assert.equal(timedOut, false, output.slice(-6000))
       const outcome = JSON.parse(readFileSync(resolve(run, planning ? 'planning-outcome.json' : 'outcome.json'), 'utf8'))
       assert.equal(outcome.state, planning ? 'completed' : 'blocked', output.slice(-6000) + '\n' + JSON.stringify(outcome))
       const observations = JSON.parse(readFileSync(observed, 'utf8'))
       assert.equal(observations.guidanceRead, true)
+      assert.equal(wire.requests > 0, scenario.http === true)
       const source = planning ? 'plan' : 'execution'
       const events = readFileSync(resolve(run, 'events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse).filter(item => item.source === source)
       assert.equal(JSON.stringify(events).includes('not-model-visible'), false)
@@ -76,11 +82,18 @@ try {
         const windows = changes.filter(item => item.event.data.operation === 'edit').map(item => item.event.data.goal.maxGoalRounds)
         assert.ok(windows.length >= 66, JSON.stringify(changes.slice(0, 4)))
         snapshots.push({ role: 'continuation', rounds: observations.rounds, sameGoal: true, sameSession: true, windows, outcome: outcome.state })
-      } else snapshots.push({ role: transient ? 'recovery' : source, ...observations, outcome: outcome.state,
+      } else snapshots.push({ role: transient ? 'recovery' : source, ...observations, ...(scenario.http ? { adapterRequests: wire.requests } : {}), outcome: outcome.state,
         goalPhases: changes.map(item => item.event.data.goal?.phase) })
-    } finally { clearTimeout(timer); if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL') }
+    } finally {
+      clearTimeout(timer)
+      if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) {
+        const exited = once(child, 'exit'); child.kill('SIGKILL'); await exited
+      }
+    }
   }
-  const expected = JSON.parse(readFileSync(resolve(release, 'scripts/fixtures/worker.snapshot.json'), 'utf8'))
+  const expectedPath = resolve(release, 'scripts/fixtures/worker.snapshot.json')
+  if (process.argv.includes('--record')) writeFileSync(expectedPath, JSON.stringify(snapshots, null, 2) + '\n')
+  const expected = JSON.parse(readFileSync(expectedPath, 'utf8'))
   assert.deepEqual(snapshots, expected)
-  console.log('Production worker profiles: scoped tools, plugin/interaction restrictions, framework guidance, durable plan/execution evidence and Goal snapshots passed without a model key.')
-} finally { removeTestDirectory(directory, resolve(release, '.artifacts')) }
+  console.log('Production worker profiles: published provider HTTP requests, scoped tools, restrictions, durable plan/execution evidence and Goal snapshots passed without a model key.')
+} finally { await api.close(); removeTestDirectory(directory, resolve(release, '.artifacts')) }

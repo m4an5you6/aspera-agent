@@ -3,15 +3,16 @@ import { fromAny } from '@total-typescript/shoehorn'
 const budget = { maxRuntimeSeconds: 3600, maxServiceSeconds: 3600, maxCommands: 100, maxGoalRounds: 100 }
 /** Cursor isolation and late-reply handling at the browser RPC boundary. */
 import { expect, it, vi } from 'vitest'
-import type { FleetExperiment } from '@aspera/dispatch/types'
+import type { FleetExperiment, FleetRegistry, ServerConnectionCheck } from '@aspera/dispatch/types'
 import { ExperimentsController } from '../src/client/controller.ts'
+import { experimentProgress } from '../src/client/experiment-progress.ts'
 const ok = <T>(value: T) => ({ ok: true as const, value })
 function record(id: string): FleetExperiment {
   const experimentId = id as FleetExperiment['request']['experimentId']
   const serverId = 'node' as FleetExperiment['request']['serverIds'][number]
   const server = { id: serverId, name: 'Node', host: 'gpu.example.test', username: 'trainer', sshPort: 22, remotePort: 43019,
     remoteRoot: '/runs', authMode: 'password' as const }
-  const target = { ...server, localRepo: '/source', dataRoots: [], allowedSystemPackages: [], agentCredentialRefs: [],
+  const target = { ...server, localRepo: '/source', dataRoots: [], preparationOutputChars: 65536, agentCredentialRefs: [],
     tokenRef: 'TEST', controlPollIntervalMs: 1000, toolTimeoutMs: 30000 }
   const submission = { protocol: 1 as const, experimentId, objective: id, deploymentId: 'a'.repeat(64), coordinator: server,
     nodes: [{ server, devicePaths: ['/dev/nvidia0'], backendPath: '/usr/bin/bwrap', hiddenPaths: [], gpuInfo: 'GPU 0' }],
@@ -31,12 +32,101 @@ function fixture() {
     readExperiment: vi.fn(async (_id: string, _kind: string, offset: number) => ok({ data: '', offset, nextOffset: offset,
       generation: 'one', eof: true, reset: false })),
     createExperiment: vi.fn(async () => ok(record('third'))), cancelExperiment: vi.fn(async () => ok(rows[0]!)),
-    saveServer: vi.fn(async () => ok({ servers: [] })), setPassword: vi.fn(async () => ok(undefined)),
+    retryPreparation: vi.fn(async (_id: string) => ok(rows[0]!)),
+    saveServer: vi.fn(async () => ok<FleetRegistry>({ servers: [] })), setPassword: vi.fn(async () => ok(undefined)),
+    removeServer: vi.fn(async () => ok<FleetRegistry>({ servers: [] })),
+    probeServer: vi.fn(async () => ok<ServerConnectionCheck>({ status: 'passed', configuration: 'test', result: { gpuInfo: 'GPU fixture', allocations: [] } })),
   }
-  const controller = new ExperimentsController(fromAny<ConstructorParameters<typeof ExperimentsController>[0], typeof remote>(remote),
+  const completeRemote = { ...remote, experimentSnapshot: async () => { const registry = await remote.servers(); const experiments = await remote.experiments(); return ok({ registry: registry.value, experiments: experiments.value, deletedIds: [], deletions: [] }) } }
+  const controller = new ExperimentsController(fromAny<ConstructorParameters<typeof ExperimentsController>[0], typeof completeRemote>(completeRemote),
     { pollIntervalMs: 3000, retainedTextChars: 1000, defaultControlPort: 43019 })
   return { controller, remote, rows }
 }
+
+it('coalesces a connection check and retains its busy state until the request settles', async () => {
+  const { controller, remote } = fixture()
+  const result = Promise.withResolvers<ReturnType<typeof ok<ServerConnectionCheck>>>()
+  remote.probeServer.mockReturnValue(result.promise)
+  try {
+    const check = controller.probe('node')
+    const rejected = expect(check).rejects.toThrow('host key changed')
+    expect(controller.probe('node')).toBe(check)
+    controller.select('second')
+    expect(controller.store.getSnapshot().probing).toEqual(['node'])
+    await Promise.resolve()
+    expect(remote.probeServer).toHaveBeenCalledTimes(1)
+    result.reject(new Error('host key changed'))
+    await rejected
+    expect(controller.store.getSnapshot()).toMatchObject({ probing: [], probeErrors: { node: expect.stringContaining('host key changed') } })
+    remote.probeServer.mockResolvedValue(ok({ status: 'passed', configuration: 'test', result: { gpuInfo: 'GPU fixture', allocations: [] } }))
+    await controller.probe('node')
+    expect(controller.store.getSnapshot().probeErrors).toEqual({})
+  } finally { controller.dispose() }
+})
+
+it('discards a connection result for a removed registration and retains rows after failed removal', async () => {
+  const { controller, remote, rows } = fixture()
+  const server = rows[0]!.servers[0]!
+  controller.receive({ deletedIds: [], deletions: [], registry: { servers: [server], coordinatorId: server.id }, experiments: [] })
+  const result = Promise.withResolvers<ReturnType<typeof ok<ServerConnectionCheck>>>()
+  remote.probeServer.mockReturnValue(result.promise)
+  try {
+    remote.removeServer.mockRejectedValueOnce(new Error('pending work'))
+    await expect(controller.removeServer(server.id)).rejects.toThrow('pending work')
+    expect(controller.store.getSnapshot().registry.servers).toEqual([server])
+    expect(controller.store.getSnapshot().removingServers).toEqual([])
+    const check = controller.probe(server.id)
+    const remove = controller.removeServer(server.id)
+    expect(controller.removeServer(server.id)).toBe(remove)
+    expect(controller.store.getSnapshot().removingServers).toEqual([server.id])
+    await remove
+    result.resolve(ok({ status: 'passed', configuration: 'test', result: { gpuInfo: 'stale GPU', allocations: [] } }))
+    await check
+    expect(controller.store.getSnapshot()).toMatchObject({ registry: { servers: [] }, probes: {}, probeErrors: {}, removingServers: [], probing: [] })
+  } finally { controller.dispose() }
+})
+it('retains one pending retry across navigation and clears it after a rejected request', async () => {
+  const { controller, remote } = fixture()
+  const result = Promise.withResolvers<ReturnType<typeof ok<FleetExperiment>>>()
+  remote.retryPreparation.mockReturnValue(result.promise)
+  try {
+    const retry = controller.retry('first')
+    const rejected = expect(retry).rejects.toThrow('release unavailable')
+    expect(controller.store.getSnapshot().retrying).toEqual(['first'])
+    controller.select('second')
+    expect(controller.retry('first')).toBe(retry)
+    await Promise.resolve()
+    expect(remote.retryPreparation).toHaveBeenCalledTimes(1)
+    result.reject(new Error('release unavailable'))
+    await rejected
+    expect(controller.store.getSnapshot().retrying).toEqual([])
+    remote.retryPreparation.mockResolvedValue(ok(record('first')))
+    await controller.retry('first')
+    expect(remote.retryPreparation).toHaveBeenCalledTimes(2)
+    expect(controller.store.getSnapshot().selectedId).toBe('second')
+  } finally { controller.dispose() }
+})
+
+it.each([
+  ['preparing', 1, true], ['planning', 1, true], ['awaiting-approval', 1, false],
+  ['queued', 2, false], ['starting', 2, true], ['running', 2, true], ['serving', 2, true], ['completed', 3, false],
+] as const)('projects remote %s into its phase without animating a human or resource wait', (state, phase, busy) => {
+  const row = record('stages')
+  row.latest = { ...row.latest!, state }
+  expect(experimentProgress(row)).toMatchObject({ phase, busy, local: false, status: state })
+})
+
+it('retains the failed or paused phase from execution evidence and treats local failure as preparation', () => {
+  const row = record('stopped')
+  row.latest = { ...row.latest!, state: 'blocked' }
+  expect(experimentProgress(row)).toMatchObject({ phase: 1, busy: false, issue: true })
+  row.latest = { ...row.latest, sessionId: 'execution', progress: { phase: 'custom model text', metrics: {}, updatedAt: 1 } }
+  expect(experimentProgress(row)).toMatchObject({ phase: 2, busy: false, issue: true })
+  row.latest = { ...row.latest, state: 'waiting-reply', questions: [fromAny<NonNullable<NonNullable<FleetExperiment['latest']>['questions']>[number], { state: 'open'; stage: 'planning' }>({ state: 'open', stage: 'planning' })] }
+  expect(experimentProgress(row)).toMatchObject({ phase: 1, busy: false, attention: true })
+  row.latest = undefined; row.receipt = undefined; row.state = 'failed'
+  expect(experimentProgress(row)).toMatchObject({ phase: 0, busy: false, local: true })
+})
 it('continues UTF-8 byte cursors independently for each experiment and node', async () => {
   const { controller, remote } = fixture()
   remote.readExperiment.mockImplementation(async (id, kind, offset) => {
@@ -76,7 +166,7 @@ it('does not erase a newly submitted Goal when an older list reply arrives', asy
   remote.experiments.mockReturnValueOnce(reply.promise)
   const loading = controller.refresh()
   try {
-    await controller.create('third', ['node'], [], [], 'third', 'automatic', 'Third', modelSelections)
+    await controller.create('third', ['node'], 'node', [], [], 'third', 'automatic', 'Third', modelSelections)
     reply.resolve(ok([])); await loading
     expect(controller.store.getSnapshot().experiments.map(row => row.request.experimentId)).toEqual(['third'])
   } finally { reply.resolve(ok([])); await loading; controller.dispose() }
@@ -139,4 +229,22 @@ it('persists dismissed revision reminders and group folding without resolving pe
       expect(experimentTodos(restored.controller.store.getSnapshot().experiments)).toEqual([])
     } finally { restored.controller.dispose() }
   } finally { f.controller.dispose(); vi.unstubAllGlobals() }
+})
+
+
+it('does not restore deleted experiments from a late refresh, stream reply or stale snapshot', async () => {
+  const { controller, remote, rows } = fixture()
+  try {
+    controller.setVisible(true); controller.select('first'); await controller.refresh()
+    const response = Promise.withResolvers<Awaited<ReturnType<typeof remote.refreshExperiment>>>()
+    remote.refreshExperiment.mockImplementationOnce(() => response.promise)
+    const loading = controller.refresh()
+    await vi.waitFor(() => { expect(remote.refreshExperiment.mock.calls.length).toBeGreaterThan(2) })
+    controller.receive({ registry: { servers: [] }, experiments: [], deletedIds: [rows[0]!.request.experimentId], deletions: [] })
+    response.resolve(ok(rows[0]!)); await loading
+    controller.receive({ registry: { servers: [] }, experiments: rows, deletedIds: [], deletions: [] })
+    expect(controller.store.getSnapshot().experiments.map(row => row.request.experimentId)).toEqual(['second'])
+    expect(controller.store.getSnapshot().selectedId).toBeNull()
+    expect(Object.keys(controller.store.getSnapshot().streams).some(key => key.startsWith('first/'))).toBe(false)
+  } finally { controller.dispose() }
 })

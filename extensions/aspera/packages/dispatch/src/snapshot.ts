@@ -65,7 +65,9 @@ export async function snapshotSource(root: string, timeoutMs: number, signal?: A
     }
     dependencies['@deepseek-ai/dsh-base'] = '0.2.0-rc.2'
     dependencies['@deepseek-ai/dsh-web-app'] = '0.2.0-rc.2'
-    const releaseManifest = { name: 'aspera-installed-release', private: true, type: 'module', packageManager: 'pnpm@11.7.0', dependencies }
+    const application = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8'))
+    const releaseManifest = { name: 'aspera-installed-release', private: true, type: 'module',
+      packageManager: application.packageManager, engines: application.engines, dependencies }
     writeFileSync(join(source, 'package.json'), JSON.stringify(releaseManifest, null, 2) + '\n')
     copyFileSync(resolve(root, 'pnpm-workspace.yaml'), join(source, 'pnpm-workspace.yaml'))
     const patchRoot = resolve(root, 'patches')

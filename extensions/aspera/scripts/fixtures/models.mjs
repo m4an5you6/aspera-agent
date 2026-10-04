@@ -8,15 +8,15 @@ export const fixtureOptions = {
 }
 export const fixtureSelections = Object.fromEntries(['preparation', 'planning', 'execution'].map(phase => [phase, { provider: fixtureProvider, model: `qwen-${phase}` }]))
 
-export function fixtureModelSnapshots() {
+export function fixtureModelSnapshots(baseURL = fixtureOptions.baseURL) {
   const refs = {}; const models = {}
   for (const [phase, selection] of Object.entries(fixtureSelections)) {
     const keyRef = `ASPERA_KEY_FIXTURE_${phase.toUpperCase()}`
     const configurationRef = `ASPERA_MODEL_FIXTURE_${phase.toUpperCase()}`
-    const value = JSON.stringify({ version: 1, adapter: 'pi-ai', provider: fixtureProvider, options: { ...fixtureOptions, apiKeyEnv: keyRef }, keyRef })
+    const value = JSON.stringify({ version: 1, adapter: 'pi-ai', provider: fixtureProvider, options: { ...fixtureOptions, baseURL, apiKeyEnv: keyRef }, keyRef })
     refs[keyRef] = `cpu-only-${phase}`; refs[configurationRef] = value
     models[phase] = { ...selection, adapter: 'pi-ai', adapterVersion: '0.2.0-rc.2', api: fixtureOptions.api,
-      baseURL: fixtureOptions.baseURL, configurationRef, configurationHash: createHash('sha256').update(value).digest('hex') }
+      baseURL, configurationRef, configurationHash: createHash('sha256').update(value).digest('hex') }
   }
   return { models, refs }
 }

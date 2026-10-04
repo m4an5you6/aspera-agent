@@ -20,18 +20,48 @@ export function resolvedFixture(server, experimentId, digest) {
 }
 
 /** Replay model responses through the production preparation Agent and its actual tools. */
-export function installStorageReplay(ctx, observedCalls) {
+export function installStorageReplay(ctx, observedCalls, environmentCalls = []) {
   const turns = new Map()
   ctx.on('llm/stream', async function* (options, next) {
     let input
     for (const message of options.messages) for (const block of message.content ?? []) {
       if (block.type !== 'text' || !block.text.startsWith('{')) continue
-      try { const value = JSON.parse(block.text); if (value.operation === 'prepare-experiment-storage') input = value }
+      try {
+        const value = JSON.parse(block.text)
+        if (value.operation === 'prepare-experiment-environment' && value.verification?.ready !== true) input = value
+        if (value.operation === 'prepare-experiment-storage' && value.servers.some(server => server.selected === undefined)) input = value
+      }
       catch (error) { if (!(error instanceof SyntaxError)) throw error }
     }
     if (input === undefined) { yield* next(); return }
     const names = (options.tools ?? []).map(tool => tool.name).sort()
-    if (JSON.stringify(names) !== JSON.stringify(['inspect_server_storage', 'select_experiment_storage'])) throw new Error('Preparation tool scope changed: ' + names.join(','))
+    const expectedTools = ['inspect_server_storage', 'select_experiment_storage', 'inspect_preparation_environment', 'run_preparation_command', 'verify_preparation_environment', 'report_preparation_blocked'].sort()
+    if (JSON.stringify(names) !== JSON.stringify(expectedTools)) throw new Error('Preparation tool scope changed: ' + names.join(','))
+    if (input.operation === 'prepare-experiment-environment') {
+      const key = input.experimentId + '/' + input.serverId + '/' + input.step
+      const step = turns.get(key) ?? 0
+      turns.set(key, step + 1)
+      const operations = [
+        ['inspect_preparation_environment', {}],
+        ['run_preparation_command', { command: 'fixture install dependencies' }],
+        ['run_preparation_command', { command: 'fixture retry installation' }],
+        ['verify_preparation_environment', { path_entries: [] }],
+      ]
+      const operation = operations[step]
+      if (operation === undefined) {
+        yield { type: 'block-start', index: 0, blockType: 'text' }
+        yield { type: 'block-end', index: 0, block: { type: 'text', text: 'Environment checks passed; continue deployment.' } }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+        return
+      }
+      const [name, args] = operation
+      environmentCalls.push({ experimentId: input.experimentId, serverId: input.serverId, name })
+      yield { type: 'block-start', index: 0, blockType: 'tool-call' }
+      yield { type: 'block-end', index: 0, block: { type: 'tool-call', id: ToolCallId(randomUUID()), name, arguments: JSON.stringify({ server_id: input.serverId, ...args }) } }
+      yield { type: 'usage', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }
+      yield { type: 'finish', reason: { kind: 'tool-calls' } }
+      return
+    }
     const step = turns.get(input.experimentId) ?? 0
     turns.set(input.experimentId, step + 1)
     const pending = input.servers.filter(server => server.selected === undefined)

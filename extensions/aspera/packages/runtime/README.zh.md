@@ -32,15 +32,21 @@ kind: "package-bundle"
 
 `goalContinuationWindow` 是部署设置，默认 `128` 轮；worker patch 通过 `DSH_CLUSTER_GOAL_WINDOW` 配置。续行插件在有限窗口耗尽前通过公开 `Goal.edit` 延长同一 Goal。每次延长都记入日志，并非用户任务预算。连接、探测和模型单次操作超时、循环保护、沙箱和取消仍然生效。
 
+[专属文件清理](src/storage.ts) 在派发端确认资源释放后，仅删除保存的实验工作目录和指定的私有移交文件。清理校验归属标记、实际路径和挂载身份，拒绝嵌套挂载，不遍历目录链接。共享发布、缓存和控制状态保留；中断后从私有清理暂存目录继续。
+
 -----
 
 <a id="understand-the-implementation"></a>
 ## 了解实现
 
-[phase-model.ts](src/phase-model.ts) 为每个阶段挂载独立 LLM 服务及选定的固定版本提供商，创建 Agent 前校验配置摘要及私有凭据，Agent 结束后释放提供商。[records.ts](src/records.ts) 分页读取真实阶段事件，节点命令在节点总览日志之外分别保存 stdout/stderr 文件。
+[phase-model.ts](src/phase-model.ts) 为每个阶段在同一环境中挂载标准 DSH Agent 驱动、独立 LLM 服务及选定的固定版本提供商，并继承 profile 的驱动限制。[phase-agents.ts](src/phase-agents.ts) 与 profile 共享 Agent 发布及发起者跟踪，保留 Goal、记录和取消的正常归属。创建与恢复均校验配置摘要和私有凭据；并行阶段可以为同名提供商使用不同的已保存设置。先释放 Agent，再释放其模型环境。[records.ts](src/records.ts) 分页读取真实阶段事件，节点命令在节点总览日志之外分别保存 stdout/stderr 文件。
 
 <details>
 <summary>实现细节</summary>
+
+[transport.ts](src/transport.ts) 为密码和密钥 SSH 命令提供独立 stdout/stderr、退出状态、超时／取消信息及退出确认证据。`remote` 保留成功返回 stdout 的接口；`remoteResult` 返回非零命令结果供诊断，连接失败仍报告错误。已验证程序目录应用于后续所有命令。SSH 断开不能证明远端进程已经结束。
+
+[ssh-host-keys.ts](src/ssh-host-keys.ts) 为本机派发提供首次使用时的公钥探测和加锁登记。认证连接只读取已登记密钥，不登记新身份；委派节点连接继续使用预先安装的私有信任文件。登记在取消后停止，保留无关条目、哈希主机记录和撤销标记。
 
 [cluster.ts](src/cluster.ts) 注册认证控制路由并管理存储生命周期；[cluster-runtime.ts](src/cluster-runtime.ts) 传输和检查输入、启动独立 Agent profile 并观察服务；[cluster-node.ts](src/cluster-node.ts) 串行处理进程申请和清理证据；[cluster-agent.ts](src/cluster-agent.ts) 只在实验 Agent 范围内安装工具。私有目录位于可写工作目录之外。资源及安全检查在接收、命令和文件路径中执行，不发布独立的服务存在检查入口。
 

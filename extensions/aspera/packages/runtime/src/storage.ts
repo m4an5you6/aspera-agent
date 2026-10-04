@@ -14,12 +14,21 @@ export async function inspectServerStorage(target: Target, directory: string | u
   return serverInventorySchema.parse(await storageRequest(target, 'inspectStorage', { directory }, password, signal))
 }
 
-async function storageRequest(target: Target, operation: 'inspectStorage' | 'prepareStorage' | 'verifyStorage', input: object,
+async function storageRequest(target: Target, operation: 'inspectStorage' | 'prepareStorage' | 'verifyStorage' | 'cleanupStorage', input: object,
   password?: string, signal?: AbortSignal, requiredBytes = 0): Promise<unknown> {
   const source = readFileSync(new URL('../scripts/storage.mjs', import.meta.url), 'utf8')
   const payload = Buffer.from(JSON.stringify(input)).toString('base64')
   const script = `${source}\nconsole.log(JSON.stringify(${operation}(JSON.parse(Buffer.from('${payload}', 'base64').toString()), ${requiredBytes})))`
   return JSON.parse(await remote(target, `node --input-type=module -e ${shellQuote(script)}`, signal, password))
+}
+
+/** Remove an ended experiment's owned files over its pinned SSH connection.
+ * @param target - saved SSH account. @param placement - saved mount and owner. @param privateNames - registered secret basenames.
+ * @param password - private credential. @returns after the remote helper confirms complete cleanup.
+ */
+export async function cleanupServerStorage(target: Target, placement: StoragePlacement, privateNames: string[], password?: string): Promise<void> {
+  const result = await storageRequest(target, 'cleanupStorage', { placement: storagePlacementSchema.parse(placement), privateNames }, password)
+  if (typeof result !== 'object' || result === null || !('cleaned' in result) || result.cleaned !== true) throw new Error('Remote cleanup was not confirmed')
 }
 
 /** Materialize a saved assignment without reselecting a disk.

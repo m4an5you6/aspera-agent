@@ -21,7 +21,7 @@ function fixture() {
     return { node, inventory: { ...inventory(), addresses: [
       { interface: 'eth0', address: `10.0.0.${index + 1}`, family: 'IPv4', private: true },
       { interface: 'eth1', address: `192.168.0.${index + 1}`, family: 'IPv4', private: true },
-    ] }, token: 'x'.repeat(32), target: { ...node.server, localRepo: '/release', dataRoots: [], allowedSystemPackages: [],
+    ] }, token: 'x'.repeat(32), target: { ...node.server, localRepo: '/release', dataRoots: [],
       agentCredentialRefs: [], tokenRef: 'token', toolTimeoutMs: 1000, controlPollIntervalMs: 100 } }
   })
   vi.mocked(request).mockImplementation(async (target, _token, path, _method, raw) => {
@@ -50,6 +50,20 @@ it('tries multiple interfaces and verifies the chosen address from every other n
   expect(selected.map(node => node.server.trainingAddress)).toEqual(['192.168.0.1', '192.168.0.2'])
   expect(vi.mocked(request).mock.calls.filter(call => call[2].endsWith('connect'))).toHaveLength(4)
   expect(vi.mocked(request).mock.calls.filter(call => call[2].endsWith('stop'))).toHaveLength(2)
+})
+
+it('verifies one assigned receiver while leaving the other node for its own preparation interval', async () => {
+  const f = fixture()
+  const selected = await resolveTrainingNetwork(f.id, f.peers, f.abort.signal, f.peers[0]!.node.server.id)
+  expect(selected.map(node => node.server.trainingAddress)).toEqual(['192.168.0.1', undefined])
+  expect(vi.mocked(request).mock.calls.filter(call => call[2].endsWith('connect')).every(call => call[0].host === 'node-b')).toBe(true)
+  expect(vi.mocked(request).mock.calls.filter(call => call[2].endsWith('stop'))).toHaveLength(2)
+})
+
+it('rejects an unselected network receiver before opening listeners', async () => {
+  const f = fixture()
+  await expect(resolveTrainingNetwork(f.id, f.peers, f.abort.signal, serverIdSchema.parse(randomUUID()))).rejects.toThrow('outside the selected group')
+  expect(request).not.toHaveBeenCalled()
 })
 
 it('reports the failing manual node and cleans both listeners when only one direction works', async () => {

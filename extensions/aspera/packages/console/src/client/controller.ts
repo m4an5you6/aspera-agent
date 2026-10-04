@@ -1,3 +1,5 @@
+import type { ExperimentDeletion, ExperimentDeletionPreview } from '@aspera/dispatch/types'
+type ManagementMessage = 'experimentsDeleted' | 'deletionIncomplete' | 'serverDeleted' | 'serverDeleteFailed'
 import type {} from '@aspera/dispatch/remote'
 import type {} from '@deepseek-ai/dsh-api-gateway/client'
 /** Independent experiment selection, incremental reads, and browser actions. */
@@ -42,6 +44,12 @@ export interface ExperimentsSnapshot {
   streams: Record<string, ExperimentStream>
   files: ClusterFile[]
   filesTruncated: boolean
+  retrying: string[]
+  probing: string[]
+  removingServers: string[]
+  deletedIds: string[]
+  deletions: ExperimentDeletion[]
+  toast: { key: ManagementMessage; sequence: number; failed: boolean } | null
   error: string | null
 }
 
@@ -50,7 +58,13 @@ export class ExperimentsController {
   /** Observable page data; execution ownership remains on the Host. */
   readonly store = createSnapshotStore<ExperimentsSnapshot>({ view: 'list', preferences: readPreferences(), modelDirectory: null, modelsLoading: false, modelsError: null, settingsOpen: false,
     registry: { servers: [] }, experiments: [], selectedId: null,
-    probes: {}, probeErrors: {}, streams: {}, files: [], filesTruncated: false, error: null })
+    probes: {}, probeErrors: {}, streams: {}, files: [], filesTruncated: false, retrying: [], probing: [], removingServers: [], deletedIds: [], deletions: [], toast: null, error: null })
+  private readonly deleted = new Set<string>()
+  private readonly removedServers = new Set<string>()
+  private readonly preparationRetries = new Map<string, Promise<void>>()
+  private readonly serverChecks = new Map<string, Promise<void>>()
+  private readonly serverRemovals = new Map<string, Promise<void>>()
+  private readonly serverRevisions = new Map<string, number>()
   private readonly decoders = new Map<string, TextDecoder>()
   private loading: Promise<void> | undefined
   private disposed = false
@@ -101,7 +115,13 @@ export class ExperimentsController {
 
   /** Apply a validated reconnect snapshot without moving local log cursors. @param snapshot - current durable records. */
   receive(snapshot: import('@aspera/dispatch/types').FleetSnapshot): void {
-    this.patch({ registry: snapshot.registry })
+    for (const id of snapshot.deletedIds) this.deleted.add(id)
+    const selectedId = this.store.getSnapshot().selectedId
+    for (const key of this.decoders.keys()) if (this.deleted.has(key.split('/')[0]!)) this.decoders.delete(key)
+    const streams = Object.fromEntries(Object.entries(this.store.getSnapshot().streams).filter(([key]) => !this.deleted.has(key.split('/')[0]!)))
+    this.patch({ registry: { ...snapshot.registry, servers: snapshot.registry.servers.filter(server => !this.removedServers.has(server.id)) },
+      experiments: this.store.getSnapshot().experiments.filter(row => !this.deleted.has(row.request.experimentId)),
+      streams, deletedIds: [...this.deleted], deletions: snapshot.deletions, ...(selectedId !== null && this.deleted.has(selectedId) ? { selectedId: null, files: [], filesTruncated: false } : {}) })
     for (const record of snapshot.experiments) this.replace(record)
   }
 
@@ -137,10 +157,11 @@ export class ExperimentsController {
 
   private async load(): Promise<void> {
     const registryRevision = this.registryRevision
-    const [registry, experiments] = await Promise.all([this.remote.servers().then(unwrap), this.remote.experiments().then(unwrap)])
+    const snapshot = unwrap(await this.remote.experimentSnapshot())
+    const { registry, experiments } = snapshot
     if (this.isDisposed()) return
-    this.patch({ ...(registryRevision === this.registryRevision ? { registry } : {}), error: null })
-    for (const row of experiments) this.replace(row)
+    this.receive({ ...snapshot, registry: registryRevision === this.registryRevision ? registry : this.store.getSnapshot().registry })
+    this.patch({ error: null })
     const selected = this.store.getSnapshot().selectedId
     const terminal = new Set(['completed', 'failed', 'blocked', 'cancelled', 'interrupted'])
     const pending = experiments.filter(row => row.submission !== undefined && (row.request.experimentId === selected
@@ -163,6 +184,7 @@ export class ExperimentsController {
   }
 
   private replace(row: FleetExperiment): void {
+    if (this.deleted.has(row.request.experimentId)) return
     const current = this.store.getSnapshot().experiments
     const previous = current.find(value => value.request.experimentId === row.request.experimentId)
     if ((previous?.latest?.revision ?? 0) > (row.latest?.revision ?? 0)) return
@@ -176,7 +198,7 @@ export class ExperimentsController {
     const previous = this.store.getSnapshot().streams[key] ?? { text: '', reset: false, offset: 0 }
     const chunk = unwrap(await this.remote.readExperiment(row.request.experimentId, kind, previous.offset, server?.id,
       undefined, previous.generation === '' ? undefined : previous.generation))
-    if (this.isDisposed()) return
+    if (this.isDisposed() || this.deleted.has(row.request.experimentId)) return
     let decoder = this.decoders.get(key)
     if (chunk.reset || decoder === undefined) { decoder = new TextDecoder(); this.decoders.set(key, decoder) }
     const bytes = Uint8Array.from(atob(chunk.data), character => character.charCodeAt(0))
@@ -195,44 +217,78 @@ export class ExperimentsController {
   }
 
   /**
-   * Save server settings while retaining the original coordinator.
+   * Save server preferences without changing submitted experiment snapshots.
    * @param server - complete server settings.
    * @param password - new secret or empty to preserve it.
    */
   async saveServer(server: FleetServerInput, password: string): Promise<void> {
     this.registryRevision++
+    this.serverRevisions.set(server.id, (this.serverRevisions.get(server.id) ?? 0) + 1)
     if (password !== '') await this.remote.setPassword({ host: server.host, username: server.username, sshPort: server.sshPort,
       ...(server.passwordRef === undefined ? {} : { passwordRef: server.passwordRef }) }, password).then(unwrap)
     const registry = unwrap(await this.remote.saveServer(server))
     this.registryRevision++
-    this.patch({ registry })
+    this.removedServers.delete(server.id)
+    const { [server.id]: _oldProbe, ...probes } = this.store.getSnapshot().probes
+    const { [server.id]: _oldError, ...probeErrors } = this.store.getSnapshot().probeErrors
+    this.patch({ registry, probes, probeErrors, error: null })
   }
 
   /**
    * Remove an unused server from future selections.
    * @param id - server removed from future selections.
    */
-  async removeServer(id: string): Promise<void> {
-    this.registryRevision++
-    const registry = unwrap(await this.remote.removeServer(id))
-    this.registryRevision++
-    this.patch({ registry })
+  removeServer(id: string): Promise<void> {
+    const existing = this.serverRemovals.get(id)
+    if (existing !== undefined) return existing
+    this.serverRevisions.set(id, (this.serverRevisions.get(id) ?? 0) + 1)
+    const operation = Promise.resolve().then(async () => {
+      this.registryRevision++
+      const registry = unwrap(await this.remote.removeServer(id))
+      this.registryRevision++
+      this.removedServers.add(id)
+      const { [id]: _oldProbe, ...probes } = this.store.getSnapshot().probes
+      const { [id]: _oldError, ...probeErrors } = this.store.getSnapshot().probeErrors
+      this.patch({ registry, probes, probeErrors })
+      this.notify('serverDeleted')
+    }).finally(() => {
+      this.serverRemovals.delete(id)
+      this.patch({ removingServers: [...this.serverRemovals.keys()] })
+    })
+    this.serverRemovals.set(id, operation)
+    this.patch({ removingServers: [...this.serverRemovals.keys()], error: null })
+    return operation
   }
 
   /**
    * Check SSH connectivity and report GPU and allocation facts.
    * @param id - server whose SSH and GPU inventory are checked.
    */
-  async probe(id: string): Promise<void> {
-    try {
-      const result = unwrap(await this.remote.probeServer(id))
-      const { [id]: _previous, ...probeErrors } = this.store.getSnapshot().probeErrors
-      this.patch({ probes: { ...this.store.getSnapshot().probes, [id]: result }, probeErrors })
-    } catch (error) {
-      const { [id]: _previous, ...probes } = this.store.getSnapshot().probes
-      this.patch({ probes, probeErrors: { ...this.store.getSnapshot().probeErrors, [id]: String(error) } })
-      throw error
-    }
+  probe(id: string): Promise<void> {
+    const existing = this.serverChecks.get(id)
+    if (existing !== undefined) return existing
+    const revision = this.serverRevisions.get(id) ?? 0
+    const operation = Promise.resolve().then(async () => {
+      try {
+        const result = unwrap(await this.remote.probeServer(id))
+        if ((this.serverRevisions.get(id) ?? 0) !== revision) return
+        const { [id]: _previous, ...probeErrors } = this.store.getSnapshot().probeErrors
+        const registry = this.store.getSnapshot().registry
+        this.patch({ registry: { ...registry, checks: { ...registry.checks, [id]: result } },
+          probes: { ...this.store.getSnapshot().probes, ...(result.result === undefined ? {} : { [id]: result.result }) }, probeErrors })
+      } catch (error) {
+        if ((this.serverRevisions.get(id) ?? 0) !== revision) return
+        const { [id]: _previous, ...probes } = this.store.getSnapshot().probes
+        this.patch({ probes, probeErrors: { ...this.store.getSnapshot().probeErrors, [id]: String(error) } })
+        throw error
+      }
+    }).finally(() => {
+      this.serverChecks.delete(id)
+      this.patch({ probing: [...this.serverChecks.keys()] })
+    })
+    this.serverChecks.set(id, operation)
+    this.patch({ probing: [...this.serverChecks.keys()], error: null })
+    return operation
   }
 
   /**
@@ -243,11 +299,11 @@ export class ExperimentsController {
    * @param uploads - browser attachments.
    * @param id - stable id reused for retries.
    */
-  async create(objective: string, serverIds: string[], files: string[], uploads: File[], id: string,
+  async create(objective: string, serverIds: string[], coordinatorId: string, files: string[], uploads: File[], id: string,
     mode: 'semi' | 'automatic', name?: string, models?: ExperimentModels): Promise<void> {
     if (models === undefined) throw new Error('Select the Agent model for every phase')
     const validated = unwrap(await this.remote.validateExperimentModels(models))
-    const row = unwrap(await this.remote.createExperiment({ experimentId: id, objective, serverIds, files,
+    const row = unwrap(await this.remote.createExperiment({ experimentId: id, objective, serverIds, coordinatorId, files,
       uploads: uploads.map(file => ({ name: file.name, size: file.size })), mode, ...(name === undefined ? {} : { name }), models: validated }))
     this.preferences({ models: validated })
     this.patch({ view: 'list' })
@@ -284,13 +340,43 @@ export class ExperimentsController {
     return this.remote.accessService(id, serviceId, path, method, body).then(unwrap)
   }
 
+  /** @param id - saved server. @returns the password only after the editor requests it. */
+  revealServerPassword(id: string): Promise<string> { return this.remote.revealServerPassword(id).then(unwrap) }
+  /** @param ids - selected records. @returns removal requirements and paths. */
+  previewDeletion(ids: string[]): Promise<ExperimentDeletionPreview[]> { return this.remote.previewExperimentDeletion(ids).then(unwrap) }
+  /** @param ids - confirmed records. @param cleanupRemote - explicit file cleanup. @param operationId - retained retry identity. @returns individual outcomes. */
+  async deleteExperiments(ids: string[], cleanupRemote: boolean, operationId: string): Promise<ExperimentDeletion[]> {
+    const results = unwrap(await this.remote.deleteExperiments({ experimentIds: ids, cleanupRemote, operationId }))
+    for (const result of results) if (result.state === 'deleted') this.deleted.add(result.experimentId)
+    this.receive({ registry: this.store.getSnapshot().registry, experiments: this.store.getSnapshot().experiments,
+      deletedIds: [], deletions: results })
+    this.notify(results.some(result => result.state !== 'deleted') ? 'deletionIncomplete' : 'experimentsDeleted', results.some(result => result.state !== 'deleted'))
+    return results
+  }
+  /** @param key - localized operation outcome. @param failed - whether to show warning treatment. */
+  notify(key: ManagementMessage, failed = false): void { this.patch({ toast: { key, failed, sequence: (this.store.getSnapshot().toast?.sequence ?? 0) + 1 } }) }
+  /** Clear only the displayed operation notification. */
+  clearToast(): void { this.patch({ toast: null }) }
+
   /**
    * Cancel the saved experiment while retaining unconfirmed allocations.
    * @param id - experiment whose cancellation is recorded remotely.
    */
   async cancel(id: string): Promise<void> { this.replace(unwrap(await this.remote.cancelExperiment(id))) }
-  /** Resume a failed preparation. @param id - immutable experiment identity. */
-  async retry(id: string): Promise<void> { this.replace(unwrap(await this.remote.retryPreparation(id))) }
+  /** Resume a failed preparation, sharing one pending request per experiment across page navigation.
+   * @param id - immutable experiment identity. @returns completion of the accepted retry request.
+   */
+  retry(id: string): Promise<void> {
+    const existing = this.preparationRetries.get(id)
+    if (existing !== undefined) return existing
+    const operation = Promise.resolve().then(() => this.remote.retryPreparation(id)).then(result => { this.replace(unwrap(result)) }).finally(() => {
+      this.preparationRetries.delete(id)
+      this.patch({ retrying: [...this.preparationRetries.keys()] })
+    })
+    this.preparationRetries.set(id, operation)
+    this.patch({ retrying: [...this.preparationRetries.keys()], error: null })
+    return operation
+  }
 
   /**
    * Request a private streaming download address.

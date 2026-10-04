@@ -1,6 +1,7 @@
 /** Versioned experiment data, atomic scheduling, and bounded artifact access. */
 export * from './cluster-protocol.ts'
 export * from './storage-protocol.ts'
+export * from './environment-protocol.ts'
 export * from './models.ts'
 export * from './records.ts'
 export * from './cluster-queue.ts'

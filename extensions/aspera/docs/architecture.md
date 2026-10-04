@@ -26,7 +26,7 @@ Aspera owns experimental work outside the Harness source tree. Published DSH sup
 | `@aspera/console` | Sidebar page, forms, record stream and per-source log cursors | Published Web slots, locale dictionaries and Remote descriptors |
 | `@aspera/desktop` | Independent window, tray and local profile lifecycle | Electron and a published `dsh` profile |
 
-The adapter retains two version-checked published-package patches: an additive sidebar group slot and forwarding of the existing settings command. The official shell, conversations and plugin manager stay in DSH. Private provider snapshots feed isolated preparation/planning/execution scopes; public records expose only their model summaries.
+The adapter retains two version-checked published-package patches: an additive sidebar group slot and forwarding of the existing settings command. The official shell, conversations and plugin manager stay in DSH. Private provider snapshots feed [phase contexts](../packages/runtime/README.md#understand-the-implementation) that bind the standard DSH Agent driver to its provider for preparation, planning and execution; public records expose only their model summaries.
 
 Host programs compile against installed package declarations. The Typert shim in [types/typert-protocol.d.ts](../types/typert-protocol.d.ts) belongs only to the generator program and exposes the registration metadata its analysis needs. Browser wrapping in [tsdown.config.ts](../packages/console/tsdown.config.ts) contains Cordis-compatible CommonJS module loading and CSS insertion; the compiled public client declarations remain separate from the JavaScript bundle.
 
@@ -44,16 +44,21 @@ flowchart TB
     Browser[Web browser] --> Page
     Page --> Remote[Typed Remote: RPC + streams]
     Remote --> Fleet[Aspera dispatch: fleet / credentials / Sessions]
+    Fleet --> Management[Peer servers / dated checks / deletion journal]
+    Management --> Cleanup[Owned paths only / cleanup receipts / tombstones]
     Fleet --> Models[Private snapshots: preparation / planning / execution]
     Models --> Selection
     Models --> Planner
     Models --> Executor
-    Fleet --> Inventory[Read-only SSH: mounts / space / interfaces]
+    Fleet --> Preparation[Local DSH Agent: inspect / configure / repair]
+    Preparation --> Checks[Provider verification: versions / sandbox availability]
+    Checks --> Inventory[Read-only SSH: mounts / space / interfaces]
     Inventory --> Selection[Restricted Agent: candidate ID + reason]
     Selection --> Placement[Persist placement before directory creation]
-    Placement --> Network[Mutual node identity and network checks]
+    Placement --> Acceptance[Workspace / isolation / credentials / GPU checks]
+    Acceptance --> Network[Mutual node identity and network checks]
   end
-  subgraph Coordinator[First server: durable coordinator]
+  subgraph Coordinator[Selected participant: durable coordinator]
     Queue[Aspera experiments: queue / plans / resource groups]
     Planner[Read-only planning Agent]
     Executor[Independent execution Agent]
@@ -87,9 +92,11 @@ sequenceDiagram
   participant Queue as Remote coordinator
   participant Agent as Planning / execution Agent
   participant Node as Selected GPU nodes
-  User->>UI: Submit Goal and server group
-  UI->>Fleet: Create independent experiment
+  User->>UI: Submit Goal, server group and coordinator
+  UI->>Fleet: Validate coordinator and cross-coordinator overlaps
   Fleet-->>UI: Preparing; another Goal can be submitted
+  Fleet->>Node: Shell-only inspection; Agent configures dependencies
+  Fleet->>Fleet: Persist diagnostics; verify tools and executable paths
   Fleet->>Node: Read mounts, space and network interfaces over SSH
   Fleet->>Fleet: Agent selects candidate; persist paths and reason
   Fleet->>Node: Create owned directories; deploy; verify mutual network
@@ -121,12 +128,14 @@ sequenceDiagram
   Note over Queue,Node: Accepted work continues after the local application quits
 ```
 
+The management profile serializes admission checks. Different coordinators cannot manage unfinished experiments sharing a node; the selected participant is pinned per experiment. Waiting for initial confirmation retains this registration constraint without allocating GPUs. Node controls independently enforce exclusive execution. Terminal record removal uses a durable deletion journal and tombstones; optional SSH cleanup validates saved owners, paths and mounts.
+
 -----
 
 <a id="execution-and-ownership"></a>
 ## Execution and ownership
 
-The management Host records read-only SSH inventory, then a restricted dispatch Agent selects an observed candidate ID and reason. Manual paths take precedence; sufficiently large system disks are allowed. Selection is saved before owned-directory creation. Mount identity, ownership, writes and space are checked again during preparation, transfer and startup. Short-lived mutual network proofs bind node and experiment identities before admission and are repeated after queue allocation. Failure stops joint startup without reducing the node group.
+The management Host starts the standard DSH preparation Agent with the selected model and existing Session. Shell-only inspection precedes Node-dependent inventory. Scoped SSH tools configure dependencies using the login account's permissions; release requirements determine Node and pnpm versions. The Host saves executable paths, node stages and diagnostics, then verifies each repair. The same Agent selects an observed storage candidate and reason; manual paths take precedence. Selection precedes directory creation. Mount identity, ownership, writes and space are rechecked during preparation, transfer and startup. Sandbox confinement, hidden credentials, CUDA and mutual network proofs gate handover. Kernel/device restrictions remain explicit blockers; model declarations cannot waive checks.
 
 Control state, queues and credentials remain under the login user’s fixed private control directory. Releases and per-experiment inputs, Agent homes, logs, caches, environments, temporary files and artifacts use the selected disk. Node tools expose granted devices, hide the control directory and registered experiment storage roots, and bind only the current workspace writable. Framework cache/environment variables point into that workspace. Network access remains shared for downloads and training; it is not network isolation.
 

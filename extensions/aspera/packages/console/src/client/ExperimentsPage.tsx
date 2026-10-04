@@ -1,22 +1,24 @@
-import { needsExperimentAttention } from '@aspera/experiments'
 /** Experiment forms and read-only execution details receive all effects through props. */
 import { useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import {
-  Button, Checkbox, IconChevronDownOutlineRegular, IconGoalOutlineRegular, IconPaperclipOutlineRegular,
-  IconPlusOutlineRegular, IconRefreshOutlineRegular, Input, Menu, Tag, Modal,
+  Button, Checkbox, IconGoalOutlineRegular, IconPaperclipOutlineRegular,
+  IconPlusOutlineRegular, IconRefreshOutlineRegular, Input, Tag, Modal,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { FleetExperiment, ServerSettings, FleetServerInput } from '@aspera/dispatch/types'
+import { ExperimentList, ExperimentStatus, DeleteExperimentsDialog } from './ExperimentManagement.tsx'
+import { ServerCards, ServerPassword } from './ServerManagement.tsx'
 import type { InferenceService, ServiceAccessInfo } from '@aspera/experiments/types'
 import type { InjectFace, PropsLocale, PropsRuntime, TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import type { ExperimentsController } from './controller.ts'
 import css from './ExperimentsPage.module.css'
 import { AgentRecords } from './AgentRecords.tsx'
 import { RuntimeMonitor } from './RuntimeMonitor.tsx'
-import { ModelFields, modelsReady } from './ModelFields.tsx'
+import { ModelFields, modelsReady, Choice as Selection } from './ModelFields.tsx'
 import type { ExperimentModels } from '@aspera/experiments/types'
 import { experimentAttentionCount, attentionLabel, experimentTodos } from './attention.ts'
 import { ExperimentQuestionCard } from './QuestionCard.tsx'
+import { ExperimentOverview } from './ExperimentOverview.tsx'
 
 /** Actions and observable state owned by the plugin controller. */
 export interface ExperimentsInjected {
@@ -49,14 +51,8 @@ export function ExperimentsPage({ controller, useExperiments, t }: PageProps) {
   const setView = (value: Snapshot['view']) => { controller.navigate(value) }
   const todos = experimentTodos(state.experiments).filter(todo => !state.preferences.dismissed.includes(todo.key))
   const [draft, setDraft] = useState<FleetExperiment | undefined>()
-  const [search, setSearch] = useState('')
   const [filter, setFilter] = useState<'all' | 'pending' | 'running' | 'queued' | 'completed' | 'failed'>('all')
   const pendingCount = experimentAttentionCount(state.experiments)
-  const rows = state.experiments.filter(row => {
-    const status = row.latest?.state ?? row.state
-    const matches = filter === 'all' || (filter === 'pending' ? row.latest !== undefined && needsExperimentAttention(row.latest) : status === filter)
-    return matches && `${row.request.name ?? ''} ${row.request.objective} ${row.request.experimentId} ${row.servers.map(server => server.name).join(' ')}`.toLocaleLowerCase().includes(search.toLocaleLowerCase())
-  })
   useEffect(() => { controller.setVisible(true); return () => { controller.setVisible(false) } }, [controller])
   const detail = state.experiments.find(row => row.request.experimentId === state.selectedId)
   const act = (operation: () => Promise<unknown>) => { void operation().catch((error: unknown) => { controller.report(error) }) }
@@ -78,17 +74,8 @@ export function ExperimentsPage({ controller, useExperiments, t }: PageProps) {
         servers={state.registry.servers} state={state} draft={draft} />
         : detail !== undefined ? <ExperimentDetail key={detail.request.experimentId} controller={controller} t={t} row={detail} state={state} onClone={() => {
           controller.select(null); setDraft(detail); setView('new')
-        }} /> : <div className={css.list}>
-          <div className={css.listTools}><Input aria-label={t('search')} placeholder={t('search')} value={search} onChange={event => { setSearch(event.target.value) }} />
-            <Selection label={t('statusFilter')} value={filter} options={(['all', 'pending', 'running', 'queued', 'completed', 'failed'] as const).map(value => ({ value, label: t(value) }))} onChange={setFilter} /></div>
-          {rows.length === 0 ? <div className={css.emptyState}><IconGoalOutlineRegular size={28} /><h2>{state.experiments.length === 0 ? t('empty') : t('noMatches')}</h2><p>{t('newHint')}</p></div> : <div className={css.tableWrap}><table className={css.table}>
-            <thead><tr><th>{t('goal')}</th><th>{t('status')}</th><th>{t('servers')}</th><th>{t('updated')}</th></tr></thead>
-            <tbody>{rows.map(row => <tr key={row.request.experimentId}>
-              <td><button className={css.rowLink} onClick={() => { controller.select(row.request.experimentId) }}>{row.request.name ?? (row.submission?.protocol === 4 ? row.submission.name : row.request.objective.split('\n')[0])}</button><small>{row.latest?.progress?.phase ?? (row.receipt !== undefined ? t('handoverShort') : t(row.state === 'preparing' && row.preparation !== undefined ? row.preparation.stage : row.state))}</small></td>
-              <td><Tag tone={row.latest !== undefined && needsExperimentAttention(row.latest) ? 'warning' : 'neutral'}>{t(row.latest?.state ?? row.state)}</Tag></td>
-              <td>{row.servers.map(server => server.name).join(' · ')}</td><td><time>{new Date(row.latest?.updatedAt ?? row.createdAt).toLocaleString()}</time></td>
-            </tr>)}</tbody></table></div>}
-        </div>}
+        }} /> : <ExperimentList controller={controller} t={t} rows={state.experiments} pendingOnly={filter === 'pending'} onPendingChange={pending => { setFilter(pending ? 'pending' : 'all') }} onClone={row => { setDraft(row); setView('new') }} />}
+
     </div>
   </section>
 }
@@ -104,32 +91,7 @@ function Servers({ controller, t, state }: ViewProps & { state: Snapshot }) {
       {editing !== undefined && <ServerForm key={editing === 'new' ? 'new' : editing.id} controller={controller} t={t}
         server={editing === 'new' ? undefined : editing} done={() => { setEditing(undefined) }} />}
     </Modal>
-    {state.registry.servers.map((server) => {
-      const probe = state.probes[server.id] ?? state.registry.probes?.[server.id]
-      const allocated = new Set<string>(state.experiments.filter(row => row.latest?.resourcesReleased === false
-        && row.servers.some(node => node.id === server.id)).map(row => row.request.experimentId))
-      for (const id of probe?.allocations ?? []) if (!state.experiments.some(row => row.request.experimentId === id)) allocated.add(id)
-      return <article key={server.id} className={css.card}>
-        <div className={css.cardHeading}><h2>{server.name}</h2>{server.id === state.registry.coordinatorId && <Tag tone="info">{t('coordinator')}</Tag>}</div>
-        <p className={css.hint}>{server.username}@{server.host}:{server.sshPort}</p>
-        {server.inferenceMapping !== undefined && <p className={css.hint}>{t('externalInferenceUrl')}: {server.inferenceMapping.url} · {t('mappedPort')}: {server.inferenceMapping.port}</p>}
-        {state.probeErrors[server.id] !== undefined ? <p role="alert" className={css.error}>{state.probeErrors[server.id]}</p>
-          : probe === undefined && <p className={css.hint}>{t('connectionUnchecked')}</p>}
-        <div className={css.actions}><Tag tone={allocated.size > 0 ? 'warning' : 'neutral'}>{t('allocations', { count: allocated.size })}</Tag>
-          {probe !== undefined && <Tag tone="success">{t('connectionReady')}</Tag>}</div>
-        {probe !== undefined && <pre className={css.log}>{probe.gpuInfo}</pre>}
-        {probe !== undefined && <details className={css.inventory}><summary>{t('storageInventory')}</summary>
-          <p className={css.hint}>{t('observedAt', { time: new Date(probe.inventory.observedAt).toLocaleString() })}</p>
-          <ul>{probe.inventory.candidates.map(candidate => <li key={candidate.id}><code>{candidate.directory}</code>
-            <span>{t('availableBytes', { size: candidate.availableBytes.toLocaleString() })} · {t(candidate.writable ? 'writable' : 'readOnly')} · {t(candidate.persistence)}</span></li>)}</ul>
-          <p>{t('trainingAddress')}: {probe.inventory.addresses.map(value => value.address).join(' · ') || t('noNetworkAddress')}</p>
-        </details>}
-        <div className={css.actions}>
-          <Button variant="outline" onClick={() => { setEditing(server) }}>{t('edit')}</Button>
-          <Button variant="outline" onClick={() => { void controller.probe(server.id).catch((error: unknown) => { controller.report(error) }) }}>{t('test')}</Button>
-          <Button variant="ghost" disabled={server.id === state.registry.coordinatorId} onClick={() => { void controller.removeServer(server.id).catch((error: unknown) => { controller.report(error) }) }}>{t('remove')}</Button>
-        </div>
-      </article>})}
+    <ServerCards controller={controller} t={t} state={state} edit={setEditing} />
   </section>
 }
 
@@ -161,7 +123,7 @@ function ServerForm({ controller, t, server, done }: ViewProps & { server: Serve
     <label>{t('name')}<Input name="name" data-modal-autofocus defaultValue={server?.name} required /></label>
     <label>{t('host')}<Input name="host" defaultValue={server?.host} required /></label>
     <label>{t('username')}<Input name="username" autoComplete="username" defaultValue={server?.username} required /></label>
-    <label>{t('password')}<Input name="password" type="password" autoComplete="new-password" required={server?.authMode !== 'password'} /></label>
+    <ServerPassword controller={controller} t={t} server={server} />
     <label>{t('sshPort')}<Input name="sshPort" type="number" min={1} max={65535} defaultValue={server?.sshPort ?? 22} required /></label>
     </div>
     <details className={css.advanced} open={server?.inferenceMapping !== undefined || undefined}><summary>{t('publicInferenceSettings')}</summary>
@@ -185,23 +147,6 @@ function ServerForm({ controller, t, server, done }: ViewProps & { server: Serve
   </form>
 }
 
-function Selection<Value extends string>({ label, value, options, onChange, disabled = false }: {
-  label: string; value: Value; options: readonly { value: Value; label: string }[]
-  onChange: (value: Value) => void; disabled?: boolean
-}) {
-  const [open, setOpen] = useState(false)
-  return <Menu open={open && !disabled} portal className={css.selection} selectedId={value}
-    items={options.map(option => ({ id: option.value, label: option.label }))}
-    onClose={() => { setOpen(false) }} onSelect={id => {
-      const selected = options.find(option => option.value === id)
-      if (selected !== undefined) onChange(selected.value)
-      setOpen(false)
-    }} anchor={<Button variant="outline" className={css.selectButton} aria-label={label}
-      aria-haspopup="menu" aria-expanded={open && !disabled} disabled={disabled} onClick={() => { setOpen(current => !current) }}>
-      <span>{options.find(option => option.value === value)?.label}</span><IconChevronDownOutlineRegular />
-    </Button>} />
-}
-
 function NewExperiment({ controller, t, servers, state, draft }: ViewProps & {
   servers: ServerSettings[]
   state: Snapshot
@@ -214,6 +159,9 @@ function NewExperiment({ controller, t, servers, state, draft }: ViewProps & {
   useEffect(() => { const current = state.modelDirectory?.current; if (models === undefined && current !== undefined) setModels({ preparation: current, planning: current, execution: current }) }, [state.modelDirectory, models])
   const [ids, setIds] = useState<string[]>(draft?.servers.map(server => server.id)
     .filter(id => servers.some(server => server.id === id)) ?? [])
+  const [chosenCoordinator, setChosenCoordinator] = useState(draft?.coordinator.id ?? '')
+  const coordinatorId = ids.includes(chosenCoordinator) ? chosenCoordinator : ids[0] ?? ''
+  useEffect(() => { if (!ids.includes(chosenCoordinator)) setChosenCoordinator(ids[0] ?? '') }, [ids, chosenCoordinator])
   const [mode, setMode] = useState<'semi' | 'automatic'>(draft?.request.mode ?? 'automatic')
   const [busy, setBusy] = useState(false)
   const uploadsInput = useRef<HTMLInputElement>(null)
@@ -228,7 +176,7 @@ function NewExperiment({ controller, t, servers, state, draft }: ViewProps & {
     const paths = data.get('paths')
     const files = (typeof paths === 'string' ? paths : '').split(/\r?\n/).map(value => value.trim()).filter(Boolean)
     const uploads = data.getAll('uploads').filter((value): value is File => value instanceof File && value.name !== '')
-    try { await controller.create(objective, ids, files, uploads, id.current, mode, name, models) }
+    try { await controller.create(objective, ids, coordinatorId, files, uploads, id.current, mode, name, models) }
     catch (error) { controller.report(error) }
     finally { pending.current = false; setBusy(false) }
   }
@@ -247,7 +195,11 @@ function NewExperiment({ controller, t, servers, state, draft }: ViewProps & {
         <Checkbox label={server.name} checked={ids.includes(server.id)} onChange={(checked) => { setIds(current => checked ? [...current, server.id] : current.filter(id => id !== server.id)) }} />
         <small>{server.username}@{server.host}</small><small>{state.probes[server.id]?.gpuInfo ?? t('connectionUnchecked')}</small>
       </div>)}
-    </fieldset></section>
+    </fieldset><div className={css.coordinatorChoice}><span>{t('experimentCoordinator')}</span>
+      <Selection label={t('experimentCoordinator')} value={coordinatorId} disabled={busy || ids.length < 2}
+        options={servers.filter(server => ids.includes(server.id)).map(server => ({ value: server.id, label: server.name }))} onChange={setChosenCoordinator} />
+      <p className={css.hint}>{t(ids.length === 1 ? 'singleNodeCoordinator' : 'coordinatorSelectionHint')}</p>
+    </div><p className={css.hint}>{t('coordinatorOverlapHint')}</p></section>
     <section className={css.formSection}><h2><span>03</span>{t('attachments')}</h2>
     <div className={css.field}><span>{t('attachments')}</span><div className={css.actions}>
       <input ref={uploadsInput} type="file" name="uploads" aria-label={t('attachments')} hidden multiple disabled={busy}
@@ -264,60 +216,40 @@ function NewExperiment({ controller, t, servers, state, draft }: ViewProps & {
       </Button>)}
     </div><p className={css.hint}>{t('noBudgetHint')}</p></section>
     <div className={css.formFooter}><span className={css.hint}>{t('handoverHint')}</span><Button type="submit" variant="primary" disabled={busy || ids.length === 0 || objective.trim() === '' || name.trim() === '' || !modelsReady(models, state.modelDirectory)}>{busy ? t('submitting') : t('submit')}</Button></div>
-    </div><aside className={css.summary}><h3>{t('summary')}</h3><dl><dt>{t('goal')}</dt><dd>{objective || t('goalHint')}</dd><dt>{t('servers')}</dt><dd>{servers.filter(server => ids.includes(server.id)).map(server => server.name).join(' · ') || t('noSelection')}</dd><dt>{t('attachments')}</dt><dd>{uploadNames.join(' · ') || t('noFilesSelected')}</dd><dt>{t('automation')}</dt><dd>{t(mode)}</dd></dl><p>{t('agentModelHint')}</p>{models !== undefined && <dl>{(['preparation', 'planning', 'execution'] as const).map(phase => <div key={phase}><dt>{t(`${phase}Model`)}</dt><dd>{models[phase].provider} · {models[phase].model}</dd></div>)}</dl>}</aside>
+    </div><aside className={css.summary}><h3>{t('summary')}</h3><dl><dt>{t('goal')}</dt><dd>{objective || t('goalHint')}</dd><dt>{t('servers')}</dt><dd>{servers.filter(server => ids.includes(server.id)).map(server => server.name).join(' · ') || t('noSelection')}</dd><dt>{t('experimentCoordinator')}</dt><dd>{servers.find(server => server.id === coordinatorId)?.name ?? t('noSelection')}</dd><dt>{t('attachments')}</dt><dd>{uploadNames.join(' · ') || t('noFilesSelected')}</dd><dt>{t('automation')}</dt><dd>{t(mode)}</dd></dl><p>{t('agentModelHint')}</p>{models !== undefined && <dl>{(['preparation', 'planning', 'execution'] as const).map(phase => <div key={phase}><dt>{t(`${phase}Model`)}</dt><dd>{models[phase].provider} · {models[phase].model}</dd></div>)}</dl>}</aside>
   </form>
 }
 
 function ExperimentDetail({ controller, t, row, state, onClone }: ViewProps & { row: FleetExperiment; state: Snapshot; onClone: () => void }) {
   const [tab, setTab] = useState<'overview' | 'agentRecords' | 'monitoring' | 'files' | 'services'>('overview')
+  const [deleting, setDeleting] = useState<string[]>()
   const [logDestination, setLogDestination] = useState<{ serverId: string; commandId: string }>()
   const status = row.latest?.state ?? row.state
   const id = row.request.experimentId
+  const retrying = state.retrying.includes(id)
   const ended = ['completed', 'failed', 'blocked', 'cancelled', 'interrupted'].includes(status) && row.latest?.resourcesReleased !== false
   const title = row.request.name ?? (row.submission?.protocol === 4 ? row.submission.name : row.request.objective.split('\n')[0]?.slice(0, 120))
   const act = (operation: () => Promise<unknown>) => { void operation().catch(error => { controller.report(error) }) }
   return <article className={`${css.detail} ${tab === 'agentRecords' || tab === 'monitoring' ? css.readerDetail : ''}`}>
-    <header className={css.detailHeader}><div className={css.detailHeading}><div className={css.titleLine}><h2 title={title}>{title}</h2><span role="status"><Tag tone={status === 'failed' ? 'warning' : 'neutral'}>{t(status)}</Tag></span></div>
-      <p className={css.hint}>{row.servers.map(server => server.name).join(' · ')} · {new Date(row.createdAt).toLocaleString()}</p></div>
+    <header className={css.detailHeader}><div className={css.detailHeading}><div className={css.titleLine}><h2 title={title}>{title}</h2><span role="status">{retrying ? <Tag tone="info">{t('retrying')}</Tag> : <ExperimentStatus row={row} t={t} />}</span></div>
+      <p className={css.hint}>{row.servers.map(server => server.name).join(' · ')} · {t('coordinator')}: {row.coordinator.name} · {new Date(row.createdAt).toLocaleString()}</p></div>
       <div className={css.actions}><Button variant="ghost" size="sm" onClick={onClone}>{t('clone')}</Button><Button variant="ghost" size="sm" onClick={() => { act(() => controller.refresh()) }}>{t('refresh')}</Button>
-        <Button variant="outline" size="sm" disabled={ended} onClick={() => { act(() => controller.cancel(id)) }}>{t('cancel')}</Button></div>
+        <Button variant="outline" size="sm" disabled={ended} onClick={() => { act(() => controller.cancel(id)) }}>{t('cancel')}</Button><Button variant="ghost" size="sm" className={css.dangerText} onClick={() => { setDeleting([id]) }}>{t('deleteExperiment')}</Button></div>
     </header>
+    {deleting !== undefined && <DeleteExperimentsDialog controller={controller} t={t} ids={deleting} close={() => { setDeleting(undefined) }} />}
     <nav className={css.detailTabs}>{(['overview', 'agentRecords', 'monitoring', 'files', 'services'] as const).map(key => <button key={key} aria-current={tab === key ? 'page' : undefined} onClick={() => { setTab(key) }}>{t(key)}</button>)}</nav>
     {tab === 'agentRecords' && <AgentRecords row={row} controller={controller} t={t} onLog={(serverId, commandId) => { setLogDestination({ serverId, commandId }); setTab('monitoring') }} />}
     {tab === 'monitoring' && <RuntimeMonitor row={row} controller={controller} t={t} aggregate={state.streams} {...(logDestination === undefined ? {} : { destination: logDestination })} />}
-    {tab === 'overview' && <div className={css.overview}>
-      <section className={css.stageCard}><span className={css.hint}>{t('latestStage')}</span><h3>{row.latest?.progress?.phase ?? (row.receipt === undefined && row.preparation !== undefined ? t(row.preparation.stage) : t(status))}</h3>
-        {row.receipt !== undefined && <p className={css.handover}>{row.receipt.handover}</p>}
-        {row.waitingFor.length > 0 && <p>{t('waiting', { servers: row.servers.filter(server => row.waitingFor.includes(server.id)).map(server => server.name).join(', ') })}</p>}
-        {row.latest?.resourcesReleased === false && ['failed', 'blocked', 'interrupted', 'cancelling'].includes(status) && <p>{t('held')}</p>}
-      </section>
-      {(row.latest?.detail ?? row.detail) !== undefined && <section className={css.errorCard} role="alert"><div><h3>{t('failedHint')}</h3><details><summary>{t('lastError')}</summary><pre>{row.latest?.detail ?? row.detail}</pre></details></div>
-        {row.state === 'failed' && row.preparation?.protocol === 4 && row.receipt === undefined && <Button variant="outline" onClick={() => { act(() => controller.retry(id)) }}>{t('retryPreparation')}</Button>}</section>}
+    {tab === 'overview' && <ExperimentOverview row={row} t={t} retrying={retrying} onRetry={() => { act(() => controller.retry(id)) }} onView={setTab}>
       {row.latest?.questions?.filter(question => question.state === 'open').map(question => <ExperimentQuestionCard key={question.questionId} controller={controller} t={t} question={question}
         records={state.streams[`${id}/events`]?.text.split('\n').filter(line => line.includes(question.sessionId)).join('\n') ?? ''} />)}
       {row.latest?.questions?.some(question => question.state === 'answered') && <p className={css.hint}>{t('replySaved')}</p>}
-      <details className={css.goalDisclosure}><summary>{t('fullGoal')}</summary><div className={css.prewrap}>{row.request.objective}</div></details>
-      {row.latest?.plan !== undefined && <section className={css.planCard} aria-label={t('plan')}><div className={css.sectionHeading}><h3>{t('plan')}</h3><Tag>#{row.latest.plan.revision}</Tag></div><p className={css.prewrap}>{row.latest.plan.summary}</p>
+      {row.latest?.plan !== undefined && <section className={css.planCard} aria-label={t('plan')}><details data-execution-plan open={status === 'awaiting-approval'}><summary>{t('plan')} · #{row.latest.plan.revision}</summary><p className={css.prewrap}>{row.latest.plan.summary}</p>
         <ol>{row.latest.plan.steps.map((step, index) => <li key={index}>{step}</li>)}</ol>
         {row.latest.plan.frameworks.map(framework => <p key={framework.name}><a href={framework.documentation} target="_blank" rel="noreferrer">{framework.name} {framework.version}</a></p>)}
         {status === 'awaiting-approval' && <div className={css.sectionHeading}><p className={css.hint}>{t('todoResourceHint')}</p><Button variant="primary" onClick={() => { act(() => controller.approve(id, row.latest!.plan!.revision)) }}>{t('approve')}</Button></div>}
-      </section>}
-      {row.models !== undefined && <section><h3>{t('agentModels')}</h3><div className={css.modelFields}>{(['preparation', 'planning', 'execution'] as const).map(phase => <div className={css.modelField} key={phase}><span className={css.hint}>{t(`${phase}Model`)}</span><span>{row.models?.[phase].model}</span><small className={css.hint}>{row.models?.[phase].provider}</small></div>)}</div></section>}
-      {row.latest?.progress !== undefined && <section><h3>{t('progress')}</h3><div className={css.metrics}>{Object.entries(row.latest.progress.metrics).map(([name, value]) => <div key={name}><span>{name}</span><strong>{value.toLocaleString()}</strong></div>)}</div><p className={css.hint}>{t('latestMetrics', { time: new Date(row.latest.progress.updatedAt).toLocaleString() })}</p></section>}
-      {(row.preparation?.placements.length ?? 0) > 0 && <section className={css.list} aria-label={t('resolvedStorage')}><h3>{t('resolvedStorage')}</h3>{row.preparation?.placements.map(placement => {
-        const server = [row.coordinator, ...row.servers].find(value => value.id === placement.serverId)
-        return <article key={placement.serverId} className={css.card}><h3>{server?.name}</h3><dl className={css.facts}><dt>{t('workspaceDirectory')}</dt><dd><code>{placement.workspaceRoot}</code></dd>
-          <dt>{t('storageLocation')}</dt><dd>{placement.candidate.directory} · {t('availableBytes', { size: placement.candidate.availableBytes.toLocaleString() })} · {t(placement.candidate.persistence)}</dd>
-          <dt>{t('selectionReason')}</dt><dd>{placement.reason}</dd><dt>{t('trainingAddress')}</dt><dd>{server?.trainingAddress ?? t('networkUnused')}</dd></dl></article>
-      })}</section>}
-      <details className={css.technical}><summary>{t('technicalDetails')}</summary><dl className={css.facts}>
-        <dt>{t('experimentId')}</dt><dd>{id}</dd><dt>{t('dispatchSession')}</dt><dd>{row.sessionId}</dd><dt>{t('planning')}</dt><dd>{row.latest?.planningSessionId ?? '—'}</dd>
-        <dt>{t('executionSession')}</dt><dd>{row.latest?.sessionId ?? t('sessionEmpty')}</dd><dt>{t('sourceVersion')}</dt><dd>{row.submission?.deploymentId ?? t('preparing')}</dd></dl>
-        {row.receipt !== undefined && <details><summary>{t('receipt')}</summary><pre className={css.log}>{JSON.stringify(row.receipt, null, 2)}</pre></details>}
-        {(row.latest?.executions.length ?? 0) > 0 && <details><summary>{t('actualVersions')}</summary><pre className={css.log}>{JSON.stringify(row.latest?.executions, null, 2)}</pre></details>}
-        {row.submission?.protocol === 1 && <details><summary>{t('legacyLimits')}</summary><pre className={css.log}>{JSON.stringify(row.submission.strategy.budget, null, 2)}</pre></details>}
-      </details>
-    </div>}
+      </details></section>}
+    </ExperimentOverview>}
     {tab === 'services' && <div className={css.overview}>{(row.latest?.services.length ?? 0) === 0 && <p className={css.empty}>{t('serviceEmpty')}</p>}<Services controller={controller} t={t} row={row} /></div>}
     {tab === 'files' && <section className={css.overview} aria-label={t('files')}>
       {state.filesTruncated && <p>{t('fileTruncated')}</p>}{state.files.length === 0 && <p className={css.empty}>{t('noOutput')}</p>}

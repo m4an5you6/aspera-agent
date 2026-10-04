@@ -83,10 +83,11 @@ export class StorageSelection {
     const content = [{ type: 'text' as const, text: JSON.stringify({ operation: 'prepare-experiment-storage', experimentId: id,
       minimumFreeBytes, servers: observations.map(({ server, inventory }) => ({ id: server.id, name: server.name,
         inventory, selected: this.placements.get(server.id) })),
-      instruction: 'Select storage for every server without a selected assignment using select_experiment_storage. Explain each choice. Once all servers are selected, finish this turn. Training starts after remote handover; do not complete the dispatch Goal.' }) }]
+      instruction: this.placements.size === observations.length ? 'Storage choices are fixed. Retain this context for subsequent preparation; no further selection is requested.'
+        : 'Select storage for every server without a selected assignment using select_experiment_storage. Explain each choice. Once all servers are selected, finish this turn. Training starts after remote handover; do not complete the dispatch Goal.' }) }]
     const message = createUserMessage({ source: { kind: 'aspera', experimentId: id }, content })
     if (this.placements.size === observations.length) {
-      agent.session.append('user/message', message, { surfaceOp: 'append' })
+      agent.inject(message)
       return observations.map(({ server }) => this.required(server.id))
     }
     signal.throwIfAborted()

@@ -15,9 +15,12 @@ export interface NetworkParticipant {
 
 /** Test candidate addresses from every other participant before freezing one per node.
  * @param id - experiment. @param participants - authorized nodes and private credentials.
- * @param signal - preparation lifetime. @returns nodes with verified training addresses.
+ * @param signal - preparation lifetime.
+ * @param serverId - optionally verify only this node's inbound paths during its preparation interval.
+ * @returns nodes with verified training addresses for the requested participants.
  */
-export async function resolveTrainingNetwork(id: ExperimentId, participants: NetworkParticipant[], signal: AbortSignal): Promise<ClusterNode[]> {
+export async function resolveTrainingNetwork(id: ExperimentId, participants: NetworkParticipant[], signal: AbortSignal, serverId?: ExperimentServerId): Promise<ClusterNode[]> {
+  if (serverId !== undefined && !participants.some(peer => peer.node.server.id === serverId)) throw new Error('Network verification server is outside the selected group')
   if (participants.length === 1) return participants.map(value => value.node)
   const call = async (peer: NetworkParticipant, operation: string, body: object, lifetime?: AbortSignal) => {
     const result = await request(peer.target, peer.token, `/aspera/v4/node/${operation}`, 'POST', { experimentId: id, ...body }, lifetime, peer.password)
@@ -35,6 +38,7 @@ export async function resolveTrainingNetwork(id: ExperimentId, participants: Net
     }
     const selected: ClusterNode[] = []
     for (const peer of participants) {
+      if (serverId !== undefined && peer.node.server.id !== serverId) { selected.push(peer.node); continue }
       const candidates = peer.node.server.trainingAddress === undefined
         ? peer.inventory.addresses.toSorted((a, b) => Number(b.private) - Number(a.private) || a.address.localeCompare(b.address)).map(value => value.address)
         : [peer.node.server.trainingAddress]

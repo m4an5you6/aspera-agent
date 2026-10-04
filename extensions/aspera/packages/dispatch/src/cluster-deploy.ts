@@ -9,7 +9,40 @@ import type { ClusterNode, ClusterServer } from '@aspera/runtime'
 import { installPrivateFile, installSource, validateEnvironment } from './deploy.ts'
 import type { DeploymentConfig, PreparedEnvironment } from './deploy.ts'
 import type { SourceSnapshot } from './snapshot.ts'
-import { copy, remote, request, shellQuote } from './transport.ts'
+import { copy, remote, RemoteCommandError, request, shellQuote } from './transport.ts'
+import type { Target } from './transport.ts'
+
+/** Retries reuse an installed immutable release even after the local application is upgraded. */
+export type DeploymentRelease = SourceSnapshot | { readonly digest: string; readonly reuse: true }
+
+/** A saved release cannot be reconstructed by changing the experiment's immutable identity. */
+export class SavedReleaseUnavailable extends Error {}
+
+/**
+ * Check an original release before configuring its account, without requiring Node.
+ * @param target - saved SSH target.
+ * @param release - original release directory.
+ * @param digest - saved immutable identity.
+ * @param password - private SSH credential.
+ * @param signal - operation cancellation.
+ * @returns the verified original DSH and extension versions.
+ */
+export async function verifySavedRelease(target: Target, release: string,
+  digest: string, password?: string, signal?: AbortSignal): Promise<{ dsh: string; extension: string }> {
+  try {
+    const output = await remote(target, `set -eu
+for file in .ready setup.mjs node_modules/@deepseek-ai/dsh/lib/bin.js node_modules/@aspera/runtime/scripts/probe-sandbox.mjs node_modules/@aspera/runtime/scripts/probe-gpu.py; do
+  test -f ${shellQuote(release)}/"$file" || { echo "Saved release entry is missing: $file; copy this experiment" >&2; exit 1; }
+done
+cat ${shellQuote(release + '/aspera-release.json')}`, signal, password)
+    const manifest = z.object({ version: z.literal(1), deploymentId: z.literal(digest), dsh: z.string().min(1), extension: z.string().min(1) })
+    return manifest.parse(JSON.parse(output))
+  } catch (error) {
+    signal?.throwIfAborted()
+    if (error instanceof RemoteCommandError && !error.result.exitConfirmed) throw error
+    throw new SavedReleaseUnavailable(`Saved release is unavailable; copy this experiment. ${String(error)}`)
+  }
+}
 
 /**
  * Install immutable source and verify sandbox and GPU access.
@@ -19,9 +52,12 @@ import { copy, remote, request, shellQuote } from './transport.ts'
  * @param signal - preparation cancellation.
  * @returns probed node.
  */
-export async function prepareClusterServer(target: DeploymentConfig, source: SourceSnapshot, password: string | undefined,
+export async function prepareClusterServer(target: DeploymentConfig, source: DeploymentRelease, password: string | undefined,
   signal: AbortSignal): Promise<PreparedEnvironment> {
-  await installSource(target, source, signal, password)
+  if ('reuse' in source) {
+    const release = target.storagePlacement?.releaseRoot ?? `${target.remoteRoot}/releases/${source.digest}`
+    await verifySavedRelease(target, release, source.digest, password, signal)
+  } else await installSource(target, source, signal, password)
   return validateEnvironment(target, source.digest, signal, password)
 }
 
@@ -67,13 +103,14 @@ ln ${shellQuote(incomingToken)} ${shellQuote(root + '/secrets/' + role + '.token
     DSH_EXPERIMENT_DEVICES: prepared.devicePaths.join(','), DSH_EXPERIMENT_BWRAP: prepared.backendPath,
     DSH_EXPERIMENT_HIDDEN_PATHS_JSON: JSON.stringify(prepared.hiddenPaths), DSH_EXPERIMENT_PORT: String(control.remotePort),
   }
+  const executablePath = target.pathEntries?.length ? `export PATH=${shellQuote(target.pathEntries.join(':'))}:"$PATH"\n` : ''
   await remote(target, `set -eu
 umask 077
 lock=${shellQuote(root + '/state/' + role + '.launch')}
 mkdir "$lock" || { echo 'control process launch is already in progress' >&2; exit 1; }
 trap 'rmdir "$lock"' EXIT
 if [ -f ${shellQuote(pidFile)} ] && kill -0 "$(cat ${shellQuote(pidFile)})" 2>/dev/null; then exit 0; fi
-${Object.entries(env).map(([name, value]) => `export ${name}=${shellQuote(value)}`).join('\n')}
+${executablePath}${Object.entries(env).map(([name, value]) => `export ${name}=${shellQuote(value)}`).join('\n')}
 cd ${shellQuote(root + '/workspace')}
 node ${shellQuote(release + '/setup.mjs')} --worker
 setsid node ${shellQuote(release + '/node_modules/@deepseek-ai/dsh/lib/bin.js')} --profile aspera-worker </dev/null >>${shellQuote(root + '/logs/' + role + '.log')} 2>&1 &

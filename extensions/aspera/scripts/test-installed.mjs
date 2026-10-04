@@ -32,7 +32,7 @@ try {
     }
     assert.ok(existsSync(resolve(packageRoot, 'LICENSE')))
   }
-  writeFileSync(resolve(installRoot, 'consumer.mts'), `import type { FleetCreateRequest } from '@aspera/dispatch/types'\nimport { TYPERT_REMOTE } from '@aspera/dispatch/remote'\nimport { clusterSubmissionSchema } from '@aspera/experiments'\nimport { setupWorkerProfile } from '@aspera/runtime'\nconst request: FleetCreateRequest = {experimentId:'draft',objective:'train',serverIds:[],mode:'semi',uploads:[{name:'data.json',size:0}]}\nvoid [request, TYPERT_REMOTE, clusterSubmissionSchema, setupWorkerProfile]\n`)
+  writeFileSync(resolve(installRoot, 'consumer.mts'), `import type { FleetCreateRequest } from '@aspera/dispatch/types'\nimport { TYPERT_REMOTE } from '@aspera/dispatch/remote'\nimport { serverRemovalBlockers } from '@aspera/dispatch/server-usage'\nimport { prepareSshHostKey } from '@aspera/runtime/transport'\nimport { clusterSubmissionSchema } from '@aspera/experiments'\nimport { setupWorkerProfile } from '@aspera/runtime'\nconst model = {provider:'qwen-chat',model:'qwen-test'}\nconst request: FleetCreateRequest = {experimentId:'draft',objective:'train',serverIds:[],coordinatorId:'node',mode:'semi',models:{preparation:model,planning:model,execution:model},uploads:[{name:'data.json',size:0}]}\nvoid [request, TYPERT_REMOTE, serverRemovalBlockers, prepareSshHostKey, clusterSubmissionSchema, setupWorkerProfile]\n`)
   await command(process.execPath, [resolve(root, 'node_modules/typescript/bin/tsc'), 'consumer.mts', '--noEmit', '--strict', '--skipLibCheck', '--module', 'NodeNext', '--target', 'ES2024'], installRoot)
   const repacked = await snapshotSource(installRoot, 120000)
   try { assert.ok(existsSync(repacked.archive)); assert.equal(repacked.digest.length, 64) }
@@ -51,7 +51,7 @@ try {
   await page.getByRole('button', { name: /^(服务器|Servers)$/ }).click()
   await page.getByRole('button', { name: /^(添加服务器|Add server)$/ }).click()
   await page.locator('input[name=username]').fill('trainer')
-  assert.equal(await page.locator('input[name=password]').getAttribute('type'), 'password')
+  assert.equal(await page.getByRole('dialog').getByLabel(/^(服务器密码|Server password)$/).getAttribute('type'), 'password')
   assert.deepEqual(errors, [])
   mkdirSync(resolve(root, '.artifacts'), { recursive: true })
   await page.screenshot({ path: resolve(root, '.artifacts/installed-web.png'), fullPage: true })

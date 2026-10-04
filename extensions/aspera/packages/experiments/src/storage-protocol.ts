@@ -65,5 +65,8 @@ export type StoragePlacement = z.infer<typeof storagePlacementSchema>
 export interface ServerProbe {
   gpuInfo: string
   allocations: string[]
-  inventory: ServerInventory
+  inventory?: ServerInventory
+  environment?: import('./environment-protocol.ts').ServerEnvironment
+  environmentReady?: boolean
+  detail?: string
 }

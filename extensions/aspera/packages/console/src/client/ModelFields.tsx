@@ -1,6 +1,6 @@
 /** Phase model controls reuse the DSH provider directory and account settings. */
 import { useState } from 'react'
-import { Button, Menu, IconChevronDownOutlineRegular, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, Menu, IconChevronDownOutlineRegular, Tag, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import type { ExperimentModels, ExperimentModelDirectory, PhaseModelSelection } from '@aspera/experiments/types'
 import css from './ExperimentsPage.module.css'
@@ -10,13 +10,14 @@ export function Choice<Value extends string>({ label, value, options, onChange, 
   label: string; value: Value; options: readonly { value: Value; label: string }[]; onChange: (value: Value) => void; disabled?: boolean
 }) {
   const [open, setOpen] = useState(false)
-  return <Menu open={open && !disabled} portal className={css.selection} selectedId={value}
-    items={options.map(option => ({ id: option.value, label: option.label }))} onClose={() => { setOpen(false) }}
+  const selectedLabel = options.find(option => option.value === value)?.label ?? label
+  return <Menu open={open && !disabled} portal className={css.selection} listClassName={css.choiceMenu} selectedId={value}
+    items={options.map(option => ({ id: option.value, label: <span className={css.choiceLabel}>{option.label}</span> }))} onClose={() => { setOpen(false) }}
     onSelect={id => { const row = options.find(option => option.value === id); if (row !== undefined) onChange(row.value); setOpen(false) }}
-    anchor={<Button variant="outline" className={css.selectButton} aria-label={label} aria-haspopup="menu"
+    anchor={<Tooltip label={selectedLabel} side="bottom" portal disabled={open && !disabled}><Button variant="outline" className={css.selectButton} aria-label={label} aria-haspopup="menu"
       aria-expanded={open && !disabled} disabled={disabled} onClick={() => { setOpen(current => !current) }}>
-      <span>{options.find(option => option.value === value)?.label ?? label}</span><IconChevronDownOutlineRegular />
-    </Button>} />
+      <span>{selectedLabel}</span><IconChevronDownOutlineRegular />
+    </Button></Tooltip>} />
 }
 
 /** @param models - phase choices. @param directory - live model readiness. @returns whether every phase is explicitly serviceable. */
@@ -50,7 +51,7 @@ export function ModelFields({ t, models, directory, change, manage, disabled }: 
             label: `${item.providerName} · ${item.name}${item.configured && item.transferable ? '' : ` · ${t('modelUnavailable')}`}` }))}
           onChange={value => { const item = directory?.models.find(item => JSON.stringify([item.provider, item.model]) === value); if (item !== undefined) choose(phase, { provider: item.provider, model: item.model }) }} />
         {row !== undefined && <div className={css.modelMeta}><Tag tone={row.configured && row.transferable ? 'success' : 'warning'}>{t(row.configured && row.transferable ? 'modelConfigured' : 'modelUnavailable')}</Tag>
-          <span title={row.provider}>{row.provider}</span></div>}
+          <Tooltip label={row.provider} side="bottom" portal><span>{row.provider}</span></Tooltip></div>}
         {row !== undefined && row.reasoning.length > 0 && <Choice label={t('reasoning')} value={selection?.reasoningEffort ?? ''}
           disabled={disabled} options={[{ value: '', label: t('providerDefault') }, ...row.reasoning.map(item => ({ value: item.id, label: item.name }))]}
           onChange={effort => { if (selection === undefined) return; const option = row.reasoning.find(item => item.id === effort)

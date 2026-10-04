@@ -30,7 +30,7 @@ pnpm run start:web --no-open
 
 Open the URL printed by DSH, finish its initial configuration and select **Aspera** in the sidebar. The startup script creates the `aspera` profile under `.dsh-home`; `ASPERA_HOME` selects another independent state directory. Use the Aspera group gear to open **Aspera model settings** and manage the existing DSH model accounts. New experiments choose preparation, planning and execution models independently; supported API configurations and private keys are captured before submission.
 
-The management host supports Windows; execution nodes require Linux, password SSH login, a trusted host key in the management user's `~/.ssh/known_hosts`, Node/pnpm, NVIDIA devices and usable bubblewrap. Install these prerequisites on the servers before dispatch. Multi-node experiments also need mutually reachable training addresses. Missing CUDA, confinement or communication blocks execution with a recorded error.
+The management host supports Windows; execution nodes require Linux, password SSH login, a trusted host key in the management user's `~/.ssh/known_hosts` and allocated NVIDIA devices. The local preparation Agent configures release-compatible Node, pinned pnpm, Python 3 and bubblewrap using the login account's existing permissions. Its first probe needs only SSH and Shell. Kernel or device restrictions require the reported platform action; confinement, CUDA and required network checks must pass before handover.
 
 -----
 
@@ -51,9 +51,9 @@ Aspera `0.1.1` builds into `.artifacts/desktop-0.1.1/<build-id>/`; `latest.json`
 <a id="submit-an-experiment"></a>
 ## Submit an experiment
 
-1. Open **Servers** and enter a name, SSH address, port, username and password. Advanced settings offer automatic/manual storage, an optional internal IP/hostname and the control port (default `43019`; coordinator uses the next port). Leave storage and networking automatic unless an explicit location is required. The first server remains the coordinator and may also execute experiments.
-2. Save and **Check connection**. Saving only records settings and a separate write-only password; checking reads SSH, GPU, disk and network facts without a model. A blank password on an existing server retains its saved value. Unknown disk persistence does not establish cloud-volume durability.
-3. Open **New experiment**, enter a short experiment name and natural-language Goal, select the three Agent models and one or more servers, attach inputs and choose execution mode. Automatic is the default; neither mode needs a task budget.
+1. Open **Servers** and enter a name, SSH address, port, username and password. Advanced settings offer automatic/manual storage, an optional internal IP/hostname and the control port (default `43019`; coordinator uses the next port). Leave storage and networking automatic unless an explicit location is required. Each experiment chooses its coordinator from its selected servers.
+2. Save and **Check connection**. Saving only records settings and a separate private password; checking reads SSH, GPU, disk and network facts without a model. A blank password on an existing server retains its saved value. The eye button explicitly reveals a saved password only in the editor. Failed checks retain dated hardware under Last successful result. Unknown disk persistence does not establish cloud-volume durability.
+3. Open **New experiment**, enter a short experiment name and natural-language Goal, select the three Agent models, one or more servers and a coordinator from those servers, attach inputs and choose execution mode. Automatic is the default; neither mode needs a task budget.
 4. Submit and continue creating experiments. The dispatch Agent selects an observed disk and records its reason before directory creation. Sufficient data disks are preferred; sufficient system disks are allowed. Details show actual paths, free space and verified internal addresses. Semi mode waits for **Confirm this plan** before model downloads or training and does not reserve nodes while waiting.
 5. After durable remote acceptance, the detail and dispatch Session show **本机派发完成，远端实验已接管**. This completes dispatch; the experiment may still be planning, queued, running or serving.
 6. For external inference, expand **External inference access (optional)** in the server form and enter the platform HTTPS base URL and its mapped container/server port. This mapping is frozen for new experiments; request public inference in the Goal. Service details distinguish local health from external reachability and expose the service-only key through **Show calling information and key**.
@@ -61,7 +61,9 @@ Aspera `0.1.1` builds into `.artifacts/desktop-0.1.1/<build-id>/`; `latest.json`
 
 Use **Needs attention** to find plan confirmations and saved questions. Semi mode pauses new Agent operations for unresolved choices; answer the question card to continue the original experiment. Opening a card does not clear its indicator. The yellow reminder can be dismissed with ×; it stays dismissed for that decision revision across reloads, without resolving the decision or reducing the pending count. A new plan or question revision is shown again. Automatic mode investigates and retries recoverable failures without asking for replies. Both modes retain cancellation, confinement and loop protection; [runtime](packages/runtime/README.md) defines continuation and failure behavior.
 
-Use **Copy as new experiment** to change a submitted objective, model, dataset, training method or server selection. Copying retains the original mode. Shared servers queue in remote admission order; disjoint server groups can execute together. A serving experiment retains its complete group, and the page names the queued experiments it blocks.
+Use **Copy as new experiment** to change a submitted objective, model, dataset, training method or server selection. Copying retains the original mode. Shared servers using the same coordinator queue in remote admission order; unfinished experiments using different coordinators cannot share nodes; disjoint server groups can execute together. A serving experiment retains its complete group, and the page names the queued experiments it blocks.
+
+Use the row menu, detail action or selected-row toolbar to **Delete experiment**. Confirming permanently removes records, with no recycle bin. **Also clean up remote files** is off by default and shows the exact owned directories. Stop unfinished work first; partial cleanup retains records for retry or an explicit record-only deletion. **Delete server** removes an unused registration regardless of its historical coordinator role. See [state and APIs](docs/state-and-api.md) for cleanup scope and recovery.
 
 -----
 
@@ -85,7 +87,7 @@ Browser checks use installed Chrome by default; `ASPERA_BROWSER_CHANNEL` selects
 
 For a DSH upgrade, update exact dependency versions and the lockfile, review the two pinned package patches in `patches/`, generated Remotes and browser compatibility code, then run these checks and publish a new extension release. Keep existing release directories and active control processes while their experiments are in flight. State and protocol compatibility decisions belong in the [versioned data reference](docs/state-and-api.md).
 
-See the [model upgrade guide](../../docs/upgrade-guide/v0.2.0-rc.2/aspera-models-v4/guide.md) for generation-4 API and persistence compatibility. Failed new preparations support **Retry preparation** with the saved identity and paths; changed mounts, inputs or builds require correction or a new experiment. `aspera-ext-spike` remains a historical probe; development and packaging use this workspace.
+See the [model upgrade guide](../../docs/upgrade-guide/v0.2.0-rc.2/aspera-models-v4/guide.md) and [preparation upgrade guide](../../docs/upgrade-guide/v0.2.0-rc.2/aspera-preparation/guide.md). **Retry preparation** retains protocol-4 experiment IDs, models, Sessions and paths, reusing the original verified remote release even after a local upgrade. Missing or mismatched releases require a copied experiment; changed mounts or inputs fail explicitly. Commands with unconfirmed exits require reconciliation before another attempt. `aspera-ext-spike` remains historical; development and packaging use this workspace.
 
 -----
 

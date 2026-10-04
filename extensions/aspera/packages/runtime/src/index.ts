@@ -7,7 +7,7 @@ import { applyClusterRole } from './cluster.ts'
 import type { ClusterRoleConfig } from './cluster.ts'
 
 export * from '@aspera/experiments'
-export { inspectServerStorage, prepareServerStorage, verifyServerStorage, resolveStoragePlacement, serverRunRoot, serverReleaseRoot } from './storage.ts'
+export { inspectServerStorage, prepareServerStorage, verifyServerStorage, cleanupServerStorage, resolveStoragePlacement, serverRunRoot, serverReleaseRoot } from './storage.ts'
 export { clusterFileHash, readClusterPrivate, clusterPrivateSchema, clusterAgentModelSchema } from './cluster-runtime.ts'
 export type { ClusterPrivate } from './cluster-runtime.ts'
 export type { ClusterRoleConfig } from './cluster.ts'
@@ -31,7 +31,7 @@ export const Config: z<Config> = z.object({
   goalContinuationWindow: z.number().step(1).min(2).max(10000).default(128),
   networkProbeLifetimeMs: z.number().step(1).min(1000).default(300000),
 })
-export const inject = ['webServer', 'storage', 'storageDomain', 'subprocess', 'sandbox', 'agents', 'goals', 'credentials', 'agentDefaultModel', 'sessionPersistence', 'agentPresets', 'userQuestions']
+export const inject = ['webServer', 'storage', 'storageDomain', 'subprocess', 'sandbox', 'agents', 'agentLoop', 'goals', 'credentials', 'agentDefaultModel', 'sessionPersistence', 'agentPresets', 'userQuestions']
 /** @param ctx - worker profile services. @param config - fixed role and operation bounds. */
 export async function apply(ctx: Context, config: Config): Promise<void> {
   await applyClusterRole(ctx, config)

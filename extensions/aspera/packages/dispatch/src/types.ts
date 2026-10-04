@@ -1,7 +1,20 @@
 /** Browser-safe experiment dispatch records. */
 import type { ClusterRecord, ClusterSubmission, ExperimentId, ExperimentServerId, ExperimentBudget, ServerSettings, ServerInventory, StoragePlacement, InferenceMapping } from '@aspera/experiments/types'
 import type { ModelSelection } from '@deepseek-ai/dsh-agent'
+import type { Branded } from '@deepseek-ai/dsh-brand'
 import type { ExperimentModels, ExperimentModelSnapshots } from '@aspera/experiments/types'
+import type { ServerEnvironment, ServerProbe } from '@aspera/experiments/types'
+
+/** Durable command ownership survives local cancellation and restart. */
+export interface PreparationCommand { directory: string }
+/** Per-node progress accompanies the detailed preparation Session. */
+export interface EnvironmentProgress {
+  serverId: ExperimentServerId
+  phase: 'inspecting-environment' | 'configuring-environment' | 'repairing-environment' | 'verifying-environment' | 'environment-ready'
+  observation?: ServerEnvironment
+  pendingCommand?: PreparationCommand
+  detail?: string
+}
 
 declare module '@deepseek-ai/cordis' {
   interface Events {
@@ -38,6 +51,7 @@ export interface FleetCreateRequest {
   models?: ExperimentModels
   objective: string
   serverIds: string[]
+  coordinatorId: string
   files?: string[]
   uploads?: { name: string; size: number }[]
   mode: 'semi' | 'automatic'
@@ -46,16 +60,66 @@ export interface FleetCreateRequest {
 /** Server form with an unparsed UUID. Password values are accepted separately. */
 export type FleetServerInput = Omit<ServerSettings, 'id' | 'storagePlacement'> & { id: string }
 
-/** Stable coordinator identity and the complete saved server list. */
+/** Peer server registrations; coordinatorId is retained only when reading older registries. */
 export interface FleetRegistry {
   coordinatorId?: ExperimentServerId | undefined
   servers: ServerSettings[]
-  probes?: Record<string, { gpuInfo: string; allocations: string[]; inventory: ServerInventory }>
+  probes?: Record<string, ServerProbe>
+  checks?: Record<string, ServerConnectionCheck>
+}
+
+/** Latest check and separately dated successful hardware observations. */
+export interface ServerConnectionCheck {
+  status: 'unchecked' | 'checking' | 'passed' | 'failed' | 'interrupted'
+  configuration: string
+  startedAt?: number
+  checkedAt?: number
+  error?: string
+  result?: ServerProbe
+  lastSuccess?: { checkedAt: number; result: ServerProbe }
+  gpu?: 'passed' | 'unavailable'
+  control?: 'passed' | 'unavailable'
+}
+
+/** One confirmed deletion request, independent of experiment and server identities. */
+export type DeletionOperationId = Branded<'AsperaDeletionOperationId'>
+
+/** Node-specific progress for an explicitly requested experiment deletion. */
+export interface ExperimentDeletion {
+  experimentId: ExperimentId
+  operationId: DeletionOperationId
+  cleanupRemote: boolean
+  started: boolean
+  state: 'deleting' | 'failed' | 'deleted'
+  updatedAt: number
+  nodes: { serverId: ExperimentServerId; path: string; state: 'pending' | 'cleaned'; detail?: string }[]
+  detail?: string
+}
+
+/** Eligibility and exact owned locations shown before confirmation. */
+export interface ExperimentDeletionPreview {
+  experimentId: ExperimentId
+  name: string
+  eligible: boolean
+  reason?: 'active' | 'cleanup-unconfirmed'
+  cleanupAvailable: boolean
+  nodes: { serverId: ExperimentServerId; name: string; path: string }[]
+}
+
+/** One confirmed batch operation; the same identity cannot change its cleanup policy. */
+export interface DeleteExperimentsRequest { operationId: string; experimentIds: string[]; cleanupRemote: boolean }
+
+/** Minimal durable identity retained after removing management records. */
+export interface DeletedExperiment {
+  experimentId: ExperimentId
+  requestHash: string
+  deletedAt: number
+  sourceGoal?: { sessionId: string; id: string; revision: number }
 }
 
 /** Concrete input and execution evidence for one independently dispatched experiment. */
 export interface FleetExperiment {
-  request: { experimentId: ExperimentId; objective: string; serverIds: ExperimentServerId[]; files: string[]; uploads: { name: string; size: number }[]; mode: 'semi' | 'automatic'; budget?: ExperimentBudget; name?: string; models?: ExperimentModels }
+  request: { experimentId: ExperimentId; objective: string; serverIds: ExperimentServerId[]; coordinatorId?: ExperimentServerId; files: string[]; uploads: { name: string; size: number }[]; mode: 'semi' | 'automatic'; budget?: ExperimentBudget; name?: string; models?: ExperimentModels }
   coordinator: ServerSettings
   servers: ServerSettings[]
   coordinatorTarget: PinnedDeployment
@@ -74,19 +138,22 @@ export interface FleetExperiment {
   handoverRecorded: boolean
   latest?: ClusterRecord | undefined
   waitingFor: ExperimentServerId[]
-  preparation?: { protocol: 3 | 4; stage: 'inspecting' | 'selecting-storage' | 'preparing-storage' | 'deploying' | 'checking-network' | 'transferring' | 'submitting';
+  preparation?: { protocol: 3 | 4; stage: 'inspecting' | 'selecting-storage' | 'preparing-storage' | 'deploying' | 'checking-network' | 'transferring' | 'submitting' | EnvironmentProgress['phase'];
     inventories: { serverId: ExperimentServerId; inventory: ServerInventory }[]; placements: StoragePlacement[];
+    environments?: EnvironmentProgress[]
     inputs?: { name: string; sha256: string }[] }
 }
 
 /** Snapshot delivered over the reconnecting Remote stream. */
-export interface FleetSnapshot { registry: FleetRegistry; experiments: FleetExperiment[] }
+export interface FleetSnapshot { registry: FleetRegistry; experiments: FleetExperiment[]; deletedIds: ExperimentId[]; deletions: ExperimentDeletion[] }
 
 /** Immutable deployment policy; all credential fields are references. */
 export interface PinnedDeployment {
   host: string; sshPort: number; remotePort: number; username?: string; authMode?: 'password' | 'key';
   passwordRef?: string; knownHostsFile?: string; remoteRoot?: string; storagePlacement?: StoragePlacement; localRepo: string; identityFile?: string;
-  dataRoots: string[]; allowedSystemPackages: string[]; tokenRef: string; agentCredentialRefs: string[];
+  dataRoots: string[]; tokenRef: string; agentCredentialRefs: string[];
+  pathEntries?: string[]
+  preparationOutputChars: number
   toolTimeoutMs: number; controlPollIntervalMs: number;
   minimumFreeBytes?: number
   inferenceMapping?: InferenceMapping

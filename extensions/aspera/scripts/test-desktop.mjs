@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { _electron as electron, expect } from '@playwright/test'
 import { openAspera, removeTestDirectory } from './test-app.mjs'
 import { desktopOutput } from './desktop-output.mjs'
+import { checkModelPickerLayout, checkAsperaDisclosure } from './test-ui-layout.mjs'
 
 const root = resolve(import.meta.dirname, '..')
 const output = desktopOutput(root)
@@ -59,6 +60,13 @@ try {
   })
   await page.waitForURL(url => url.hostname === '127.0.0.1', { timeout: 60000 })
   await openAspera(page, page.url())
+  await checkModelPickerLayout(page, output, 'desktop', size => app.evaluate(({ BrowserWindow }, dimensions) => {
+    BrowserWindow.getAllWindows()[0].setContentSize(dimensions.width, dimensions.height)
+  }, size))
+  await checkAsperaDisclosure(page, output, 'desktop', () => app.evaluate(({ BrowserWindow }) => {
+    const window = BrowserWindow.getAllWindows()[0]
+    window.focus(); window.webContents.focus()
+  }))
   const api = await page.evaluate(async () => {
     const method = 'aspera/servers'
     const response = await fetch(new URL(`api/${method}`, location.href), { method: 'POST', headers: { 'content-type': 'application/json' },
@@ -70,7 +78,7 @@ try {
   await page.getByRole('button', { name: /^(服务器|Servers)$/ }).click()
   await page.getByRole('button', { name: /^(添加服务器|Add server)$/ }).click()
   await page.locator('input[name=username]').fill('trainer')
-  assert.equal(await page.locator('input[name=password]').getAttribute('type'), 'password')
+  assert.equal(await page.getByRole('dialog').getByLabel(/^(服务器密码|Server password)$/).getAttribute('type'), 'password')
   const isolation = await app.evaluate(({ BrowserWindow }) => {
     const preferences = BrowserWindow.getAllWindows()[0].webContents.getLastWebPreferences()
     return { sandbox: preferences.sandbox, nodeIntegration: preferences.nodeIntegration, contextIsolation: preferences.contextIsolation }

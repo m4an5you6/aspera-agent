@@ -1,3 +1,4 @@
+import type { ServerConnectionCheck, ExperimentDeletionPreview, ExperimentDeletion, DeleteExperimentsRequest } from './types.ts'
 /** Aspera's DSH adapter: public Remote methods and effect-owned dispatch tools. */
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
@@ -7,7 +8,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { randomUUID } from 'node:crypto'
 import { isAbsolute } from 'node:path'
 import { experimentIdSchema, serverIdSchema, experimentModelsSchema } from '@aspera/experiments'
-import type { ClusterChunk, ClusterFile, ServerSettings, ServerProbe, AnswerExperimentQuestion, ServiceAccessInfo, ExperimentModels, ExperimentModelDirectory } from '@aspera/experiments/types'
+import type { ClusterChunk, ClusterFile, ServerSettings, AnswerExperimentQuestion, ServiceAccessInfo, ExperimentModels, ExperimentModelDirectory } from '@aspera/experiments/types'
 import { experimentModelDirectory, validateExperimentModels } from './models.ts'
 import type { AgentRecordRequest, AgentRecordPage, ExperimentProcess, ProcessLogRequest, ProcessLogPage } from '@aspera/experiments/types'
 import { ExperimentFleet } from './fleet.ts'
@@ -20,7 +21,7 @@ export type * from './types.ts'
 export interface Config {
   extensionRoot: string
   dataRoots: string[]
-  allowedSystemPackages: string[]
+  preparationOutputChars: number
   agentCredentialRefs: string[]
   toolTimeoutMs: number
   pollIntervalMs: number
@@ -30,7 +31,7 @@ export interface Config {
 /** Validated Host policy supplied by the independent profile. */
 export const Config: z<Config> = z.object({
   extensionRoot: z.string().required(), dataRoots: z.array(z.string()).default([]),
-  allowedSystemPackages: z.array(z.string()).default([]),
+  preparationOutputChars: z.number().step(1).min(1024).max(2_000_000).default(65536),
   agentCredentialRefs: z.array(z.string()).default(['DEEPSEEK_API_KEY']),
   toolTimeoutMs: z.number().step(1).min(1000).default(300000),
   pollIntervalMs: z.number().step(1).min(100).default(1000),
@@ -42,18 +43,18 @@ export const Config: z<Config> = z.object({
 export class AsperaRemote extends TypertRemoteService {
   constructor(private readonly host: Context, private readonly fleet: ExperimentFleet,
     private readonly downloads: ExperimentDownloads, private readonly config: Config) { super(host, 'aspera') }
-  /** @returns saved non-secret servers and fixed coordinator identity. */
+  /** @returns saved peer servers and connection observations. */
   @Remote
   servers(): FleetRegistry { return this.fleet.servers() }
   /** @param server - complete server settings. @returns saved registry. */
   @Remote
   saveServer(server: FleetServerInput): Promise<FleetRegistry> { return this.fleet.saveServer(server) }
-  /** @param id - unused non-coordinator server. @returns saved registry. */
+  /** @param id - unused server registration. @returns saved registry; historical experiment destinations remain pinned. */
   @Remote
   removeServer(id: string): Promise<FleetRegistry> { return this.fleet.removeServer(serverIdSchema.parse(id)) }
   /** @param id - configured server. @returns connection, GPU and allocation facts. */
   @Remote
-  probeServer(id: string): Promise<ServerProbe> { return this.fleet.probe(serverIdSchema.parse(id)) }
+  probeServer(id: string): Promise<ServerConnectionCheck> { return this.fleet.probe(serverIdSchema.parse(id)) }
   /** @param account - configured SSH account. @returns presence and writability, without plaintext. */
   @Remote
   async passwordStatus(account: ExperimentSshAccount): Promise<ExperimentPasswordStatus> {
@@ -66,7 +67,20 @@ export class AsperaRemote extends TypertRemoteService {
   async setPassword(account: ExperimentSshAccount, password: string): Promise<void> {
     if (password.length === 0) throw new Error('password is required')
     await this.host.credentials.set(sshPasswordRef(account), password)
+    await this.fleet.invalidatePassword(sshPasswordRef(account))
   }
+  /** @param id - saved server. @returns its password after an explicit editor reveal. */
+  @Remote
+  revealServerPassword(id: string): Promise<string> { return this.fleet.revealPassword(serverIdSchema.parse(id)) }
+  /** @param ids - selected records. @returns eligibility and owned cleanup locations. */
+  @Remote
+  previewExperimentDeletion(ids: string[]): ExperimentDeletionPreview[] { return this.fleet.previewDeletion(ids) }
+  /** @param request - confirmed batch and cleanup policy. @returns individual durable outcomes. */
+  @Remote
+  deleteExperiments(request: DeleteExperimentsRequest): Promise<ExperimentDeletion[]> { return this.fleet.deleteExperiments(request) }
+  /** @returns complete reconnect state, including removed identities. */
+  @Remote
+  experimentSnapshot(): FleetSnapshot { return this.fleet.snapshot() }
   /** @returns independent local dispatch records. */
   @Remote
   experiments(): FleetExperiment[] { return this.fleet.list() }
@@ -145,7 +159,7 @@ export class AsperaRemote extends TypertRemoteService {
   async *watch(signal: AbortSignal): AsyncIterable<FleetSnapshot> {
     let previous = ''
     while (!signal.aborted) {
-      const snapshot = { registry: this.fleet.servers(), experiments: this.fleet.list() }
+      const snapshot = this.fleet.snapshot()
       const encoded = JSON.stringify(snapshot)
       if (encoded !== previous) { previous = encoded; yield snapshot }
       try { await delay(this.config.pollIntervalMs, undefined, { signal }) }
@@ -153,31 +167,31 @@ export class AsperaRemote extends TypertRemoteService {
     }
   }
 }
-export const inject = ['storage', 'storageDomain', 'agents', 'goals', 'credentials', 'agentDefaultModel', 'sessionPersistence', 'tools', 'llm', 'settings']
+export const inject = ['storage', 'storageDomain', 'agents', 'agentLoop', 'goals', 'credentials', 'agentDefaultModel', 'sessionPersistence', 'tools', 'llm', 'settings']
 /** Mount the published DSH adapter without changing the Agent loop. @param ctx - Host services. @param config - resolved policy. */
 export async function apply(ctx: Context, config: Config): Promise<void> {
   if (!isAbsolute(config.extensionRoot) || config.dataRoots.some(path => !isAbsolute(path))) throw new Error('Aspera directories must be absolute')
   const fleet = await ExperimentFleet.open(ctx, (server: ServerSettings) => ({ ...server,
-    localRepo: config.extensionRoot, dataRoots: config.dataRoots, allowedSystemPackages: config.allowedSystemPackages,
+    localRepo: config.extensionRoot, dataRoots: config.dataRoots, preparationOutputChars: config.preparationOutputChars,
     agentCredentialRefs: config.agentCredentialRefs, tokenRef: 'ASPERA_COORDINATOR', toolTimeoutMs: config.toolTimeoutMs,
     controlPollIntervalMs: config.pollIntervalMs, minimumFreeBytes: config.minimumFreeBytes }))
   new AsperaRemote(ctx, fleet, new ExperimentDownloads(ctx, fleet, config.downloadTtlMs), config)
   const output = { schema: { type: 'string' as const }, render: (_args: object, value: string) => [{ type: 'text' as const, text: value }] }
   const presentCall = (args: object) => ({ card: 'generic' as const, title: 'Aspera experiment', kind: 'other' as const, rawInput: args })
-  ctx.effect(() => ctx.tools.register(defineTool({ name: 'list_experiment_servers', description: 'Read configured Aspera servers and their fixed coordinator. No credentials are returned.', parameters: {}, output, presentCall,
+  ctx.effect(() => ctx.tools.register(defineTool({ name: 'list_experiment_servers', description: 'Read configured peer Aspera servers and their latest connection checks. No credentials are returned.', parameters: {}, output, presentCall,
     execute: async () => JSON.stringify(fleet.servers()) })))
   ctx.effect(() => ctx.tools.register(defineTool({ name: 'list_experiment_models', description: 'List configured Agent models, reasoning options and credential readiness. Select a provider and model independently for preparation, planning and execution.', parameters: {}, output, presentCall,
     execute: async () => JSON.stringify(await experimentModelDirectory(ctx)) })))
   ctx.effect(() => ctx.tools.register(defineTool({ name: 'dispatch_experiment', description: 'Dispatch one independent experiment to explicitly selected servers. They jointly execute the same Goal. Captures this Goal revision; retries reuse it. Semi mode confirms the plan and pauses for unresolved decisions; automatic mode continues within immutable requirements.',
-    parameters: { objective: { type: 'string', required: true }, server_ids: { type: 'array', items: { type: 'string' }, required: true },
+    parameters: { objective: { type: 'string', required: true }, coordinator_id: { type: 'string', required: true, description: 'Coordinator chosen from server_ids.' }, server_ids: { type: 'array', items: { type: 'string' }, required: true },
       files: { type: 'array', items: { type: 'string' } }, name: { type: 'string', description: 'Short experiment title.' },
       models_json: { type: 'string', required: true, description: 'JSON object with preparation, planning and execution, each containing provider, model and optional reasoningEffort from list_experiment_models.' },
       mode: { type: 'string', enum: ['semi', 'automatic'], required: true } },
     output, presentCall, execute: async (args, execution) => {
       const agent = execution.agent
       const models = experimentModelsSchema.parse(JSON.parse(args.models_json))
-      const record = agent === undefined || ctx.goals.get(agent) === undefined ? await fleet.create({ experimentId: randomUUID(), objective: args.objective, serverIds: args.server_ids, files: args.files ?? [], mode: args.mode === 'semi' ? 'semi' : 'automatic', models, ...(args.name === undefined ? {} : { name: args.name }) })
-        : await fleet.createForGoal(agent, args.objective, args.server_ids, args.files ?? [], args.mode === 'semi' ? 'semi' : 'automatic', models, args.name)
+      const record = agent === undefined || ctx.goals.get(agent) === undefined ? await fleet.create({ experimentId: randomUUID(), objective: args.objective, serverIds: args.server_ids, coordinatorId: args.coordinator_id, files: args.files ?? [], mode: args.mode === 'semi' ? 'semi' : 'automatic', models, ...(args.name === undefined ? {} : { name: args.name }) })
+        : await fleet.createForGoal(agent, args.objective, args.server_ids, args.coordinator_id, args.files ?? [], args.mode === 'semi' ? 'semi' : 'automatic', models, args.name)
       return JSON.stringify(record)
     } })))
   ctx.effect(() => ctx.tools.register(defineTool({ name: 'get_experiment', description: 'Refresh a saved Aspera experiment, including its plan, handover, queue blockers and services.', parameters: { experiment_id: { type: 'string', required: true } }, output, presentCall,

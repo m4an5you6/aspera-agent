@@ -1,4 +1,125 @@
 {
+  "managementChecks": {
+    "passwordRevealAndCancel": true,
+    "failedCheckRetainsDatedHardware": true,
+    "coordinatorSelection": true
+  },
+  "managementDeletion": {
+    "layoutA": true,
+    "recordOnlyAfterCleanupFailure": true,
+    "survivesReload": true,
+    "batchOwnedCleanup": true
+  },
+  "serverRegistration": {
+    "removedUnusedCoordinator": true,
+    "perExperimentCoordinator": true,
+    "connectionBusy": true,
+    "activeCoordinatorProtected": true
+  },
+  "overviewPhases": {
+    "planning": [
+      "complete",
+      "active",
+      "pending",
+      "pending"
+    ],
+    "approval": [
+      "complete",
+      "attention",
+      "pending",
+      "pending"
+    ],
+    "execution": [
+      "complete",
+      "complete",
+      "active",
+      "pending"
+    ],
+    "queued": [
+      "complete",
+      "complete",
+      "waiting",
+      "pending"
+    ],
+    "retry": [
+      "active",
+      "pending",
+      "pending",
+      "pending"
+    ],
+    "completed": [
+      "complete",
+      "complete",
+      "complete",
+      "complete"
+    ],
+    "question": [
+      "complete",
+      "complete",
+      "attention",
+      "pending"
+    ]
+  },
+  "stageCards": {
+    "preparation": {
+      "errorInStage": true,
+      "retryInStage": true,
+      "nodes": 1,
+      "pipeline": [
+        "attention",
+        "pending",
+        "pending",
+        "pending"
+      ]
+    },
+    "remote": {
+      "errorInStage": true,
+      "retryInStage": false,
+      "nodes": 1,
+      "pipeline": [
+        "complete",
+        "complete",
+        "attention",
+        "pending"
+      ]
+    },
+    "retryRetainsSession": true,
+    "recoveryHandover": [
+      "本机派发完成，远端实验已接管"
+    ]
+  },
+  "environmentTools": [
+    "inspect_preparation_environment",
+    "run_preparation_command",
+    "run_preparation_command",
+    "verify_preparation_environment"
+  ],
+  "environmentCommands": [
+    {
+      "exitCode": 1,
+      "stdout": "Package metadata loaded",
+      "stderr": "Fixture download failed"
+    },
+    {
+      "exitCode": 0,
+      "stdout": "Required tools installed",
+      "stderr": ""
+    }
+  ],
+  "agentModels": {
+    "preparation": {
+      "provider": "aspera-cpu",
+      "model": "qwen-preparation"
+    },
+    "planning": {
+      "provider": "aspera-cpu",
+      "model": "qwen-planning"
+    },
+    "execution": {
+      "provider": "aspera-cpu",
+      "model": "qwen-execution"
+    }
+  },
   "dispatchGoalPhases": [
     "active",
     "complete"
@@ -6,12 +127,6 @@
   "handover": [
     "本机派发完成，远端实验已接管"
   ],
-  "inference": {
-    "mapped": true,
-    "external": "reachable",
-    "modelName": "cpu-fixture",
-    "stopped": "stopped"
-  },
   "storageTools": [
     "inspect_server_storage",
     "select_experiment_storage"
@@ -23,6 +138,12 @@
       "persistence": "unknown"
     }
   ],
+  "inference": {
+    "mapped": true,
+    "external": "reachable",
+    "modelName": "cpu-fixture",
+    "stopped": "stopped"
+  },
   "receiptStates": [
     {
       "goal": "CPU failure experiment",
@@ -39,19 +160,5 @@
       "handover": "本机派发完成，远端实验已接管",
       "state": "cancelled"
     }
-  ],
-  "agentModels": {
-    "preparation": {
-      "provider": "aspera-cpu",
-      "model": "qwen-preparation"
-    },
-    "planning": {
-      "provider": "aspera-cpu",
-      "model": "qwen-planning"
-    },
-    "execution": {
-      "provider": "aspera-cpu",
-      "model": "qwen-execution"
-    }
-  }
+  ]
 }

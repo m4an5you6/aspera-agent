@@ -1,50 +1,13 @@
 /** Password-only SSH commands, SFTP uploads and receiver channels with host-key verification. */
-import { execFile } from 'node:child_process'
 import { createReadStream } from 'node:fs'
 import { request as httpRequest } from 'node:http'
-import { homedir } from 'node:os'
-import { join } from 'node:path'
-import { promisify } from 'node:util'
 import { pipeline } from 'node:stream/promises'
 import ssh2 from 'ssh2'
-import type { Client, ClientChannel, SFTPWrapper, ServerHostKeyAlgorithm } from 'ssh2'
+import type { Client, ClientChannel, SFTPWrapper } from 'ssh2'
 import type { Target } from './transport.ts'
-
-const exec = promisify(execFile)
-
-async function hostKeys(target: Target, signal: AbortSignal): Promise<{ keys: Set<string>; algorithms: ServerHostKeyAlgorithm[] }> {
-  const file = target.knownHostsFile ?? join(homedir(), '.ssh', 'known_hosts')
-  const lookup = target.sshPort === 22 ? target.host : `[${target.host}]:${target.sshPort}`
-  let output: string
-  try {
-    const result = await exec('ssh-keygen', ['-F', lookup, '-f', file], { windowsHide: true, signal })
-    output = result.stdout
-  } catch (error: unknown) {
-    signal.throwIfAborted()
-    throw new Error(`SSH host key is unavailable in ${file}; verify this server with OpenSSH before dispatching`, { cause: error })
-  }
-  const keys = new Set<string>()
-  const algorithms = new Set<ServerHostKeyAlgorithm>()
-  for (const line of output.split(/\r?\n/)) {
-    if (line.startsWith('#') || line.trim() === '') continue
-    const fields = line.trim().split(/\s+/)
-    if (fields[0] === '@revoked') throw new Error('SSH host key is revoked in known_hosts')
-    // Certificate authorities require certificate verification, which this transport does not implement.
-    if (fields[0]?.startsWith('@')) continue
-    if (fields[2] !== undefined) keys.add(fields[2])
-    switch (fields[1]) {
-      case 'ssh-rsa':
-        algorithms.add('rsa-sha2-512'); algorithms.add('rsa-sha2-256'); algorithms.add('ssh-rsa')
-        break
-      case 'ssh-ed25519': case 'ecdsa-sha2-nistp256': case 'ecdsa-sha2-nistp384': case 'ecdsa-sha2-nistp521':
-        algorithms.add(fields[1])
-        break
-      default: break // Unsupported key algorithms cannot authorize this connection.
-    }
-  }
-  if (keys.size === 0 || algorithms.size === 0) throw new Error('SSH requires a verified server key in known_hosts')
-  return { keys, algorithms: [...algorithms] }
-}
+import { RemoteCommandError, SshConnectionError } from './command-result.ts'
+import type { RemoteCommandResult } from './command-result.ts'
+import { verifiedHostKeys } from './ssh-host-keys.ts'
 
 async function withPassword<T>(
   target: Target, password: string | undefined, timeoutMs: number, signal: AbortSignal | undefined,
@@ -56,7 +19,7 @@ async function withPassword<T>(
   }
   const timeout = AbortSignal.timeout(timeoutMs)
   const lifetime = signal === undefined ? timeout : AbortSignal.any([signal, timeout])
-  const { keys, algorithms } = await hostKeys(target, lifetime)
+  const { keys, algorithms } = await verifiedHostKeys(target, lifetime)
   lifetime.throwIfAborted()
   const client = new ssh2.Client()
   let rejectedKey = false
@@ -104,23 +67,52 @@ async function withPassword<T>(
  * @param signal - cancels connection and command execution.
  * @returns bounded stdout after a zero exit status.
  */
-export function passwordRemote(target: Target, password: string | undefined, command: string, signal?: AbortSignal): Promise<string> {
-  return withPassword(target, password, target.toolTimeoutMs, signal, client => new Promise<string>((resolve, reject) => {
+export async function passwordRemote(target: Target, password: string | undefined, command: string, signal?: AbortSignal): Promise<string> {
+  const result = await passwordResult(target, password, command, signal)
+  signal?.throwIfAborted()
+  if (result.exitCode !== 0 || result.cancelled || result.timedOut || !result.exitConfirmed) throw new RemoteCommandError(result)
+  return result.stdout
+}
+
+/**
+ * Capture password-authenticated command diagnostics, including interrupted commands.
+ * @param target - saved SSH account.
+ * @param password - private password.
+ * @param command - quoted remote program.
+ * @param signal - operation cancellation.
+ * @returns remote exit evidence; authentication and connection failures reject.
+ */
+export async function passwordResult(target: Target, password: string | undefined, command: string, signal?: AbortSignal): Promise<RemoteCommandResult> {
+  const result: RemoteCommandResult = { stdout: '', stderr: '', exitCode: null, signal: null, timedOut: false, cancelled: false, exitConfirmed: false }
+  let started = false
+  try {
+    return await withPassword(target, password, target.toolTimeoutMs, signal, client => new Promise<RemoteCommandResult>((resolve, reject) => {
+    started = true
     client.exec(command, (error, channel) => {
       if (error !== undefined) { reject(error); return }
-      let stdout = ''
-      let stderr = ''
       channel.setEncoding('utf8')
       channel.stderr.setEncoding('utf8')
-      channel.on('data', (part: string) => { stdout = (stdout + part).slice(-2_000_000) })
-      channel.stderr.on('data', (part: string) => { stderr = (stderr + part).slice(-4000) })
+      channel.on('data', (part: string) => { result.stdout = (result.stdout + part).slice(-2_000_000) })
+      channel.stderr.on('data', (part: string) => { result.stderr = (result.stderr + part).slice(-2_000_000) })
       channel.once('error', reject)
+      channel.once('exit', (code: number | null, exitSignal?: string) => {
+        result.exitCode = code; result.signal = exitSignal ?? null
+        result.exitConfirmed = code !== null || exitSignal !== undefined
+      })
       channel.once('close', (code: number | undefined) => {
-        if (code === 0) resolve(stdout)
-        else reject(new Error(`SSH command exited ${String(code)}: ${stderr}`))
+        if (code !== undefined) { result.exitCode = code; result.exitConfirmed = true }
+        resolve(result)
       })
     })
-  }))
+    }))
+  } catch (error) {
+    result.cancelled = signal?.aborted === true
+    result.timedOut = error instanceof Error && error.name === 'TimeoutError'
+    if (!started || (!result.cancelled && !result.timedOut)) {
+      throw new SshConnectionError({ ...result, stderr: result.stderr || String(error) })
+    }
+    return result
+  }
 }
 
 /**

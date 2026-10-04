@@ -1,6 +1,6 @@
 ---
 kind: upgrade-guide
-description: "Aspera 0.1.1 requires three model selections for new experiments and writes protocol and storage generation 4."
+description: "Aspera 0.1.1 requires three model selections and writes protocol 4 with local fleet storage generation 5."
 ---
 
 # Aspera phase models and management interface
@@ -9,7 +9,7 @@ English | [中文](guide.zh.md)
 
 ## Change
 
-Aspera remains `0.1.1` with DSH `0.2.0-rc.2`. New experiments use protocol and storage generation 4. Preparation, planning and execution each have immutable provider settings and a private credential snapshot. The create API requires explicit `models` selections; the dispatch tool requires `models_json`. Missing credentials and unsupported authentication reject submission, without switching to DeepSeek.
+Aspera remains `0.1.1` with DSH `0.2.0-rc.2`. New experiments use protocol 4; local fleet storage uses generation 5 as described in the [preparation upgrade guide](../aspera-preparation/guide.md). Preparation, planning and execution each have immutable provider settings and a private credential snapshot. The create API requires explicit `models` selections; the dispatch tool requires `models_json`. Missing credentials and unsupported authentication reject submission, without switching to DeepSeek.
 
 The release includes two pinned package patches for the grouped sidebar slot and the existing settings-command invocation. Generated Remote consumers and desktop installations must use the complete matching build. Agent records now have phase/Session/sequence cursors; process logs have node/command/stream/generation cursors.
 
@@ -20,3 +20,4 @@ The release includes two pinned package patches for the grouped sidebar slot and
 3. Open **Aspera model settings**, manage existing DSH accounts and choose all three Agent models before creating an experiment. API addresses, options and credentials are saved independently of subsequent global configuration changes.
 4. Copy unfinished generation-1–3 preparations into new experiments. Historical records retain their original version values, hashes and model records; old receipts naming `0.2.0` are not relabeled.
 5. Verify the selected models in experiment details and inspect preparation, planning and execution records separately. Raw keys and provider headers must remain absent from browser records and receipts. See the [state/API reference](../../../../extensions/aspera/docs/state-and-api.md) for ownership and compatibility.
+6. A handed-over experiment keeps its pinned remote release after a desktop update. If its planning or execution Agent reports `no adapter registered for provider`, install the complete corrected build and copy the experiment to use that build. Keep the original experiment and Session records; preparation retry cannot replace an already handed-over release.

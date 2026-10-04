@@ -1,5 +1,5 @@
 /** A grouped contribution inside the official DSH sidebar. */
-import { Button, Modal, Tag, IconGoalOutlineRegular, IconSettingsOutlineMedium, IconFlatListOutlineRegular, IconDataOutlineMedium } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, Modal, Tag, IconGoalOutlineRegular, IconSettingsOutlineMedium, IconFlatListOutlineRegular, IconDataOutlineMedium, IconTriangleRightFillRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type { ExperimentsPageProps } from './ExperimentsPage.tsx'
 import { experimentAttentionCount, attentionLabel } from './attention.ts'
@@ -17,7 +17,8 @@ export function AsperaSidebar({ wide, expandSidebar, controller, useExperiments,
       <div className={css.sidebarGroupHeader}>
         <button className={css.sidebarGroupButton} title={t('title')} aria-label={t('title')} aria-expanded={wide && !state.preferences.collapsed}
           onClick={() => { if (!wide) expandSidebar(); else controller.toggleGroup() }}>
-          <IconGoalOutlineRegular size={18} />{wide && <span>{t('title')}</span>}
+          <span className={css.sidebarGroupIcon} aria-hidden="true"><IconGoalOutlineRegular size={18} className={css.sidebarIdentity} />
+            <IconTriangleRightFillRegular size={12} className={css.sidebarDisclosure} /></span>{wide && <span className={css.sidebarGroupLabel}>{t('title')}</span>}
           {count > 0 && <span className={css.count} aria-label={t('pendingCount', { count })}>{attentionLabel(count)}</span>}
         </button>
         {wide && <><small className={css.sidebarVersion}>0.1.1</small><button className={css.sidebarGear} aria-label={t('modelSettings')} title={t('modelSettings')} onClick={() => { controller.modelSettings(true) }}><IconSettingsOutlineMedium size={14} /></button></>}

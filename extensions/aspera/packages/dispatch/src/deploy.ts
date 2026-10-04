@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { SourceSnapshot } from './snapshot.ts'
-import { copy, remote, shellQuote } from './transport.ts'
+import { copy, remote, RemoteCommandError, shellQuote } from './transport.ts'
 import type { Target } from './transport.ts'
 import type { StoragePlacement, InferenceMapping } from '@aspera/experiments'
 import { verifyServerStorage } from '@aspera/runtime'
@@ -17,7 +17,6 @@ export interface DeploymentConfig extends Target {
   readonly inferenceMapping?: InferenceMapping
   readonly localRepo: string
   readonly dataRoots: readonly string[]
-  readonly allowedSystemPackages: readonly string[]
   readonly agentCredentialRefs: readonly string[]
   readonly tokenRef: string
   /** Interval for observing remote control process transitions. */
@@ -37,6 +36,9 @@ export interface PreparedEnvironment {
   readonly hiddenPaths: readonly string[]
   readonly workspaceRoot: string
 }
+
+/** An earlier release installer has not reported that its process exited. */
+export class ReleaseInstallationPending extends Error {}
 
 function paths(config: DeploymentConfig, digest: string) {
   const root = config.remoteRoot
@@ -64,6 +66,21 @@ export async function installSource(config: DeploymentConfig, snapshot: SourceSn
   await copy(config, snapshot.archive, p.archive, signal, password)
   const script = `set -eu
 umask 077
+lock=${shellQuote(p.release + '.installing')}
+if ! mkdir "$lock" 2>/dev/null; then
+  test -f "$lock/exited" || { echo "ASPERA_INSTALL_PENDING=$lock" >&2; exit 1; }
+  rm -- "$lock/exited"
+  rmdir "$lock"
+  mkdir "$lock"
+fi
+stage=''
+finish() {
+  status=$?
+  if [ -n "$stage" ]; then rm -rf -- "$stage"; fi
+  printf '%s\\n' "$status" > "$lock/exited"
+}
+trap finish EXIT
+trap '' HUP
 export XDG_CACHE_HOME=${shellQuote((config.storagePlacement?.namespaceRoot ?? p.root) + '/cache')}
 export npm_config_cache="$XDG_CACHE_HOME/npm"
 export COREPACK_HOME="$XDG_CACHE_HOME/corepack"
@@ -76,7 +93,6 @@ fi
 if [ ! -f ${shellQuote(p.release + '/.ready')} ]; then
   stage=${shellQuote(p.release + '.building-' + randomUUID())}
   mkdir -p "$stage"
-  trap 'rm -rf -- "$stage"' EXIT
   tar -xf ${shellQuote(p.archive)} -C "$stage"
   cd "$stage"
   if command -v pnpm >/dev/null 2>&1; then
@@ -90,7 +106,13 @@ if [ ! -f ${shellQuote(p.release + '/.ready')} ]; then
   touch .ready
   if [ ! -e ${shellQuote(p.release)} ]; then mv "$stage" ${shellQuote(p.release)}; fi
 fi`
-  await remote(config, script, signal, password)
+  try { await remote(config, script, signal, password) }
+  catch (error) {
+    if (error instanceof RemoteCommandError && error.result.stderr.includes('ASPERA_INSTALL_PENDING=')) {
+      throw new ReleaseInstallationPending(`Release installation has no confirmed exit at ${p.release}.installing; inspect the original installer before retrying.`)
+    }
+    throw error
+  }
 }
 
 /**
@@ -108,17 +130,8 @@ export async function validateEnvironment(
   const script = `set -eu
 workspace=${shellQuote(p.workspace)}
 outside=${shellQuote(p.outside)}
-tools=${shellQuote(p.tools)}
 bwrap_bin=$(command -v bwrap || true)
-if [ -z "$bwrap_bin" ] || ! "$bwrap_bin" --ro-bind / / --dev /dev --unshare-pid --proc /proc --die-with-parent -- true >/dev/null 2>&1; then
-  test ${shellQuote(config.allowedSystemPackages.includes('bubblewrap') ? 'yes' : 'no')} = yes || { echo 'bubblewrap unavailable and not allowed by deployment configuration' >&2; exit 1; }
-  command -v apt-get >/dev/null && command -v dpkg-deb >/dev/null || { echo 'bubblewrap unavailable and apt extraction unsupported' >&2; exit 1; }
-  mkdir -p "$tools"
-  cd "$tools"
-  apt-get download bubblewrap
-  for deb in bubblewrap_*.deb; do test -f "$deb" || exit 1; dpkg-deb -x "$deb" "$tools"; done
-  bwrap_bin="$tools/usr/bin/bwrap"
-fi
+test -n "$bwrap_bin" || { echo 'bubblewrap is missing from the verified executable directories' >&2; exit 1; }
 "$bwrap_bin" --ro-bind / / --dev /dev --unshare-pid --proc /proc --die-with-parent -- true
 devices=''
 gpu_count=0

@@ -1,7 +1,7 @@
 /** Linux inventory and owned-directory preparation, executable before the runtime is installed. */
 import { createHash, randomUUID } from 'node:crypto'
 import { accessSync, constants, existsSync, lstatSync, mkdirSync, openSync, closeSync, readFileSync, realpathSync,
-  readdirSync, statSync, statfsSync, writeFileSync, unlinkSync, linkSync } from 'node:fs'
+  readdirSync, statSync, statfsSync, writeFileSync, unlinkSync, linkSync, renameSync, rmdirSync } from 'node:fs'
 import { homedir, networkInterfaces } from 'node:os'
 import { dirname, posix } from 'node:path'
 
@@ -32,7 +32,9 @@ function rejectLinks(path) {
   let current = '/'
   for (const part of path.split('/').filter(Boolean)) {
     current = posix.join(current, part)
-    if (existsSync(current) && lstatSync(current).isSymbolicLink()) throw new Error(`Storage path contains a symbolic link: ${current}`)
+    let stat
+    try { stat = lstatSync(current) } catch (error) { if (error.code !== 'ENOENT') throw error }
+    if (stat?.isSymbolicLink()) throw new Error(`Storage path contains a symbolic link: ${current}`)
   }
 }
 
@@ -161,4 +163,60 @@ export function prepareStorage(placement, requiredBytes = 0) {
   mkdirSync(registry, { recursive: true, mode: 0o700 })
   makeOwned(posix.join(registry, hash(placement.namespaceRoot)), { namespaceRoot: placement.namespaceRoot })
   return observed
+}
+
+/** Remove only a verified experiment tree; keep its marker until every child is removed. */
+export function removeOwnedTree(directory, owner) {
+  rejectLinks(directory)
+  if (!existsSync(directory)) return
+  const marker = posix.join(directory, '.aspera-owner.json')
+  rejectLinks(marker)
+  if (readFileSync(marker, 'utf8') !== JSON.stringify(owner)) throw new Error('Experiment directory ownership differs')
+  const mounts = parseMounts(readFileSync('/proc/self/mountinfo', 'utf8'))
+  if (mounts.some(mount => inside(directory, mount.mountPoint))) throw new Error('Refusing to cross a mounted filesystem during cleanup')
+  const device = statSync(directory).dev
+  const remove = path => {
+    const stat = lstatSync(path)
+    if (stat.isSymbolicLink()) { unlinkSync(path); return }
+    if (stat.dev !== device) throw new Error('Refusing to cross a mounted filesystem during cleanup')
+    if (!stat.isDirectory()) { unlinkSync(path); return }
+    for (const name of readdirSync(path)) remove(posix.join(path, name))
+    rmdirSync(path)
+  }
+  for (const name of readdirSync(directory)) if (name !== '.aspera-owner.json') remove(posix.join(directory, name))
+  unlinkSync(marker)
+  rmdirSync(directory)
+}
+
+/** Validate the saved mount, quarantine the owned run, and remove only named experiment secrets. */
+export function cleanupStorage({ placement, privateNames }) {
+  verifyStorage({ ...placement, minimumFreeBytes: 0 })
+  const { serverId, experimentId, runRoot, namespaceRoot, controlRoot } = placement
+  const allowed = new RegExp('^' + experimentId + '(?:-model)?\\.json$|^' + experimentId + '-[0-9a-f-]{36}\\.(?:known_hosts|identity)$')
+  if (!Array.isArray(privateNames) || privateNames.some(name => !allowed.test(name))) throw new Error('Private file does not belong to the experiment')
+  const controlMarker = posix.join(controlRoot, '.aspera-owner.json')
+  rejectLinks(controlMarker)
+  if (readFileSync(controlMarker, 'utf8') !== JSON.stringify({ version: 1, serverId, kind: 'control' })) throw new Error('Control directory ownership differs')
+  const owner = { version: 1, serverId, experimentId }
+  const quarantine = posix.join(namespaceRoot, '.cleanup-' + experimentId)
+  rejectLinks(quarantine)
+  if (existsSync(runRoot)) {
+    const marker = posix.join(runRoot, '.aspera-owner.json')
+    rejectLinks(marker)
+    if (readFileSync(marker, 'utf8') !== JSON.stringify(owner)) throw new Error('Experiment directory ownership differs')
+    if (existsSync(quarantine)) throw new Error('Both experiment and cleanup directories exist')
+    const mounts = parseMounts(readFileSync('/proc/self/mountinfo', 'utf8'))
+    if (mounts.some(mount => inside(runRoot, mount.mountPoint))) throw new Error('Refusing to cross a mounted filesystem during cleanup')
+    renameSync(runRoot, quarantine)
+  }
+  if (existsSync(quarantine)) {
+    if (readdirSync(quarantine).length === 0) rmdirSync(quarantine)
+    else removeOwnedTree(quarantine, owner)
+  }
+  for (const name of privateNames) {
+    const path = posix.join(controlRoot, 'secrets', name)
+    rejectLinks(path)
+    if (existsSync(path)) { if (!lstatSync(path).isFile()) throw new Error('Private experiment file is not a regular file'); unlinkSync(path) }
+  }
+  return { cleaned: true }
 }

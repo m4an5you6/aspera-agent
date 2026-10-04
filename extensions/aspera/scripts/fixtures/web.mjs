@@ -13,8 +13,9 @@ import { ExperimentDownloads } from '@aspera/dispatch/downloads'
 import { inventory, installStorageReplay } from './storage.mjs'
 import { readPhaseRecords } from '../../packages/runtime/lib/records.js'
 import { openInferenceGateway } from '../../packages/runtime/lib/inference-gateway.js'
+import { SavedReleaseUnavailable } from '../../packages/dispatch/lib/cluster-deploy.js'
 
-export const inject = ['storage', 'storageDomain', 'agents', 'goals', 'credentials', 'agentDefaultModel', 'sessionPersistence', 'subprocess', 'webServer', 'llm', 'settings']
+export const inject = ['storage', 'storageDomain', 'agents', 'agentLoop', 'goals', 'credentials', 'agentDefaultModel', 'sessionPersistence', 'subprocess', 'webServer', 'llm', 'settings']
 
 export async function apply(ctx, config) {
   if (config.role === 'service') {
@@ -36,7 +37,14 @@ export async function apply(ctx, config) {
   const children = new Map()
   const events = []
   const storageCalls = []
-  installStorageReplay(ctx, storageCalls)
+  const environmentCalls = []
+  const preparationCommands = []
+  const configuredHosts = new Set()
+  const restoredPreparations = new Set()
+  let planGate; let retryGate; let hostKeyGate; let failConnection = false; let failCleanup = false
+  const cleanupCalls = []
+  ctx.effect(() => () => hostKeyGate?.resolve())
+  installStorageReplay(ctx, storageCalls, environmentCalls)
   ctx.on('session/event', (session, event) => {
     const match = /^aspera-(dispatch|fixture-plan|fixture-execution)-(.+)$/.exec(session.id)
     if (match === null) return
@@ -75,6 +83,7 @@ export async function apply(ctx, config) {
   const executor = {
     prepare: async record => {
       const identity = await session(record, 'plan', 'Prepare a CPU fixture service in the experiment directory.')
+      if (record.submission.objective === 'CPU semi experiment') await planGate?.promise
       return { plan: { revision: 1, summary: 'Local CPU service plan', steps: ['Write an output file', 'Start a managed loopback service', 'Check health'], frameworks: [], createdAt: 1 }, sessionId: identity.sessionId }
     },
     run: async (record, signal, started, update) => {
@@ -93,6 +102,7 @@ export async function apply(ctx, config) {
       writeFileSync(resolve(workspace, 'result.txt'), 'local output\n')
       appendFileSync(runPath(id, 'node.log'), '训练准备完成\n')
       if (record.submission.objective.includes('failure')) return { state: 'failed', detail: 'CPU fixture dependency failed', resourcesReleased: true }
+      if (record.submission.objective === 'CPU completed experiment') return { state: 'completed', resourcesReleased: true }
       const home = resolve(root, 'service-homes', id)
       const profile = resolve(home, 'profiles/cpu-service')
       mkdirSync(profile, { recursive: true })
@@ -148,20 +158,50 @@ export async function apply(ctx, config) {
     reconcile: record => stop(record.submission.experimentId),
   }
   const queue = new ClusterQueue(store.table('experiments'), executor, error => ctx.logger.error(String(error)))
-  ctx.effect(() => async () => { await queue.close(); await store.close() })
+  ctx.effect(() => async () => { planGate?.resolve(); retryGate?.resolve(); await queue.close(); await store.close() })
   await queue.recover()
   const driver = {
+    environmentRequirements: () => ({ node: '^22.19.0 || >=24.0.0', pnpm: '11.7.0' }),
+    installedEnvironmentRequirements: async () => ({ node: '^22.19.0 || >=24.0.0', pnpm: '11.7.0' }),
+    inspectEnvironment: async target => ({
+      home: '/home/trainer', system: 'Linux', architecture: 'x86_64', identity: 'uid=1000(trainer)',
+      programs: [
+        { name: 'node', path: '/usr/bin/node', version: 'v24.1.0' },
+        { name: 'pnpm', path: '/usr/bin/pnpm', version: '11.7.0' },
+        { name: 'python3', path: '/usr/bin/python3', version: 'Python 3.12.0' },
+        { name: 'bwrap', path: configuredHosts.has(target.host) ? '/fixture/bwrap' : '', version: configuredHosts.has(target.host) ? 'bubblewrap fixture' : '' },
+      ].map(program => configuredHosts.has(target.host) ? program : { ...program, path: '', version: '' }),
+      sandboxExitCode: configuredHosts.has(target.host) ? 0 : 127, diagnostics: 'CPU environment fixture',
+    }),
+    remoteResult: async (target, script) => {
+      const installed = script.includes('fixture retry installation')
+      if (installed) configuredHosts.add(target.host)
+      const result = { stdout: installed ? 'Required tools installed' : 'Package metadata loaded', stderr: installed ? '' : 'Fixture download failed',
+        exitCode: installed ? 0 : 1, signal: null, timedOut: false, cancelled: false, exitConfirmed: true }
+      preparationCommands.push({ host: target.host, ...result })
+      return result
+    },
+    prepareSshHostKey: async () => { await hostKeyGate?.promise; if (failConnection) throw new Error('Timed out while waiting for handshake') },
     inspectServerStorage: async (target, directory) => inventory(directory ?? '/fixture/data/' + target.host),
+    cleanupServerStorage: async (_target, placement, names) => { if (failCleanup) throw new Error('CPU fixture cleanup temporarily unavailable'); cleanupCalls.push({ serverId: placement.serverId, experimentId: placement.experimentId, path: placement.runRoot, names }) },
     prepareServerStorage: async (_target, placement) => placement.candidate,
     verifyServerStorage: async (_target, placement) => placement.candidate,
     resolveTrainingNetwork: async (_id, participants) => participants.map(value => value.node),
     snapshotSource: async () => ({ directory: root, archive: 'fixture.tar', archiveHash: 'f'.repeat(64), digest: 'f'.repeat(64), dispose() {} }),
-    prepareClusterServer: async () => ({ state: 'ready', deploymentId: 'f'.repeat(64), preparationId: 'f'.repeat(64), backend: 'bwrap', backendPath: '/fixture/bwrap', sandboxWriteProbe: 'passed', cudaProbe: 'passed', devicePaths: ['/dev/nvidia_fixture'], hiddenPaths: [], workspaceRoot: '/fixture/workspace' }),
+    prepareClusterServer: async target => {
+      const record = fleet.list().find(row => row.preparation?.placements.some(placement => placement.workspaceRoot === target.storagePlacement?.workspaceRoot))
+      if (record?.request.objective === 'CPU preparation recovery' && !restoredPreparations.has(record.request.experimentId)) {
+        throw new SavedReleaseUnavailable(`CPU fixture release requirements unavailable at ${target.storagePlacement.releaseRoot}`)
+      }
+      return { state: 'ready', deploymentId: 'f'.repeat(64), preparationId: 'f'.repeat(64), backend: 'bwrap', backendPath: '/fixture/bwrap', sandboxWriteProbe: 'passed', cudaProbe: 'passed', devicePaths: ['/dev/nvidia_fixture'], hiddenPaths: [], workspaceRoot: '/fixture/workspace' }
+    },
     ensureClusterRole: async () => {},
     describeClusterNode: async server => ({ server, backendPath: '/fixture/bwrap', devicePaths: ['/dev/nvidia_fixture'], hiddenPaths: [], gpuInfo: 'CPU test provider; GPU validation is separate' }),
     delegateClusterLogin: async () => ({ knownHostsFile: '/fixture/private/known_hosts' }),
     installPrivateFile: async (_target, destination, content) => { const file = path(destination); mkdirSync(dirname(file), { recursive: true }); writeFileSync(file, content) },
-    remote: async () => 'CPU test provider',
+    remote: async (target, script) => script.includes('/exited')
+      ? String(preparationCommands.findLast(command => command.host === target.host)?.exitCode ?? 0)
+      : script.includes('for role in coordinator node') ? '' : 'CPU test provider',
     copy: async (_target, source, destination) => { const file = path(destination); mkdirSync(dirname(file), { recursive: true }); copyFileSync(source, file) },
     request: async (_target, _token, route, _method, body) => {
       const operation = route.split('/').at(-1)
@@ -206,7 +246,9 @@ export async function apply(ctx, config) {
     },
   }
   const policy = AdapterConfig({ extensionRoot: config.release, agentCredentialRefs: [], pollIntervalMs: 100 })
-  const fleet = await ExperimentFleet.open(ctx, server => ({ ...server, localRepo: config.release, dataRoots: [], allowedSystemPackages: [], agentCredentialRefs: [], tokenRef: 'FIXTURE', toolTimeoutMs: 30000, controlPollIntervalMs: 100, minimumFreeBytes: policy.minimumFreeBytes }), driver)
+  const fleet = await ExperimentFleet.open(ctx, server => ({ ...server, localRepo: config.release, dataRoots: [], preparationOutputChars: policy.preparationOutputChars, agentCredentialRefs: [], tokenRef: 'FIXTURE', toolTimeoutMs: 30000, controlPollIntervalMs: 100, minimumFreeBytes: policy.minimumFreeBytes }), driver)
+  const retry = fleet.retry.bind(fleet)
+  fleet.retry = async id => { await retryGate?.promise; return retry(id) }
   new AsperaRemote(ctx, fleet, new ExperimentDownloads(ctx, fleet, 60000), policy)
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: '/aspera-test', handler: async (req, res) => {
     const url = new URL(req.url, 'http://localhost')
@@ -215,8 +257,19 @@ export async function apply(ctx, config) {
     if (kind === 'append') appendFileSync(runPath(id, 'node.log'), '断线后继续\n')
     if (kind === 'rotate') writeFileSync(runPath(id, 'node.log'), '轮转后日志\n')
     if (kind === 'crash') children.get(id)?.handle.terminate()
+    if (kind === 'restore-release') restoredPreparations.add(id)
+    if (kind === 'hold-plan') planGate = Promise.withResolvers()
+    if (kind === 'release-plan') planGate?.resolve()
+    if (kind === 'hold-host-key') hostKeyGate = Promise.withResolvers()
+    if (kind === 'release-host-key') hostKeyGate?.resolve()
+    if (kind === 'fail-connection') failConnection = true
+    if (kind === 'restore-connection') failConnection = false
+    if (kind === 'fail-cleanup') failCleanup = true
+    if (kind === 'restore-cleanup') failCleanup = false
+    if (kind === 'hold-retry') retryGate = Promise.withResolvers()
+    if (kind === 'release-retry') retryGate?.resolve()
     res.setHeader('content-type', 'application/json')
-    res.end(JSON.stringify({ experiments: fleet.list(), queue: queue.list(), events, storageCalls }))
+    res.end(JSON.stringify({ experiments: fleet.list(), queue: queue.list(), deletedIds: fleet.snapshot().deletedIds, cleanupCalls, events, storageCalls, environmentCalls, preparationCommands }))
   } }))
 }
 

@@ -9,6 +9,7 @@ import type { MainPanelId } from '@deepseek-ai/dsh-client-ui-layout/client'
 import type { Config } from '../config.ts'
 import { ExperimentsController } from './controller.ts'
 import { ExperimentsPage } from './ExperimentsPage.tsx'
+import { ManagementFeedback } from './ExperimentManagement.tsx'
 import { AsperaSidebar } from './AsperaSidebar.tsx'
 import type { ShortcutCommandId } from '@deepseek-ai/dsh-client-shortcuts/client'
 import { en, zh } from './locales.ts'
@@ -57,6 +58,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     scope.slots.inject('main', () => scope.slots.register({ name: 'main', key: panel, locale: 'experiments',
       inject: () => ({ controller, hooks: { experiments: controller.store } }),
     }, ExperimentsPage))
+    scope.slots.inject('shell.overlay', () => scope.slots.register({ name: 'shell.overlay', id: 'aspera-management-feedback', locale: 'experiments',
+      inject: () => ({ controller, hooks: { experiments: controller.store } }),
+    }, ManagementFeedback))
     scope.slots.inject('sidebar.sections', () => scope.slots.register({ name: 'sidebar.sections', id: panel, order: 5,
       label: () => t('title'), locale: 'experiments',
       inject: () => ({ controller, hooks: { experiments: controller.store },

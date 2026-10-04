@@ -1,6 +1,6 @@
 import type {} from '@aspera/runtime'
 /** Local server registry, independent dispatch Sessions, and immutable cluster submissions. */
-import { randomBytes, randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readSync, realpathSync, statSync, appendFileSync } from 'node:fs'
 import { basename, isAbsolute, resolve, sep } from 'node:path'
 import { z } from 'zod'
@@ -17,60 +17,58 @@ import { installModelSelection } from '@deepseek-ai/dsh-agent'
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import {
-  CLUSTER_HANDOVER, clusterAgentModelSchema, clusterChunkSchema, clusterFileHash, clusterFileSchema, clusterRecordSchema, clusterServerSchema,
-  clusterSubmissionSchema, clusterSubmissionV2Schema, clusterSubmissionV4Schema, experimentIdSchema, serverIdSchema, budgetSchema, answerExperimentQuestionSchema,
-  serverSettingsSchema, legacyClusterServerSchema, serverInventorySchema, storagePlacementSchema, inspectServerStorage, prepareServerStorage, verifyServerStorage, serviceAccessInfoSchema,
+  CLUSTER_HANDOVER, clusterChunkSchema, clusterFileHash, clusterFileSchema, clusterRecordSchema, clusterServerSchema,
+  clusterSubmissionV2Schema, clusterSubmissionV4Schema, experimentIdSchema, serverIdSchema, answerExperimentQuestionSchema,
+  serverSettingsSchema, inspectServerStorage, prepareServerStorage, verifyServerStorage, cleanupServerStorage, serviceAccessInfoSchema,
 } from '@aspera/runtime'
-import type { ClusterChunk, ClusterFile, ClusterPrivate, ClusterRecord, ClusterServer, ExperimentId, ExperimentServerId, ServerSettings, ServerProbe } from '@aspera/runtime'
-import { copy, remote, request, shellQuote } from './transport.ts'
+import type { ClusterChunk, ClusterFile, ClusterNode, ClusterPrivate, ClusterRecord, ClusterServer, ExperimentId, ExperimentServerId, ServerSettings, ServerProbe } from '@aspera/runtime'
+import { copy, remote, remoteResult, request, shellQuote, prepareSshHostKey } from './transport.ts'
 import { installPrivateFile } from './deploy.ts'
-import type { DeploymentConfig } from './deploy.ts'
+import type { DeploymentConfig, PreparedEnvironment } from './deploy.ts'
 import { snapshotSource } from './snapshot.ts'
 import { sshPasswordRef } from './ssh-account.ts'
 import { pinnedTargetSchema } from './deployment-settings.ts'
+import { fleetExperimentV5Schema, fleetRegistryV5Schema, fleetRequestV5Schema } from './fleet-schema-v5.ts'
+import { serverConnectionCheckSchema, deletedExperimentSchema, experimentDeletionSchema, deleteRequestSchema } from './management-schema.ts'
+import { cleanupLocalInputs } from './cleanup.ts'
+import type { ServerConnectionCheck, DeletedExperiment, ExperimentDeletion, ExperimentDeletionPreview, DeleteExperimentsRequest, FleetSnapshot } from './types.ts'
 import { delegateClusterLogin, describeClusterNode, ensureClusterRole, prepareClusterServer } from './cluster-deploy.ts'
+import type { DeploymentRelease } from './cluster-deploy.ts'
+import { EnvironmentPreparation, UnconfirmedPreparationCommand } from './environment-preparation.ts'
+import type { EnvironmentPreparationInput } from './environment-preparation.ts'
+import type { EnvironmentProgress } from './types.ts'
+import { environmentRequirements, installedEnvironmentRequirements, inspectEnvironment, checkEnvironment } from './environment.ts'
 import type { FleetCreateRequest, FleetExperiment, FleetRegistry, FleetServerInput, PinnedDeployment } from './types.ts'
 import type { AnswerExperimentQuestion, ExperimentModels } from '@aspera/experiments'
+import { experimentRemovalBlocker, serverRemovalBlockers } from './server-usage.ts'
 import { StorageSelection } from './storage-selection.ts'
 import { resolveTrainingNetwork } from './network-selection.ts'
 import { captureExperimentModels } from './models.ts'
-import { experimentModelSnapshotsSchema, experimentModelsSchema, experimentPhases } from '@aspera/experiments'
+import { experimentPhases } from '@aspera/experiments'
 import { openPhaseModelContext, privateModelConfigurationSchema } from '@aspera/runtime'
 import { agentRecordRequestSchema, agentRecordPageSchema, projectAgentRecord, experimentProcessSchema, processLogRequestSchema, processLogPageSchema } from '@aspera/experiments'
 import type { AgentRecordRequest, AgentRecordPage, ExperimentProcess, ProcessLogRequest, ProcessLogPage } from '@aspera/experiments'
 
-const storedServerSchema = z.union([serverSettingsSchema, legacyClusterServerSchema])
-const registrySchema = z.object({ coordinatorId: serverIdSchema.optional(), servers: z.array(storedServerSchema),
-  probes: z.record(z.string(), z.object({ gpuInfo: z.string(), allocations: z.array(z.string()), inventory: serverInventorySchema })).optional() })
-const legacyRequestSchema = z.object({ experimentId: experimentIdSchema, objective: z.string().trim().min(1).max(20_000),
-  serverIds: z.array(serverIdSchema).min(1).max(32), files: z.array(z.string()).max(128).default([]),
-  uploads: z.array(z.object({ name: clusterSubmissionV2Schema.shape.inputs.element.shape.name, size: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER) }).strict()).max(128).default([]), mode: z.enum(['semi', 'automatic']),
-}).strict().refine(value => new Set(value.serverIds).size === value.serverIds.length, 'duplicate server selection')
-  .refine(value => new Set(value.uploads.map(file => file.name)).size === value.uploads.length, 'duplicate attachment name')
-const requestSchema = legacyRequestSchema.safeExtend({ name: z.string().trim().min(1).max(120).optional(), models: experimentModelsSchema.optional() })
-const localSchema = z.object({
-  request: z.union([requestSchema, legacyRequestSchema.safeExtend({ budget: budgetSchema })]), coordinator: storedServerSchema, servers: z.array(storedServerSchema),
-  coordinatorTarget: pinnedTargetSchema, targets: z.array(pinnedTargetSchema),
-  agentModel: clusterAgentModelSchema,
-  models: experimentModelSnapshotsSchema.optional(),
-  createdAt: z.number().int(), state: z.enum(['staging', 'preparing', 'submitted', 'failed', 'cancelled']), detail: z.string().optional(),
-  sessionId: z.string(), goalId: z.string().optional(), goalRevision: z.number().optional(),
-  sourceGoal: z.object({ sessionId: z.string(), id: z.string(), revision: z.number().int() }).optional(),
-  submission: clusterSubmissionSchema.optional(), receipt: clusterRecordSchema.optional(), latest: clusterRecordSchema.optional(),
-  handoverRecorded: z.boolean().default(false),
-  waitingFor: z.array(serverIdSchema).default([]),
-  preparation: z.object({ protocol: z.union([z.literal(3), z.literal(4)]), stage: z.enum(['inspecting', 'selecting-storage', 'preparing-storage', 'deploying', 'checking-network', 'transferring', 'submitting']),
-    inventories: z.array(z.object({ serverId: serverIdSchema, inventory: serverInventorySchema })), placements: z.array(storagePlacementSchema),
-    inputs: clusterSubmissionV2Schema.shape.inputs.optional() }).optional(),
-})
-const storeSpec = defineDomain({ name: 'aspera_fleet', version: 4, compatibleVersions: [1, 2, 3], layout: 'per-record', tables: {
+const requestSchema = fleetRequestV5Schema.safeExtend({ coordinatorId: serverIdSchema })
+  .refine(value => value.serverIds.includes(value.coordinatorId), 'Coordinator must be a selected execution node')
+const localSchema = fleetExperimentV5Schema.extend({ request: z.union([requestSchema, fleetExperimentV5Schema.shape.request]) })
+const registrySchema = fleetRegistryV5Schema.extend({ checks: z.record(z.string(), serverConnectionCheckSchema).optional() })
+const storeSpec = defineDomain({ name: 'aspera_fleet', version: 6, compatibleVersions: [1, 2, 3, 4, 5], layout: 'per-record', tables: {
   registry: domainTable<string, FleetRegistry>(registrySchema),
   experiments: domainTable<ExperimentId, FleetExperiment>(localSchema),
+  deleted: domainTable<ExperimentId, DeletedExperiment>(deletedExperimentSchema),
+  deletions: domainTable<ExperimentId, ExperimentDeletion>(experimentDeletionSchema),
 } })
 type Store = Domain<typeof storeSpec>
 
+function connectionConfiguration(server: ServerSettings): string {
+  return createHash('sha256').update(JSON.stringify([server.host, server.sshPort, server.username, server.authMode, server.passwordRef,
+    server.remotePort, server.storagePreference, server.remoteRoot])).digest('hex')
+}
+
 /** Deployment provider for release transfer, private credentials and authenticated control requests. */
 export interface FleetDriver {
+  prepareSshHostKey: typeof prepareSshHostKey
   snapshotSource: typeof snapshotSource
   prepareClusterServer: typeof prepareClusterServer
   ensureClusterRole: typeof ensureClusterRole
@@ -78,16 +76,21 @@ export interface FleetDriver {
   delegateClusterLogin: typeof delegateClusterLogin
   installPrivateFile: typeof installPrivateFile
   remote: typeof remote
+  remoteResult: typeof remoteResult
+  inspectEnvironment: typeof inspectEnvironment
+  environmentRequirements: typeof environmentRequirements
+  installedEnvironmentRequirements: typeof installedEnvironmentRequirements
   copy: typeof copy
   request: typeof request
   inspectServerStorage: typeof inspectServerStorage
   prepareServerStorage: typeof prepareServerStorage
+  cleanupServerStorage: typeof cleanupServerStorage
   verifyServerStorage: typeof verifyServerStorage
   resolveTrainingNetwork: typeof resolveTrainingNetwork
 }
 
-const productionDriver: FleetDriver = { snapshotSource, prepareClusterServer, ensureClusterRole, describeClusterNode,
-  delegateClusterLogin, installPrivateFile, remote, copy, request, inspectServerStorage, prepareServerStorage, verifyServerStorage, resolveTrainingNetwork }
+const productionDriver: FleetDriver = { prepareSshHostKey, snapshotSource, prepareClusterServer, ensureClusterRole, describeClusterNode,
+  delegateClusterLogin, installPrivateFile, remote, remoteResult, inspectEnvironment, environmentRequirements, installedEnvironmentRequirements, copy, request, inspectServerStorage, prepareServerStorage, verifyServerStorage, cleanupServerStorage, resolveTrainingNetwork }
 
 class CoordinatorRequestError extends Error {
   constructor(readonly status: number, message: string) { super(message) }
@@ -101,6 +104,8 @@ export class ExperimentFleet {
   private readonly handles = new Map<ExperimentId, AgentHandle>()
   private readonly tokens = new Map<string, Promise<string>>()
   private readonly acceptance = new Map<ExperimentId, Promise<void>>()
+  private readonly checks = new Map<ExperimentServerId, Promise<ServerConnectionCheck>>()
+  private readonly deletionWork = new Map<ExperimentId, Promise<ExperimentDeletion>>()
   private closing = false
   private readonly uploadRoot = resolve(resolveDshHome(), 'aspera-inputs')
 
@@ -121,7 +126,18 @@ export class ExperimentFleet {
     if (store.table('registry').get('servers') === undefined) {
       await store.table('registry').put('servers', { servers: [] })
     }
+    const registry = fleet.servers()
+    if (Object.values(registry.checks ?? {}).some(check => check.status === 'checking')) {
+      await store.table('registry').put('servers', { ...registry, checks: Object.fromEntries(Object.entries(registry.checks ?? {}).map(([id, check]) =>
+        [id, check.status === 'checking' ? { ...check, status: 'interrupted', checkedAt: Date.now() } : check])) })
+    }
+    for (const [id, job] of store.table('deletions').entries()) {
+      if (store.table('deleted').get(id) !== undefined) {
+        await store.table('deletions').put(id, { experimentId: id, operationId: job.operationId, cleanupRemote: job.cleanupRemote, started: job.started, state: 'deleted', nodes: [], updatedAt: job.updatedAt })
+      } else if (job.state === 'deleting') await store.table('deletions').put(id, { ...job, state: 'failed', detail: 'Cleanup was interrupted; retry to resume saved progress', updatedAt: Date.now() })
+    }
     for (const [id, record] of store.table('experiments').entries()) {
+      if (store.table('deleted').get(id) !== undefined) { await store.table('experiments').delete(id); continue }
       if (record.state === 'preparing') await store.table('experiments').put(id, { ...record, state: 'failed', detail:
         record.submission === undefined ? 'Local preparation was interrupted before remote handover.' : 'Submission outcome is unknown; refresh to reconcile the saved experiment id.' })
     }
@@ -138,9 +154,24 @@ export class ExperimentFleet {
     return result
   }
 
-  private async onServer<T>(id: ExperimentServerId, operation: () => Promise<T>): Promise<T> {
+  private async onServer<T>(id: ExperimentServerId, signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
     const prior = this.serverChains.get(id) ?? Promise.resolve()
-    const result = prior.then(operation)
+    const result = prior.then(async () => {
+      signal.throwIfAborted()
+      for (const record of this.list()) {
+        const environment = record.preparation?.environments?.find(value => value.serverId === id)
+        if (environment?.pendingCommand === undefined) continue
+        const server = record.coordinator.id === id ? record.coordinator : record.servers.find(value => value.id === id)
+        const target = record.coordinator.id === id ? record.coordinatorTarget : record.targets[record.servers.findIndex(value => value.id === id)]
+        if (server === undefined || target === undefined) throw new Error('Pending preparation command has no saved server')
+        const directory = environment.pendingCommand.directory
+        const exit = await this.driver.remote(target, `if [ -f ${shellQuote(directory + '/exited')} ]; then cat ${shellQuote(directory + '/exited')}; else printf unknown; fi`, signal, await this.password(server))
+        if (!/^\d+\s*$/.test(exit)) throw new UnconfirmedPreparationCommand(`Server preparation is still unconfirmed at ${directory}; inspect that command before retrying.`)
+        const { pendingCommand: _pending, ...settled } = environment
+        await this.environmentProgress(record.request.experimentId, { ...settled, detail: `Previous command exited ${exit.trim()}; environment must be rechecked.` })
+      }
+      return operation()
+    })
     const done = result.then(() => {}, () => {})
     this.serverChains.set(id, done)
     try { return await result } finally { if (this.serverChains.get(id) === done) this.serverChains.delete(id) }
@@ -148,7 +179,7 @@ export class ExperimentFleet {
 
   /**
    * Read configured servers without credential values.
-   * @returns server list and coordinator identity.
+   * @returns peer server registrations and dated checks.
    */
   servers(): FleetRegistry {
     const registry = this.store.table('registry').get('servers')
@@ -157,9 +188,9 @@ export class ExperimentFleet {
   }
 
   /**
-   * Save server settings while retaining the original coordinator.
+   * Save peer server settings without changing pinned experiment destinations.
    * @param raw - complete server definition.
-   * @returns persisted registry; the first server remains coordinator.
+   * @returns persisted peer server registrations.
    */
   saveServer(raw: FleetServerInput): Promise<FleetRegistry> {
     const server = serverSettingsSchema.omit({ storagePlacement: true }).parse(raw)
@@ -171,18 +202,18 @@ export class ExperimentFleet {
     return this.serial(async () => {
       const registry = this.servers()
       const previous = registry.servers.find(other => other.id === server.id)
-      if (server.id === registry.coordinatorId && previous !== undefined
-        && (previous.host !== server.host || previous.sshPort !== server.sshPort || previous.username !== server.username
-          || previous.remoteRoot !== server.remoteRoot || previous.remotePort !== server.remotePort)) {
-        throw new Error('the coordinator address and state directory are fixed; automatic coordinator relocation is not supported')
-      }
       if (registry.servers.some(other => other.id !== server.id && other.host === server.host && other.sshPort === server.sshPort)) {
         throw new Error('this SSH server is already configured')
       }
       const servers = registry.servers.some(other => other.id === server.id)
         ? registry.servers.map(other => other.id === server.id ? server : other) : [...registry.servers, server]
       const probes = { ...registry.probes }; delete probes[server.id]
-      const next = { coordinatorId: registry.coordinatorId ?? server.id, servers, probes }
+      const checks = { ...registry.checks }
+      if (previous === undefined || connectionConfiguration(previous) !== connectionConfiguration(server)) {
+        const lastSuccess = checks[server.id]?.lastSuccess
+        checks[server.id] = { status: 'unchecked', configuration: connectionConfiguration(server), ...(lastSuccess === undefined ? {} : { lastSuccess }) }
+      }
+      const next = { servers, probes, checks }
       await this.store.table('registry').put('servers', next)
       return next
     })
@@ -190,19 +221,23 @@ export class ExperimentFleet {
 
   /**
    * Remove an unused server from future selections.
-   * @param id - server to remove.
+   * @param id - server registration to remove; historical snapshots and remote files remain.
    * @returns registry after safe removal.
    */
   removeServer(id: ExperimentServerId): Promise<FleetRegistry> {
     return this.serial(async () => {
       const current = this.servers()
-      if (id === current.coordinatorId) throw new Error('the coordinator cannot be removed or changed automatically')
-      if (this.list().some(record => record.servers.some(server => server.id === id) && (record.state === 'preparing'
-        || (record.latest !== undefined && (!record.latest.resourcesReleased || record.latest.state === 'queued'))))) {
-        throw new Error('server belongs to a pending or running experiment')
+      if (serverRemovalBlockers(id, this.list(), current.checks?.[id]?.result ?? current.checks?.[id]?.lastSuccess?.result ?? current.probes?.[id], [...this.store.table('deleted').entries()].map(([key]) => key)).length > 0) {
+        throw new Error('Server has pending work or unconfirmed cleanup; stop or reconcile that work before removing its registration')
       }
-      const next = { ...current, servers: current.servers.filter(server => server.id !== id) }
+      const servers = current.servers.filter(server => server.id !== id)
+      const { [id]: _removedProbe, ...probes } = current.probes ?? {}
+      if ([...this.store.table('deletions').entries()].some(([, job]) => job.state === 'deleting' && job.nodes.some(node => node.serverId === id))) throw new Error('Experiment file cleanup is still in progress')
+      const { [id]: _removedCheck, ...checks } = current.checks ?? {}
+      const next = { servers, probes, checks }
       await this.store.table('registry').put('servers', next)
+      const removed = current.servers.find(server => server.id === id)
+      if (removed !== undefined) await this.removeUnusedCredential(sshPasswordRef(removed))
       return next
     })
   }
@@ -212,6 +247,140 @@ export class ExperimentFleet {
     const value = await this.ctx.credentials.resolve(sshPasswordRef(server))
     if (value === undefined) throw new Error(`SSH password is missing for ${server.name}`)
     return value.value
+  }
+
+  /** Explicit editor reveal; ordinary snapshots never contain the returned value.
+   * @param id - saved server identity. @returns its saved password, only on operator request.
+   */
+  async revealPassword(id: ExperimentServerId): Promise<string> {
+    const server = this.servers().servers.find(value => value.id === id)
+    if (server === undefined) throw new Error('Server is no longer configured')
+    return await this.password(server) ?? ''
+  }
+
+  /** Invalidate observations made with a replaced credential.
+   * @param ref - credential changed by the server editor.
+   */
+  invalidatePassword(ref: string): Promise<void> {
+    return this.serial(async () => {
+      const registry = this.servers(); const checks = { ...registry.checks }; const probes = { ...registry.probes }
+      for (const server of registry.servers) if (sshPasswordRef(server) === ref) {
+        const lastSuccess = checks[server.id]?.lastSuccess
+        checks[server.id] = { status: 'unchecked', configuration: connectionConfiguration(server), ...(lastSuccess === undefined ? {} : { lastSuccess }) }; delete probes[server.id]
+      }
+      await this.store.table('registry').put('servers', { ...registry, checks, probes })
+    })
+  }
+
+  private async removeUnusedCredential(ref: string, deletingId?: ExperimentId): Promise<void> {
+    if (!/^(DSH_EXPERIMENT_SSH_PASSWORD_|ASPERA_(SSH|MODEL|KEY)_)/.test(ref)) return
+    if (this.servers().servers.some(server => sshPasswordRef(server) === ref)) return
+    for (const record of this.list()) {
+      if (record.request.experimentId === deletingId) continue
+      if ([record.coordinator, ...record.servers].some(server => sshPasswordRef(server) === ref)) return
+      if (record.models !== undefined && experimentPhases.some(phase => record.models?.[phase].configurationRef === ref
+        || `ASPERA_KEY_${record.request.experimentId.replaceAll('-', '_')}_${phase}`.toUpperCase() === ref)) return
+    }
+    const key = credentialRef(ref)
+    if ((await this.ctx.credentials.describe(key)).writable) await this.ctx.credentials.unset(key)
+  }
+
+  /** Complete snapshots include deletion identities so stale replies cannot restore rows. @returns public management state. */
+  snapshot(): FleetSnapshot {
+    return { registry: this.servers(), experiments: this.list(), deletedIds: [...this.store.table('deleted').entries()].map(([id]) => id),
+      deletions: [...this.store.table('deletions').entries()].map(([, job]) => job) }
+  }
+
+  /** Compute removal eligibility without changing tasks or remote files.
+   * @param rawIds - selected experiments. @returns node directories and outstanding obligations.
+   */
+  previewDeletion(rawIds: string[]): ExperimentDeletionPreview[] {
+    const ids = z.array(experimentIdSchema).max(100).parse(rawIds)
+    return ids.map(id => {
+      const record = this.get(id)
+      const reason = this.preparing.has(id) ? 'active' : experimentRemovalBlocker(record)
+      const servers = [...new Map([record.coordinator, ...record.servers].map(server => [server.id, server])).values()]
+      const nodes = servers.flatMap(server => {
+        const placement = server.storagePlacement ?? record.preparation?.placements.find(value => value.serverId === server.id)
+        return placement === undefined ? [] : [{ serverId: server.id, name: server.name, path: placement.runRoot }]
+      })
+      return { experimentId: id, name: record.request.name ?? record.request.objective.split('\n')[0]!.slice(0, 120),
+        eligible: reason === undefined, ...(reason === undefined ? {} : { reason }), cleanupAvailable: nodes.length === servers.length, nodes }
+    })
+  }
+
+  /** Remove confirmed terminal records, retaining failures and per-node cleanup receipts.
+   * @param raw - explicit batch identity and cleanup choice. @returns independent outcomes, including skipped active records.
+   */
+  async deleteExperiments(raw: DeleteExperimentsRequest): Promise<ExperimentDeletion[]> {
+    const input = deleteRequestSchema.parse(raw)
+    return Promise.all(input.experimentIds.map(id => {
+      const existing = this.deletionWork.get(id)
+      if (existing !== undefined) return existing.then(job => {
+        if (job.cleanupRemote !== input.cleanupRemote) throw new Error('Cleanup is already running with a different policy')
+        return job
+      })
+      const work = this.deleteOne(id, input).finally(() => { this.deletionWork.delete(id) })
+      this.deletionWork.set(id, work)
+      return work
+    }))
+  }
+
+  private async deleteOne(id: ExperimentId, input: z.infer<typeof deleteRequestSchema>): Promise<ExperimentDeletion> {
+    let job = await this.serial(async () => {
+      if (this.closing) throw new Error('Experiment management is stopping')
+      const prior = this.store.table('deletions').get(id)
+      if (this.store.table('deleted').get(id) !== undefined && prior !== undefined) return { ...prior, state: 'deleted' as const }
+      if (prior?.operationId === input.operationId && prior.cleanupRemote !== input.cleanupRemote) throw new Error('Deletion identity has a different cleanup policy')
+      const preview = this.previewDeletion([id])[0]!
+      const failed = !preview.eligible || (input.cleanupRemote && !preview.cleanupAvailable)
+      const next: ExperimentDeletion = { experimentId: id, operationId: input.operationId, cleanupRemote: input.cleanupRemote,
+        started: !failed || prior?.started === true, state: failed ? 'failed' : 'deleting', updatedAt: Date.now(), nodes: preview.nodes.map(node => ({ serverId: node.serverId, path: node.path,
+          state: prior?.nodes.some(old => old.serverId === node.serverId && old.path === node.path && old.state === 'cleaned') ? 'cleaned' : 'pending' })),
+        ...(failed ? { detail: !preview.eligible ? 'Stop the experiment and confirm all resources are released before deleting'
+          : 'Saved directory ownership is incomplete; only record deletion is available' } : {}) }
+      await this.store.table('deletions').put(id, next)
+      return next
+    })
+    if (job.state !== 'deleting') return job
+    const record = this.get(id)
+    try {
+      if (job.cleanupRemote) for (const node of job.nodes) {
+        if (node.state === 'cleaned') continue
+        const server = [record.coordinator, ...record.servers].find(value => value.id === node.serverId)!
+        const placement = server.storagePlacement ?? record.preparation?.placements.find(value => value.serverId === server.id)
+        if (placement === undefined) throw new Error('Saved directory assignment is missing')
+        const target = server.id === record.coordinator.id ? record.coordinatorTarget : record.targets[record.servers.findIndex(value => value.id === server.id)]!
+        const names = server.id !== record.coordinator.id ? [] : [`${id}.json`, `${id}-model.json`,
+          ...record.servers.flatMap(value => [`${id}-${value.id}.known_hosts`, ...(value.identityFile === undefined ? [] : [`${id}-${value.id}.identity`])])]
+        const password = await this.password(server)
+        try { await this.driver.cleanupServerStorage(target, placement, names, password) } catch (error) {
+          const detail = password ? String(error).replaceAll(password, '[redacted]') : String(error)
+          job = { ...job, nodes: job.nodes.map(value => value.serverId === node.serverId ? { ...value, detail } : value) }
+          throw new Error(detail)
+        }
+        job = { ...job, nodes: job.nodes.map(value => value.serverId === node.serverId ? { ...value, state: 'cleaned' } : value), updatedAt: Date.now() }
+        await this.store.table('deletions').put(id, job)
+      }
+      cleanupLocalInputs(this.uploadRoot, id)
+      await this.serial(async () => {
+        if (experimentRemovalBlocker(this.get(id)) !== undefined) throw new Error('Experiment state changed before deletion')
+        for (const server of [record.coordinator, ...record.servers]) await this.removeUnusedCredential(sshPasswordRef(server), id)
+        if (record.models !== undefined) for (const phase of experimentPhases) {
+          await this.removeUnusedCredential(record.models[phase].configurationRef, id)
+          await this.removeUnusedCredential(`ASPERA_KEY_${id.replaceAll('-', '_')}_${phase}`.toUpperCase(), id)
+        }
+        await this.store.table('deleted').put(id, { experimentId: id, requestHash: createHash('sha256').update(JSON.stringify(record.request)).digest('hex'),
+          deletedAt: Date.now(), ...(record.sourceGoal === undefined ? {} : { sourceGoal: record.sourceGoal }) })
+        await this.store.table('experiments').delete(id)
+      })
+      job = { ...job, nodes: [], state: 'deleted', updatedAt: Date.now() }
+    } catch (error) {
+      job = this.store.table('deleted').get(id) !== undefined ? { ...job, state: 'deleted', updatedAt: Date.now() }
+        : { ...job, state: 'failed', detail: String(error), updatedAt: Date.now() }
+    }
+    await this.store.table('deletions').put(id, job)
+    return job
   }
 
   private async token(server: ServerSettings, role: 'coordinator' | 'node'): Promise<string> {
@@ -236,43 +405,73 @@ export class ExperimentFleet {
    * @param id - configured server.
    * @returns GPU inventory and allocation visibility.
    */
-  async probe(id: ExperimentServerId): Promise<ServerProbe> {
+  probe(id: ExperimentServerId): Promise<ServerConnectionCheck> {
+    const existing = this.checks.get(id)
+    if (existing !== undefined) return existing
+    const work = this.checkServer(id).finally(() => { this.checks.delete(id) })
+    this.checks.set(id, work)
+    return work
+  }
+
+  private async checkServer(id: ExperimentServerId): Promise<ServerConnectionCheck> {
     const server = this.servers().servers.find(server => server.id === id)
-    if (server === undefined) throw new Error('server not found')
-    const target = this.deployment(server)
-    const password = await this.password(server)
-    const directory = server.storagePreference?.mode === 'manual' ? server.storagePreference.directory
-      : server.storagePreference === undefined ? server.remoteRoot : undefined
-    const observations = await Promise.allSettled([this.driver.inspectServerStorage(target, directory, password),
-      this.driver.remote(target, 'nvidia-smi -L', undefined, password)])
-    if (observations[0].status === 'rejected') throw observations[0].reason
-    const inventory = observations[0].value
-    const gpuInfo = observations[1].status === 'fulfilled' ? observations[1].value : `GPU check failed: ${String(observations[1].reason)}`
-    let allocations: string[] = []
-    try {
-      const health = await this.driver.request(target, await this.token(server, 'node'), '/aspera/v1/health', 'GET', undefined, undefined, password)
-      if (health.status === 200) {
-        allocations = z.object({ node: z.object({ allocations: z.array(z.string()) }) }).parse(health.value).node.allocations
-      }
-    } catch (error) { this.ctx.logger.debug(`experiment node has no ready control process: ${String(error)}`) }
-    const result = { gpuInfo, allocations, inventory }
+    if (server === undefined) throw new Error('Server is no longer configured')
+    const configuration = connectionConfiguration(server)
+    const startedAt = Date.now()
+    const previous = this.servers().checks?.[id]
+    const checking: ServerConnectionCheck = { status: 'checking', configuration, startedAt,
+      ...(previous?.lastSuccess === undefined ? {} : { lastSuccess: previous.lastSuccess }) }
     await this.serial(async () => {
       const registry = this.servers()
-      if (JSON.stringify(registry.servers.find(value => value.id === id)) !== JSON.stringify(server)) return
-      await this.store.table('registry').put('servers', { ...registry, probes: { ...registry.probes, [id]: result } })
+      if (!registry.servers.some(value => value.id === id && connectionConfiguration(value) === configuration)) throw new Error('Server configuration changed before the check began')
+      await this.store.table('registry').put('servers', { ...registry, checks: { ...registry.checks, [id]: checking } })
     })
-    return result
+    let check: ServerConnectionCheck
+    let password: string | undefined
+    try {
+      const target = this.reuseExecutablePaths(server.id, this.deployment(server))
+      await this.driver.prepareSshHostKey(target)
+      password = await this.password(server)
+      const directory = server.storagePreference?.mode === 'manual' ? server.storagePreference.directory
+        : server.storagePreference === undefined ? server.remoteRoot : undefined
+      const environment = await this.driver.inspectEnvironment(target, password)
+      const readiness = checkEnvironment(environment, this.driver.environmentRequirements(target.localRepo), target.pathEntries)
+      const observations = await Promise.allSettled([this.driver.inspectServerStorage(target, directory, password),
+        this.driver.remote(target, 'nvidia-smi -L', undefined, password),
+        this.driver.request(target, await this.token(server, 'node'), '/aspera/v1/health', 'GET', undefined, undefined, password)])
+      const inventory = observations[0].status === 'fulfilled' ? observations[0].value : undefined
+      const gpuInfo = observations[1].status === 'fulfilled' ? observations[1].value : ''
+      const health = observations[2].status === 'fulfilled' && observations[2].value.status === 200
+        ? z.object({ node: z.object({ allocations: z.array(z.string()) }) }).safeParse(observations[2].value.value) : undefined
+      const result: ServerProbe = { gpuInfo, allocations: health?.success ? health.data.node.allocations : [],
+        ...(inventory === undefined ? {} : { inventory }), environment, environmentReady: readiness.ready,
+        ...(!readiness.ready ? { detail: readiness.failures.join('\n') } : observations[0].status === 'rejected' ? { detail: String(observations[0].reason) } : {}) }
+      const checkedAt = Date.now()
+      check = { status: 'passed', configuration, startedAt, checkedAt, result, lastSuccess: { checkedAt, result },
+        gpu: observations[1].status === 'fulfilled' && gpuInfo.trim() !== '' ? 'passed' : 'unavailable', control: health?.success ? 'passed' : 'unavailable' }
+    } catch (error) {
+      const message = String(error)
+      check = { ...checking, status: 'failed', checkedAt: Date.now(), error: password ? message.replaceAll(password, '[redacted]') : message }
+    }
+    return this.serial(async () => {
+      const registry = this.servers()
+      if (registry.checks?.[id]?.startedAt !== startedAt || !registry.servers.some(value => value.id === id && connectionConfiguration(value) === configuration)) {
+        return registry.checks?.[id] ?? { status: 'unchecked', configuration }
+      }
+      await this.store.table('registry').put('servers', { ...registry, checks: { ...registry.checks, [id]: check } })
+      return check
+    })
   }
 
   /**
    * Read experiments in their durable display order.
    * @returns independent experiments in most-recent-first order.
    */
-  list(): FleetExperiment[] { return [...this.store.table('experiments').entries()].map(([, record]) => record).sort((a,
+  list(): FleetExperiment[] { return [...this.store.table('experiments').entries()].filter(([id]) => this.store.table('deleted').get(id) === undefined).map(([, record]) => record).sort((a,
     b) => b.createdAt - a.createdAt) }
 
   private get(id: ExperimentId): FleetExperiment {
-    const record = this.store.table('experiments').get(id)
+    const record = this.store.table('deleted').get(id) === undefined ? this.store.table('experiments').get(id) : undefined
     if (record === undefined) throw new Error('experiment not found')
     return record
   }
@@ -288,7 +487,7 @@ export class ExperimentFleet {
   upload(id: ExperimentId, name: string, offset: number, data: string): { nextOffset: number } {
     experimentIdSchema.parse(id)
     clusterSubmissionV2Schema.shape.inputs.element.shape.name.parse(name)
-    const submitted = this.store.table('experiments').get(id)
+    const submitted = this.get(id)
     if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('invalid upload offset')
     const bytes = Buffer.from(data, 'base64')
     if (bytes.length > 65536) throw new Error('upload chunk exceeds 64 KiB')
@@ -322,6 +521,8 @@ export class ExperimentFleet {
     const input = requestSchema.parse(raw)
     return this.serial(async () => {
       if (this.closing) throw new Error('experiment dispatch is stopping')
+      if (this.store.table('deleted').get(input.experimentId) !== undefined || (sourceGoal !== undefined && [...this.store.table('deleted').entries()].some(([, value]) =>
+        value.sourceGoal?.sessionId === sourceGoal.sessionId && value.sourceGoal.id === sourceGoal.id && value.sourceGoal.revision === sourceGoal.revision))) throw new Error('Experiment was deleted; copy to a new experiment')
       const previous = this.store.table('experiments').get(input.experimentId) ?? (sourceGoal === undefined ? undefined
         : this.list().find(row => row.sourceGoal?.sessionId === sourceGoal.sessionId
           && row.sourceGoal.id === sourceGoal.id && row.sourceGoal.revision === sourceGoal.revision))
@@ -331,7 +532,10 @@ export class ExperimentFleet {
         return previous
       }
       const registry = this.servers()
-      const coordinator = registry.servers.find(server => server.id === registry.coordinatorId)
+      const coordinator = registry.servers.find(server => server.id === input.coordinatorId)
+      const conflict = this.list().find(row => row.coordinator.id !== input.coordinatorId && (experimentRemovalBlocker(row) !== undefined || this.preparing.has(row.request.experimentId) || this.deletionWork.has(row.request.experimentId))
+        && [row.coordinator.id, ...row.servers.map(server => server.id)].some(id => input.serverIds.includes(id)))
+      if (conflict !== undefined) throw new Error(`Selected nodes are assigned to experiment ${conflict.request.name ?? conflict.request.experimentId} under another coordinator; finish that experiment or use its coordinator`)
       if (coordinator === undefined) throw new Error('configure the coordinator server before submitting an experiment')
       if (input.models === undefined) throw new Error('Select preparation, planning and execution models before submitting')
       const models = await captureExperimentModels(this.ctx, input.experimentId, input.models)
@@ -372,16 +576,17 @@ export class ExperimentFleet {
    * @param agent - local caller with an active Goal.
    * @param objective - authorized requirements.
    * @param serverIds - explicitly selected participants.
+   * @param coordinatorId - selected participant responsible for coordination.
    * @param files - admitted local data files.
    * @param mode - plan confirmation policy.
    * @param models - explicit phase model selections.
    * @param name - optional short experiment label.
    * @returns independent experiment, deduplicated by the caller's Goal revision.
    */
-  async createForGoal(agent: Agent, objective: string, serverIds: string[], files: string[], mode: FleetCreateRequest['mode'], models: ExperimentModels, name?: string): Promise<FleetExperiment> {
+  async createForGoal(agent: Agent, objective: string, serverIds: string[], coordinatorId: string, files: string[], mode: FleetCreateRequest['mode'], models: ExperimentModels, name?: string): Promise<FleetExperiment> {
     const goal = this.ctx.goals.get(agent)
     if (goal === undefined || goal.phase === 'complete') throw new Error('cluster dispatch requires an active local Goal')
-    return this.create({ experimentId: randomUUID(), objective, serverIds, files, mode, models, ...(name === undefined ? {} : { name }) }, { sessionId: agent.id, id: goal.id,
+    return this.create({ experimentId: randomUUID(), objective, serverIds, coordinatorId, files, mode, models, ...(name === undefined ? {} : { name }) }, { sessionId: agent.id, id: goal.id,
       revision: goal.revision })
   }
 
@@ -400,9 +605,17 @@ export class ExperimentFleet {
     return this.serial(async () => {
       const current = this.get(id)
       if (this.closing) throw new Error('Experiment dispatch is stopping')
+      const deletion = this.store.table('deletions').get(id)
+      if (deletion?.started) throw new Error('Experiment cleanup was requested; copy to start a new experiment')
       if (this.preparing.has(id) || current.state === 'submitted') return current
       if (current.preparation?.protocol !== 4 || current.models === undefined) throw new Error('Copy this legacy preparation to a new experiment')
       if (current.state !== 'failed') throw new Error('Only interrupted or failed preparation can be retried')
+      const serverIds = [...new Set([current.coordinator.id, ...current.servers.map(server => server.id)])]
+      const placements = current.preparation.placements
+      if (placements.length !== serverIds.length || serverIds.some(serverId =>
+        !placements.some(placement => placement.serverId === serverId && /\/[a-f0-9]{64}$/.test(placement.releaseRoot)))) {
+        throw new Error('Original release directories are missing from the preparation record; copy this experiment')
+      }
       const next = { ...current, state: 'preparing' as const }
       delete next.detail
       await this.store.table('experiments').put(id, next)
@@ -461,8 +674,9 @@ export class ExperimentFleet {
       const selection = record.agentModel
       modelScope = await openPhaseModelContext(this.ctx, record.models.preparation)
       const storage = new StorageSelection()
+      const environment = new EnvironmentPreparation()
       const options = { agentOptions: { ...selection },
-        setup: async (ctx: Context, agent: Agent) => { installModelSelection(ctx, { current: selection, assembled: undefined }); storage.install(ctx, agent) } }
+        setup: async (ctx: Context, agent: Agent) => { installModelSelection(ctx, { current: selection, assembled: undefined }); storage.install(ctx, agent); environment.install(ctx, agent) } }
       const storedSession = await this.ctx.sessionPersistence.stat(SessionId(record.sessionId), { signal })
       if (storedSession === undefined && record.goalId !== undefined) throw new Error('The recorded dispatch Session is missing; copy to a new experiment')
       const handle = storedSession === undefined
@@ -483,13 +697,24 @@ export class ExperimentFleet {
         await this.store.table('experiments').put(id, next)
         return next
       })
-      source = await this.driver.snapshotSource(pendingTarget.localRepo, pendingTarget.toolTimeoutMs, signal)
-      const snapshot = source
       const preparation = record.preparation
       if (preparation === undefined) throw new Error('Storage preparation is missing')
-      if (preparation.placements.some(placement => !placement.releaseRoot.endsWith('/' + snapshot.digest))) {
-        throw new Error('The saved release is unavailable in this installation; restore that build or copy to a new experiment')
+      const unique = [...new Map([record.coordinator, ...record.servers].map(server => [server.id, server])).values()]
+      const targetFor = (server: ServerSettings): PinnedDeployment => {
+        if (server.id === record.coordinator.id) return record.coordinatorTarget
+        const index = record.servers.findIndex(value => value.id === server.id)
+        const target = record.targets[index]
+        if (target === undefined) throw new Error('Selected server has no pinned preparation settings')
+        return target
       }
+      for (const server of unique) await this.driver.prepareSshHostKey(targetFor(server), signal)
+      const savedDigest = preparation.placements[0]?.releaseRoot.split('/').at(-1)
+      if (savedDigest === undefined) source = await this.driver.snapshotSource(pendingTarget.localRepo, pendingTarget.toolTimeoutMs, signal)
+      const snapshot: DeploymentRelease = source ?? { digest: z.string().regex(/^[a-f0-9]{64}$/).parse(savedDigest), reuse: true }
+      if (preparation.placements.some(placement => !placement.releaseRoot.endsWith('/' + snapshot.digest))) throw new Error('Saved server releases differ; copy this experiment')
+      const savedRelease = preparation.placements.find(value => value.serverId === record.coordinator.id)?.releaseRoot
+      const requirements = savedRelease === undefined ? this.driver.environmentRequirements(pendingTarget.localRepo)
+        : await this.driver.installedEnvironmentRequirements(pendingTarget, savedRelease, snapshot.digest, await this.password(record.coordinator), signal)
       const files = record.request.files.map(path => this.localInput(path, pendingTarget.dataRoots))
       for (const file of record.request.uploads) files.push(resolve(this.uploadRoot, id, file.name))
       const inputs: { name: string; sha256: string }[] = []
@@ -502,13 +727,34 @@ export class ExperimentFleet {
         throw new Error('Experiment inputs changed after preparation; copy to a new experiment')
       }
       record = await this.preparationStage(id, preparation.stage, { inputs })
-      const unique = [...new Map([record.coordinator, ...record.servers].map(server => [server.id, server])).values()]
-      const targetFor = (server: ServerSettings): PinnedDeployment => {
-        if (server.id === record.coordinator.id) return record.coordinatorTarget
-        const index = record.servers.findIndex(value => value.id === server.id)
-        const target = record.targets[index]
-        if (target === undefined) throw new Error('Selected server has no pinned preparation settings')
-        return target
+      const environmentInput = async (server: ServerSettings, target: PinnedDeployment, operation: EnvironmentPreparationInput['operation']): Promise<EnvironmentPreparationInput> => ({
+        experimentId: id, serverId: server.id, serverName: server.name, target, requirements, operation,
+        controlRoot: target.remoteRoot, password: await this.password(server),
+        directories: target.storagePlacement === undefined ? undefined : {
+          workspace: target.storagePlacement.workspaceRoot, release: target.storagePlacement.releaseRoot, control: target.storagePlacement.controlRoot,
+        },
+        observation: await this.driver.inspectEnvironment(target, await this.password(server), signal),
+        pendingCommand: this.get(id).preparation?.environments?.find(value => value.serverId === server.id)?.pendingCommand,
+        outputChars: target.preparationOutputChars,
+        progress: value => this.environmentProgress(id, value),
+      })
+      for (const server of unique) {
+        await this.onServer(server.id, signal, async () => {
+          const target = this.reuseExecutablePaths(server.id, targetFor(server))
+          if ('reuse' in snapshot && server.id !== record.coordinator.id) {
+            const release = preparation.placements.find(value => value.serverId === server.id)?.releaseRoot
+            if (release === undefined) throw new Error('Saved node release is missing; copy this experiment')
+            const original = await this.driver.installedEnvironmentRequirements(target, release, snapshot.digest, await this.password(server), signal)
+            if (original.node !== requirements.node || original.pnpm !== requirements.pnpm) throw new Error('Saved node release requirements differ; copy this experiment')
+          }
+          const result = await environment.ensure(handle.agent, await environmentInput(server, target, 'bootstrap'), this.driver,
+            async (candidate, observed) => {
+              const checked = checkEnvironment(observed, requirements, candidate.pathEntries)
+              if (!checked.ready) throw new Error(checked.failures.join('\n'))
+              return checked.toolchain
+            }, signal)
+          record = await this.saveExecutablePaths(id, server.id, result.value.pathEntries)
+        })
       }
       let inventories = record.preparation?.inventories ?? []
       if (inventories.length === 0) {
@@ -548,41 +794,98 @@ export class ExperimentFleet {
         await this.store.table('experiments').put(id, next)
         return next
       })
-      const target = this.resolvedTarget(record.coordinatorTarget)
+      let target = this.resolvedTarget(record.coordinatorTarget)
       const coordinatorPassword = await this.password(record.coordinator)
       const coordinatorToken = await this.token(record.coordinator, 'coordinator')
-      const preparedCoordinator = await this.onServer(record.coordinator.id, async () => {
+      const startRole = async (server: ServerSettings, pending: PinnedDeployment, prepared: PreparedEnvironment, role: 'coordinator' | 'node', token: string, password: string | undefined) => {
+        const result = await environment.ensure(handle.agent, await environmentInput(server, pending, 'controller'), this.driver,
+          async (candidate, observed, operationSignal) => {
+            const checked = checkEnvironment(observed, requirements, candidate.pathEntries)
+            if (!checked.ready) throw new Error(checked.failures.join('\n'))
+            await this.driver.ensureClusterRole({ ...this.resolvedTarget(pending), pathEntries: checked.toolchain.pathEntries }, prepared, role, token, password, operationSignal)
+            return checked.toolchain
+          }, signal)
+        record = await this.saveExecutablePaths(id, server.id, result.value.pathEntries)
+        return { ...this.resolvedTarget(pending), pathEntries: result.value.pathEntries }
+      }
+      const preparedCoordinator = await this.onServer(record.coordinator.id, signal, async () => {
         const placement = resolvedCoordinator.storagePlacement
         if (placement === undefined) throw new Error('Coordinator storage is missing')
-        await this.driver.prepareServerStorage(target, placement, coordinatorPassword, signal)
         await this.preparationStage(id, 'deploying')
-        const prepared = await this.driver.prepareClusterServer(target, snapshot, coordinatorPassword, signal)
-        await this.driver.ensureClusterRole(target, prepared, 'coordinator', coordinatorToken, coordinatorPassword, signal)
+        const result = await environment.ensure(handle.agent, await environmentInput(record.coordinator, record.coordinatorTarget, 'deployment'), this.driver,
+          async (candidate, observed, operationSignal) => {
+            const checked = checkEnvironment(observed, requirements, candidate.pathEntries)
+            if (!checked.ready) throw new Error(checked.failures.join('\n'))
+            const configured = { ...target, pathEntries: checked.toolchain.pathEntries }
+            await this.driver.prepareServerStorage(configured, placement, coordinatorPassword, operationSignal)
+            return this.driver.prepareClusterServer(configured, snapshot, coordinatorPassword, operationSignal)
+          }, signal)
+        const prepared = result.value
+        target = { ...target, pathEntries: result.pathEntries }
+        record = await this.saveExecutablePaths(id, record.coordinator.id, result.pathEntries)
+        target = await startRole(record.coordinator, record.coordinatorTarget, prepared, 'coordinator', coordinatorToken, coordinatorPassword)
         return prepared
       })
-      const preparedNodes = await Promise.allSettled(resolvedNodes.map((server, index) => this.onServer(server.id, async () => {
+      const preparedNodes: ClusterNode[] = []
+      for (const [index, server] of resolvedNodes.entries()) preparedNodes.push(await this.onServer(server.id, signal, async () => {
         const pendingNode = record.targets[index]
         if (pendingNode === undefined) throw new Error('selected server has no pinned deployment settings')
-        const nodeTarget = this.resolvedTarget(pendingNode)
+        let nodeTarget = this.resolvedTarget(pendingNode)
         const password = await this.password(server)
         if (server.storagePlacement === undefined) throw new Error('Node storage is missing')
-        await this.driver.prepareServerStorage(nodeTarget, server.storagePlacement, password, signal)
-        const prepared = server.id === record.coordinator.id ? preparedCoordinator : await this.driver.prepareClusterServer(nodeTarget,
-          snapshot, password, signal)
-        await this.driver.ensureClusterRole(nodeTarget, prepared, 'node', await this.token(server, 'node'), password, signal)
+        const nodePlacement = server.storagePlacement
+        const result = server.id === record.coordinator.id ? { value: preparedCoordinator, pathEntries: [...(target.pathEntries ?? [])] }
+          : await environment.ensure(handle.agent, await environmentInput(server, pendingNode, 'deployment'), this.driver,
+            async (candidate, observed, operationSignal) => {
+              const checked = checkEnvironment(observed, requirements, candidate.pathEntries)
+              if (!checked.ready) throw new Error(checked.failures.join('\n'))
+              const configured = { ...nodeTarget, pathEntries: checked.toolchain.pathEntries }
+              await this.driver.prepareServerStorage(configured, nodePlacement, password, operationSignal)
+              return this.driver.prepareClusterServer(configured, snapshot, password, operationSignal)
+            }, signal)
+        const prepared = result.value
+        nodeTarget = { ...nodeTarget, pathEntries: result.pathEntries }
+        record = await this.saveExecutablePaths(id, server.id, result.pathEntries)
+        nodeTarget = await startRole(server, record.targets[index], prepared, 'node', await this.token(server, 'node'), password)
         return this.driver.describeClusterNode(server, prepared, nodeTarget, password, signal)
-      })))
-      let nodes = preparedNodes.map((result) => {
-        if (result.status === 'rejected') throw result.reason
-        return result.value
-      })
+      }))
+      let nodes = preparedNodes
       await this.preparationStage(id, 'checking-network')
-      nodes = await this.driver.resolveTrainingNetwork(id, await Promise.all(nodes.map(async (node, index) => {
-        const observed = inventories.find(value => value.serverId === node.server.id)
-        if (observed === undefined) throw new Error('Node network inventory is missing')
-        return { node, target: this.resolvedTarget(record.targets[index]), inventory: observed.inventory,
-          password: await this.password(node.server), token: await this.token(node.server, 'node') }
-      })), signal)
+      for (const server of resolvedNodes) await this.onServer(server.id, signal, async () => {
+        const pending = targetFor(server)
+        const result = await environment.ensure(handle.agent, await environmentInput(server, pending, 'network'), this.driver,
+          async (candidate, observed, operationSignal) => {
+            const checked = checkEnvironment(observed, requirements, candidate.pathEntries)
+            if (!checked.ready) throw new Error(checked.failures.join('\n'))
+            const participants = await Promise.all(nodes.map(async (node, index) => {
+              const inventory = inventories.find(value => value.serverId === node.server.id)?.inventory
+              if (inventory === undefined) throw new Error('Node network inventory is missing')
+              return { node, target: this.resolvedTarget(record.targets[index]), inventory,
+                password: await this.password(node.server), token: await this.token(node.server, 'node') }
+            }))
+            return this.driver.resolveTrainingNetwork(id, participants, operationSignal, server.id)
+          }, signal)
+        nodes = result.value
+      })
+      for (const server of unique) await this.onServer(server.id, signal, async () => {
+        const pending = targetFor(server)
+        const expected = server.id === record.coordinator.id ? preparedCoordinator : preparedNodes.find(node => node.server.id === server.id)
+        if (expected === undefined) throw new Error('Node has no verified deployment')
+        await environment.ensure(handle.agent, await environmentInput(server, pending, 'deployment'), this.driver,
+          async (candidate, observed, operationSignal) => {
+            if (JSON.stringify(candidate.pathEntries) !== JSON.stringify(pending.pathEntries)) {
+              throw new Error('Final acceptance must use the executable directories saved for the running controller')
+            }
+            const checked = checkEnvironment(observed, requirements, candidate.pathEntries)
+            if (!checked.ready) throw new Error(checked.failures.join('\n'))
+            const verified = await this.driver.prepareClusterServer({ ...this.resolvedTarget(pending), pathEntries: checked.toolchain.pathEntries },
+              { digest: snapshot.digest, reuse: true }, await this.password(server), operationSignal)
+            if (verified.backendPath !== expected.backendPath || JSON.stringify(verified.devicePaths) !== JSON.stringify(expected.devicePaths)) {
+              throw new Error('Sandbox executable or GPU allocation changed after controller startup')
+            }
+            return verified
+          }, signal)
+      })
       const coordinator = nodes.find(node => node.server.id === resolvedCoordinator.id)?.server ?? resolvedCoordinator
       record = await this.serial(async () => {
         const next = { ...this.get(id), coordinator, servers: nodes.map(node => node.server) }
@@ -654,6 +957,37 @@ export class ExperimentFleet {
   private resolvedTarget(target: PinnedDeployment): DeploymentConfig {
     if (target.remoteRoot === undefined) throw new Error('Server directories have not been resolved')
     return { ...target, remoteRoot: target.remoteRoot }
+  }
+
+  private reuseExecutablePaths(serverId: ExperimentServerId, target: PinnedDeployment): PinnedDeployment {
+    if (target.pathEntries !== undefined) return target
+    for (const record of this.list()) {
+      const saved = record.coordinator.id === serverId ? record.coordinatorTarget : record.targets[record.servers.findIndex(server => server.id === serverId)]
+      if (saved?.pathEntries !== undefined && saved.host === target.host && saved.sshPort === target.sshPort && saved.username === target.username) {
+        return { ...target, pathEntries: [...saved.pathEntries] }
+      }
+    }
+    return target
+  }
+
+  private async environmentProgress(id: ExperimentId, value: EnvironmentProgress): Promise<void> {
+    await this.serial(async () => {
+      const current = this.get(id)
+      if (current.preparation === undefined) throw new Error('Preparation record is missing')
+      const environments = [...(current.preparation.environments ?? []).filter(row => row.serverId !== value.serverId), value]
+      await this.store.table('experiments').put(id, { ...current, preparation: { ...current.preparation, stage: value.phase, environments } })
+    })
+    await this.ctx.sessionPersistence.flush()
+  }
+
+  private saveExecutablePaths(id: ExperimentId, serverId: ExperimentServerId, pathEntries: string[]): Promise<FleetExperiment> {
+    return this.serial(async () => {
+      const current = this.get(id)
+      const next = { ...current,
+        coordinatorTarget: serverId === current.coordinator.id ? { ...current.coordinatorTarget, pathEntries } : current.coordinatorTarget,
+        targets: current.targets.map((target, index) => current.servers[index]?.id === serverId ? { ...target, pathEntries } : target) }
+      await this.store.table('experiments').put(id, next); return next
+    })
   }
 
   private preparationStage(id: ExperimentId, stage: NonNullable<FleetExperiment['preparation']>['stage'],
@@ -876,6 +1210,7 @@ export class ExperimentFleet {
     await this.chain
     for (const pending of this.preparing.values()) pending.abort.abort(new Error('local dispatcher stopped'))
     await Promise.all([...this.preparing.values()].map(pending => pending.done))
+    await Promise.allSettled([...this.checks.values(), ...this.deletionWork.values()])
     await Promise.allSettled(this.acceptance.values())
     await this.store.close()
   }

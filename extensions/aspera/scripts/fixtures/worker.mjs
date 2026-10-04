@@ -14,13 +14,7 @@ export function apply(ctx, config) {
     renameSync(config.ready + '.incoming', config.ready)
     return
   }
-  const knowledge = ['get_experiment_requirements', 'read_experiment_input', 'read_framework_documentation', 'read_framework_guidance']
-  const execution = ['run_experiment_command', 'get_experiment_commands', 'read_experiment_file', 'list_experiment_files',
-    'record_experiment_execution', 'report_experiment_progress', 'start_inference_service', 'get_inference_services', 'finish_experiment']
-  const expected = [...knowledge, ...(config.semi ? ['ask_user_question'] : []), ...(config.planning ? ['save_experiment_plan'] : execution)].sort()
   const observed = { tools: [], calls: [], guidanceRead: false, inputRead: false, inputBlocked: false }
-  let step = 0
-  let rounds = 0
   let admitted = false
   ctx.on('agent/pre-step', async ({ agent }, next) => {
     if (!agent.session.id.endsWith(config.id) || admitted) return next()
@@ -35,14 +29,29 @@ export function apply(ctx, config) {
       writeFileSync(config.observed, JSON.stringify(observed))
       throw new HarnessError('Keyless recoverable connection failure', 'TRANSPORT')
     }
+    if (config.http) writeFileSync(config.observed, JSON.stringify(observed))
     return next()
   }, { global: true })
+  if (config.http) return
+  const responses = workerResponses(config, observed)
   ctx.on('llm/stream', async function* (options, next) {
     if (options.provider !== fixtureProvider || !options.messages.some(message => JSON.stringify(message).includes(config.id))) {
       yield* next(); return
     }
+    yield* responses(options)
+  }, { global: true })
+}
+
+/** Deterministic actions shared by stream replay and the actual provider HTTP fixture. */
+export function workerResponses(config, observed) {
+  const knowledge = ['get_experiment_requirements', 'read_experiment_input', 'read_framework_documentation', 'read_framework_guidance']
+  const execution = ['run_experiment_command', 'get_experiment_commands', 'read_experiment_file', 'list_experiment_files',
+    'record_experiment_execution', 'report_experiment_progress', 'start_inference_service', 'get_inference_services', 'finish_experiment']
+  const expected = [...knowledge, ...(config.semi ? ['ask_user_question'] : []), ...(config.planning ? ['save_experiment_plan'] : execution)].sort()
+  let step = 0
+  let rounds = 0
+  return async function* (options) {
     assert.equal(options.model, config.planning ? 'qwen-planning' : 'qwen-execution')
-    // Replay intentionally supplies the response without contacting a model provider.
     observed.tools = (options.tools ?? []).map(tool => tool.name).sort()
     assert.deepEqual(observed.tools, expected)
     if (rounds < (config.renewRounds ?? 0)) {
@@ -97,5 +106,5 @@ export function apply(ctx, config) {
     yield { type: 'block-end', index: 0, block }
     yield { type: 'usage', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }
     yield { type: 'finish', reason: { kind: 'tool-calls' } }
-  }, { global: true })
+  }
 }

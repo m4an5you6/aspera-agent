@@ -3,14 +3,14 @@
 # After editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write docs/upgrade-guide/v0.2.0-rc.2/aspera-models-v4/guide.md
 /:
-  en: c176e5789c6ad2d9
-  zh: 158dbedbdddc8433
+  en: 3b92ab705b4c909f
+  zh: 863fd5d398dcac51
 /aspera-phase-models-and-management-interface:
   en: 6b128d6441615802
   zh: 4031c7da48625e8f
 /aspera-phase-models-and-management-interface/change:
-  en: 7a865a42f3063016
-  zh: fe330e80933565a6
+  en: aa1861cd8b082c08
+  zh: 631c4927be388489
 /aspera-phase-models-and-management-interface/migration:
-  en: 97df21ebb8f8569f
-  zh: 2d18eef91d4742b1
+  en: 81625f7bc38f6c76
+  zh: f924a895886be388

@@ -40,6 +40,8 @@ kind: "package-library"
 <details>
 <summary>实现细节</summary>
 
+[environment-protocol.ts](src/environment-protocol.ts) 定义不含凭据的程序探测及已验证路径。连接探测可在安装 Node 前报告环境未就绪，使用方分别处理可选磁盘清单和 SSH 可达状态。
+
 [cluster-protocol.ts](src/cluster-protocol.ts) 冻结第 1～3 代读取定义并声明第 4 代提交；[storage-protocol.ts](src/storage-protocol.ts) 分开定义偏好、SSH 证据及实际目录。[cluster-queue.ts](src/cluster-queue.ts) 管理持久状态转换和提供者生命周期。[cluster-files.ts](src/cluster-files.ts) 限制读取范围及大小。接收时检查实验／节点／发布归属与资源分配，不发布单独的存在性 invariant。
 
 </details>
