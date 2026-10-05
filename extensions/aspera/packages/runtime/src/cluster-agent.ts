@@ -16,6 +16,8 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { z } from 'zod'
 import { clusterChunkSchema, serverIdSchema, serviceIdSchema, planSchema, executionEntrySchema, progressSchema, serviceSchema } from '@aspera/experiments'
 import { clusterPath, readClusterChunk } from '@aspera/experiments'
+import { observationPolicySchema } from '@aspera/experiments'
+import { saveMetricSample } from './metrics.ts'
 import type { ExperimentId, InferenceService } from '@aspera/experiments'
 import { clusterCommandStatuses, clusterNodeRequest, readClusterPrivate, writeClusterReceipt } from './cluster-runtime.ts'
 import type { ClusterRuntimeConfig, ClusterPrivate } from './cluster-runtime.ts'
@@ -82,7 +84,10 @@ function installNodeTools(ctx: Context, runtime: ClusterPrivate, config: Cluster
     parameters: { json: { type: 'string', required: true } }, output, presentCall,
     execute: async args => { const entry = executionEntrySchema.parse(JSON.parse(args.json)); if (!runtime.submission.nodes.some(node => node.server.id === entry.serverId)) throw new Error('execution node is outside this experiment'); appendFileSync(resolve(serverRunRoot(runtime.submission.coordinator, runtime.submission.experimentId), 'executions.jsonl'), JSON.stringify(entry) + '\n', { mode: 0o600 }); return JSON.stringify(entry) } })))
   ctx.effect(() => ctx.tools.register(defineTool({ name: 'report_experiment_progress', description: 'Persist measured numeric metrics and the current phase. Do not invent measurements.', parameters: { phase: { type: 'string', required: true }, metrics_json: { type: 'string', required: true } }, output, presentCall,
-    execute: async args => { const progress = progressSchema.parse({ phase: args.phase, metrics: JSON.parse(args.metrics_json), updatedAt: Date.now() }); writeClusterReceipt(config.root, runtime.submission.experimentId, progress, 'progress.json'); return JSON.stringify(progress) } })))
+    execute: async args => { const progress = progressSchema.parse({ phase: args.phase, metrics: JSON.parse(args.metrics_json), updatedAt: Date.now() }); writeClusterReceipt(config.root, runtime.submission.experimentId, progress, 'progress.json');
+      saveMetricSample(serverRunRoot(runtime.submission.coordinator, runtime.submission.experimentId), { experimentId: runtime.submission.experimentId,
+        serverId: runtime.submission.coordinator.id, time: progress.updatedAt, gpus: [], training: progress.metrics }, observationPolicySchema.parse(config.observations), 'training')
+      return JSON.stringify(progress) } })))
   ctx.effect(() => ctx.tools.register(defineTool({ name: 'start_inference_service', description: 'Register a managed inference process on an assigned node. Reuse service_id on retries. Bind the model command to 127.0.0.1 on an unused port, supply its real HTTP health path and model artifact. Set publish=true only when public inference is requested and the node has a saved inferenceMapping. The node opens that mapping port on 0.0.0.0 with separate Bearer authentication and forwards to the private model port; never bind the model to the mapping port. model_name is the model API identifier. No credentials are returned. Check both local health and external reachability. Services survive Goal completion; no automatic restart.',
     parameters: { server_id: { type: 'string', required: true }, service_id: { type: 'string', required: true }, command: { type: 'string', required: true }, model_path: { type: 'string', required: true }, port: { type: 'number', required: true }, health_path: { type: 'string', required: true }, publish: { type: 'boolean' }, model_name: { type: 'string' } }, output, presentCall,
     execute: async args => { const id = serviceIdSchema.parse(args.service_id); return JSON.stringify(await run(args.server_id, `service-${id}`, 'register-service', { id, command: args.command, modelPath: args.model_path, port: args.port, healthPath: args.health_path, publish: args.publish, modelName: args.model_name })) } })))

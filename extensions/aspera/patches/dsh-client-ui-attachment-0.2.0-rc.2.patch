@@ -1,0 +1,10 @@
+--- a/lib/client.js
++++ b/lib/client.js
+@@ -871,6 +871,7 @@ window.__ModuleLoader__.load({
+ 		const inject = ["slots"];
+ 		/** Register attachment presentation without exporting React components as package values. */
+ 		function apply(ctx) {
++            ctx.slots.registerFactory({name:'attachments.readonlyImages', scope:'root', locale:'conversation'}, MessageImages);
+ 			ctx.slots.inject("conversation.input.attachments", () => ctx.slots.register({
+ 				name: "conversation.input.attachments",
+ 				locale: "conversation"

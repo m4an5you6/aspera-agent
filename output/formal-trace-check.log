@@ -1,0 +1,10 @@
+locator.click: Timeout 30000ms exceeded.
+Call log:
+  - waiting for getByRole('button').filter({ has: getByText('CPU semi experiment', { exact: true }) })
+
+    at E:\platform\aspera-agent\output\check-formal-trajectory.mjs:18:98 {
+  log: [
+    "  - waiting for getByRole('button').filter({ has: getByText('CPU semi experiment', { exact: true }) })"
+  ],
+  name: 'TimeoutError'
+}

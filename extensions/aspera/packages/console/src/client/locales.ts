@@ -1,5 +1,14 @@
 /** Typed experiment navigation, forms, and execution status labels. */
 export const en = {
+  operationTimedOut: 'The request timed out. Saved content is retained', operationFailed: 'The operation failed. Saved content is retained',
+  trajectoryUnavailable: 'The read-only trajectory component is unavailable. Check the Aspera compatibility patch',
+  lastSample: 'Last received {time}', captureIncomplete: 'Some output was not captured completely',
+  traceReadOnly: 'Read-only trajectory', metricMissing: 'Not reported', sampledAt: 'Sampled {time}',
+  resourceMetrics: 'Resources', trainingMetrics: 'Training', cpuMetric: 'CPU', memoryMetric: 'Memory', gpuMetric: 'GPU', gpuMemoryMetric: 'GPU memory',
+  lossMetric: 'Loss', stepMetric: 'Step', throughputMetric: 'Throughput', processLogs: 'Process logs', allOutput: 'All output',
+  latestOutput: 'Back to latest', newOutput: 'New output', logHistory: 'Earlier output', legacyLogs: 'Legacy output · stream and time are unavailable',
+  liveMonitoring: 'Updating', metricWindow: 'Recent {minutes} minutes', downloadLogs: 'Download complete log', resizeLogs: 'Resize log reader',
+  sourcePreparation: 'Preparation', sourceAgent: 'Agent', sourceProcess: 'Process', sourceLegacy: 'Legacy log',
   linkedExperiments: '{count} unfinished experiments',
   cleanupDone: 'Cleaned', cleanupPending: 'Pending cleanup',
   "deleteExperiments": "Delete experiments",
@@ -168,6 +177,15 @@ export const en = {
 export type ExperimentLocaleKey = keyof typeof en
 /** Simplified Chinese experiment UI. */
 export const zh: Record<ExperimentLocaleKey, string> = {
+  operationTimedOut: '请求超时，已保留当前内容', operationFailed: '操作失败，已保留当前内容',
+  trajectoryUnavailable: '只读轨迹组件不可用，请检查 Aspera 兼容补丁',
+  lastSample: '上次采集 {time}', captureIncomplete: '部分输出未完整采集',
+  traceReadOnly: '只读轨迹', metricMissing: '未上报', sampledAt: '采样于 {time}',
+  resourceMetrics: '资源监控', trainingMetrics: '训练指标', cpuMetric: 'CPU', memoryMetric: '内存', gpuMetric: 'GPU', gpuMemoryMetric: '显存',
+  lossMetric: 'Loss', stepMetric: '步数', throughputMetric: '吞吐量', processLogs: '进程日志', allOutput: '全部输出',
+  latestOutput: '回到最新', newOutput: '有新输出', logHistory: '更早输出', legacyLogs: '历史混合日志 · 未记录输出流与时间',
+  liveMonitoring: '持续更新', metricWindow: '最近 {minutes} 分钟', downloadLogs: '下载完整日志', resizeLogs: '调整日志区域高度',
+  sourcePreparation: '准备命令', sourceAgent: 'Agent', sourceProcess: '受管进程', sourceLegacy: '历史日志',
   linkedExperiments: '关联 {count} 个未结束实验',
   cleanupDone: '已清理', cleanupPending: '待清理',
   "deleteExperiments": "删除实验",

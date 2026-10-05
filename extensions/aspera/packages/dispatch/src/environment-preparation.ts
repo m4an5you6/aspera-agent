@@ -1,6 +1,9 @@
 /** The standard dispatch Agent repairs SSH environments; providers own verification and completion. */
 import { randomUUID } from 'node:crypto'
-import { posix } from 'node:path'
+import { posix, resolve } from 'node:path'
+import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
+import { ObservationWriter } from '@aspera/runtime'
+import { observationSourceIdSchema } from '@aspera/experiments'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
@@ -45,7 +48,7 @@ export class UnconfirmedPreparationCommand extends Error {}
 interface ActivePreparation {
   serverId: ExperimentServerId
   inspect: (signal: AbortSignal) => Promise<object>
-  command: (script: string, signal: AbortSignal) => Promise<RemoteCommandResult>
+  command: (script: string, signal: AbortSignal, callId: string) => Promise<RemoteCommandResult>
   verify: (pathEntries: string[], signal: AbortSignal) => Promise<object>
   block: (reason: string) => Promise<void>
 }
@@ -68,7 +71,7 @@ export class EnvironmentPreparation {
     ctx.effect(() => ctx.tools.register(defineTool({ name: 'run_preparation_command',
       description: 'Run a foreground POSIX command on the currently assigned server using its existing SSH account permissions. Install and configure required user-space dependencies. Never background work, read credentials, replace sealed releases, stop controllers, change host drivers, or disable isolation checks. Nonzero exits retain stdout and stderr.',
       parameters: { server_id: { type: 'string', required: true }, command: { type: 'string', required: true } }, output, presentCall,
-      execute: async (args, exec) => JSON.stringify(await this.owner(args.server_id).command(args.command, exec.signal)) })))
+      execute: async (args, exec) => JSON.stringify(await this.owner(args.server_id).command(args.command, exec.signal, exec.callId)) })))
     ctx.effect(() => ctx.tools.register(defineTool({ name: 'verify_preparation_environment',
       description: 'Run the application-owned checks for this preparation step. Supply absolute executable directories when tools were installed outside the original SSH PATH. Completion requires a successful provider result.',
       parameters: { server_id: { type: 'string', required: true }, path_entries: { type: 'array', items: { type: 'string' }, required: true } }, output, presentCall,
@@ -181,7 +184,7 @@ export class EnvironmentPreparation {
         if (reason.trim() === '') throw new Error('A preparation blocker requires a reason')
         terminal = new Error(reason)
       },
-      command: async (script, operationSignal) => {
+      command: async (script, operationSignal, callId) => {
         const lifetime = AbortSignal.any([signal, operationSignal])
         if (accepted !== undefined || terminal !== undefined) throw new Error('Preparation step has already finished')
         if (script.trim() === '') throw new Error('Preparation command must not be empty')
@@ -193,25 +196,40 @@ export class EnvironmentPreparation {
   if [ -f "$file" ] && kill -0 "$(cat "$file")" 2>/dev/null; then printf active; fi
 done`, lifetime, input.password)
         if (active !== '' && (input.operation === 'bootstrap' || input.operation === 'deployment')) throw new Error('A node controller is running. Reuse its compatible environment; stop it only after its tasks finish and cleanup is confirmed before changing shared dependencies.')
-        pending = { directory: posix.join(observation.home, '.local/state/aspera/preparation', input.experimentId, input.serverId, randomUUID()) }
+        const commandId = randomUUID()
+        pending = { directory: posix.join(observation.home, '.local/state/aspera/preparation', input.experimentId, input.serverId, commandId) }
         await progress('configuring-environment')
+        const capture = new ObservationWriter(resolve(resolveDshHome(), 'aspera-observations', input.experimentId), {
+          version: 1, id: observationSourceIdSchema.parse(`preparation-${commandId}`), experimentId: input.experimentId, serverId: input.serverId,
+          kind: 'preparation', phase: 'preparation', sessionId: agent.session.id, commandId, toolCallId: callId, label: input.operation,
+          createdAt: Date.now(), streams: ['stdout', 'stderr'], complete: false }, input.password === undefined ? [] : [input.password])
         let result: RemoteCommandResult
+        let captureComplete = false
         try {
           result = await driver.remoteResult(target, `umask 077
 mkdir -p ${shellQuote(posix.dirname(pending.directory))}
 mkdir ${shellQuote(pending.directory)} || exit 1
-sh -c ${shellQuote(script)}
+mkfifo ${shellQuote(pending.directory + '/stdout.pipe')} ${shellQuote(pending.directory + '/stderr.pipe')} || exit 1
+tee ${shellQuote(pending.directory + '/stdout.log')} < ${shellQuote(pending.directory + '/stdout.pipe')} &
+output_reader=$!
+tee ${shellQuote(pending.directory + '/stderr.log')} < ${shellQuote(pending.directory + '/stderr.pipe')} >&2 &
+error_reader=$!
+sh -c ${shellQuote(script)} > ${shellQuote(pending.directory + '/stdout.pipe')} 2> ${shellQuote(pending.directory + '/stderr.pipe')}
 status=$?
+wait "$output_reader"
+wait "$error_reader"
+rm -f ${shellQuote(pending.directory + '/stdout.pipe')} ${shellQuote(pending.directory + '/stderr.pipe')}
 printf '%s\\n' "$status" > ${shellQuote(pending.directory + '/exited')}
-exit "$status"`, lifetime, input.password)
+exit "$status"`, lifetime, input.password, (stream, chunk) => { capture.append(stream, chunk) })
           if (result.exitConfirmed) {
             const receipt = await driver.remote(target, `if [ -f ${shellQuote(pending.directory + '/exited')} ]; then cat ${shellQuote(pending.directory + '/exited')}; else printf unknown; fi`, lifetime, input.password)
             result = { ...result, exitConfirmed: /^\d+\s*$/.test(receipt) }
           }
+          captureComplete = result.exitConfirmed
         } catch (error) {
           const unresolved = new UnconfirmedPreparationCommand(`Preparation command outcome is unknown at ${pending.directory}: ${String(error)}`)
           await progress('configuring-environment', unresolved.message); stop(unresolved); throw unresolved
-        }
+        } finally { capture.close(captureComplete) }
         const publicResult = { ...result, stdout: result.stdout.slice(-input.outputChars), stderr: result.stderr.slice(-input.outputChars) }
         if (!result.exitConfirmed) {
           const unresolved = new UnconfirmedPreparationCommand(`Preparation command outcome is unknown at ${pending.directory}; inspect its exit before retrying.`)
@@ -227,7 +245,7 @@ exit "$status"`, lifetime, input.password)
     this.active = {
       serverId: input.serverId,
       inspect: operationSignal => serial(() => handlers.inspect(operationSignal)),
-      command: (script, operationSignal) => serial(() => handlers.command(script, operationSignal)),
+      command: (script, operationSignal, callId) => serial(() => handlers.command(script, operationSignal, callId)),
       verify: (paths, operationSignal) => serial(() => handlers.verify(paths, operationSignal)),
       block: reason => serial(() => handlers.block(reason)),
     }

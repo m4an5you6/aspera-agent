@@ -28,6 +28,8 @@ kind: "package-bundle"
 
 `extensionRoot` 选择固定发布，`dataRoots` 允许读取本地输入文件，阶段快照标识私有模型凭据。`minimumFreeBytes` 配置保留空间，默认 1 GiB；`preparationOutputChars` 限制每条命令向模型返回的 stdout 和 stderr，默认各 65536 字符。准备使用所选 SSH 账号的现有权限，不依赖系统包白名单。操作、轮询和下载设置由 [Config](src/index.ts) 校验；随包配置读取 `ASPERA_DATA_ROOTS` 并兼容旧 `ASPERA_MODEL_CREDENTIAL_REFS`。连接检查只读取远端状态，不调用模型或配置依赖，区分 SSH 可达与依赖未就绪，磁盘清单可能缺失。
 
+`connectionCheckTimeoutMs` 为整轮连接检查设置统一截止时间，默认 20000 毫秒。主机密钥探测、环境检查、磁盘、GPU 和控制服务共用取消信号。到期后关闭活动 SSH 连接并保存失败状态，结束后才能再次检查；保留带时间的历史成功信息。准备与安装继续使用独立的 `toolTimeoutMs` 策略。自定义调用者在 `ExperimentFleet.open` 的可选驱动之前传入检查时限；驱动必须响应探测取消，并等待连接清理完成。
+
 服务器使用密码登录和独立用户名。每个创建请求从 `serverIds` 中指定 `coordinatorId`，登记修改不影响提交快照。同一管理 profile 内，不同调度主机的未结束实验不能使用重叠节点。同调度主机继续按远端顺序排队，首次等待确认不分配 GPU。删除空闲服务器保留历史快照与远端文件，移除不再引用的自有凭据。待完成任务和清理未确认会阻止删除。节点使用配置的控制端口，调度服务使用下一端口。记录删除及兼容规则见[管理状态与清理](../../docs/state-and-api.zh.md)。
 
 本机连接检查和准备会把首次遇到的主机密钥自动登记到所选 `known_hosts` 文件，默认 `~/.ssh/known_hosts`。探测不发送密码或执行远端命令，采用首次使用时信任，并使用跨进程文件锁登记。已有、已撤销或不受支持的身份不会被覆盖。后续密码登录核对已登记的密钥；远端委派连接要求预先安装的密钥。`FleetDriver` 提供方实现 `prepareSshHostKey` 及经过验证的 `cleanupServerStorage`；浏览器和 Host 通过 `@aspera/dispatch/server-usage` 共用移除检查。
@@ -40,6 +42,8 @@ kind: "package-bundle"
 
 <a id="understand-the-implementation"></a>
 ## 了解实现
+
+只读观测在返回完整事件、已登记日志、附件或实测采样前校验实验、节点和 Session 归属。准备命令先完整记录输出，再限制工具结果长度。提示指纹按管理 profile 持久保存；关闭 Toast 不清除失败或清理状态。[观测接口](../../docs/state-and-api.zh.md#logs-outputs-and-services) 定义游标和历史版本可用性。安装及发布移交通过 `@aspera/dispatch/compatibility` 校验固定版本的已发布 DSH 渲染适配。
 
 模型提交通过 DSH 提供商目录解析三个显式选择。[models.ts](src/models.ts) 保存私有 API 设置和独立凭据引用，重试读取这些快照。DeepSeek 及支持的 pi-ai 密钥接口使用固定适配器。保留历史 `agentCredentialRefs` 配置的读取；第 4 代仅移交已接收阶段快照引用的凭据。
 

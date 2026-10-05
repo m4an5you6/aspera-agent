@@ -36,6 +36,11 @@ const storeSpec = defineDomain({ name: 'aspera_node', version: 4, compatibleVers
   services: domainTable<string, InferenceService>(serviceSchema),
 } })
 
+import { observationPolicySchema, observationReadSchema, observationSourceIdSchema, metricReadSchema } from '@aspera/experiments'
+import type { ObservationPolicy } from '@aspera/experiments'
+import { ObservationWriter, observationSources, readObservation } from './observations.ts'
+import { NodeMetricSampler, saveMetricSample, readMetricSamples } from './metrics.ts'
+
 /** Configured bounds for a node control process. */
 export interface ClusterNodeConfig {
   root: string
@@ -49,6 +54,7 @@ export interface ClusterNodeConfig {
   serviceRequestBytes: number
   devicePaths: readonly string[]
   networkProbeLifetimeMs?: number
+  observations?: ObservationPolicy
 }
 
 /**
@@ -63,6 +69,7 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
   const allocations = store.table('allocations')
   const commands = store.table('commands')
   const services = store.table('services')
+  const observationPolicy = observationPolicySchema.parse(config.observations)
   const gateways = new Map<string, InferenceGateway>()
   const stopGateway = async (id: string) => {
     const gateway = gateways.get(id)
@@ -91,6 +98,21 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
   const workspace = (id: ExperimentId) => resolve(runRoot(id), 'workspace')
   const logPath = (id: ExperimentId) => resolve(runRoot(id), 'node.log')
   const processLogPath = (id: ExperimentId, commandId: string, stream: 'stdout' | 'stderr') => resolve(runRoot(id), 'process-logs', commandId, `${stream}.log`)
+  const sampler = new NodeMetricSampler(ctx, observationPolicy)
+  const samplingLifetime = new AbortController()
+  let sampling: Promise<void> | undefined
+  const sample = () => {
+    if (sampling !== undefined || samplingLifetime.signal.aborted) return
+    const active = [...allocations.entries()].filter(([, row]) => !row.released && row.bootId === config.bootId)
+    if (active.length === 0) return
+    sampling = sampler.sample(samplingLifetime.signal).then(value => {
+      for (const [experimentId, allocation] of active) saveMetricSample(runRoot(experimentId), { ...value, experimentId, serverId: allocation.node.server.id }, observationPolicy)
+    }).catch((error: unknown) => { if (!samplingLifetime.signal.aborted) ctx.logger.warn(`Resource sampling failed: ${String(error)}`) }).finally(() => { sampling = undefined })
+  }
+  ctx.effect(() => {
+    const timer = setInterval(sample, observationPolicy.intervalMs)
+    return async () => { clearInterval(timer); samplingLifetime.abort(); await sampling }
+  }, 'Aspera: node resource samples')
   const allocation = (id: ExperimentId) => {
     const saved = allocations.get(id)
     if (saved === undefined || saved.released || saved.releasing || saved.bootId !== config.bootId) throw new Error('node allocation is unavailable or interrupted')
@@ -137,6 +159,20 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
     if (operation === 'health') return { allocations: [...allocations.entries()].filter(([, row]) => !row.released).map(([id]) => id) }
     const input = z.object({ experimentId: experimentIdSchema }).loose().parse(raw)
     const id = input.experimentId
+    if (operation === 'observation-sources') {
+      if (allocations.get(id) === undefined) return []
+      return observationSources(runRoot(id)).filter(source => source.experimentId === id)
+    }
+    if (operation === 'observation-read') {
+      const query = observationReadSchema.parse(raw)
+      return readObservation(runRoot(id), { ...query, limit: Math.min(query.limit, observationPolicy.readBytes) })
+    }
+    if (operation === 'observation-metrics') {
+      const query = metricReadSchema.parse(raw)
+      if (allocations.get(id) === undefined) return []
+      if (allocations.get(id)?.node.server.id !== query.serverId) throw new Error('Metric node is outside the experiment')
+      return readMetricSamples(runRoot(id), query)
+    }
     if (operation === 'allocate') return serial(async () => {
       if (closing) throw new Error('node is stopping')
 
@@ -462,9 +498,13 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
       const row = { ...request, experimentId: id, state: 'starting' as const, exitCode: null, released: false }
       await commands.put(key, row)
       let handle: SubprocessHandle
+      let observation: ObservationWriter
       try {
         mkdirSync(resolve(runRoot(id), 'process-logs', request.commandId), { recursive: true, mode: 0o700 })
         for (const stream of ['stdout', 'stderr'] as const) appendFileSync(processLogPath(id, request.commandId, stream), '', { mode: 0o600 })
+        observation = new ObservationWriter(runRoot(id), { version: 1, experimentId: id, serverId: current.node.server.id,
+          id: observationSourceIdSchema.parse(`process-${request.commandId}`), kind: 'process', phase: 'execution', commandId: request.commandId,
+          label: request.commandId, createdAt: Date.now(), streams: ['stdout', 'stderr'], complete: false })
         const argv = [current.node.backendPath, '--ro-bind', '/', '/', '--unshare-user', '--unshare-pid', '--unshare-ipc',
           '--unshare-uts', '--die-with-parent', '--new-session', '--dev', '/dev', '--proc', '/proc', '--tmpfs', '/tmp', '--clearenv',
           '--setenv', 'PATH', '/usr/local/bin:/usr/bin:/bin', '--setenv', 'HOME', workspace(id), '--setenv', 'PYTHONUNBUFFERED', '1']
@@ -496,6 +536,7 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
         try {
           appendFileSync(logPath(id), chunk, { mode: 0o600 })
           if (stream !== undefined) appendFileSync(processLogPath(id, request.commandId, stream), chunk, { mode: 0o600 })
+          if (stream !== undefined) observation.append(stream, chunk)
         }
         catch (error) { ctx.logger.error(`experiment log failed: ${String(error)}`); handle.terminate() }
       }
@@ -503,7 +544,7 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
       handle.stdout?.on('data', (chunk: Buffer) => { append(chunk, 'stdout') })
       handle.stderr?.on('data', (chunk: Buffer) => { append(chunk, 'stderr') })
       const settled = finish(key, handle).catch((error: unknown) => { ctx.logger.error(`experiment node: ${String(error)}`) })
-        .finally(() => { settlements.delete(key) })
+        .finally(() => { observation.close(commands.get(key)?.released === true); settlements.delete(key) })
       settlements.set(key, settled)
       try { await commands.put(key, { ...row, state: 'running' }) }
       catch (error) { handle.terminate(); throw error }

@@ -46,8 +46,11 @@ import { resolveTrainingNetwork } from './network-selection.ts'
 import { captureExperimentModels } from './models.ts'
 import { experimentPhases } from '@aspera/experiments'
 import { openPhaseModelContext, privateModelConfigurationSchema } from '@aspera/runtime'
-import { agentRecordRequestSchema, agentRecordPageSchema, projectAgentRecord, experimentProcessSchema, processLogRequestSchema, processLogPageSchema } from '@aspera/experiments'
+import { agentRecordRequestSchema, agentRecordPageSchema, projectAgentRecord, experimentProcessSchema, processLogRequestSchema, processLogPageSchema, traceEventChunkSchema } from '@aspera/experiments'
 import type { AgentRecordRequest, AgentRecordPage, ExperimentProcess, ProcessLogRequest, ProcessLogPage } from '@aspera/experiments'
+import { observationReadSchema, observationSourceSchema, observationSourceIdSchema, observationPageSchema, metricReadSchema, metricSampleSchema } from '@aspera/experiments'
+import type { ObservationSource, ObservationRead, ObservationPage, MetricRead, MetricSample } from '@aspera/experiments'
+import { observationSources, readObservation, redactObservation, readTraceAttachment } from '@aspera/runtime'
 
 const requestSchema = fleetRequestV5Schema.safeExtend({ coordinatorId: serverIdSchema })
   .refine(value => value.serverIds.includes(value.coordinatorId), 'Coordinator must be a selected execution node')
@@ -110,18 +113,21 @@ export class ExperimentFleet {
   private readonly uploadRoot = resolve(resolveDshHome(), 'aspera-inputs')
 
   private constructor(private readonly ctx: Context, private readonly store: Store,
-    private readonly deployment: (server: ServerSettings) => PinnedDeployment, private readonly driver: FleetDriver) {}
+    private readonly deployment: (server: ServerSettings) => PinnedDeployment,
+    private readonly connectionCheckTimeoutMs: number, private readonly driver: FleetDriver) {}
 
   /**
    * Open durable records and reconcile interrupted local preparation.
    * @param ctx - dispatch host.
    * @param deployment - resolves shared policy against a selected server.
+   * @param connectionCheckTimeoutMs - total connection-check deadline, independent of preparation command timeouts.
    * @param driver - release and transport provider; the default uses password SSH.
    * @returns effect-owned fleet service.
    */
-  static async open(ctx: Context, deployment: (server: ServerSettings) => PinnedDeployment, driver: FleetDriver = productionDriver): Promise<ExperimentFleet> {
+  static async open(ctx: Context, deployment: (server: ServerSettings) => PinnedDeployment,
+    connectionCheckTimeoutMs: number, driver: FleetDriver = productionDriver): Promise<ExperimentFleet> {
     const store = await ctx.storage.domain.open(storeSpec)
-    const fleet = new ExperimentFleet(ctx, store, deployment, driver)
+    const fleet = new ExperimentFleet(ctx, store, deployment, connectionCheckTimeoutMs, driver)
     ctx.effect(() => () => fleet.close(), 'experiment fleet: local preparations')
     if (store.table('registry').get('servers') === undefined) {
       await store.table('registry').put('servers', { servers: [] })
@@ -363,6 +369,7 @@ export class ExperimentFleet {
         await this.store.table('deletions').put(id, job)
       }
       cleanupLocalInputs(this.uploadRoot, id)
+      cleanupLocalInputs(resolve(resolveDshHome(), 'aspera-observations'), id)
       await this.serial(async () => {
         if (experimentRemovalBlocker(this.get(id)) !== undefined) throw new Error('Experiment state changed before deletion')
         for (const server of [record.coordinator, ...record.servers]) await this.removeUnusedCredential(sshPasswordRef(server), id)
@@ -401,9 +408,9 @@ export class ExperimentFleet {
   }
 
   /**
-   * Check SSH connectivity and report GPU and allocation facts.
+   * Check SSH connectivity and report GPU and allocation facts within the configured deadline.
    * @param id - configured server.
-   * @returns GPU inventory and allocation visibility.
+   * @returns saved success or failure after cancelled SSH operations settle; concurrent checks share this result.
    */
   probe(id: ExperimentServerId): Promise<ServerConnectionCheck> {
     const existing = this.checks.get(id)
@@ -421,24 +428,37 @@ export class ExperimentFleet {
     const previous = this.servers().checks?.[id]
     const checking: ServerConnectionCheck = { status: 'checking', configuration, startedAt,
       ...(previous?.lastSuccess === undefined ? {} : { lastSuccess: previous.lastSuccess }) }
-    await this.serial(async () => {
-      const registry = this.servers()
-      if (!registry.servers.some(value => value.id === id && connectionConfiguration(value) === configuration)) throw new Error('Server configuration changed before the check began')
-      await this.store.table('registry').put('servers', { ...registry, checks: { ...registry.checks, [id]: checking } })
-    })
+    const deadline = new AbortController()
+    const timer = setTimeout(() => {
+      deadline.abort(new Error(`Connection check timed out after ${this.connectionCheckTimeoutMs / 1000} ${this.connectionCheckTimeoutMs === 1000 ? 'second' : 'seconds'}`))
+    }, this.connectionCheckTimeoutMs)
+    const signal = deadline.signal
     let check: ServerConnectionCheck
     let password: string | undefined
     try {
-      const target = this.reuseExecutablePaths(server.id, this.deployment(server))
-      await this.driver.prepareSshHostKey(target)
+      await this.serial(async () => {
+        const registry = this.servers()
+        if (!registry.servers.some(value => value.id === id && connectionConfiguration(value) === configuration)) throw new Error('Server configuration changed before the check began')
+        await this.store.table('registry').put('servers', { ...registry, checks: { ...registry.checks, [id]: checking } })
+      })
+      signal.throwIfAborted()
+      const deployment = this.reuseExecutablePaths(server.id, this.deployment(server))
+      const target = { ...deployment, toolTimeoutMs: Math.min(deployment.toolTimeoutMs, this.connectionCheckTimeoutMs) }
+      await this.driver.prepareSshHostKey(target, signal)
+      signal.throwIfAborted()
       password = await this.password(server)
+      signal.throwIfAborted()
       const directory = server.storagePreference?.mode === 'manual' ? server.storagePreference.directory
         : server.storagePreference === undefined ? server.remoteRoot : undefined
-      const environment = await this.driver.inspectEnvironment(target, password)
+      const environment = await this.driver.inspectEnvironment(target, password, signal)
+      signal.throwIfAborted()
       const readiness = checkEnvironment(environment, this.driver.environmentRequirements(target.localRepo), target.pathEntries)
-      const observations = await Promise.allSettled([this.driver.inspectServerStorage(target, directory, password),
-        this.driver.remote(target, 'nvidia-smi -L', undefined, password),
-        this.driver.request(target, await this.token(server, 'node'), '/aspera/v1/health', 'GET', undefined, undefined, password)])
+      const token = await this.token(server, 'node')
+      signal.throwIfAborted()
+      const observations = await Promise.allSettled([this.driver.inspectServerStorage(target, directory, password, signal),
+        this.driver.remote(target, 'nvidia-smi -L', signal, password),
+        this.driver.request(target, token, '/aspera/v1/health', 'GET', undefined, signal, password)])
+      signal.throwIfAborted()
       const inventory = observations[0].status === 'fulfilled' ? observations[0].value : undefined
       const gpuInfo = observations[1].status === 'fulfilled' ? observations[1].value : ''
       const health = observations[2].status === 'fulfilled' && observations[2].value.status === 200
@@ -450,9 +470,9 @@ export class ExperimentFleet {
       check = { status: 'passed', configuration, startedAt, checkedAt, result, lastSuccess: { checkedAt, result },
         gpu: observations[1].status === 'fulfilled' && gpuInfo.trim() !== '' ? 'passed' : 'unavailable', control: health?.success ? 'passed' : 'unavailable' }
     } catch (error) {
-      const message = String(error)
+      const message = String(signal.aborted ? signal.reason : error)
       check = { ...checking, status: 'failed', checkedAt: Date.now(), error: password ? message.replaceAll(password, '[redacted]') : message }
-    }
+    } finally { clearTimeout(timer) }
     return this.serial(async () => {
       const registry = this.servers()
       if (registry.checks?.[id]?.startedAt !== startedAt || !registry.servers.some(value => value.id === id && connectionConfiguration(value) === configuration)) {
@@ -1144,32 +1164,80 @@ export class ExperimentFleet {
   }
 
   /** Read only the requested experiment's own phase Session.
-   * @param raw - phase and source-bound cursor. @returns real events, never synthesized history.
+   * @param raw - phase and source-bound cursor. @param complete - request complete payloads where the pinned runtime supports them. @returns real events, never synthesized history.
    */
-  async records(raw: AgentRecordRequest): Promise<AgentRecordPage> {
+  async records(raw: AgentRecordRequest, complete = false): Promise<AgentRecordPage> {
     const input = agentRecordRequestSchema.parse(raw)
     const record = this.get(input.experimentId)
     if (input.phase !== 'preparation') {
       if (record.submission === undefined || record.submission.protocol !== 4) return { records: [], hasMore: false, missing: true, reset: false }
-      return agentRecordPageSchema.parse(await this.call(record, 'records', input))
+      try {
+        const page = agentRecordPageSchema.parse(await this.call(record, complete ? 'trace-records' : 'records', input))
+        if (page.records.some(event => event.experimentId !== input.experimentId || event.phase !== input.phase
+          || (page.cursor !== undefined && event.sessionId !== page.cursor.sessionId))
+          || (page.cursor !== undefined && (page.cursor.experimentId !== input.experimentId || page.cursor.phase !== input.phase))) throw new Error('Trajectory page belongs to another experiment or phase')
+        if (complete) for (const event of page.records) {
+          if (!event.truncated) continue
+          let data = ''; let digest: string | undefined
+          for (;;) {
+            const chunk = traceEventChunkSchema.parse(await this.call(record, 'trace-event', { experimentId: event.experimentId, phase: event.phase,
+              sessionId: event.sessionId, seq: event.seq, offset: data.length, ...(page.cursor?.generation === undefined ? {} : { generation: page.cursor.generation }), ...(digest === undefined ? {} : { digest }) }))
+            if (chunk.nextOffset !== data.length + chunk.data.length || (digest !== undefined && chunk.digest !== digest)) throw new Error('Event fragments are inconsistent')
+            data += chunk.data; digest = chunk.digest
+            if (data.length === chunk.length) break
+            if (chunk.data.length === 0 || data.length > chunk.length) throw new Error('Event fragment did not advance')
+          }
+          if (createHash('sha256').update(data).digest('hex') !== digest) throw new Error('Event content failed integrity verification')
+          JSON.parse(data); event.data = data; event.truncated = false
+        }
+        return page
+      }
+      catch (error) {
+        if (!complete || !(error instanceof CoordinatorRequestError) || error.status !== 404) throw error
+        return agentRecordPageSchema.parse(await this.call(record, 'records', input))
+      }
     }
     const cursor = input.cursor
     if (cursor !== undefined && (cursor.experimentId !== input.experimentId || cursor.phase !== input.phase || cursor.sessionId !== record.sessionId)) throw new Error('Agent cursor belongs to another experiment, phase or Session')
     const id = SessionId(record.sessionId)
-    if (await this.ctx.sessionPersistence.stat(id) === undefined) return { records: [], hasMore: false, missing: true, reset: false }
+    const stat = await this.ctx.sessionPersistence.stat(id)
+    if (stat === undefined) return { records: [], hasMore: false, missing: true, reset: false }
     const handle = await this.ctx.sessionPersistence.open(id, 'read')
     try {
-      const start = input.beforeSeq === undefined ? cursor?.nextSeq ?? 0 : Math.max(0, input.beforeSeq - input.limit)
+      const start = input.beforeSeq === undefined ? cursor?.nextSeq ?? (complete ? Math.max(0, (stat.eventCount ?? 0) - input.limit) : 0) : Math.max(0, input.beforeSeq - input.limit)
       const events = (await handle.read(start, input.limit + 1)).events
       const records: AgentRecordPage['records'] = []; let characters = 0
+      const tail = complete && input.cursor === undefined
       for (const event of events) {
-        if (records.length >= input.limit || characters >= 65536 || (input.beforeSeq !== undefined && event.seq >= input.beforeSeq)) break
-        const row = projectAgentRecord(event, { experimentId: input.experimentId, phase: input.phase, sessionId: record.sessionId }, 65536 - characters)
+        if ((!tail && (records.length >= input.limit || characters >= 65536)) || (input.beforeSeq !== undefined && event.seq >= input.beforeSeq)) break
+        const row = projectAgentRecord(event, { experimentId: input.experimentId, phase: input.phase, sessionId: record.sessionId }, complete ? Infinity : 65536 - characters)
+        if (event.type === 'tool/call') {
+          const call = z.object({ callId: z.string() }).safeParse(event.data)
+          const source = call.success ? observationSources(resolve(resolveDshHome(), 'aspera-observations', input.experimentId)).find(source => source.toolCallId === call.data.callId && source.sessionId === record.sessionId) : undefined
+          if (source?.commandId !== undefined) row.log = { serverId: source.serverId, commandId: source.commandId }
+        }
         records.push(row); characters += row.data.length
+        if (tail) while (records.length > 1 && (characters > 65536 || records.length > input.limit)) characters -= records.shift()!.data.length
       }
       return { records, cursor: { experimentId: input.experimentId, phase: input.phase, sessionId: record.sessionId,
         nextSeq: (records.at(-1)?.seq ?? start - 1) + 1 }, hasMore: events.length > records.length, missing: false, reset: false }
     } finally { await handle.close() }
+  }
+
+  /** @param id - experiment. @param phase - saved Session role. @param seq - owning event. @param attachmentId - recorded reference.
+   * @param offset - byte offset. @returns a bounded verified attachment fragment.
+   */
+  async traceAttachment(id: ExperimentId, phase: 'preparation' | 'planning' | 'execution', seq: number, attachmentId: string, offset: number): Promise<{ data: string; mediaType: string; name: string; nextOffset: number; size: number }> {
+    const record = this.get(id)
+    if (phase === 'preparation') {
+      const event = (await this.records({ experimentId: id, phase, beforeSeq: seq + 1, limit: 1 }, true)).records.find(event => event.seq === seq)
+      if (event === undefined || event.truncated) throw new Error('The attachment event is unavailable')
+      return readTraceAttachment(resolveDshHome(), JSON.parse(event.data), attachmentId, offset, 65536)
+    }
+    const sessionId = phase === 'planning' ? record.latest?.planningSessionId : record.latest?.sessionId
+    if (sessionId === undefined) throw new Error('The phase Session is unavailable')
+    return z.object({ data: z.string(), mediaType: z.string(), name: z.string(), nextOffset: z.number(), size: z.number() }).parse(
+      await this.call(record, 'trace-attachment', { experimentId: id, phase, seq, sessionId, attachmentId, offset }))
   }
 
   /** @param id - experiment. @param serverId - assigned node. @returns managed process directory. */
@@ -1186,6 +1254,107 @@ export class ExperimentFleet {
     const record = this.get(request.experimentId)
     if (!record.servers.some(server => server.id === request.serverId)) throw new Error('Node belongs to another experiment')
     return processLogPageSchema.parse(await this.call(record, 'process-log', request))
+  }
+
+  /** @param id - experiment. @param serverId - pinned node. @returns registered sources and explicit legacy availability. */
+  async logSources(id: ExperimentId, serverId: ExperimentServerId): Promise<{ sources: ObservationSource[]; legacy: boolean }> {
+    const record = this.get(id)
+    if (!record.servers.some(server => server.id === serverId)) throw new Error('Node belongs to another experiment')
+    const local = observationSources(resolve(resolveDshHome(), 'aspera-observations', id)).filter(source => source.serverId === serverId && source.experimentId === id)
+    if (record.receipt === undefined) return { sources: local, legacy: false }
+    try {
+      const remote = z.array(observationSourceSchema).parse(await this.call(record, 'observation-sources', { experimentId: id, serverId }))
+      if (remote.some(source => source.experimentId !== id || source.serverId !== serverId)) throw new Error('Observation directory ownership mismatch')
+      return { sources: [...local, ...remote], legacy: remote.some(source => source.kind === 'legacy') }
+    } catch (error) {
+      if (!(error instanceof CoordinatorRequestError) || error.status !== 404) throw error
+      const source = (name: string, label: string): ObservationSource => ({ version: 1, id: observationSourceIdSchema.parse(name), experimentId: id,
+        serverId, kind: 'legacy', label, createdAt: record.createdAt, streams: ['mixed'], complete: record.latest?.resourcesReleased === true })
+      return { sources: [...local, source('legacy-node', 'node'), ...(record.coordinator.id === serverId ? [source('legacy-agent', 'agent')] : [])], legacy: true }
+    }
+  }
+
+  /** @param raw - registered log source and bound cursor. @param signal - download cancellation. @returns bounded complete log records. */
+  async logRead(raw: ObservationRead, signal?: AbortSignal): Promise<ObservationPage> {
+    const input = observationReadSchema.parse(raw); const record = this.get(input.experimentId)
+    if (!record.servers.some(server => server.id === input.serverId)) throw new Error('Node belongs to another experiment')
+    const refs = new Set<string>(record.servers.flatMap(server => [sshPasswordRef(server),
+      `ASPERA_CLUSTER_NODE_${server.id.replaceAll('-', '_')}`, `ASPERA_CLUSTER_COORDINATOR_${server.id.replaceAll('-', '_')}`]))
+    const secrets: string[] = []
+    for (const model of Object.values(record.models ?? {})) {
+      const configuration = await this.ctx.credentials.resolve(credentialRef(model.configurationRef))
+      if (configuration === undefined) continue
+      const saved = privateModelConfigurationSchema.parse(JSON.parse(configuration.value)); refs.add(saved.keyRef)
+      const scan = (value: unknown): void => {
+        if (value === null || typeof value !== 'object') return
+        for (const [key, entry] of Object.entries(value)) {
+          if (/^(?:extra)?headers$/i.test(key) && entry !== null && typeof entry === 'object') secrets.push(...Object.values(entry).filter((item): item is string => typeof item === 'string'))
+          else scan(entry)
+        }
+      }
+      scan(saved.options)
+    }
+    for (const ref of refs) { const value = await this.ctx.credentials.resolve(credentialRef(ref)); if (value !== undefined) secrets.push(value.value) }
+    const publish = (page: ObservationPage): ObservationPage => ({ ...page, lines: page.lines.map(line => ({ ...line, text: redactObservation(line.text, secrets) })) })
+    const cursor = input.cursor ?? input.before
+    if (cursor !== undefined && (cursor.experimentId !== input.experimentId || cursor.serverId !== input.serverId || cursor.sourceId !== input.sourceId || cursor.stream !== input.stream)) throw new Error('Log cursor belongs to another source')
+    if (input.sourceId.startsWith('preparation-')) return publish(readObservation(resolve(resolveDshHome(), 'aspera-observations', input.experimentId), input))
+    if (input.sourceId === 'legacy-node' || input.sourceId === 'legacy-agent') {
+      if (input.sourceId === 'legacy-agent' && record.coordinator.id !== input.serverId) throw new Error('Agent log belongs to the coordinator')
+      if (input.stream !== 'all' && input.stream !== 'mixed') throw new Error('Legacy logs do not identify output streams')
+      const start = input.before === undefined ? input.cursor?.offset ?? 0 : Math.max(0, input.before.offset - input.limit)
+      const encodedSecrets = secrets.map(secret => Buffer.from(secret).toString('latin1'))
+      const context = Math.max(input.limit, ...encodedSecrets.map(secret => secret.length))
+      const kind = input.sourceId === 'legacy-agent' ? 'agent-log' : 'log'
+      const readStart = Math.max(0, start - context)
+      let chunk = await this.read(input.experimentId, kind, readStart, input.serverId, undefined, cursor?.generation, signal)
+      const reset = chunk.reset
+      let beginning = chunk.reset ? chunk.offset : start
+      const prefixBytes = chunk.reset ? 0 : start - readStart
+      const buffers = [Buffer.from(chunk.data, 'base64')]
+      let size = buffers[0]!.length
+      while (!chunk.eof && size < prefixBytes + input.limit + context) {
+        const next = await this.read(input.experimentId, kind, chunk.nextOffset, input.serverId, undefined, chunk.generation, signal)
+        if (next.reset || next.generation !== chunk.generation) throw new Error('Legacy log rotated during reading')
+        if (next.nextOffset <= chunk.nextOffset) break
+        chunk = next; const bytes = Buffer.from(chunk.data, 'base64'); buffers.push(bytes); size += bytes.length
+      }
+      // Redact the surrounding bytes before slicing so adjacent pages cannot reveal a split credential.
+      let bytes = Buffer.from(redactObservation(Buffer.concat(buffers).toString('latin1'), encodedSecrets, true), 'latin1').subarray(prefixBytes)
+      if (input.before !== undefined && beginning > 0) {
+        let prefix = 0
+        while (prefix < bytes.length && (bytes[prefix]! & 0xc0) === 0x80) prefix++
+        beginning += prefix; bytes = bytes.subarray(prefix)
+      }
+      let end = Math.min(bytes.length, input.before === undefined ? input.limit : Math.max(0, input.before.offset - beginning))
+      if ((!chunk.eof || end < bytes.length) && end > 0) {
+        let lead = end - 1
+        while (lead > 0 && (bytes[lead]! & 0xc0) === 0x80) lead--
+        const first = bytes[lead]!
+        const width = first >= 0xf0 ? 4 : first >= 0xe0 ? 3 : first >= 0xc0 ? 2 : 1
+        if (lead + width > end) end = lead
+      }
+      const next = (offset: number) => ({ experimentId: input.experimentId, serverId: input.serverId, sourceId: input.sourceId, stream: input.stream, generation: chunk.generation, offset })
+      return publish({ lines: end === 0 ? [] : [{ seq: beginning, stream: 'mixed', text: bytes.subarray(0, end).toString('utf8') }],
+        cursor: next(beginning + end), before: next(beginning), hasEarlier: beginning > 0, hasMore: !chunk.eof || end < bytes.length, reset, missing: chunk.generation === '' })
+    }
+    const page = observationPageSchema.parse(await this.call(record, 'observation-read', input, signal))
+    for (const cursor of [page.cursor, page.before]) if (cursor.experimentId !== input.experimentId || cursor.serverId !== input.serverId
+      || cursor.sourceId !== input.sourceId || cursor.stream !== input.stream) throw new Error('Log response belongs to another source')
+    return publish(page)
+  }
+
+  /** @param raw - experiment, node and sampled-time range. @returns only recorded measurements. */
+  async metrics(raw: MetricRead): Promise<MetricSample[]> {
+    const input = metricReadSchema.parse(raw); const record = this.get(input.experimentId)
+    if (!record.servers.some(server => server.id === input.serverId)) throw new Error('Node belongs to another experiment')
+    if (record.receipt === undefined) return []
+    try {
+      const samples = z.array(metricSampleSchema).parse(await this.call(record, 'observation-metrics', input))
+      if (samples.some(sample => sample.experimentId !== input.experimentId || sample.serverId !== input.serverId)) throw new Error('Metrics belong to another experiment or node')
+      return samples
+    }
+    catch (error) { if (error instanceof CoordinatorRequestError && error.status === 404) return []; throw error }
   }
 
   /**

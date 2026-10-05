@@ -2,6 +2,7 @@
   "managementChecks": {
     "passwordRevealAndCancel": true,
     "failedCheckRetainsDatedHardware": true,
+    "connectionDeadlineStopsSpinnerAndPermitsRetry": true,
     "coordinatorSelection": true
   },
   "managementDeletion": {

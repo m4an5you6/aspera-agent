@@ -6,10 +6,12 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { ExperimentId, ExperimentServerId } from '@aspera/runtime'
 import type { ExperimentFleet } from './fleet.ts'
+import type { ObservationRead, ObservationCursor } from '@aspera/experiments'
+import { observationReadSchema } from '@aspera/experiments'
 
 /** Ticket issuer and effect-owned HTTP stream handler. */
 export class ExperimentDownloads {
-  private readonly tickets = new Map<string, { id: ExperimentId; serverId: ExperimentServerId; path: string; expires: number }>()
+  private readonly tickets = new Map<string, { id: ExperimentId; serverId: ExperimentServerId; path: string; expires: number; log?: ObservationRead }>()
   private ready = false
 
   constructor(ctx: Context, private readonly fleet: ExperimentFleet, private readonly ttlMs: number) {
@@ -28,7 +30,20 @@ export class ExperimentDownloads {
           const abort = new AbortController()
           active.add(abort)
           const read = this.fleet.read.bind(this.fleet)
+          const logRead = this.fleet.logRead.bind(this.fleet)
           async function* bytes() {
+            if (ticket?.log !== undefined) {
+              let cursor: ObservationCursor | undefined
+              for (;;) {
+                abort.signal.throwIfAborted()
+                const page = await logRead({ ...ticket.log, fromStart: cursor === undefined, ...(cursor === undefined ? {} : { cursor }) }, abort.signal)
+                if (page.reset || page.missing) throw new Error('Log changed or disappeared during download')
+                for (const line of page.lines) yield Buffer.from(line.text)
+                if (!page.hasMore) return
+                if (cursor?.offset === page.cursor.offset) throw new Error('Log download made no progress')
+                cursor = page.cursor
+              }
+            }
             let offset = 0
             let generation: string | undefined
             do {
@@ -76,6 +91,18 @@ export class ExperimentDownloads {
     for (const [token, ticket] of this.tickets) if (ticket.expires < Date.now()) this.tickets.delete(token)
     const token = randomBytes(32).toString('hex')
     this.tickets.set(token, { id, serverId, path, expires: Date.now() + this.ttlMs })
+    return `/experiment-download/${token}`
+  }
+  /** @param raw - selected registered source. @returns a short-lived URL; cursor state is owned by the download. */
+  async issueLog(raw: ObservationRead): Promise<string> {
+    if (!this.ready) throw new Error('experiment downloads require the Web profile')
+    const { experimentId, serverId, sourceId, stream, limit } = observationReadSchema.parse(raw)
+    const log = { experimentId, serverId, sourceId, stream, limit }
+    const first = await this.fleet.logRead({ ...log, fromStart: true })
+    if (first.missing) throw new Error('Log is missing')
+    for (const [token, ticket] of this.tickets) if (ticket.expires < Date.now()) this.tickets.delete(token)
+    const token = randomBytes(32).toString('hex')
+    this.tickets.set(token, { id: experimentId, serverId, path: `${sourceId}-${stream}.log`, expires: Date.now() + this.ttlMs, log })
     return `/experiment-download/${token}`
   }
 }

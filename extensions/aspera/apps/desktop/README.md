@@ -41,7 +41,7 @@ pnpm run test:desktop
 pnpm run start:desktop
 ```
 
-Outputs are `.artifacts/desktop-0.1.1/<build-id>/win-unpacked/Aspera.exe` and `aspera-desktop-build.json`; no ZIP is generated; `latest.json` points to the latest successful build. The record contains executable/runtime SHA-256, build ID, exact DSH/Aspera/Electron versions, protocol/storage generations and remote release digest. The application embeds `resources/build-info.json`. Staging uses `.artifacts/desktop-build-*`; initial dependency downloads require network access.
+Outputs are `.artifacts/desktop-0.1.1/<build-id>/win-unpacked/Aspera.exe` and `aspera-desktop-build.json`; no ZIP is generated; `latest.json` points to the latest successful build. The record contains executable/runtime SHA-256, build ID, exact DSH/Aspera/Electron versions, control protocol generation 4, local management storage generation 6, remote storage generation 4 and remote release digest. The application embeds `resources/build-info.json`. Staging uses `.artifacts/desktop-build-*`; initial dependency downloads require network access.
 
 Desktop verification uses the latest build by default; `ASPERA_DESKTOP_BUILD_ID` selects a particular build directory.
 

@@ -51,7 +51,7 @@ try {
   await page.locator('input[name=name]').fill('API regression server')
   await page.locator('input[name=host]').fill('127.0.0.1')
   await page.locator('input[name=username]').fill('trainer')
-  await page.locator('input[name=password]').fill('fixture-password')
+  await page.getByRole('dialog').getByLabel(/^(服务器密码|Server password)$/).fill('fixture-password')
   await expect(page.locator('input[name=remoteRoot]')).toHaveCount(0)
   await page.screenshot({ path: resolve(root, '.artifacts/desktop-server-auto.png'), fullPage: true })
   await page.locator('summary').filter({ hasText: /高级设置|Advanced settings/ }).click()

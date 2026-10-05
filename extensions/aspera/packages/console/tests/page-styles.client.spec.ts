@@ -19,7 +19,8 @@ it('keeps form placement rules off the shared checkbox label', () => {
 })
 
 it('keeps flat neutral borders at the shared hairline width', () => {
-  const widths = [...css.matchAll(/border(?:-(?:top|right|bottom|left))?:\s*([\d.]+)px solid var\(--dsw-alias-border-/g)]
+  const surfaces = css.replace(/\.pipeline li\s*\{[^}]*\}/g, '')
+  const widths = [...surfaces.matchAll(/border(?:-(?:top|right|bottom|left))?:\s*([\d.]+)px solid var\(--dsw-alias-border-/g)]
   expect(widths.length).toBeGreaterThan(0)
   for (const match of widths) expect(Number(match[1])).toBe(0.5)
 })

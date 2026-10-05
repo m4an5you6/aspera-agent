@@ -26,7 +26,7 @@ Aspera owns experimental work outside the Harness source tree. Published DSH sup
 | `@aspera/console` | Sidebar page, forms, record stream and per-source log cursors | Published Web slots, locale dictionaries and Remote descriptors |
 | `@aspera/desktop` | Independent window, tray and local profile lifecycle | Electron and a published `dsh` profile |
 
-The adapter retains two version-checked published-package patches: an additive sidebar group slot and forwarding of the existing settings command. The official shell, conversations and plugin manager stay in DSH. Private provider snapshots feed [phase contexts](../packages/runtime/README.md#understand-the-implementation) that bind the standard DSH Agent driver to its provider for preparation, planning and execution; public records expose only their model summaries.
+The adapter owns version-checked patches of published packages for sidebar groups, settings commands and a read-only trajectory factory with attachment rendering. The factory uses DSH's conversation assembler, timeline, ledger and inspector with an experiment-owned event feed; it creates no editable Session and imports no upstream source paths. The official shell, ordinary conversations and plugin manager stay in DSH. Private provider snapshots feed [phase contexts](../packages/runtime/README.md#understand-the-implementation); public records expose only model summaries.
 
 Host programs compile against installed package declarations. The Typert shim in [types/typert-protocol.d.ts](../types/typert-protocol.d.ts) belongs only to the generator program and exposes the registration metadata its analysis needs. Browser wrapping in [tsdown.config.ts](../packages/console/tsdown.config.ts) contains Cordis-compatible CommonJS module loading and CSS insertion; the compiled public client declarations remain separate from the JavaScript bundle.
 
@@ -44,6 +44,9 @@ flowchart TB
     Browser[Web browser] --> Page
     Page --> Remote[Typed Remote: RPC + streams]
     Remote --> Fleet[Aspera dispatch: fleet / credentials / Sessions]
+    Page --> Trace[Official read-only DSH trajectory]
+    Trace --> Remote
+    Remote --> Observations[Versioned observations: events / sources / logs / metrics]
     Fleet --> Management[Peer servers / dated checks / deletion journal]
     Management --> Cleanup[Owned paths only / cleanup receipts / tombstones]
     Fleet --> Models[Private snapshots: preparation / planning / execution]
@@ -76,8 +79,10 @@ flowchart TB
     External[Platform HTTPS URL] --> Gateway[Authenticated inference gateway]
     Gateway --> Service
   end
-  Executor -- SSH tunnel + private HTTP --> NodeA
+  Executor -- Authenticated loopback for coordinator node --> NodeA
   Executor -- SSH tunnel + private HTTP --> NodeB
+  RunA --> Observations
+  RunB --> Observations
   Frameworks -- metrics / artifacts --> Queue
   Service -- health / resource occupancy --> Queue
 ```

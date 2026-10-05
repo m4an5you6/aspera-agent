@@ -14,6 +14,9 @@ import type { ExperimentModels, ExperimentModelDirectory, AgentRecordRequest, Ag
 import { readPreferences, savePreferences } from './preferences.ts'
 import type { AsperaPreferences } from './preferences.ts'
 import { experimentTodos } from './attention.ts'
+import { errorIdentity } from './error-identity.ts'
+import type { ObservationSource, ObservationRead, ObservationPage, MetricRead, MetricSample } from '@aspera/experiments/types'
+type FailureScope = { experimentId?: string; phase?: 'preparation' | 'planning' | 'execution'; serverId?: string; operation?: string }
 
 function unwrap<T>(result: RemoteResult<T>): T {
   if (!result.ok) throw new Error(result.error.message)
@@ -51,6 +54,8 @@ export interface ExperimentsSnapshot {
   deletions: ExperimentDeletion[]
   toast: { key: ManagementMessage; sequence: number; failed: boolean } | null
   error: string | null
+  sourceErrors: Record<string, string>
+  errorNotice: { message: string; identity: string; sequence: number } | null
 }
 
 /** The page's RPC lifecycle and cursor ownership. */
@@ -58,7 +63,11 @@ export class ExperimentsController {
   /** Observable page data; execution ownership remains on the Host. */
   readonly store = createSnapshotStore<ExperimentsSnapshot>({ view: 'list', preferences: readPreferences(), modelDirectory: null, modelsLoading: false, modelsError: null, settingsOpen: false,
     registry: { servers: [] }, experiments: [], selectedId: null,
-    probes: {}, probeErrors: {}, streams: {}, files: [], filesTruncated: false, retrying: [], probing: [], removingServers: [], deletedIds: [], deletions: [], toast: null, error: null })
+    probes: {}, probeErrors: {}, streams: {}, files: [], filesTruncated: false, retrying: [], probing: [], removingServers: [], deletedIds: [], deletions: [], toast: null, error: null, sourceErrors: {}, errorNotice: null })
+  private readonly announcedErrors = new Set<string>()
+  private readonly errorQueue: NonNullable<ExperimentsSnapshot['errorNotice']>[] = []
+  private errorSequence = 0
+  private detailView = 'overview'
   private readonly deleted = new Set<string>()
   private readonly removedServers = new Set<string>()
   private readonly preparationRetries = new Map<string, Promise<void>>()
@@ -71,7 +80,11 @@ export class ExperimentsController {
   private visible = false
   private registryRevision = 0
 
-  constructor(private readonly remote: Context['remote']['aspera'], private readonly config: Config) {}
+  private readonly config: Required<Config>
+  constructor(private readonly remote: Context['remote']['aspera'], config: Config) {
+    this.config = { ...config, metricWindowMs: config.metricWindowMs ?? 900000, observationReadBytes: config.observationReadBytes ?? 65536,
+      traceRetainedChars: config.traceRetainedChars ?? 2000000, metricSampleLimit: config.metricSampleLimit ?? 1000 }
+  }
 
   /** @param view - Aspera sidebar destination. */
   navigate(view: ExperimentsSnapshot['view']): void { this.patch({ view, selectedId: null }); void this.refresh() }
@@ -97,13 +110,36 @@ export class ExperimentsController {
     finally { this.patch({ modelsLoading: false }) }
   }
   /** @param request - phase and cursor. @returns a bounded record page. */
-  records(request: AgentRecordRequest): Promise<AgentRecordPage> { return this.remote.experimentRecords(request).then(unwrap) }
+  records(request: AgentRecordRequest): Promise<AgentRecordPage> { return this.remote.experimentTrace(request).then(unwrap) }
+  /** @param id - experiment. @param phase - saved Session role. @param seq - owning event. @param attachmentId - recorded image or file. @returns a browser-owned blob URL. */
+  async traceImage(id: string, phase: 'preparation' | 'planning' | 'execution', seq: number, attachmentId: string): Promise<string> {
+    const parts: BlobPart[] = []; let offset = 0; let mediaType = ''
+    for (;;) {
+      const part = unwrap(await this.remote.experimentTraceAttachment(id, phase, seq, attachmentId, offset))
+      const bytes = Uint8Array.from(atob(part.data), char => char.charCodeAt(0))
+      if (part.nextOffset !== offset + bytes.length) throw new Error('Attachment did not advance')
+      parts.push(bytes); offset = part.nextOffset; mediaType = part.mediaType
+      if (offset === part.size) break
+      if (bytes.length === 0 || offset > part.size) throw new Error('Attachment is incomplete')
+    }
+    return URL.createObjectURL(new Blob(parts, { type: mediaType }))
+  }
+  /** @param view - mounted detail region; expensive reads belong to their consuming view. */
+  setDetailView(view: string): void { this.detailView = view; this.tick() }
+  /** @param id - experiment. @param serverId - pinned node. @returns real registered log sources. */
+  logSources(id: string, serverId: string): Promise<{ sources: ObservationSource[]; legacy: boolean }> { return this.remote.experimentLogSources(id, serverId).then(unwrap) }
+  /** @param request - selected source and cursor. @returns bounded output records. */
+  logRead(request: ObservationRead): Promise<ObservationPage> { return this.remote.experimentLog(request).then(unwrap) }
+  /** @param request - metric history range. @returns actually recorded samples. */
+  metrics(request: MetricRead): Promise<MetricSample[]> { return this.remote.experimentMetrics(request).then(unwrap) }
+  /** @param request - complete source download. @returns one-use address. */
+  logDownload(request: ObservationRead): Promise<string> { return this.remote.downloadExperimentLog(request).then(unwrap) }
   /** @param id - experiment. @param serverId - node. @returns real managed processes. */
   processes(id: string, serverId: string): Promise<ExperimentProcess[]> { return this.remote.experimentProcesses(id, serverId).then(unwrap) }
   /** @param request - process and output stream. @returns resumable bytes. */
   processLog(request: ProcessLogRequest): Promise<ProcessLogPage> { return this.remote.experimentProcessLog(request).then(unwrap) }
   /** @returns polling and memory limits shared by record and log views. */
-  displayLimits(): Config { return this.config }
+  displayLimits(): Required<Config> { return this.config }
 
   /** @returns profile-configured initial node control port; the coordinator uses the following port. */
   initialControlPort(): number { return this.config.defaultControlPort }
@@ -135,7 +171,30 @@ export class ExperimentsController {
    * Show an operation failure without discarding existing records.
    * @param error - operation failure shown without dropping saved rows.
    */
-  report(error: unknown): void { this.patch({ error: error instanceof Error ? error.message : String(error) }) }
+  report(error: unknown, scope: FailureScope = {}): void {
+    const message = error instanceof Error ? error.message : String(error)
+    const selectedId = this.store.getSnapshot().selectedId
+    const owner = { ...(selectedId === null ? {} : { experimentId: selectedId }), ...scope, operation: scope.operation ?? 'operation' }
+    const key = JSON.stringify(owner)
+    this.patch({ error: message, sourceErrors: { ...this.store.getSnapshot().sourceErrors, [key]: message } })
+    const identity = errorIdentity(message); const fingerprint = JSON.stringify([owner, identity])
+    if (this.announcedErrors.has(fingerprint)) return
+    this.announcedErrors.add(fingerprint)
+    const display = () => {
+      const notice = { message, identity, sequence: ++this.errorSequence }
+      if (this.store.getSnapshot().errorNotice === null) this.patch({ errorNotice: notice })
+      else this.errorQueue.push(notice)
+    }
+    void Promise.resolve().then(() => this.remote.claimErrorNotice({ ...owner, identity })).then(unwrap).then(first => { if (first) display() }).catch(display)
+  }
+  /** Dismiss transient feedback without clearing the failed operation or experiment state. */
+  dismissErrorNotice(): void { this.patch({ errorNotice: this.errorQueue.shift() ?? null }) }
+  /** @param scope - independently recovered read source. */
+  sourceRecovered(scope: FailureScope): void {
+    const key = JSON.stringify({ ...scope, operation: scope.operation ?? 'operation' })
+    const sourceErrors = { ...this.store.getSnapshot().sourceErrors }; delete sourceErrors[key]
+    this.patch({ sourceErrors })
+  }
 
   /**
    * Enable polling while the experiment page is mounted.
@@ -161,22 +220,21 @@ export class ExperimentsController {
     const { registry, experiments } = snapshot
     if (this.isDisposed()) return
     this.receive({ ...snapshot, registry: registryRevision === this.registryRevision ? registry : this.store.getSnapshot().registry })
-    this.patch({ error: null })
     const selected = this.store.getSnapshot().selectedId
     const terminal = new Set(['completed', 'failed', 'blocked', 'cancelled', 'interrupted'])
     const pending = experiments.filter(row => row.submission !== undefined && (row.request.experimentId === selected
       || row.latest === undefined || !row.latest.resourcesReleased || !terminal.has(row.latest.state)))
     const refreshed = await Promise.allSettled(pending.map(row => this.remote.refreshExperiment(row.request.experimentId).then(unwrap)))
-    for (const result of refreshed) {
-      if (result.status === 'fulfilled') this.replace(result.value)
-      else this.report(result.reason)
+    for (const [index, result] of refreshed.entries()) {
+      const scope = { experimentId: pending[index]!.request.experimentId, operation: 'status' }
+      if (result.status === 'fulfilled') { this.replace(result.value); this.sourceRecovered(scope) }
+      else this.report(result.reason, scope)
     }
     if (this.isDisposed()) return
     const detail = this.store.getSnapshot().experiments.find(row => row.request.experimentId === selected)
     if (!this.visible || detail?.receipt === undefined) return
-    await this.readStream(detail, 'events')
-    await this.readStream(detail, 'agent-log')
-    for (const server of detail.servers) await this.readStream(detail, 'log', server)
+    if (this.detailView === 'overview' && detail.latest?.questions?.some(question => question.state === 'open')) await this.readStream(detail, 'events')
+    if (this.detailView !== 'files') return
     const files = await Promise.all(detail.servers.map(server => this.remote.experimentFiles(detail.request.experimentId,
       server.id).then(unwrap)))
     if (this.store.getSnapshot().selectedId === selected) this.patch({ files: files.flatMap(row => row.files),

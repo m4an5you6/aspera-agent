@@ -158,3 +158,4 @@ export interface PinnedDeployment {
   minimumFreeBytes?: number
   inferenceMapping?: InferenceMapping
 }
+export type { ErrorNoticeScope } from './error-notices.ts'

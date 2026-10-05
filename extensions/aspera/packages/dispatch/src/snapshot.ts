@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { create } from 'tar'
 import { run } from './transport.ts'
+import { assertPublishedUiCompatibility } from './published-ui.ts'
 
 /** Private deployment archive; disposing it never changes installed releases. */
 export interface SourceSnapshot {
@@ -20,6 +21,7 @@ export interface SourceSnapshot {
  * @returns complete immutable release; caller disposes the temporary directory.
  */
 export async function snapshotSource(root: string, timeoutMs: number, signal?: AbortSignal): Promise<SourceSnapshot> {
+  assertPublishedUiCompatibility(root)
   const directory = mkdtempSync(join(tmpdir(), 'aspera-release-'))
   const source = join(directory, 'release'); const archive = join(directory, 'release.tar')
   mkdirSync(source)

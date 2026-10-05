@@ -127,7 +127,7 @@ it('retains the failed or paused phase from execution evidence and treats local 
   row.latest = undefined; row.receipt = undefined; row.state = 'failed'
   expect(experimentProgress(row)).toMatchObject({ phase: 0, busy: false, local: true })
 })
-it('continues UTF-8 byte cursors independently for each experiment and node', async () => {
+it('leaves log polling to the mounted monitor instead of reading unused sources', async () => {
   const { controller, remote } = fixture()
   remote.readExperiment.mockImplementation(async (id, kind, offset) => {
     const bytes = new TextEncoder().encode(id === 'first' ? '训练' : '另一个')
@@ -138,15 +138,13 @@ it('continues UTF-8 byte cursors independently for each experiment and node', as
   try {
     controller.setVisible(true)
     controller.select('first'); await controller.refresh(); await controller.refresh(); await controller.refresh()
-    expect(controller.store.getSnapshot().streams['first/node']!.text).toBe('训练')
+    expect(controller.store.getSnapshot().streams).toEqual({})
     controller.select('second'); await controller.refresh()
-    expect(controller.store.getSnapshot().streams['second/node']!.offset).toBe(2)
-    expect(controller.store.getSnapshot().streams['first/node']!.text).toBe('训练')
-    expect(remote.readExperiment.mock.calls.filter(([id, kind]) => id === 'first' && kind === 'log').map(([, ,
-      offset]) => offset)).toEqual([0, 2, 4])
+    expect(controller.store.getSnapshot().streams).toEqual({})
+    expect(remote.readExperiment).not.toHaveBeenCalled()
   } finally { controller.dispose() }
 })
-it('retains rows when a request fails and shows a rotation warning after recovery', async () => {
+it('retains rows and remote errors when a local snapshot succeeds', async () => {
   const { controller, remote } = fixture()
   try {
     controller.setVisible(true)
@@ -157,7 +155,8 @@ it('retains rows when a request fails and shows a rotation warning after recover
     remote.readExperiment.mockResolvedValue({ ok: true, value: { data: btoa('restarted'), offset: 0, nextOffset: 9,
       generation: 'two', eof: true, reset: true } })
     await controller.refresh()
-    expect(controller.store.getSnapshot().streams['first/node']).toMatchObject({ text: 'restarted', reset: true, offset: 9 })
+    expect(controller.store.getSnapshot().error).toBe('connection lost')
+    expect(controller.store.getSnapshot().experiments).toHaveLength(2)
   } finally { controller.dispose() }
 })
 it('does not erase a newly submitted Goal when an older list reply arrives', async () => {
@@ -203,6 +202,24 @@ it('refreshes pending receipts off-page without reading logs or artifacts', asyn
   } finally { controller.dispose() }
 })
 
+
+it('queues distinct errors while repeated reports preserve source health without another toast', async () => {
+  const { controller } = fixture()
+  try {
+    const scope = { operation: 'logs' }
+    controller.report(new Error('The operation was aborted due to timeout'), scope)
+    await vi.waitFor(() => { expect(controller.store.getSnapshot().errorNotice?.identity).toBe('timeout') })
+    controller.report(new Error('ECONNREFUSED'), scope)
+    controller.report(new Error('The operation was aborted due to timeout'), scope)
+    await vi.waitFor(() => { expect(controller.store.getSnapshot().error).toContain('timeout') })
+    await new Promise<void>(resolve => { queueMicrotask(resolve) })
+    controller.dismissErrorNotice()
+    await vi.waitFor(() => { expect(controller.store.getSnapshot().errorNotice?.identity).toBe('ECONNREFUSED') })
+    controller.dismissErrorNotice()
+    expect(controller.store.getSnapshot().errorNotice).toBeNull()
+    expect(Object.values(controller.store.getSnapshot().sourceErrors)).toHaveLength(1)
+  } finally { controller.dispose() }
+})
 
 it('persists dismissed revision reminders and group folding without resolving pending work', async () => {
   const values = new Map<string, string>()

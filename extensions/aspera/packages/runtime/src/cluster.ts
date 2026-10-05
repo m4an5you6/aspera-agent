@@ -1,6 +1,6 @@
 import type {} from '@deepseek-ai/cordis-plugin-loader'
 /** Authenticated coordinator and node roles of the experiment-worker profile. */
-import { randomUUID, timingSafeEqual } from 'node:crypto'
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { isAbsolute, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -16,7 +16,11 @@ import { clusterNodeRequest, readClusterPrivate, RemoteClusterExecutor, validate
 import { serverRunRoot } from './storage.ts'
 import type { ClusterRuntimeConfig } from './cluster-runtime.ts'
 import { readPhaseRecords } from './records.ts'
-import { agentRecordRequestSchema } from '@aspera/experiments'
+import { agentRecordRequestSchema, traceEventReadSchema } from '@aspera/experiments'
+import { observationReadSchema, observationSourceSchema, metricReadSchema, metricSampleSchema } from '@aspera/experiments'
+import { observationSources, readObservation } from './observations.ts'
+import { readMetricSamples } from './metrics.ts'
+import { readTraceAttachment } from './trace-attachments.ts'
 
 const storeSpec = defineDomain({ name: 'aspera_queue', version: 4, compatibleVersions: [1, 2, 3], layout: 'per-record',
   tables: { experiments: domainTable<ExperimentId, ClusterRecord>(clusterRecordSchema) } })
@@ -154,13 +158,58 @@ export async function applyClusterRole(ctx: Context, config: ClusterRoleConfig):
       }
       if (path === '/aspera/v1/status') { respond(200, { record, waitingFor: queue.waitingFor(input.experimentId) }); return }
       const operation = path.slice('/aspera/v1/'.length)
-      if (operation === 'records') {
+      if (operation === 'observation-capabilities') { respond(200, { version: 1, completeEvents: true, logs: true, metrics: true }); return }
+      if (operation === 'observation-sources') {
+        const target = z.object({ serverId: serverIdSchema }).parse(body)
+        const runtime = readClusterPrivate(config.root, input.experimentId)
+        if (!runtime.submission.nodes.some(node => node.server.id === target.serverId)) throw new Error('Observation node is outside the experiment')
+        const local = target.serverId === runtime.submission.coordinator.id ? observationSources(serverRunRoot(runtime.submission.coordinator, input.experimentId)).filter(source => source.kind === 'agent') : []
+        const remote = z.array(observationSourceSchema).parse(await clusterNodeRequest(runtime, target.serverId, operation, input))
+        respond(200, [...new Map([...local, ...remote].map(source => [source.id, source])).values()]); return
+      }
+      if (operation === 'observation-read') {
+        const query = observationReadSchema.parse(body)
+        const runtime = readClusterPrivate(config.root, input.experimentId)
+        if (query.sourceId.startsWith('agent-') && query.serverId === runtime.submission.coordinator.id) {
+          respond(200, readObservation(serverRunRoot(runtime.submission.coordinator, input.experimentId), query)); return
+        }
+        respond(200, await clusterNodeRequest(runtime, query.serverId, operation, input)); return
+      }
+      if (operation === 'observation-metrics') {
+        const query = metricReadSchema.parse(body)
+        const runtime = readClusterPrivate(config.root, input.experimentId)
+        const samples = z.array(metricSampleSchema).parse(await clusterNodeRequest(runtime, query.serverId, operation, input))
+        const training = query.serverId === runtime.submission.coordinator.id ? readMetricSamples(serverRunRoot(runtime.submission.coordinator, input.experimentId), query, 'training') : []
+        respond(200, [...samples, ...training].sort((a, b) => a.time - b.time)); return
+      }
+      if (operation === 'trace-event' || operation === 'trace-attachment') {
+        const attachment = operation === 'trace-attachment' ? z.object({ attachmentId: z.string(), offset: z.number().int().nonnegative() }).parse(body) : undefined
+        const query = traceEventReadSchema.parse(operation === 'trace-attachment' ? Object.fromEntries(Object.entries(input).filter(([key]) => key !== 'attachmentId')) : body)
+        const sessionId = query.phase === 'planning' ? record.planningSessionId : record.sessionId
+        const sourceId = sessionId ?? `aspera-${query.phase === 'planning' ? 'plan' : 'execution'}-${input.experimentId}`
+        if (query.phase === 'preparation' || query.sessionId !== sourceId) throw new Error('Event belongs to another phase or Session')
+        const page = await readPhaseRecords(resolve(serverRunRoot(record.submission.coordinator, input.experimentId), 'events.jsonl'),
+          { experimentId: query.experimentId, phase: query.phase, beforeSeq: query.seq + 1, limit: 1 }, sourceId, config.chunkBytes, true)
+        const event = page.records.find(event => event.seq === query.seq)
+        if (event === undefined) throw new Error('The recorded event is unavailable')
+        if (query.generation !== undefined && query.generation !== page.cursor?.generation) throw new Error('The phase log changed during reading')
+        if (attachment !== undefined) {
+          respond(200, await readTraceAttachment(resolve(serverRunRoot(record.submission.coordinator, input.experimentId), 'agent-homes', query.phase === 'planning' ? 'plan' : 'execution'),
+            JSON.parse(event.data), attachment.attachmentId, attachment.offset, config.chunkBytes)); return
+        }
+        const digest = createHash('sha256').update(event.data).digest('hex')
+        if (query.digest !== undefined && query.digest !== digest) throw new Error('The recorded event changed during reading')
+        if (query.offset > event.data.length) throw new Error('Event offset exceeds its payload')
+        const data = event.data.slice(query.offset, query.offset + config.chunkBytes)
+        respond(200, { data, nextOffset: query.offset + data.length, length: event.data.length, digest }); return
+      }
+      if (operation === 'records' || operation === 'trace-records') {
         const request = agentRecordRequestSchema.parse(body)
         if (request.phase === 'preparation') throw new Error('Preparation records belong to the dispatch Host')
         const sessionId = request.phase === 'planning' ? record.planningSessionId : record.sessionId
         const sourceId = sessionId ?? (record.submission.protocol === 4 ? `aspera-${request.phase === 'planning' ? 'plan' : 'execution'}-${input.experimentId}` : undefined)
         respond(200, sourceId === undefined ? { records: [], hasMore: false, missing: true, reset: false }
-          : await readPhaseRecords(resolve(serverRunRoot(record.submission.coordinator, input.experimentId), 'events.jsonl'), request, sourceId, config.chunkBytes))
+          : await readPhaseRecords(resolve(serverRunRoot(record.submission.coordinator, input.experimentId), 'events.jsonl'), request, sourceId, config.chunkBytes, operation === 'trace-records', config.chunkBytes))
         return
       }
       if (operation === 'events' || operation === 'agent-log') {

@@ -15,6 +15,8 @@ import type { ClusterCommandResult, ClusterRecord, ClusterSubmission, Experiment
 import type { ClusterExecutor, ClusterOutcome } from '@aspera/experiments'
 import { request } from './transport.ts'
 import { readClusterChunk } from '@aspera/experiments'
+import { observationSourceIdSchema } from '@aspera/experiments'
+import { ObservationWriter } from './observations.ts'
 
 /** Complete model selection captured before dispatch, including provider-owned reasoning effort. */
 export const clusterAgentModelSchema = z.object({ provider: z.string(), model: z.string(),
@@ -43,6 +45,7 @@ export interface ClusterRuntimeConfig {
   documentationHosts: string[]
   documentationBytes: number
   goalContinuationWindow: number
+  observations?: import('@aspera/experiments').ObservationPolicy
 }
 
 /**
@@ -78,15 +81,30 @@ export async function clusterNodeRequest(runtime: ClusterPrivate, serverId: Expe
   const node = runtime.submission.nodes.find(node => node.server.id === serverId)
   const connection = runtime.connections.find(connection => connection.serverId === serverId)
   if (node === undefined || connection === undefined) throw new Error('server is outside this experiment allocation')
-  const result = await request({ ...node.server, knownHostsFile: connection.knownHostsFile,
+  const path = `/aspera/v${runtime.submission.protocol}/node/${operation}`
+  const payload = { ...body, experimentId: runtime.submission.experimentId }
+  const result = serverId === runtime.submission.coordinator.id
+    ? await loopbackNodeRequest(node.server.remotePort, connection.token, path, payload, runtime.toolTimeoutMs, signal)
+    : await request({ ...node.server, knownHostsFile: connection.knownHostsFile,
     ...(connection.identityFile === undefined ? {} : { identityFile: connection.identityFile }),
-    toolTimeoutMs: runtime.toolTimeoutMs }, connection.token, `/aspera/v${runtime.submission.protocol}/node/${operation}`, 'POST',
-  { ...body, experimentId: runtime.submission.experimentId }, signal, connection.password)
+    toolTimeoutMs: runtime.toolTimeoutMs }, connection.token, path, 'POST', payload, signal, connection.password)
   if (result.status !== 200) {
     const error = z.object({ error: z.string() }).safeParse(result.value)
     throw new Error(error.success ? error.data.error : `node ${node.server.name} returned HTTP ${result.status}`)
   }
   return result.value
+}
+
+/** The coordinator's own node uses its pinned control port and node credential. */
+async function loopbackNodeRequest(port: number, token: string, path: string, body: object, timeoutMs: number,
+  signal?: AbortSignal): Promise<{ status: number; value: unknown }> {
+  const deadline = AbortSignal.timeout(timeoutMs)
+  const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+    method: 'POST', redirect: 'error', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    body: JSON.stringify(body), signal: signal === undefined ? deadline : AbortSignal.any([signal, deadline]),
+  })
+  const value: unknown = await response.json()
+  return { status: response.status, value }
 }
 
 /**
@@ -280,6 +298,12 @@ export class RemoteClusterExecutor implements ClusterExecutor {
     // Profiles are installed before launching; no mutable checkout or CLI argv escape is used.
     await setupWorkerProfile(home, release)
     if (!planning) writeClusterReceipt(this.config.root, submission.experimentId, { cleanupConfirmed: false }, 'execution.json')
+    const credentials = z.object({ refs: z.record(z.string(), z.string()) }).parse(JSON.parse(readFileSync(runtime.modelCredentialFile, 'utf8')))
+    const logObservation = new ObservationWriter(runRoot, { version: 1, experimentId: submission.experimentId, serverId: submission.coordinator.id,
+      id: observationSourceIdSchema.parse(planning ? 'agent-planning' : 'agent-execution'), kind: 'agent', phase: planning ? 'planning' : 'execution',
+      sessionId: `aspera-${planning ? 'plan' : 'execution'}-${submission.experimentId}`, label: planning ? 'planning' : 'execution',
+      createdAt: Date.now(), streams: ['stdout', 'stderr'], complete: false }, [...Object.values(credentials.refs),
+        ...runtime.connections.flatMap(connection => [connection.token, ...(connection.password === undefined ? [] : [connection.password])])])
     const child = this.ctx.subprocess.spawn({ argv: [process.execPath, resolve(release, 'node_modules/@deepseek-ai/dsh/lib/bin.js'), '--profile', 'aspera-worker'],
       cwd: workspace, graceMs: this.config.cleanupTimeoutMs, signal,
       env: { DSH_HOME: home, DSH_EXPERIMENT_ROLE: planning ? 'planner' : 'agent', DSH_CLUSTER_ROOT: this.config.root,
@@ -292,8 +316,10 @@ export class RemoteClusterExecutor implements ClusterExecutor {
         DSH_EXPERIMENT_MODEL_CREDENTIAL_FILE: runtime.modelCredentialFile, DSH_EXPERIMENT_DEPLOYMENT_ID: submission.deploymentId,
         DSH_EXPERIMENT_PORT: '0', DSH_EXPERIMENT_DEVICES: '', DSH_TELEMETRY_DISABLED: '1' },
       stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' } })
-    const append = (chunk: Buffer) => { try { appendFileSync(resolve(runRoot, 'agent.log'), chunk, { mode: 0o600 }) } catch (error) { this.ctx.logger.error(String(error)); child.terminate() } }
-    child.stdout?.on('data', append); child.stderr?.on('data', append)
+    const append = (chunk: Buffer, stream: 'stdout' | 'stderr') => { try {
+      appendFileSync(resolve(runRoot, 'agent.log'), chunk, { mode: 0o600 }); logObservation.append(stream, chunk)
+    } catch (error) { this.ctx.logger.error(String(error)); child.terminate() } }
+    child.stdout?.on('data', (chunk: Buffer) => { append(chunk, 'stdout') }); child.stderr?.on('data', (chunk: Buffer) => { append(chunk, 'stderr') })
     let reported = false
     let observation: Promise<void> = Promise.resolve()
     const observe = async () => {
@@ -314,7 +340,9 @@ export class RemoteClusterExecutor implements ClusterExecutor {
       if (!await child.waitForExit(AbortSignal.timeout(this.config.cleanupTimeoutMs))) throw new Error('Agent process cleanup is unconfirmed')
     } finally {
       clearInterval(timer); child.terminate(); await child.done.catch((error: unknown) => { this.ctx.logger.debug(String(error)) }); await observation
-      if (!planning && await child.waitForExit(AbortSignal.timeout(this.config.cleanupTimeoutMs))) writeClusterReceipt(this.config.root, submission.experimentId, { cleanupConfirmed: true }, 'execution.json')
+      const exited = await child.waitForExit(AbortSignal.timeout(this.config.cleanupTimeoutMs))
+      logObservation.close(exited)
+      if (!planning && exited) writeClusterReceipt(this.config.root, submission.experimentId, { cleanupConfirmed: true }, 'execution.json')
     }
     signal.throwIfAborted()
   }

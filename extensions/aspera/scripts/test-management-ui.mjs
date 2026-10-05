@@ -39,6 +39,16 @@ export async function checkServerManagement(page, control, output) {
   await control('restore-connection')
   await card().getByRole('button', { name: /^(检查连接|Check connection)$/ }).click()
   await expect(card().getByText(/^(检查通过|Check passed)$/)).toBeVisible()
+  await control('timeout-connection')
+  await card().getByRole('button', { name: /^(检查连接|Check connection)$/ }).click()
+  await expect(card().getByRole('button', { name: /^(检查中…|Checking…)$/ })).toBeDisabled()
+  await expect(card().getByText(/^(检查失败|Check failed)$/)).toBeVisible()
+  await card().locator('summary').filter({ hasText: /技术详情|Technical details/ }).click()
+  await expect(card().getByText(/Connection check timed out after 1 second/)).toBeVisible()
+  await expect(card().getByRole('button', { name: /^(检查连接|Check connection)$/ })).toBeEnabled()
+  await control('restore-connection')
+  await card().getByRole('button', { name: /^(检查连接|Check connection)$/ }).click()
+  await expect(card().getByText(/^(检查通过|Check passed)$/)).toBeVisible()
   await page.getByRole('button', { name: /^(新建实验|New experiment)$/ }).click()
   await page.getByRole('checkbox', { name: 'CPU A', exact: true }).check()
   const coordinator = page.getByRole('button', { name: /^(本次实验调度主机|Experiment coordinator)$/ })
@@ -52,7 +62,7 @@ export async function checkServerManagement(page, control, output) {
   await expect(coordinator).toContainText('CPU A')
   await page.getByRole('checkbox', { name: 'CPU A', exact: true }).uncheck()
   await expect(page.getByRole('button', { name: /^(提交实验|Submit experiment)$/ })).toBeDisabled()
-  return { passwordRevealAndCancel: true, failedCheckRetainsDatedHardware: true, coordinatorSelection: true }
+  return { passwordRevealAndCancel: true, failedCheckRetainsDatedHardware: true, connectionDeadlineStopsSpinnerAndPermitsRetry: true, coordinatorSelection: true }
 }
 
 /** Verify layout, remote-cleanup failures, record-only recovery and late snapshot exclusion. */

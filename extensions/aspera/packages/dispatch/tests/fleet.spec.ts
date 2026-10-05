@@ -7,6 +7,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+import { z } from 'zod'
 import { CLUSTER_HANDOVER, clusterRecordSchema, clusterServerSchema, inspectServerStorage, prepareServerStorage, cleanupServerStorage } from '@aspera/runtime'
 import type { ClusterSubmission } from '@aspera/runtime'
 import { ExperimentFleet } from '../src/fleet.ts'
@@ -115,7 +116,7 @@ async function fixture() {
     dataRoots: [], preparationOutputChars: 65536, tokenRef: 'TOKEN', agentCredentialRefs: [], controlPollIntervalMs: 1000,
     toolTimeoutMs: 30000, minimumFreeBytes: 1024 })
   const open = async () => { const fleet = await ExperimentFleet.open(ctx,
-    deployment); fleets.push(fleet); return fleet }
+    deployment, 20000); fleets.push(fleet); return fleet }
   const fleet = await open()
   const a = clusterServerSchema.parse({ id: randomUUID(), name: 'Coordinator', host: 'gpu-a', username: 'trainer',
     sshPort: 22, remotePort: 43019, remoteRoot: '/runs', authMode: 'password' })
@@ -509,6 +510,54 @@ it('marks a persisted connection check as interrupted after restart', async () =
   expect(reopened.servers().checks?.[f.a.id]).toMatchObject({ status: 'interrupted', startedAt: 1 })
 })
 
+it.each(['host key', 'environment', 'observations'])('ends a stalled %s check at the shared 20-second deadline and permits retry', async stage => {
+  const f = await fixture()
+  vi.mocked(remote).mockResolvedValue('GPU 0: CPU fixture')
+  const passed = await f.fleet.probe(f.a.id)
+  const entered = Promise.withResolvers<void>()
+  const signals: AbortSignal[] = []
+  const waitForAbort = (signal: AbortSignal | undefined): Promise<never> => {
+    if (signal === undefined) throw new Error('Check did not pass its deadline')
+    signals.push(signal)
+    entered.resolve()
+    return new Promise((_resolve, reject) => {
+      signal.throwIfAborted()
+      signal.addEventListener('abort', () => { reject(signal.reason) }, { once: true })
+    })
+  }
+  vi.mocked(prepareSshHostKey).mockImplementationOnce(async (_target, signal) => {
+    if (stage === 'host key') return waitForAbort(signal)
+    await new Promise<void>(resolve => { setTimeout(resolve, 8000) })
+  })
+  if (stage === 'environment') vi.mocked(inspectEnvironment).mockImplementationOnce((_target, _password, signal) => waitForAbort(signal))
+  if (stage === 'observations') {
+    vi.mocked(inspectServerStorage).mockImplementationOnce((_target, _directory, _password, signal) => waitForAbort(signal))
+    vi.mocked(remote).mockImplementationOnce((_target, _command, signal) => waitForAbort(signal))
+    vi.mocked(request).mockImplementationOnce((_target, _token, _path, _method, _body, signal) => waitForAbort(signal))
+  }
+  vi.useFakeTimers()
+  try {
+    const pending = f.fleet.probe(f.a.id)
+    expect(f.fleet.probe(f.a.id)).toBe(pending)
+    await vi.advanceTimersByTimeAsync(stage === 'host key' ? 0 : 8000)
+    await entered.promise
+    await vi.advanceTimersByTimeAsync(stage === 'host key' ? 19999 : 11999)
+    expect(f.fleet.servers().checks?.[f.a.id]?.status).toBe('checking')
+    expect(signals.every(signal => !signal.aborted)).toBe(true)
+    await vi.advanceTimersByTimeAsync(1)
+    const failed = await pending
+    expect(failed).toMatchObject({ status: 'failed', error: 'Error: Connection check timed out after 20 seconds', lastSuccess: passed.lastSuccess })
+    expect(failed.result).toBeUndefined()
+    expect(signals).toHaveLength(stage === 'observations' ? 3 : 1)
+    expect(signals.every(signal => signal.aborted)).toBe(true)
+    expect(f.fleet.servers().checks?.[f.a.id]).toEqual(failed)
+    expect(await f.fleet.probe(f.a.id)).toMatchObject({ status: 'passed' })
+    expect(vi.getTimerCount()).toBe(0)
+    expect(vi.mocked(prepareSshHostKey).mock.lastCall?.[0].toolTimeoutMs).toBe(20000)
+    expect(f.fleet.list()).toEqual([])
+  } finally { await vi.runAllTimersAsync(); vi.useRealTimers() }
+})
+
 it('reveals a saved password explicitly while snapshots exclude credential values', async () => {
   const f = await fixture()
   expect(await f.fleet.revealPassword(f.a.id)).toBe('test-only-secret')
@@ -529,6 +578,31 @@ async function finished(f: Awaited<ReturnType<typeof fixture>>) {
   f.records.set(created.request.experimentId, completed)
   return completed
 }
+
+it('reads legacy UTF-8 history without overlap, removes saved secrets and rejects foreign cursors and metrics', async () => {
+  const f = await fixture(); const row = await finished(f)
+  const splitSecret = 'x'.repeat(1017) + 'test-only-secret\n'
+  const text = splitSecret + '准备🙂\n'.repeat(400) + 'Authorization: Bearer hidden-key\npassword=test-only-secret\n'
+  const bytes = Buffer.from(text)
+  vi.mocked(request).mockImplementation(async (_target, _token, route, _method, body) => {
+    if (route.endsWith('observation-metrics')) return { status: 200, value: [{ experimentId: randomUUID(), serverId: f.a.id, time: 1, gpus: [] }] }
+    const { offset } = z.object({ offset: z.number() }).parse(body)
+    const nextOffset = Math.min(bytes.length, offset + 4103)
+    return { status: 200, value: { generation: 'fixture', offset, nextOffset, data: bytes.subarray(offset, nextOffset).toString('base64'), reset: false, eof: nextOffset === bytes.length } }
+  })
+  const input = { experimentId: row.request.experimentId, serverId: f.a.id, sourceId: 'legacy-node', stream: 'all' as const, limit: 1024 }
+  let page = await f.fleet.logRead(input); let content = page.lines.map(line => line.text).join('')
+  while (page.hasMore) { page = await f.fleet.logRead({ ...input, cursor: page.cursor }); content += page.lines.map(line => line.text).join('') }
+  expect(content).toBe('x'.repeat(1017) + '*'.repeat(16) + '\n' + '准备🙂\n'.repeat(400) + 'Authorization: [redacted]\npassword=[redacted]\n')
+  let before = page.before; const history: string[] = []
+  while (before.offset > 0) {
+    const previous = await f.fleet.logRead({ ...input, before }); expect(previous.before.offset).toBeLessThan(before.offset)
+    history.unshift(...previous.lines.map(line => line.text)); before = previous.before
+  }
+  expect(history.join('') + page.lines.map(line => line.text).join('')).toBe(content)
+  await expect(f.fleet.logRead({ ...input, cursor: { ...page.cursor, experimentId: randomUUID() } })).rejects.toThrow('another source')
+  await expect(f.fleet.metrics({ experimentId: row.request.experimentId, serverId: f.a.id })).rejects.toThrow('another experiment')
+})
 
 it('reads a generation-5 request without rewriting its coordinator or remote receipt', async () => {
   const f = await fixture()

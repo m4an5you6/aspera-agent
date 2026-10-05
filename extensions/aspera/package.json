@@ -14,6 +14,8 @@
     "typecheck": "tsc -b tsconfig.host.json && tsc -p packages/console/tsconfig.client.json --noEmit && tsc -p tsconfig.tests.json",
     "test": "vitest run",
     "test:web": "node scripts/test-web.mjs",
+    "test:observations:web": "node scripts/test-observations-web.mjs",
+    "update:desktop:resources": "node scripts/update-desktop-resources.mjs",
     "test:installed": "node scripts/test-installed.mjs",
     "test:worker": "node scripts/test-worker.mjs",
     "test:control": "node scripts/test-control.mjs",

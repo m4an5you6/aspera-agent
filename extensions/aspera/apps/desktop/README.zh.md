@@ -41,7 +41,7 @@ pnpm run test:desktop
 pnpm run start:desktop
 ```
 
-输出为 `.artifacts/desktop-0.1.1/<build-id>/win-unpacked/Aspera.exe` 和 `aspera-desktop-build.json`，不生成 ZIP，`latest.json` 指向最近成功构建。记录包含 可执行文件及运行时的 SHA-256、构建标识、固定的 DSH／Aspera／Electron 版本、协议／存储代数和远端发布摘要。程序内含 `resources/build-info.json`。暂存目录使用 `.artifacts/desktop-build-*`，首次下载依赖需要网络。
+输出为 `.artifacts/desktop-0.1.1/<build-id>/win-unpacked/Aspera.exe` 和 `aspera-desktop-build.json`，不生成 ZIP，`latest.json` 指向最近成功构建。记录包含可执行文件及运行时的 SHA-256、构建标识、固定的 DSH／Aspera／Electron 版本、第 4 代控制协议、第 6 代本机管理存储、第 4 代远端存储和远端发布摘要。程序内含 `resources/build-info.json`。暂存目录使用 `.artifacts/desktop-build-*`，首次下载依赖需要网络。
 
 桌面验证默认使用最近的构建，也可通过 `ASPERA_DESKTOP_BUILD_ID` 指定构建目录。
 

@@ -68,24 +68,50 @@ export async function verifiedHostKeys(target: Target, signal: AbortSignal): Pro
 }
 
 async function scanKeys(target: Target, signal: AbortSignal, cancellation?: AbortSignal): Promise<string> {
-  const output = Promise.withResolvers<string>()
-  // OpenSSH uses whole seconds; the application deadline owns timeout classification and child shutdown.
-  const child = execFile('ssh-keyscan', ['-T', String(Math.floor(target.toolTimeoutMs / 1000) + 1),
-    '-p', String(target.sshPort), '-t', 'ed25519,ecdsa,rsa', target.host], { windowsHide: true, signal, maxBuffer: 1_000_000, encoding: 'utf8' },
-  (error, stdout, stderr) => {
-    if (error === null) { output.resolve(stdout); return }
-    const timedOut = signal.aborted && cancellation?.aborted !== true
-    const cancelled = cancellation?.aborted === true
-    const status = timedOut ? 'timed out' : cancelled ? 'was cancelled' : 'failed'
-    output.reject(new SshConnectionError({ stdout,
-      stderr: `SSH host-key discovery ${status} for ${hostName(target)}: ${stderr || error.message}`,
-      exitCode: typeof error.code === 'number' ? error.code : null, signal: error.signal ?? null,
-      timedOut, cancelled, exitConfirmed: false }))
+  const client = new ssh2.Client()
+  const closed = new Promise<void>(resolve => client.once('close', () => { resolve() }))
+  let started = false
+  let discovered = false
+  let abort = () => {}
+  const output = new Promise<string>((resolve, reject) => {
+    const fail = (message: string) => {
+      const timedOut = signal.aborted && cancellation?.aborted !== true
+      const cancelled = cancellation?.aborted === true
+      const status = timedOut ? 'timed out' : cancelled ? 'was cancelled' : 'failed'
+      reject(new SshConnectionError({ stdout: '',
+        stderr: `SSH host-key discovery ${status} for ${hostName(target)}: ${message}`,
+        exitCode: null, signal: null, timedOut, cancelled, exitConfirmed: false }))
+    }
+    abort = () => { fail(String(signal.reason)); client.destroy() }
+    client.on('error', error => { if (!discovered) fail(error.message) })
+    client.once('close', () => { if (!discovered) fail('SSH connection closed before a public key was received') })
+    signal.addEventListener('abort', abort, { once: true })
+    try {
+      signal.throwIfAborted()
+      client.connect({ host: target.host, port: target.sshPort,
+        username: target.username ?? 'aspera-host-key-discovery',
+        authHandler: [], tryKeyboard: false, readyTimeout: target.toolTimeoutMs,
+        hostVerifier: (key: Buffer) => {
+          if (signal.aborted) return false
+          if (key.length < 4) { fail('SSH returned an invalid public host key'); return false }
+          const typeLength = key.readUInt32BE(0)
+          if (typeLength === 0 || typeLength > key.length - 4) { fail('SSH returned an invalid public host key'); return false }
+          const type = key.subarray(4, typeLength + 4).toString('ascii')
+          discovered = true
+          resolve(`${hostName(target)} ${type} ${key.toString('base64')}\n`)
+          // Returning false stops the handshake before any authentication request.
+          return false
+        },
+      })
+      started = true
+    } catch (error) { reject(error) }
   })
-  const closed = new Promise<void>(resolve => child.once('close', () => { resolve() }))
-  child.stdin?.end()
-  try { return await output.promise }
-  finally { await closed }
+  try { return await output }
+  finally {
+    signal.removeEventListener('abort', abort)
+    client.destroy()
+    if (started) await closed
+  }
 }
 
 /**

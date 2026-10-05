@@ -31,6 +31,12 @@ export function ExperimentStatus({ row, t }: { row: FleetExperiment; t: Props['t
 /** @param props - plugin-owned feedback. @returns a notification that survives page navigation. */
 export function ManagementFeedback({ controller, useExperiments, t }: ExperimentsPageProps) {
   const toast = useExperiments(value => value.toast)
+  const error = useExperiments(value => value.errorNotice)
+  const [details, setDetails] = useState<string>()
+  if (error !== null) return <><Toast key={error.sequence} text={t(error.identity === 'timeout' ? 'operationTimedOut' : 'operationFailed')}
+    icon={<IconWarningOutlineRegular />} holdMs={8000} onDone={() => { controller.dismissErrorNotice() }}
+    actions={[{ label: t('technicalDetails'), onClick: () => { setDetails(error.message); controller.dismissErrorNotice() } }, { label: '×', onClick: () => { controller.dismissErrorNotice() } }]} /></>
+  if (details !== undefined) return <Modal open title={t('technicalDetails')} closeLabel={t('close')} onClose={() => { setDetails(undefined) }}><div className={css.deleteContent}><pre className={css.prewrap}>{details}</pre></div></Modal>
   return toast === null ? null : <Toast key={toast.sequence} text={t(toast.key)} {...(toast.failed ? { icon: <IconWarningOutlineRegular /> } : { tone: 'success' as const })}
     onDone={() => { controller.clearToast() }} />
 }

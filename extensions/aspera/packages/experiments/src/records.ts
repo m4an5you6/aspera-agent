@@ -24,6 +24,12 @@ export type AgentRecordRequest = z.input<typeof agentRecordRequestSchema>
 export type AgentRecordPage = z.infer<typeof agentRecordPageSchema>
 /** Cursor used for reconnection. */
 export type AgentRecordCursor = z.infer<typeof agentRecordCursorSchema>
+/** Large immutable events are transported in bounded fragments of their serialized payload. */
+export const traceEventReadSchema = agentRecordCursorSchema.omit({ nextSeq: true }).extend({ seq: z.number().int().nonnegative(),
+  offset: z.number().int().nonnegative(), digest: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict()
+/** A fragment's digest covers the entire payload, preventing mixed generations. */
+export const traceEventChunkSchema = z.object({ data: z.string(), nextOffset: z.number().int().nonnegative(),
+  length: z.number().int().nonnegative(), digest: z.string().regex(/^[a-f0-9]{64}$/) }).strict()
 /** Process directory entry; old records may lack separated streams. */
 export const experimentProcessSchema = clusterCommandResultSchema.extend({ experimentId: experimentIdSchema,
   serverId: serverIdSchema, command: z.string(), streams: z.array(z.enum(['stdout', 'stderr'])) }).strict()

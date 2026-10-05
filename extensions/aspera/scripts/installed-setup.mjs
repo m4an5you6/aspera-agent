@@ -2,7 +2,9 @@
 import { existsSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { setupWorkerProfile } from '@aspera/runtime'
+import { assertPublishedUiCompatibility } from '@aspera/dispatch/compatibility'
 const root = resolve(import.meta.dirname)
+assertPublishedUiCompatibility(root)
 const home = process.env.DSH_HOME || resolve(root, '.dsh-home')
 if (process.argv.includes('--worker')) await setupWorkerProfile(home, root)
 else {

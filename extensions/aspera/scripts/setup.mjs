@@ -1,7 +1,9 @@
 /** Initializes an independent development profile over built extension packages. */
 import { existsSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { assertPublishedUiCompatibility } from '@aspera/dispatch/compatibility'
 const root = resolve(import.meta.dirname, '..')
+assertPublishedUiCompatibility(root)
 const home = process.env.ASPERA_HOME || resolve(root, '.dsh-home')
 const profile = resolve(home, 'profiles/aspera')
 mkdirSync(profile, { recursive: true, mode: 0o700 })

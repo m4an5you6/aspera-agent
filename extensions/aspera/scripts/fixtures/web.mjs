@@ -12,6 +12,8 @@ import { ExperimentFleet } from '@aspera/dispatch/fleet'
 import { ExperimentDownloads } from '@aspera/dispatch/downloads'
 import { inventory, installStorageReplay } from './storage.mjs'
 import { readPhaseRecords } from '../../packages/runtime/lib/records.js'
+import { ObservationWriter, observationSources, readObservation } from '../../packages/runtime/lib/observations.js'
+import { freemem, totalmem } from 'node:os'
 import { openInferenceGateway } from '../../packages/runtime/lib/inference-gateway.js'
 import { SavedReleaseUnavailable } from '../../packages/dispatch/lib/cluster-deploy.js'
 
@@ -41,8 +43,9 @@ export async function apply(ctx, config) {
   const preparationCommands = []
   const configuredHosts = new Set()
   const restoredPreparations = new Set()
-  let planGate; let retryGate; let hostKeyGate; let failConnection = false; let failCleanup = false
+  let planGate; let retryGate; let hostKeyGate; let failConnection = false; let timeoutConnection = false; let failCleanup = false
   const cleanupCalls = []
+  let statusFailure
   ctx.effect(() => () => hostKeyGate?.resolve())
   installStorageReplay(ctx, storageCalls, environmentCalls)
   ctx.on('session/event', (session, event) => {
@@ -62,6 +65,10 @@ export async function apply(ctx, config) {
       const goal = ctx.goals.create(handle.agent, { objective: record.submission.objective })
       ctx.goals.disarm(handle.agent)
       handle.agent.session.append('user/message', createUserMessage({ source: { kind: 'aspera', experimentId: record.submission.experimentId }, content: [{ type: 'text', text }] }), { surfaceOp: 'append' })
+      if (config.observationHistory && role === 'plan') for (let index = 0; index < 220; index++) {
+        handle.agent.session.append('user/message', createUserMessage({ source: { kind: 'aspera', experimentId: record.submission.experimentId },
+          content: [{ type: 'text', text: `Planning history ${index.toString().padStart(3, '0')} · ${'Recorded CPU fixture observation. '.repeat(8)}` }] }), { surfaceOp: 'append' })
+      }
       if (role === 'execution') handle.agent.session.append('tool/call', { turn: 0, step: 0, callId: 'cpu-service-call', name: 'run_experiment_command', arguments: JSON.stringify({ server_id: record.submission.nodes[0].server.id, run_id: 'fixture-service', command: 'dsh --profile cpu-service' }) })
       ctx.goals.complete(handle.agent, { id: goal.id, revision: goal.revision })
       await ctx.sessionPersistence.flush()
@@ -102,7 +109,14 @@ export async function apply(ctx, config) {
       writeFileSync(resolve(workspace, 'result.txt'), 'local output\n')
       appendFileSync(runPath(id, 'node.log'), '训练准备完成\n')
       if (record.submission.objective.includes('failure')) return { state: 'failed', detail: 'CPU fixture dependency failed', resourcesReleased: true }
-      if (record.submission.objective === 'CPU completed experiment') return { state: 'completed', resourcesReleased: true }
+      if (record.submission.objective === 'CPU completed experiment') {
+        const output = new ObservationWriter(runPath(id, ''), { version: 1, id: 'process-fixture-service', kind: 'process',
+          experimentId: id, serverId: record.submission.nodes[0].server.id, phase: 'execution', sessionId: identity.sessionId,
+          commandId: 'fixture-service', label: 'CPU recorded output', createdAt: Date.now(), streams: ['stdout', 'stderr'], complete: false })
+        for (let index = 0; index < 240; index++) output.append(index % 7 === 0 ? 'stderr' : 'stdout', `CPU observation ${index}\n`)
+        output.close()
+        return { state: 'completed', resourcesReleased: true }
+      }
       const home = resolve(root, 'service-homes', id)
       const profile = resolve(home, 'profiles/cpu-service')
       mkdirSync(profile, { recursive: true })
@@ -114,6 +128,12 @@ export async function apply(ctx, config) {
       ] }]))
       const handle = ctx.subprocess.spawn({ argv: [process.execPath, resolve(config.release, 'node_modules/@deepseek-ai/dsh/lib/bin.js'), '--profile', 'cpu-service'],
         cwd: config.release, env: { DSH_HOME: home, DSH_TELEMETRY_DISABLED: '1' }, graceMs: 3000, stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' } })
+      const observation = new ObservationWriter(runPath(id, ''), { version: 1, id: 'process-fixture-service', kind: 'process',
+        experimentId: id, serverId: record.submission.nodes[0].server.id, phase: 'execution', sessionId: identity.sessionId,
+        commandId: 'fixture-service', label: 'CPU service', createdAt: Date.now(), streams: ['stdout', 'stderr'], complete: false })
+      handle.stdout?.on('data', chunk => observation.append('stdout', chunk))
+      handle.stderr?.on('data', chunk => observation.append('stderr', chunk))
+      void handle.done.finally(() => observation.close()).catch(() => {})
       for (const stream of ['stdout', 'stderr']) writeFileSync(runPath(id, `process-${stream}.log`), '')
       handle.stdout?.on('data', bytes => { appendFileSync(runPath(id, 'agent.log'), bytes); appendFileSync(runPath(id, 'process-stdout.log'), bytes) })
       handle.stderr?.on('data', bytes => { appendFileSync(runPath(id, 'agent.log'), bytes); appendFileSync(runPath(id, 'process-stderr.log'), bytes) })
@@ -136,6 +156,10 @@ export async function apply(ctx, config) {
         assertHealth(await fetch(`http://127.0.0.1:${port}/health`))
         const mapping = record.submission.nodes[0].server.inferenceMapping
         if (mapping !== undefined) {
+          if (config.portLease !== undefined && !existsSync(config.portLease + '.released')) {
+            writeFileSync(config.portLease, '')
+            while (!existsSync(config.portLease + '.released')) { signal.throwIfAborted(); await delay(50) }
+          }
           owned.service = { ...owned.service, modelName: 'cpu-fixture', external: { ...mapping, state: 'unchecked' } }
           owned.gateway = await openInferenceGateway(owned.service, { root, healthTimeoutMs: 3000, requestTimeoutMs: 5000, requestBytes: 65536 }, () => !exited && !owned.stopping)
           owned.service.external = await owned.gateway.probe()
@@ -173,15 +197,23 @@ export async function apply(ctx, config) {
       ].map(program => configuredHosts.has(target.host) ? program : { ...program, path: '', version: '' }),
       sandboxExitCode: configuredHosts.has(target.host) ? 0 : 127, diagnostics: 'CPU environment fixture',
     }),
-    remoteResult: async (target, script) => {
+    remoteResult: async (target, script, _signal, _password, output) => {
       const installed = script.includes('fixture retry installation')
       if (installed) configuredHosts.add(target.host)
       const result = { stdout: installed ? 'Required tools installed' : 'Package metadata loaded', stderr: installed ? '' : 'Fixture download failed',
         exitCode: installed ? 0 : 1, signal: null, timedOut: false, cancelled: false, exitConfirmed: true }
       preparationCommands.push({ host: target.host, ...result })
+      output?.('stdout', Buffer.from(result.stdout)); output?.('stderr', Buffer.from(result.stderr))
       return result
     },
-    prepareSshHostKey: async () => { await hostKeyGate?.promise; if (failConnection) throw new Error('Timed out while waiting for handshake') },
+    prepareSshHostKey: async (_target, signal) => {
+      if (timeoutConnection) await new Promise((_resolve, reject) => {
+        signal.throwIfAborted()
+        signal.addEventListener('abort', () => { reject(signal.reason) }, { once: true })
+      })
+      await hostKeyGate?.promise
+      if (failConnection) throw new Error('Timed out while waiting for handshake')
+    },
     inspectServerStorage: async (target, directory) => inventory(directory ?? '/fixture/data/' + target.host),
     cleanupServerStorage: async (_target, placement, names) => { if (failCleanup) throw new Error('CPU fixture cleanup temporarily unavailable'); cleanupCalls.push({ serverId: placement.serverId, experimentId: placement.experimentId, path: placement.runRoot, names }) },
     prepareServerStorage: async (_target, placement) => placement.candidate,
@@ -211,14 +243,21 @@ export async function apply(ctx, config) {
         if (!existsSync(path(`${body.coordinator.remoteRoot}/secrets/${id}.json`))) throw new Error('private materials are missing')
         return { status: 200, value: await queue.submit(body) }
       }
-      if (operation === 'status') return { status: 200, value: { record: queue.get(id), waitingFor: queue.waitingFor(id) } }
+      if (operation === 'status') { if (statusFailure !== undefined) throw new Error(statusFailure); return { status: 200, value: { record: queue.get(id), waitingFor: queue.waitingFor(id) } } }
       if (operation === 'approve') return { status: 200, value: await queue.approve(id, body.revision) }
       if (operation === 'answer-question') { const { experimentId: _id, ...reply } = body; return { status: 200, value: await queue.answerQuestion(id, reply) } }
       if (operation === 'cancel') return { status: 200, value: await queue.cancel(id, body.submission) }
       const record = queue.get(id)
       if (record === undefined) throw new Error('experiment not found')
       if (body.serverId !== undefined && !record.submission.nodes.some(node => node.server.id === body.serverId)) throw new Error('node is outside this experiment')
-      if (operation === 'records') return { status: 200, value: await readPhaseRecords(runPath(id, 'events.jsonl'), body, body.phase === 'planning' ? record.planningSessionId : record.sessionId, 65536) }
+      if (operation === 'records' || operation === 'trace-records') return { status: 200, value: await readPhaseRecords(runPath(id, 'events.jsonl'), body, body.phase === 'planning' ? record.planningSessionId : record.sessionId, 65536, operation === 'trace-records') }
+      if (operation === 'observation-sources') return { status: 200, value: [
+        { version: 1, id: 'legacy-node', kind: 'legacy', experimentId: id, serverId: body.serverId, label: 'Node log', createdAt: record.submission.createdAt ?? 1, streams: ['mixed'], complete: false },
+        ...observationSources(runPath(id, '')),
+      ] }
+      if (operation === 'observation-read') return { status: 200, value: readObservation(runPath(id, ''), body) }
+      if (operation === 'observation-metrics') return { status: 200, value: [{ experimentId: id, serverId: body.serverId, time: Date.now(),
+        memoryUsedBytes: totalmem() - freemem(), memoryTotalBytes: totalmem(), gpus: [] }] }
       if (operation === 'processes') return { status: 200, value: children.get(id)?.service === undefined ? [] : [{ experimentId: id, serverId: body.serverId, commandId: 'fixture-service', command: 'dsh --profile cpu-service', state: 'running', released: false, exitCode: null, streams: ['stdout', 'stderr'] }] }
       if (operation === 'process-log') {
         const request = processLogRequestSchema.parse(body); const cursor = request.cursor
@@ -245,8 +284,8 @@ export async function apply(ctx, config) {
       throw new Error('Unknown CPU fixture operation: ' + operation)
     },
   }
-  const policy = AdapterConfig({ extensionRoot: config.release, agentCredentialRefs: [], pollIntervalMs: 100 })
-  const fleet = await ExperimentFleet.open(ctx, server => ({ ...server, localRepo: config.release, dataRoots: [], preparationOutputChars: policy.preparationOutputChars, agentCredentialRefs: [], tokenRef: 'FIXTURE', toolTimeoutMs: 30000, controlPollIntervalMs: 100, minimumFreeBytes: policy.minimumFreeBytes }), driver)
+  const policy = AdapterConfig({ extensionRoot: config.release, agentCredentialRefs: [], pollIntervalMs: 100, connectionCheckTimeoutMs: 1000 })
+  const fleet = await ExperimentFleet.open(ctx, server => ({ ...server, localRepo: config.release, dataRoots: [], preparationOutputChars: policy.preparationOutputChars, agentCredentialRefs: [], tokenRef: 'FIXTURE', toolTimeoutMs: 30000, controlPollIntervalMs: 100, minimumFreeBytes: policy.minimumFreeBytes }), policy.connectionCheckTimeoutMs, driver)
   const retry = fleet.retry.bind(fleet)
   fleet.retry = async id => { await retryGate?.promise; return retry(id) }
   new AsperaRemote(ctx, fleet, new ExperimentDownloads(ctx, fleet, 60000), policy)
@@ -254,8 +293,15 @@ export async function apply(ctx, config) {
     const url = new URL(req.url, 'http://localhost')
     const id = url.searchParams.get('id')
     const kind = url.pathname.split('/').at(-1)
+    if (kind === 'fail-status') statusFailure = 'SSH connection failed: ECONNREFUSED observations.test'
+    if (kind === 'timeout-status') statusFailure = 'The operation was aborted due to timeout'
     if (kind === 'append') appendFileSync(runPath(id, 'node.log'), '断线后继续\n')
     if (kind === 'rotate') writeFileSync(runPath(id, 'node.log'), '轮转后日志\n')
+    if (kind === 'observation-append') {
+      const source = observationSources(runPath(id, '')).find(source => source.id === 'process-fixture-service')
+      const output = new ObservationWriter(runPath(id, ''), { ...source, complete: false })
+      output.append('stdout', 'CPU newly received output\n'); output.close()
+    }
     if (kind === 'crash') children.get(id)?.handle.terminate()
     if (kind === 'restore-release') restoredPreparations.add(id)
     if (kind === 'hold-plan') planGate = Promise.withResolvers()
@@ -263,7 +309,8 @@ export async function apply(ctx, config) {
     if (kind === 'hold-host-key') hostKeyGate = Promise.withResolvers()
     if (kind === 'release-host-key') hostKeyGate?.resolve()
     if (kind === 'fail-connection') failConnection = true
-    if (kind === 'restore-connection') failConnection = false
+    if (kind === 'timeout-connection') timeoutConnection = true
+    if (kind === 'restore-connection') { failConnection = false; timeoutConnection = false }
     if (kind === 'fail-cleanup') failCleanup = true
     if (kind === 'restore-cleanup') failCleanup = false
     if (kind === 'hold-retry') retryGate = Promise.withResolvers()

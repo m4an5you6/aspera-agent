@@ -45,12 +45,16 @@ kind: "package-reference"
 <a id="understand-the-implementation"></a>
 ## 了解实现
 
-官方侧栏包含可折叠的 Aspera 分组，悬停或键盘聚焦时将原图标替换为三角箭头。齿轮打开 Aspera 模型设置，配置入口调用官方 DSH 设置命令。三个阶段的模型选择复用已有提供商账户。选择框文字保持单行并在超长时省略，悬停或键盘聚焦时由 DSH 提示显示完整名称；菜单选项在卡片内换行。Agent 记录默认展示轨迹，事件与详情独立滚动；运行监控区分节点及进程输出流，提供有界跟随、暂停和搜索。关闭提醒按实验、待办类型及版本保存，新待办再次显示，共用的待处理数量不受影响。
+官方侧栏包含可折叠的 Aspera 分组，悬停或键盘聚焦时将原图标替换为三角箭头。齿轮打开 Aspera 模型设置，配置入口调用官方 DSH 设置命令。三个阶段的模型选择复用已有提供商账户。选择框文字保持单行并在超长时省略，悬停或键盘聚焦时由 DSH 提示显示完整名称；菜单选项在卡片内换行。关闭提醒按实验、待办类型及版本保存，新待办再次显示，共用的待处理数量不受影响。
+
+Agent 记录通过只读工厂补丁使用已发布 DSH 的轨迹组装、时间轴、轮次／调用折叠、搜索和详情。阶段选择与轨迹工具共用一行，各阶段保留搜索、选择和阅读位置。时间轴显示记录的实际时刻，横向滚动与可见事件联动。接近历史边缘时自动加载分页。两种执行模式均使用此只读视图，决策仍在概览处理。历史事件缺失或截断时明确标注，不重建虚构内容。
+
+运行监控显示实测资源、上报的训练指标和可调高度的日志阅读区，默认每两秒更新、曲线保留十五分钟。阅读历史只停止滚动，输出继续接收；“回到最新”返回实时窗口。登记来源、输出流、搜索、历史及完整日志下载共用有界游标。DSH 悬浮 Toast 对同一归属的错误只提示一次，提供关闭和技术详情操作；实验失败与来源断线状态继续显示。[状态与接口](../../docs/state-and-api.zh.md#logs-outputs-and-services)说明存储、凭据保护和兼容规则。
 
 <details>
 <summary>实现细节</summary>
 
-[client/index.ts](src/client/index.ts) 管理 Remote 描述、流卸载、字典及样式注册、侧栏及页面插槽；[controller.ts](src/client/controller.ts) 合并刷新、拒绝过期结果并限制展示文本；[ExperimentsPage.tsx](src/client/ExperimentsPage.tsx) 通过注入参数接收动作及状态；[conversation.ts](src/client/conversation.ts) 按 Session ID 及序号隔离完整记录。服务端解析与浏览器行为测试执行归属检查，不发布仅检查存在的 invariant 入口。
+[client/index.ts](src/client/index.ts) 管理 Remote 描述、流卸载、字典及样式注册、侧栏及页面插槽；[controller.ts](src/client/controller.ts) 合并刷新并保留各来源独立的失败状态；[AgentRecords.tsx](src/client/AgentRecords.tsx) 向官方渲染器提供完整事件；[RuntimeMonitor.tsx](src/client/RuntimeMonitor.tsx) 分开保存正在阅读的历史和新接收的输出。服务端解析与浏览器行为测试执行归属检查，不发布仅检查存在的 invariant 入口。
 
 </details>
 

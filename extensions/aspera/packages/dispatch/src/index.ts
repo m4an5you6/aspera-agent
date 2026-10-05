@@ -11,7 +11,9 @@ import { experimentIdSchema, serverIdSchema, experimentModelsSchema } from '@asp
 import type { ClusterChunk, ClusterFile, ServerSettings, AnswerExperimentQuestion, ServiceAccessInfo, ExperimentModels, ExperimentModelDirectory } from '@aspera/experiments/types'
 import { experimentModelDirectory, validateExperimentModels } from './models.ts'
 import type { AgentRecordRequest, AgentRecordPage, ExperimentProcess, ProcessLogRequest, ProcessLogPage } from '@aspera/experiments/types'
+import type { ObservationSource, ObservationRead, ObservationPage, MetricRead, MetricSample } from '@aspera/experiments/types'
 import { ExperimentFleet } from './fleet.ts'
+import { claimErrorNotice, type ErrorNoticeScope } from './error-notices.ts'
 import { ExperimentDownloads } from './downloads.ts'
 import { sshPasswordRef } from './ssh-account.ts'
 import type { ExperimentPasswordStatus, ExperimentSshAccount, FleetCreateRequest, FleetExperiment, FleetRegistry, FleetServerInput, FleetSnapshot } from './types.ts'
@@ -24,6 +26,7 @@ export interface Config {
   preparationOutputChars: number
   agentCredentialRefs: string[]
   toolTimeoutMs: number
+  connectionCheckTimeoutMs: number
   pollIntervalMs: number
   downloadTtlMs: number
   minimumFreeBytes: number
@@ -34,6 +37,7 @@ export const Config: z<Config> = z.object({
   preparationOutputChars: z.number().step(1).min(1024).max(2_000_000).default(65536),
   agentCredentialRefs: z.array(z.string()).default(['DEEPSEEK_API_KEY']),
   toolTimeoutMs: z.number().step(1).min(1000).default(300000),
+  connectionCheckTimeoutMs: z.number().step(1).min(1000).default(20000),
   pollIntervalMs: z.number().step(1).min(100).default(1000),
   downloadTtlMs: z.number().step(1).min(1000).default(60000),
   minimumFreeBytes: z.number().step(1).min(1).default(1073741824),
@@ -46,13 +50,16 @@ export class AsperaRemote extends TypertRemoteService {
   /** @returns saved peer servers and connection observations. */
   @Remote
   servers(): FleetRegistry { return this.fleet.servers() }
+  /** @param scope - object and normalized operation failure. @returns whether its first notification was claimed. */
+  @Remote
+  claimErrorNotice(scope: ErrorNoticeScope): Promise<boolean> { return claimErrorNotice(this.host, scope) }
   /** @param server - complete server settings. @returns saved registry. */
   @Remote
   saveServer(server: FleetServerInput): Promise<FleetRegistry> { return this.fleet.saveServer(server) }
   /** @param id - unused server registration. @returns saved registry; historical experiment destinations remain pinned. */
   @Remote
   removeServer(id: string): Promise<FleetRegistry> { return this.fleet.removeServer(serverIdSchema.parse(id)) }
-  /** @param id - configured server. @returns connection, GPU and allocation facts. */
+  /** @param id - configured server. @returns connection, GPU and allocation facts within the configured check deadline. */
   @Remote
   probeServer(id: string): Promise<ServerConnectionCheck> { return this.fleet.probe(serverIdSchema.parse(id)) }
   /** @param account - configured SSH account. @returns presence and writability, without plaintext. */
@@ -93,12 +100,40 @@ export class AsperaRemote extends TypertRemoteService {
   /** @param request - phase and Session-bound cursor. @returns real events and the next sequence. */
   @Remote
   experimentRecords(request: AgentRecordRequest): Promise<AgentRecordPage> { return this.fleet.records(request) }
+  /** @param request - experiment, phase and cursor. @returns complete events; legacy truncated records remain explicitly marked. */
+  @Remote
+  experimentTrace(request: AgentRecordRequest): Promise<AgentRecordPage> { return this.fleet.records(request, true) }
+  /** @param id - experiment. @param phase - saved Session role. @param seq - original event sequence. @returns complete event detail if retained. */
+  @Remote
+  async experimentTraceEvent(id: string, phase: 'preparation' | 'planning' | 'execution', seq: number): Promise<import('@aspera/experiments/types').AgentRecord | null> {
+    const page = await this.fleet.records({ experimentId: id, phase, beforeSeq: seq + 1, limit: 1 }, true)
+    return page.records.find(record => record.seq === seq) ?? null
+  }
+  /** @param id - experiment. @param phase - owning Session role. @param seq - original event sequence. @param attachmentId - recorded attachment.
+   * @param offset - byte continuation. @returns bounded verified attachment bytes.
+   */
+  @Remote
+  experimentTraceAttachment(id: string, phase: 'preparation' | 'planning' | 'execution', seq: number, attachmentId: string, offset: number): Promise<{ data: string; mediaType: string; name: string; nextOffset: number; size: number }> {
+    return this.fleet.traceAttachment(experimentIdSchema.parse(id), phase, seq, attachmentId, offset)
+  }
   /** @param id - experiment. @param serverId - assigned node. @returns durable process directory. */
   @Remote
   experimentProcesses(id: string, serverId: string): Promise<ExperimentProcess[]> { return this.fleet.processes(experimentIdSchema.parse(id), serverIdSchema.parse(serverId)) }
   /** @param request - source-bound stdout or stderr cursor. @returns bounded log bytes and continuation. */
   @Remote
   experimentProcessLog(request: ProcessLogRequest): Promise<ProcessLogPage> { return this.fleet.processLog(request) }
+  /** @param id - experiment. @param serverId - pinned node. @returns dynamically registered log sources. */
+  @Remote
+  experimentLogSources(id: string, serverId: string): Promise<{ sources: ObservationSource[]; legacy: boolean }> { return this.fleet.logSources(experimentIdSchema.parse(id), serverIdSchema.parse(serverId)) }
+  /** @param request - source, direction and owned cursor. @returns bounded public output. */
+  @Remote
+  experimentLog(request: ObservationRead): Promise<ObservationPage> { return this.fleet.logRead(request) }
+  /** @param request - measured time range. @returns retained real resource and training observations. */
+  @Remote
+  experimentMetrics(request: MetricRead): Promise<MetricSample[]> { return this.fleet.metrics(request) }
+  /** @param request - selected source and stream. @returns a one-use complete-log download URL. */
+  @Remote
+  downloadExperimentLog(request: ObservationRead): Promise<string> { return this.downloads.issueLog(request) }
   /** @param input - immutable Goal, resources and strategy. @returns saved preparation immediately. */
   @Remote
   createExperiment(input: FleetCreateRequest): Promise<FleetExperiment> { return this.fleet.create(input) }
@@ -174,7 +209,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const fleet = await ExperimentFleet.open(ctx, (server: ServerSettings) => ({ ...server,
     localRepo: config.extensionRoot, dataRoots: config.dataRoots, preparationOutputChars: config.preparationOutputChars,
     agentCredentialRefs: config.agentCredentialRefs, tokenRef: 'ASPERA_COORDINATOR', toolTimeoutMs: config.toolTimeoutMs,
-    controlPollIntervalMs: config.pollIntervalMs, minimumFreeBytes: config.minimumFreeBytes }))
+    controlPollIntervalMs: config.pollIntervalMs, minimumFreeBytes: config.minimumFreeBytes }), config.connectionCheckTimeoutMs)
   new AsperaRemote(ctx, fleet, new ExperimentDownloads(ctx, fleet, config.downloadTtlMs), config)
   const output = { schema: { type: 'string' as const }, render: (_args: object, value: string) => [{ type: 'text' as const, text: value }] }
   const presentCall = (args: object) => ({ card: 'generic' as const, title: 'Aspera experiment', kind: 'other' as const, rawInput: args })

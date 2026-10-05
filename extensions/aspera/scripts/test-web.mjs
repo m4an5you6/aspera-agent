@@ -1,6 +1,6 @@
 /** Exercise the real Web composition against the explicitly local CPU test provider. */
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { createServer } from 'node:net'
@@ -22,7 +22,12 @@ const home = resolve(directory, 'home')
 const portReservation = createServer()
 await new Promise((ready, reject) => { portReservation.once('error', reject); portReservation.listen(0, '127.0.0.1', ready) })
 const mappedPort = portReservation.address().port
-await new Promise(done => { portReservation.close(done) })
+const portLease = resolve(directory, 'mapped-port-lease')
+const leaseWatcher = setInterval(() => {
+  if (!existsSync(portLease)) return
+  clearInterval(leaseWatcher)
+  portReservation.close(() => { writeFileSync(portLease + '.released', '') })
+}, 50)
 const externalUrl = `http://127.0.0.1:${mappedPort}`
 await command(process.execPath, ['scripts/setup.mjs'], root, { ASPERA_HOME: home })
 const profile = resolve(home, 'profiles/aspera')
@@ -34,7 +39,7 @@ writeFileSync(resolve(profile, 'cordis.patch.yml'), JSON.stringify([
   { id: 'llm-pi-ai', config: { providers: { [fixtureProvider]: fixtureOptions } } },
   { id: 'agent-default-model', config: { provider: fixtureProvider, model: 'qwen-preparation' } },
   { insert: [{ id: 'aspera-test-fixture', name: pathToFileURL(resolve(root, 'scripts/fixtures/web.mjs')).href,
-    config: { role: 'web', root: resolve(directory, 'remote'), release: root, profileStartupMs } }] },
+    config: { role: 'web', root: resolve(directory, 'remote'), release: root, profileStartupMs, portLease } }] },
 ]))
 let app; let browser; let page
 try {
@@ -195,7 +200,7 @@ try {
   await page.getByRole('button', { name: /^(返回|Back)$/ }).click()
   await page.getByRole('button').filter({ has: page.getByText('CPU semi experiment', { exact: true }) }).click()
   await page.getByRole('button', { name: /^(运行监控|Runtime monitor)$/ }).click()
-  const log = () => page.getByRole('region', { name: /^(运行监控|Runtime monitor)$/ }).locator('pre').first()
+  const log = () => page.getByRole('region', { name: /^(进程日志|Process logs)$/ })
   await expect(log()).toContainText('服务健康')
   await context.setOffline(true)
   await control('append', first.request.experimentId)
@@ -206,15 +211,14 @@ try {
   await expect(log()).toContainText('轮转后日志')
   await page.getByRole('button', { name: /^(Agent 记录|Agent records)$/ }).click()
   await page.getByRole('button', { name: /^(计划|Planning)$/ }).click()
-  await page.getByRole('button', { name: /^(对话|Conversation)$/ }).click()
+  await expect(page.getByRole('button', { name: /^(对话|Conversation)$/ })).toHaveCount(0)
   await expect(page.getByText('Prepare a CPU fixture service in the experiment directory.', { exact: true })).toBeVisible()
   await page.getByRole('button', { name: /^(执行|Execution)$/ }).click()
   await expect(page.getByText('Run the approved CPU fixture plan.', { exact: true })).toBeVisible()
-  await page.getByRole('button', { name: /^(轨迹|Trajectory)$/ }).click()
-  await page.getByRole('listitem').filter({ hasText: 'run_experiment_command' }).click()
+  await page.locator('[data-record-index]').filter({ hasText: 'run_experiment_command' }).click()
   await page.screenshot({ path: resolve(root, '.artifacts/web-agent-trace.png'), fullPage: true })
-  await page.getByRole('button', { name: /^(原始内容|Raw content)$/ }).click()
-  const inspector = page.getByRole('complementary', { name: /事件详情|Event details/ })
+  await page.locator('#trajectory-detail-input:visible').click()
+  const inspector = page.locator('#trajectory-detail-panel:visible')
   assert.ok((await inspector.boundingBox()).height >= 230, 'The event inspector must retain readable height')
   await page.evaluate(() => { document.body.dataset.dsDarkTheme = '' })
   await page.screenshot({ path: resolve(root, '.artifacts/web-agent-trace-dark.png'), fullPage: true })
@@ -223,12 +227,12 @@ try {
   await page.screenshot({ path: resolve(root, '.artifacts/web-agent-trace-narrow.png'), fullPage: true })
   await page.evaluate(() => { delete document.body.dataset.dsDarkTheme })
   await page.setViewportSize({ width: 1280, height: 720 })
-  await inspector.getByRole('button', { name: /^(概览|Overview)$/ }).click()
+  await page.getByRole('tab', { name: /^(概述|概览|Overview|Summary)$/ }).click()
   await page.getByRole('button', { name: /查看日志|View logs/ }).click()
   await expect(page.getByRole('region', { name: /运行监控|Runtime monitor/ })).toBeVisible()
-  const processOutput = page.getByRole('region', { name: /运行监控|Runtime monitor/ }).locator('pre')
+  const processOutput = log()
   await expect(processOutput).toContainText('CPU fixture service ready')
-  await page.getByRole('button', { name: /^(暂停跟随|Pause follow)$/ }).click()
+  await expect(page.getByRole('button', { name: /^(暂停跟随|Pause follow)$/ })).toHaveCount(0)
   await page.getByRole('button', { name: /^(节点日志|Node logs)$/ }).click()
   await page.getByRole('menuitem', { name: 'stderr', exact: true }).click()
   await expect(processOutput).toContainText('CPU fixture diagnostic stream')
@@ -277,7 +281,7 @@ try {
   assert.equal(crashed.latest.services[0].state, 'failed')
   assert.equal(crashed.latest.services[0].released, true)
   await create('CPU failure experiment', 'CPU A')
-  await expect(page.getByRole('alert')).toContainText('CPU fixture dependency failed')
+  await expect(page.getByRole('region', { name: /^(当前阶段|Current stage)$/ })).toContainText('CPU fixture dependency failed')
   const remoteFailureStage = await checkStageLayout(page, resolve(root, '.artifacts'), false)
   await page.screenshot({ path: resolve(root, '.artifacts/web-error.png'), fullPage: true })
   await create('CPU preparation recovery', 'CPU A', 'automatic', false, true)
@@ -371,6 +375,8 @@ try {
   console.error('Web test profile tail: ' + (app?.output() ?? '').replace(/token=[A-Za-z0-9_-]+/g, 'token=<redacted>').slice(-7000))
   throw error
 } finally {
+  clearInterval(leaseWatcher)
+  if (portReservation.listening) await new Promise(done => { portReservation.close(done) })
   await browser?.close(); await app?.close()
   removeTestDirectory(directory, resolve(root, '.artifacts'))
 }

@@ -9,6 +9,8 @@ import type { CommandResult, RemoteCommandResult } from './command-result.ts'
 export { RemoteCommandError, SshConnectionError } from './command-result.ts'
 export type { CommandResult, RemoteCommandResult } from './command-result.ts'
 export { prepareSshHostKey } from './ssh-host-keys.ts'
+/** Receives complete SSH pipe chunks before bounded command-result capture. */
+export type CommandOutputSink = (stream: 'stdout' | 'stderr', chunk: string) => void
 
 /** Deployment address and SSH identity selected by the trusted profile. */
 export interface Target {
@@ -51,16 +53,20 @@ export async function run(program: string, args: readonly string[], timeoutMs: n
   return result.stdout
 }
 
-async function runResult(program: string, args: readonly string[], timeoutMs: number, signal?: AbortSignal): Promise<CommandResult> {
+async function runResult(program: string, args: readonly string[], timeoutMs: number, signal?: AbortSignal, output?: CommandOutputSink): Promise<CommandResult> {
   signal?.throwIfAborted()
   const child = spawn(program, [...args], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
-  let output = ''
+  let stdout = ''
   let errorOutput = ''
+  let captureError: unknown
+  const capture = (stream: 'stdout' | 'stderr', part: string) => {
+    try { output?.(stream, part) } catch (error) { captureError = error; child.kill() }
+  }
   const limit = 2_000_000
   child.stdout.setEncoding('utf8')
   child.stderr.setEncoding('utf8')
-  child.stdout.on('data', (part: string) => { output = (output + part).slice(-limit) })
-  child.stderr.on('data', (part: string) => { errorOutput = (errorOutput + part).slice(-limit) })
+  child.stdout.on('data', (part: string) => { stdout = (stdout + part).slice(-limit); capture('stdout', part) })
+  child.stderr.on('data', (part: string) => { errorOutput = (errorOutput + part).slice(-limit); capture('stderr', part) })
   let timedOut = false
   let cancelled = false
   const abort = () => { cancelled = true; child.kill() }
@@ -71,7 +77,8 @@ async function runResult(program: string, args: readonly string[], timeoutMs: nu
       child.once('error', reject)
       child.once('close', (exitCode, exitSignal) => { resolve({ exitCode, signal: exitSignal ?? null }) })
     })
-    return { stdout: output, stderr: errorOutput, ...exit, timedOut, cancelled }
+    if (captureError !== undefined) throw captureError
+    return { stdout, stderr: errorOutput, ...exit, timedOut, cancelled }
   } finally {
     clearTimeout(timer)
     signal?.removeEventListener('abort', abort)
@@ -114,15 +121,16 @@ export async function remote(target: Target, script: string, signal?: AbortSigna
  * @param script - remote POSIX shell program.
  * @param signal - operation cancellation.
  * @param password - private operation credential.
+ * @param output - optional complete pipe capture; capture failure stops the command channel.
  * @returns captured outcome; connection and authentication failures reject.
  */
-export async function remoteResult(target: Target, script: string, signal?: AbortSignal, password?: string): Promise<RemoteCommandResult> {
+export async function remoteResult(target: Target, script: string, signal?: AbortSignal, password?: string, output?: CommandOutputSink): Promise<RemoteCommandResult> {
   const prefix = target.pathEntries?.length ? `export PATH=${shellQuote(target.pathEntries.join(':'))}:"$PATH"\n` : ''
   const command = `sh -c ${shellQuote(prefix + script)}`
-  if (target.authMode === 'password') return passwordResult(target, password, command, signal)
+  if (target.authMode === 'password') return passwordResult(target, password, command, signal, output)
   const marker = `ASPERA_EXIT_${randomUUID()}=`
   const checked = `${command}; status=$?; printf '\\n${marker}%s\\n' "$status" >&2`
-  const result = await runResult('ssh', [...sshOptions(target), destination(target), checked], target.toolTimeoutMs, signal)
+  const result = await runResult('ssh', [...sshOptions(target), destination(target), checked], target.toolTimeoutMs, signal, output)
   const receipt = new RegExp(`\\n${marker}(\\d+)\\r?\\n$`).exec(result.stderr)
   if (receipt !== null) return { ...result, exitCode: Number(receipt[1]), stderr: result.stderr.slice(0, receipt.index), exitConfirmed: true }
   const unconfirmed = { ...result, exitCode: null, exitConfirmed: false }

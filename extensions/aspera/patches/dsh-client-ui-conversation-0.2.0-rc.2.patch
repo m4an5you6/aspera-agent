@@ -1,0 +1,16 @@
+--- a/lib/client.js
++++ b/lib/client.js
+@@ -3076,6 +3076,13 @@ window.__ModuleLoader__.load({
+ 			* @returns stable Conversation binding.
+ 			* @throws if the Session is unknown or its binding is no longer current.
+ 			*/
++			/** Assemble an externally owned, read-only event feed. The caller disposes it. */
++			bindReadonly(feed) {
++				const binding = new BoundConversation(feed, new ConversationNodeAssembler(this.events, this.views, this.groups));
++				const rebuild = () => binding.rebuild();
++				const disposers = [this.events.subscribe(rebuild), this.views.subscribe(rebuild), this.groups.subscribe(rebuild)];
++				return { target: target => binding.target(target), dispose: () => { disposers.forEach(dispose => dispose()); binding.dispose(); } };
++			}
+ 			binding(source) {
+ 				const sessionId = typeof source === "string" ? source : source.sessionId;
+ 				const owner = typeof source === "string" ? this.sessions.binding(source) : source;

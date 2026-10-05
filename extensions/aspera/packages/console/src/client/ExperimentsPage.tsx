@@ -19,6 +19,7 @@ import type { ExperimentModels } from '@aspera/experiments/types'
 import { experimentAttentionCount, attentionLabel, experimentTodos } from './attention.ts'
 import { ExperimentQuestionCard } from './QuestionCard.tsx'
 import { ExperimentOverview } from './ExperimentOverview.tsx'
+import type { PropsRenderFactories } from '@deepseek-ai/dsh-client-ui-slots'
 
 /** Actions and observable state owned by the plugin controller. */
 export interface ExperimentsInjected {
@@ -27,7 +28,7 @@ export interface ExperimentsInjected {
 }
 
 /** Composed page props supplied by the DSH slot renderer. */
-export type ExperimentsPageProps = InjectFace<ExperimentsInjected> & PropsLocale<'experiments'>
+export type ExperimentsPageProps = InjectFace<ExperimentsInjected> & PropsLocale<'experiments'> & PropsRenderFactories
 type PageProps = ExperimentsPageProps
 type ViewProps = { controller: ExperimentsController; t: TranslateNS<'experiments'> }
 
@@ -45,7 +46,7 @@ export function ExperimentsIcon({ size, useExperiments, t }: PropsRuntime<'sideb
  * @param props - controller actions, live state, and dictionary.
  * @returns independent experiment panel.
  */
-export function ExperimentsPage({ controller, useExperiments, t }: PageProps) {
+export function ExperimentsPage({ controller, useExperiments, t, renderFactorySlot }: PageProps) {
   const state = useExperiments(value => value)
   const view = state.view
   const setView = (value: Snapshot['view']) => { controller.navigate(value) }
@@ -65,14 +66,13 @@ export function ExperimentsPage({ controller, useExperiments, t }: PageProps) {
         <Button variant="ghost" icon={<IconRefreshOutlineRegular />} onClick={() => { act(() => controller.refresh()) }}>{t('refresh')}</Button>
       </div>
     </header>}
-    {state.error !== null && <p role="alert" className={css.error}>{t('error')}: {state.error}</p>}
     <div className={css.content}>
     {view === 'list' && detail === undefined && todos.length > 0 && <aside className={css.todoBanner} role="status"><div><span>{t('todoHint', { count: new Set(todos.map(todo => todo.experimentId)).size })}</span><small>{t('todoResourceHint')}</small></div><Button variant="outline" size="sm" onClick={() => { const todo = todos[0]; if (todo !== undefined) controller.select(todo.experimentId) }}>{t('viewTodo')}</Button><button className={css.todoClose} aria-label={t('dismissTodo')} onClick={() => { controller.dismissTodos() }}>×</button></aside>}
-    {(view !== 'list' || detail !== undefined) && <div className={css.actions}><Button variant="ghost" size="sm" onClick={() => { controller.select(null); setView('list') }}>{t('back')}</Button></div>}
+    {view !== 'list' && <div className={css.actions}><Button variant="ghost" size="sm" onClick={() => { controller.select(null); setView('list') }}>{t('back')}</Button></div>}
     {view === 'services' ? <section className={css.list}><p className={css.hint}>{t('serviceHint')}</p>{state.experiments.every(row => !row.latest?.services.length) && <p className={css.empty}>{t('serviceEmpty')}</p>}{state.experiments.map(row => <Services key={row.request.experimentId} controller={controller} t={t} row={row} />)}</section> : view === 'servers' ? <Servers controller={controller} t={t} state={state} />
       : view === 'new' ? <NewExperiment key={draft?.request.experimentId ?? 'new'} controller={controller} t={t}
         servers={state.registry.servers} state={state} draft={draft} />
-        : detail !== undefined ? <ExperimentDetail key={detail.request.experimentId} controller={controller} t={t} row={detail} state={state} onClone={() => {
+        : detail !== undefined ? <ExperimentDetail key={detail.request.experimentId} renderFactorySlot={renderFactorySlot} controller={controller} t={t} row={detail} state={state} onClone={() => {
           controller.select(null); setDraft(detail); setView('new')
         }} /> : <ExperimentList controller={controller} t={t} rows={state.experiments} pendingOnly={filter === 'pending'} onPendingChange={pending => { setFilter(pending ? 'pending' : 'all') }} onClone={row => { setDraft(row); setView('new') }} />}
 
@@ -220,8 +220,9 @@ function NewExperiment({ controller, t, servers, state, draft }: ViewProps & {
   </form>
 }
 
-function ExperimentDetail({ controller, t, row, state, onClone }: ViewProps & { row: FleetExperiment; state: Snapshot; onClone: () => void }) {
+function ExperimentDetail({ controller, t, row, state, onClone, renderFactorySlot }: ViewProps & PropsRenderFactories & { row: FleetExperiment; state: Snapshot; onClone: () => void }) {
   const [tab, setTab] = useState<'overview' | 'agentRecords' | 'monitoring' | 'files' | 'services'>('overview')
+  useEffect(() => { controller.setDetailView(tab) }, [controller, tab])
   const [deleting, setDeleting] = useState<string[]>()
   const [logDestination, setLogDestination] = useState<{ serverId: string; commandId: string }>()
   const status = row.latest?.state ?? row.state
@@ -231,15 +232,15 @@ function ExperimentDetail({ controller, t, row, state, onClone }: ViewProps & { 
   const title = row.request.name ?? (row.submission?.protocol === 4 ? row.submission.name : row.request.objective.split('\n')[0]?.slice(0, 120))
   const act = (operation: () => Promise<unknown>) => { void operation().catch(error => { controller.report(error) }) }
   return <article className={`${css.detail} ${tab === 'agentRecords' || tab === 'monitoring' ? css.readerDetail : ''}`}>
-    <header className={css.detailHeader}><div className={css.detailHeading}><div className={css.titleLine}><h2 title={title}>{title}</h2><span role="status">{retrying ? <Tag tone="info">{t('retrying')}</Tag> : <ExperimentStatus row={row} t={t} />}</span></div>
+    <header className={css.detailHeader}><Button variant="ghost" size="sm" aria-label={t('back')} onClick={() => { controller.select(null) }}>‹</Button><div className={css.detailHeading}><div className={css.titleLine}><h2 title={title}>{title}</h2><span role="status">{retrying ? <Tag tone="info">{t('retrying')}</Tag> : <ExperimentStatus row={row} t={t} />}</span></div>
       <p className={css.hint}>{row.servers.map(server => server.name).join(' · ')} · {t('coordinator')}: {row.coordinator.name} · {new Date(row.createdAt).toLocaleString()}</p></div>
       <div className={css.actions}><Button variant="ghost" size="sm" onClick={onClone}>{t('clone')}</Button><Button variant="ghost" size="sm" onClick={() => { act(() => controller.refresh()) }}>{t('refresh')}</Button>
         <Button variant="outline" size="sm" disabled={ended} onClick={() => { act(() => controller.cancel(id)) }}>{t('cancel')}</Button><Button variant="ghost" size="sm" className={css.dangerText} onClick={() => { setDeleting([id]) }}>{t('deleteExperiment')}</Button></div>
     </header>
     {deleting !== undefined && <DeleteExperimentsDialog controller={controller} t={t} ids={deleting} close={() => { setDeleting(undefined) }} />}
     <nav className={css.detailTabs}>{(['overview', 'agentRecords', 'monitoring', 'files', 'services'] as const).map(key => <button key={key} aria-current={tab === key ? 'page' : undefined} onClick={() => { setTab(key) }}>{t(key)}</button>)}</nav>
-    {tab === 'agentRecords' && <AgentRecords row={row} controller={controller} t={t} onLog={(serverId, commandId) => { setLogDestination({ serverId, commandId }); setTab('monitoring') }} />}
-    {tab === 'monitoring' && <RuntimeMonitor row={row} controller={controller} t={t} aggregate={state.streams} {...(logDestination === undefined ? {} : { destination: logDestination })} />}
+    {tab === 'agentRecords' && <AgentRecords renderFactorySlot={renderFactorySlot} row={row} controller={controller} t={t} onLog={(serverId, commandId) => { setLogDestination({ serverId, commandId }); setTab('monitoring') }} />}
+    {tab === 'monitoring' && <RuntimeMonitor row={row} controller={controller} t={t} {...(logDestination === undefined ? {} : { destination: logDestination })} />}
     {tab === 'overview' && <ExperimentOverview row={row} t={t} retrying={retrying} onRetry={() => { act(() => controller.retry(id)) }} onView={setTab}>
       {row.latest?.questions?.filter(question => question.state === 'open').map(question => <ExperimentQuestionCard key={question.questionId} controller={controller} t={t} question={question}
         records={state.streams[`${id}/events`]?.text.split('\n').filter(line => line.includes(question.sessionId)).join('\n') ?? ''} />)}

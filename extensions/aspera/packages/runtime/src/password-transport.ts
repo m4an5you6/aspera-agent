@@ -82,7 +82,7 @@ export async function passwordRemote(target: Target, password: string | undefine
  * @param signal - operation cancellation.
  * @returns remote exit evidence; authentication and connection failures reject.
  */
-export async function passwordResult(target: Target, password: string | undefined, command: string, signal?: AbortSignal): Promise<RemoteCommandResult> {
+export async function passwordResult(target: Target, password: string | undefined, command: string, signal?: AbortSignal, output?: import('./transport.ts').CommandOutputSink): Promise<RemoteCommandResult> {
   const result: RemoteCommandResult = { stdout: '', stderr: '', exitCode: null, signal: null, timedOut: false, cancelled: false, exitConfirmed: false }
   let started = false
   try {
@@ -92,8 +92,11 @@ export async function passwordResult(target: Target, password: string | undefine
       if (error !== undefined) { reject(error); return }
       channel.setEncoding('utf8')
       channel.stderr.setEncoding('utf8')
-      channel.on('data', (part: string) => { result.stdout = (result.stdout + part).slice(-2_000_000) })
-      channel.stderr.on('data', (part: string) => { result.stderr = (result.stderr + part).slice(-2_000_000) })
+      const capture = (stream: 'stdout' | 'stderr', part: string) => {
+        try { output?.(stream, part) } catch (error) { channel.close(); reject(error) }
+      }
+      channel.on('data', (part: string) => { result.stdout = (result.stdout + part).slice(-2_000_000); capture('stdout', part) })
+      channel.stderr.on('data', (part: string) => { result.stderr = (result.stderr + part).slice(-2_000_000); capture('stderr', part) })
       channel.once('error', reject)
       channel.once('exit', (code: number | null, exitSignal?: string) => {
         result.exitCode = code; result.signal = exitSignal ?? null

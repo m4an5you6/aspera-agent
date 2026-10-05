@@ -168,6 +168,24 @@ it('registers a first-use server without sending a password and then uses the re
   expect(f.methods).toEqual(['password'])
 })
 
+it('discovers a first-use server without the native keyscan command', async () => {
+  const f = await fixture()
+  const previousPath = process.env.PATH
+  const restorePath = () => {
+    if (previousPath === undefined) delete process.env.PATH
+    else process.env.PATH = previousPath
+  }
+  onTestFinished(restorePath)
+  process.env.PATH = ''
+  const target = { ...f.target, knownHostsFile: join(f.root, 'keyscan-independent', 'known_hosts') }
+  try {
+    await prepareSshHostKey(target)
+    expect(await readFile(target.knownHostsFile, 'utf8')).toContain(`[127.0.0.1]:${target.sshPort} ssh-rsa `)
+    expect(f.methods).toEqual([])
+    expect(f.commands).toEqual([])
+  } finally { restorePath() }
+})
+
 it('preserves both server identities when first-use registrations share a host-key file', async () => {
   const [first, second] = await Promise.all([fixture(), fixture()])
   const knownHostsFile = join(first.root, 'shared', 'known_hosts')
