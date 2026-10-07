@@ -1,4 +1,4 @@
-import type { ServerConnectionCheck, ExperimentDeletionPreview, ExperimentDeletion, DeleteExperimentsRequest } from './types.ts'
+import type { ServerConnectionCheck, ExperimentDeletionPreview, ExperimentDeletion, DeleteExperimentsRequest, ServerDeletionPreview } from './types.ts'
 /** Aspera's DSH adapter: public Remote methods and effect-owned dispatch tools. */
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
@@ -7,12 +7,14 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { setTimeout as delay } from 'node:timers/promises'
 import { randomUUID } from 'node:crypto'
 import { isAbsolute } from 'node:path'
+import type { ExperimentId } from '@aspera/experiments'
 import { experimentIdSchema, serverIdSchema, experimentModelsSchema } from '@aspera/experiments'
 import type { ClusterChunk, ClusterFile, ServerSettings, AnswerExperimentQuestion, ServiceAccessInfo, ExperimentModels, ExperimentModelDirectory } from '@aspera/experiments/types'
 import { experimentModelDirectory, validateExperimentModels } from './models.ts'
 import type { AgentRecordRequest, AgentRecordPage, ExperimentProcess, ProcessLogRequest, ProcessLogPage } from '@aspera/experiments/types'
 import type { ObservationSource, ObservationRead, ObservationPage, MetricRead, MetricSample } from '@aspera/experiments/types'
 import { ExperimentFleet } from './fleet.ts'
+import { installationPolicySchema } from './installation-model.ts'
 import { claimErrorNotice, type ErrorNoticeScope } from './error-notices.ts'
 import { ExperimentDownloads } from './downloads.ts'
 import { sshPasswordRef } from './ssh-account.ts'
@@ -30,6 +32,9 @@ export interface Config {
   pollIntervalMs: number
   downloadTtlMs: number
   minimumFreeBytes: number
+  installationTotalTimeoutMs: number
+  installationIdleTimeoutMs: number
+  installationMaxRetries: number
 }
 /** Validated Host policy supplied by the independent profile. */
 export const Config: z<Config> = z.object({
@@ -41,6 +46,9 @@ export const Config: z<Config> = z.object({
   pollIntervalMs: z.number().step(1).min(100).default(1000),
   downloadTtlMs: z.number().step(1).min(1000).default(60000),
   minimumFreeBytes: z.number().step(1).min(1).default(1073741824),
+  installationTotalTimeoutMs: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(1_800_000),
+  installationIdleTimeoutMs: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(300_000),
+  installationMaxRetries: z.number().step(1).min(0).max(Number.MAX_SAFE_INTEGER).default(2),
 })
 
 /** Experiment API shared by the independent page and Agent tool consumers. */
@@ -56,9 +64,17 @@ export class AsperaRemote extends TypertRemoteService {
   /** @param server - complete server settings. @returns saved registry. */
   @Remote
   saveServer(server: FleetServerInput): Promise<FleetRegistry> { return this.fleet.saveServer(server) }
-  /** @param id - unused server registration. @returns saved registry; historical experiment destinations remain pinned. */
+  /** @param id - server registration. @param allowLinked - acknowledgement of retained work. @returns saved registry; experiment destinations remain pinned. */
   @Remote
-  removeServer(id: string): Promise<FleetRegistry> { return this.fleet.removeServer(serverIdSchema.parse(id)) }
+  removeServer(id: string, allowLinked?: boolean): Promise<FleetRegistry> { return this.fleet.removeServer(serverIdSchema.parse(id), allowLinked ?? false) }
+
+  /** @param id - server registration. @returns retained experiments and unconfirmed remote work without connecting. */
+  @Remote
+  previewServerRemoval(id: string): ServerDeletionPreview { return this.fleet.previewServerRemoval(serverIdSchema.parse(id)) }
+
+  /** @param id - current registration. @returns deleted experiments still awaiting remote release evidence after a bounded read-only check. */
+  @Remote
+  reconcileRemovedWork(id: string): Promise<ExperimentId[]> { return this.fleet.reconcileRemovedWork(serverIdSchema.parse(id)) }
   /** @param id - configured server. @returns connection, GPU and allocation facts within the configured check deadline. */
   @Remote
   probeServer(id: string): Promise<ServerConnectionCheck> { return this.fleet.probe(serverIdSchema.parse(id)) }
@@ -131,6 +147,9 @@ export class AsperaRemote extends TypertRemoteService {
   /** @param request - measured time range. @returns retained real resource and training observations. */
   @Remote
   experimentMetrics(request: MetricRead): Promise<MetricSample[]> { return this.fleet.metrics(request) }
+  /** @param id - owning experiment. @returns exact-plan Agent reports or explicit old-release availability. */
+  @Remote
+  experimentExecutionProgress(id: string): Promise<import('@aspera/experiments/types').ExecutionProgressRead> { return this.fleet.executionProgress(experimentIdSchema.parse(id)) }
   /** @param request - selected source and stream. @returns a one-use complete-log download URL. */
   @Remote
   downloadExperimentLog(request: ObservationRead): Promise<string> { return this.downloads.issueLog(request) }
@@ -148,9 +167,12 @@ export class AsperaRemote extends TypertRemoteService {
   /** @param id - experiment. @returns reconciled remote state. */
   @Remote
   refreshExperiment(id: string): Promise<FleetExperiment> { return this.fleet.refresh(experimentIdSchema.parse(id)) }
-  /** @param id - interrupted v4 preparation. @returns resumed preparation with the same identity and directories. */
+  /** @param id - interrupted v4 preparation. @returns original record and the new explicit recovery budget. */
   @Remote
-  retryPreparation(id: string): Promise<FleetExperiment> { return this.fleet.retry(experimentIdSchema.parse(id)) }
+  async retryPreparation(id: string): Promise<import('./types.ts').PreparationRetryResult> {
+    const record = await this.fleet.retry(experimentIdSchema.parse(id))
+    return { record, installations: this.fleet.snapshot().installations.filter(value => value.experimentId === record.request.experimentId) }
+  }
   /** @param id - experiment. @param revision - displayed plan revision. @returns queued state. */
   @Remote
   approvePlan(id: string, revision: number): Promise<FleetExperiment> { return this.fleet.approve(experimentIdSchema.parse(id), revision) }
@@ -209,7 +231,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const fleet = await ExperimentFleet.open(ctx, (server: ServerSettings) => ({ ...server,
     localRepo: config.extensionRoot, dataRoots: config.dataRoots, preparationOutputChars: config.preparationOutputChars,
     agentCredentialRefs: config.agentCredentialRefs, tokenRef: 'ASPERA_COORDINATOR', toolTimeoutMs: config.toolTimeoutMs,
-    controlPollIntervalMs: config.pollIntervalMs, minimumFreeBytes: config.minimumFreeBytes }), config.connectionCheckTimeoutMs)
+    controlPollIntervalMs: config.pollIntervalMs, minimumFreeBytes: config.minimumFreeBytes }), config.connectionCheckTimeoutMs,
+    undefined, installationPolicySchema.parse(config))
   new AsperaRemote(ctx, fleet, new ExperimentDownloads(ctx, fleet, config.downloadTtlMs), config)
   const output = { schema: { type: 'string' as const }, render: (_args: object, value: string) => [{ type: 'text' as const, text: value }] }
   const presentCall = (args: object) => ({ card: 'generic' as const, title: 'Aspera experiment', kind: 'other' as const, rawInput: args })

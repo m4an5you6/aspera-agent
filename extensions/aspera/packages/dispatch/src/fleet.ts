@@ -26,12 +26,17 @@ import { copy, remote, remoteResult, request, shellQuote, prepareSshHostKey } fr
 import { installPrivateFile } from './deploy.ts'
 import type { DeploymentConfig, PreparedEnvironment } from './deploy.ts'
 import { snapshotSource } from './snapshot.ts'
+import { InstallationRecovery } from './installation.ts'
+import { installationPolicySchema } from './installation-model.ts'
+import type { InstallationPolicy } from './installation-model.ts'
 import { sshPasswordRef } from './ssh-account.ts'
 import { pinnedTargetSchema } from './deployment-settings.ts'
 import { fleetExperimentV5Schema, fleetRegistryV5Schema, fleetRequestV5Schema } from './fleet-schema-v5.ts'
 import { serverConnectionCheckSchema, deletedExperimentSchema, experimentDeletionSchema, deleteRequestSchema } from './management-schema.ts'
 import { cleanupLocalInputs } from './cleanup.ts'
-import type { ServerConnectionCheck, DeletedExperiment, ExperimentDeletion, ExperimentDeletionPreview, DeleteExperimentsRequest, FleetSnapshot } from './types.ts'
+import type { ServerConnectionCheck, DeletedExperiment, ExperimentDeletion, ExperimentDeletionPreview, DeleteExperimentsRequest, FleetSnapshot, ServerDeletionPreview } from './types.ts'
+import { removalStoreSpec, removedWork, sameServerEndpoint } from './removals.ts'
+import type { LocalRemoval } from './removals.ts'
 import { delegateClusterLogin, describeClusterNode, ensureClusterRole, prepareClusterServer } from './cluster-deploy.ts'
 import type { DeploymentRelease } from './cluster-deploy.ts'
 import { EnvironmentPreparation, UnconfirmedPreparationCommand } from './environment-preparation.ts'
@@ -41,6 +46,7 @@ import { environmentRequirements, installedEnvironmentRequirements, inspectEnvir
 import type { FleetCreateRequest, FleetExperiment, FleetRegistry, FleetServerInput, PinnedDeployment } from './types.ts'
 import type { AnswerExperimentQuestion, ExperimentModels } from '@aspera/experiments'
 import { experimentRemovalBlocker, serverRemovalBlockers } from './server-usage.ts'
+import { executionProgressReadSchema } from '@aspera/experiments'
 import { StorageSelection } from './storage-selection.ts'
 import { resolveTrainingNetwork } from './network-selection.ts'
 import { captureExperimentModels } from './models.ts'
@@ -109,12 +115,17 @@ export class ExperimentFleet {
   private readonly acceptance = new Map<ExperimentId, Promise<void>>()
   private readonly checks = new Map<ExperimentServerId, Promise<ServerConnectionCheck>>()
   private readonly deletionWork = new Map<ExperimentId, Promise<ExperimentDeletion>>()
+  private readonly cleanupControllers = new Map<ExperimentId, AbortController>()
+  private readonly localCleanupWork = new Map<ExperimentId, Promise<void>>()
+  private readonly checkControllers = new Map<ExperimentServerId, AbortController>()
+  private readonly requests = new Map<ExperimentId, Set<AbortController>>()
   private closing = false
   private readonly uploadRoot = resolve(resolveDshHome(), 'aspera-inputs')
 
-  private constructor(private readonly ctx: Context, private readonly store: Store,
+  private constructor(private readonly ctx: Context, private readonly store: Store, private readonly removals: Domain<typeof removalStoreSpec>,
     private readonly deployment: (server: ServerSettings) => PinnedDeployment,
-    private readonly connectionCheckTimeoutMs: number, private readonly driver: FleetDriver) {}
+    private readonly connectionCheckTimeoutMs: number, private readonly driver: FleetDriver,
+    private readonly installations: InstallationRecovery) {}
 
   /**
    * Open durable records and reconcile interrupted local preparation.
@@ -125,9 +136,12 @@ export class ExperimentFleet {
    * @returns effect-owned fleet service.
    */
   static async open(ctx: Context, deployment: (server: ServerSettings) => PinnedDeployment,
-    connectionCheckTimeoutMs: number, driver: FleetDriver = productionDriver): Promise<ExperimentFleet> {
+    connectionCheckTimeoutMs: number, driver: FleetDriver = productionDriver,
+    installationPolicy: InstallationPolicy = installationPolicySchema.parse({})): Promise<ExperimentFleet> {
     const store = await ctx.storage.domain.open(storeSpec)
-    const fleet = new ExperimentFleet(ctx, store, deployment, connectionCheckTimeoutMs, driver)
+    const removals = await ctx.storage.domain.open(removalStoreSpec)
+    const installations = await InstallationRecovery.open(ctx, installationPolicy, driver)
+    const fleet = new ExperimentFleet(ctx, store, removals, deployment, connectionCheckTimeoutMs, driver, installations)
     ctx.effect(() => () => fleet.close(), 'experiment fleet: local preparations')
     if (store.table('registry').get('servers') === undefined) {
       await store.table('registry').put('servers', { servers: [] })
@@ -138,19 +152,21 @@ export class ExperimentFleet {
         [id, check.status === 'checking' ? { ...check, status: 'interrupted', checkedAt: Date.now() } : check])) })
     }
     for (const [id, job] of store.table('deletions').entries()) {
-      if (store.table('deleted').get(id) !== undefined) {
+      if (fleet.isRemoved(id)) {
         await store.table('deletions').put(id, { experimentId: id, operationId: job.operationId, cleanupRemote: job.cleanupRemote, started: job.started, state: 'deleted', nodes: [], updatedAt: job.updatedAt })
       } else if (job.state === 'deleting') await store.table('deletions').put(id, { ...job, state: 'failed', detail: 'Cleanup was interrupted; retry to resume saved progress', updatedAt: Date.now() })
     }
     for (const [id, record] of store.table('experiments').entries()) {
-      if (store.table('deleted').get(id) !== undefined) { await store.table('experiments').delete(id); continue }
-      if (record.state === 'preparing') await store.table('experiments').put(id, { ...record, state: 'failed', detail:
+      if (fleet.isRemoved(id)) { await store.table('experiments').delete(id); continue }
+      if (record.state === 'preparing' && !(installations.has(id) && record.submission === undefined)) await store.table('experiments').put(id, { ...record, state: 'failed', detail:
         record.submission === undefined ? 'Local preparation was interrupted before remote handover.' : 'Submission outcome is unknown; refresh to reconcile the saved experiment id.' })
     }
     ctx.on('domain/changed', (change) => {
-      if (change.domain === 'aspera_fleet') ctx.emit('experiment-fleet/changed',
+      if (change.domain === 'aspera_fleet' || change.domain === 'aspera_removals' || change.domain === 'aspera_preparation') ctx.emit('experiment-fleet/changed',
         { kind: change.table === 'registry' ? 'servers' : 'experiments' })
     })
+    for (const [id, removal] of removals.table('removals').entries()) if (removal.localCleanup === 'pending') fleet.beginLocalCleanup(id)
+    for (const record of fleet.list()) if (record.state === 'preparing' && installations.has(record.request.experimentId) && record.submission === undefined) fleet.beginPreparation(record.request.experimentId)
     return fleet
   }
 
@@ -160,11 +176,12 @@ export class ExperimentFleet {
     return result
   }
 
-  private async onServer<T>(id: ExperimentServerId, signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
+  private async onServer<T>(id: ExperimentServerId, signal: AbortSignal, operation: () => Promise<T>, ownerId: ExperimentId): Promise<T> {
     const prior = this.serverChains.get(id) ?? Promise.resolve()
     const result = prior.then(async () => {
       signal.throwIfAborted()
       for (const record of this.list()) {
+        if (record.request.experimentId !== ownerId && this.installations.pending(record.request.experimentId).includes(id)) throw new UnconfirmedPreparationCommand('Another experiment still owns an installation on this server; reconcile its exit before preparing a new experiment')
         const environment = record.preparation?.environments?.find(value => value.serverId === id)
         if (environment?.pendingCommand === undefined) continue
         const server = record.coordinator.id === id ? record.coordinator : record.servers.find(value => value.id === id)
@@ -190,7 +207,7 @@ export class ExperimentFleet {
   servers(): FleetRegistry {
     const registry = this.store.table('registry').get('servers')
     if (registry === undefined) throw new Error('server registry is missing')
-    return registry
+    return { ...registry, servers: registry.servers.filter(server => this.removals.table('removed_servers').get(server.id) === undefined) }
   }
 
   /**
@@ -206,6 +223,7 @@ export class ExperimentFleet {
       throw new Error('Mapped inference port must differ from the SSH and internal control ports')
     }
     return this.serial(async () => {
+      if (this.removals.table('removed_servers').get(server.id) !== undefined) throw new Error('Server registration was removed; add it with a new identity')
       const registry = this.servers()
       const previous = registry.servers.find(other => other.id === server.id)
       if (registry.servers.some(other => other.id !== server.id && other.host === server.host && other.sshPort === server.sshPort)) {
@@ -226,19 +244,21 @@ export class ExperimentFleet {
   }
 
   /**
-   * Remove an unused server from future selections.
+   * Remove a server configuration from future selections without stopping pinned experiments.
    * @param id - server registration to remove; historical snapshots and remote files remain.
+   * @param allowLinked - explicit acknowledgement that unfinished work and cleanup obligations remain.
    * @returns registry after safe removal.
    */
-  removeServer(id: ExperimentServerId): Promise<FleetRegistry> {
+  removeServer(id: ExperimentServerId, allowLinked: boolean = false): Promise<FleetRegistry> {
     return this.serial(async () => {
       const current = this.servers()
-      if (serverRemovalBlockers(id, this.list(), current.checks?.[id]?.result ?? current.checks?.[id]?.lastSuccess?.result ?? current.probes?.[id], [...this.store.table('deleted').entries()].map(([key]) => key)).length > 0) {
+      if (!allowLinked && (serverRemovalBlockers(id, this.list(), current.checks?.[id]?.result ?? current.checks?.[id]?.lastSuccess?.result ?? current.probes?.[id], this.deletedIds()).length > 0 || this.list().some(row => this.installations.pending(row.request.experimentId).includes(id)))) {
         throw new Error('Server has pending work or unconfirmed cleanup; stop or reconcile that work before removing its registration')
       }
       const servers = current.servers.filter(server => server.id !== id)
       const { [id]: _removedProbe, ...probes } = current.probes ?? {}
-      if ([...this.store.table('deletions').entries()].some(([, job]) => job.state === 'deleting' && job.nodes.some(node => node.serverId === id))) throw new Error('Experiment file cleanup is still in progress')
+      await this.removals.table('removed_servers').put(id, { removedAt: Date.now() })
+      this.checkControllers.get(id)?.abort(new Error('Server configuration removed'))
       const { [id]: _removedCheck, ...checks } = current.checks ?? {}
       const next = { servers, probes, checks }
       await this.store.table('registry').put('servers', next)
@@ -246,6 +266,15 @@ export class ExperimentFleet {
       if (removed !== undefined) await this.removeUnusedCredential(sshPasswordRef(removed))
       return next
     })
+  }
+
+  /** Preview local configuration deletion without connecting to the server.
+   * @param id - saved server identity. @returns retained experiments and unresolved deleted work.
+   */
+  previewServerRemoval(id: ExperimentServerId): ServerDeletionPreview {
+    return { serverId: id, linkedExperiments: this.list().filter(row => row.servers.some(server => server.id === id) || row.coordinator.id === id)
+      .map(row => ({ experimentId: row.request.experimentId, name: row.request.name ?? row.request.objective.split('\n')[0]!.slice(0, 120), unfinished: experimentRemovalBlocker(row) !== undefined || this.installations.pending(row.request.experimentId).includes(id) })),
+    unconfirmedExperimentIds: [...this.removals.table('removals').entries()].filter(([, value]) => value.work?.nodes.some(node => node.server.id === id)).map(([key]) => key) }
   }
 
   private async password(server: ServerSettings): Promise<string | undefined> {
@@ -287,14 +316,23 @@ export class ExperimentFleet {
       if (record.models !== undefined && experimentPhases.some(phase => record.models?.[phase].configurationRef === ref
         || `ASPERA_KEY_${record.request.experimentId.replaceAll('-', '_')}_${phase}`.toUpperCase() === ref)) return
     }
+    for (const [id, removal] of this.removals.table('removals').entries()) {
+      if (removal.work?.nodes.some(node => sshPasswordRef(node.server) === ref)) return
+      if (id !== deletingId && removal.localCleanup === 'pending' && removal.credentialRefs.includes(ref)) return
+    }
     const key = credentialRef(ref)
     if ((await this.ctx.credentials.describe(key)).writable) await this.ctx.credentials.unset(key)
   }
 
   /** Complete snapshots include deletion identities so stale replies cannot restore rows. @returns public management state. */
   snapshot(): FleetSnapshot {
-    return { registry: this.servers(), experiments: this.list(), deletedIds: [...this.store.table('deleted').entries()].map(([id]) => id),
-      deletions: [...this.store.table('deletions').entries()].map(([, job]) => job) }
+    return { registry: this.servers(), experiments: this.list(), deletedIds: this.deletedIds(),
+      installations: this.installations.progress(this.list().map(row => row.request.experimentId)),
+      removedServerIds: [...this.removals.table('removed_servers').entries()].map(([id]) => id),
+      unconfirmedWork: [...this.removals.table('removals').entries()].flatMap(([experimentId, value]) => value.work === undefined ? [] :
+        [{ experimentId, name: value.name, serverIds: [...new Set(value.work.nodes.flatMap(node => [node.server.id,
+          ...this.servers().servers.filter(server => sameServerEndpoint(node.server, server)).map(server => server.id)]))] }]),
+      deletions: [...this.store.table('deletions').entries()].map(([id, job]) => this.isRemoved(id) ? { ...job, state: 'deleted' as const } : job) }
   }
 
   /** Compute removal eligibility without changing tasks or remote files.
@@ -304,14 +342,14 @@ export class ExperimentFleet {
     const ids = z.array(experimentIdSchema).max(100).parse(rawIds)
     return ids.map(id => {
       const record = this.get(id)
-      const reason = this.preparing.has(id) ? 'active' : experimentRemovalBlocker(record)
+      const reason = this.preparing.has(id) ? 'active' : this.installations.pending(id).length ? 'cleanup-unconfirmed' : experimentRemovalBlocker(record)
       const servers = [...new Map([record.coordinator, ...record.servers].map(server => [server.id, server])).values()]
       const nodes = servers.flatMap(server => {
         const placement = server.storagePlacement ?? record.preparation?.placements.find(value => value.serverId === server.id)
         return placement === undefined ? [] : [{ serverId: server.id, name: server.name, path: placement.runRoot }]
       })
       return { experimentId: id, name: record.request.name ?? record.request.objective.split('\n')[0]!.slice(0, 120),
-        eligible: reason === undefined, ...(reason === undefined ? {} : { reason }), cleanupAvailable: nodes.length === servers.length, nodes }
+        eligible: reason === undefined, recordDeletionAvailable: true, ...(reason === undefined ? {} : { reason }), cleanupAvailable: reason === undefined && nodes.length === servers.length, nodes }
     })
   }
 
@@ -320,23 +358,25 @@ export class ExperimentFleet {
    */
   async deleteExperiments(raw: DeleteExperimentsRequest): Promise<ExperimentDeletion[]> {
     const input = deleteRequestSchema.parse(raw)
+    if (!input.cleanupRemote) return Promise.all(input.experimentIds.map(id => this.deleteLocally(id, input)))
     return Promise.all(input.experimentIds.map(id => {
       const existing = this.deletionWork.get(id)
       if (existing !== undefined) return existing.then(job => {
         if (job.cleanupRemote !== input.cleanupRemote) throw new Error('Cleanup is already running with a different policy')
         return job
       })
-      const work = this.deleteOne(id, input).finally(() => { this.deletionWork.delete(id) })
+      const abort = new AbortController(); this.cleanupControllers.set(id, abort)
+      const work = this.deleteOne(id, input, abort.signal).finally(() => { this.deletionWork.delete(id); this.cleanupControllers.delete(id) })
       this.deletionWork.set(id, work)
       return work
     }))
   }
 
-  private async deleteOne(id: ExperimentId, input: z.infer<typeof deleteRequestSchema>): Promise<ExperimentDeletion> {
+  private async deleteOne(id: ExperimentId, input: z.infer<typeof deleteRequestSchema>, signal: AbortSignal): Promise<ExperimentDeletion> {
     let job = await this.serial(async () => {
       if (this.closing) throw new Error('Experiment management is stopping')
       const prior = this.store.table('deletions').get(id)
-      if (this.store.table('deleted').get(id) !== undefined && prior !== undefined) return { ...prior, state: 'deleted' as const }
+      if (this.isRemoved(id) && prior !== undefined) return { ...prior, state: 'deleted' as const }
       if (prior?.operationId === input.operationId && prior.cleanupRemote !== input.cleanupRemote) throw new Error('Deletion identity has a different cleanup policy')
       const preview = this.previewDeletion([id])[0]!
       const failed = !preview.eligible || (input.cleanupRemote && !preview.cleanupAvailable)
@@ -352,6 +392,7 @@ export class ExperimentFleet {
     const record = this.get(id)
     try {
       if (job.cleanupRemote) for (const node of job.nodes) {
+        signal.throwIfAborted()
         if (node.state === 'cleaned') continue
         const server = [record.coordinator, ...record.servers].find(value => value.id === node.serverId)!
         const placement = server.storagePlacement ?? record.preparation?.placements.find(value => value.serverId === server.id)
@@ -360,34 +401,143 @@ export class ExperimentFleet {
         const names = server.id !== record.coordinator.id ? [] : [`${id}.json`, `${id}-model.json`,
           ...record.servers.flatMap(value => [`${id}-${value.id}.known_hosts`, ...(value.identityFile === undefined ? [] : [`${id}-${value.id}.identity`])])]
         const password = await this.password(server)
-        try { await this.driver.cleanupServerStorage(target, placement, names, password) } catch (error) {
+        try { await this.driver.cleanupServerStorage(target, placement, names, password, signal) } catch (error) {
           const detail = password ? String(error).replaceAll(password, '[redacted]') : String(error)
           job = { ...job, nodes: job.nodes.map(value => value.serverId === node.serverId ? { ...value, detail } : value) }
           throw new Error(detail)
         }
+        signal.throwIfAborted()
         job = { ...job, nodes: job.nodes.map(value => value.serverId === node.serverId ? { ...value, state: 'cleaned' } : value), updatedAt: Date.now() }
         await this.store.table('deletions').put(id, job)
       }
-      cleanupLocalInputs(this.uploadRoot, id)
-      cleanupLocalInputs(resolve(resolveDshHome(), 'aspera-observations'), id)
-      await this.serial(async () => {
-        if (experimentRemovalBlocker(this.get(id)) !== undefined) throw new Error('Experiment state changed before deletion')
-        for (const server of [record.coordinator, ...record.servers]) await this.removeUnusedCredential(sshPasswordRef(server), id)
-        if (record.models !== undefined) for (const phase of experimentPhases) {
-          await this.removeUnusedCredential(record.models[phase].configurationRef, id)
-          await this.removeUnusedCredential(`ASPERA_KEY_${id.replaceAll('-', '_')}_${phase}`.toUpperCase(), id)
-        }
-        await this.store.table('deleted').put(id, { experimentId: id, requestHash: createHash('sha256').update(JSON.stringify(record.request)).digest('hex'),
-          deletedAt: Date.now(), ...(record.sourceGoal === undefined ? {} : { sourceGoal: record.sourceGoal }) })
-        await this.store.table('experiments').delete(id)
-      })
-      job = { ...job, nodes: [], state: 'deleted', updatedAt: Date.now() }
+      job = await this.deleteLocally(id, input)
     } catch (error) {
-      job = this.store.table('deleted').get(id) !== undefined ? { ...job, state: 'deleted', updatedAt: Date.now() }
+      job = this.isRemoved(id) ? { ...job, state: 'deleted', updatedAt: Date.now() }
         : { ...job, state: 'failed', detail: String(error), updatedAt: Date.now() }
     }
     await this.store.table('deletions').put(id, job)
     return job
+  }
+
+  private isRemoved(id: ExperimentId): boolean {
+    return this.removals.table('removals').get(id) !== undefined || this.store.table('deleted').get(id) !== undefined
+  }
+
+  private deletedIds(): ExperimentId[] {
+    return [...new Set([...this.store.table('deleted').entries(), ...this.removals.table('removals').entries()].map(([id]) => id))]
+  }
+
+  private async deleteLocally(id: ExperimentId, input: z.infer<typeof deleteRequestSchema>): Promise<ExperimentDeletion> {
+    const result = await this.serial(async () => {
+      const prior = this.store.table('deletions').get(id)
+      if (this.isRemoved(id)) {
+        const removal = this.removals.table('removals').get(id)
+        return prior === undefined ? { experimentId: id, operationId: input.operationId, cleanupRemote: input.cleanupRemote,
+          started: true, state: 'deleted' as const, nodes: [], updatedAt: removal?.identity.deletedAt ?? Date.now() } : { ...prior, state: 'deleted' as const }
+      }
+      if (this.closing) throw new Error('Experiment management is stopping')
+      if (prior?.operationId === input.operationId && prior.cleanupRemote !== input.cleanupRemote) throw new Error('Deletion identity has a different cleanup policy')
+      const record = this.get(id)
+      const blocked = this.preparing.has(id) || this.installations.pending(id).length > 0 || experimentRemovalBlocker(record) !== undefined
+      if (blocked && (!input.allowUnconfirmed || input.cleanupRemote)) {
+        const failed: ExperimentDeletion = { experimentId: id, operationId: input.operationId, cleanupRemote: input.cleanupRemote,
+          state: 'failed', started: prior?.started ?? false, nodes: prior?.nodes ?? [], updatedAt: Date.now(),
+          detail: 'Remote release is unconfirmed; explicitly choose local record deletion or confirm release before file cleanup' }
+        await this.store.table('deletions').put(id, failed); return failed
+      }
+      const credentialRefs: string[] = [...new Set([record.coordinator, ...record.servers].map(sshPasswordRef))]
+      if (record.models !== undefined) for (const phase of experimentPhases) {
+        credentialRefs.push(record.models[phase].configurationRef, ('ASPERA_KEY_' + id.replaceAll('-', '_') + '_' + phase).toUpperCase())
+      }
+      const identity = { experimentId: id, requestHash: createHash('sha256').update(JSON.stringify(record.request)).digest('hex'),
+        deletedAt: Date.now(), ...(record.sourceGoal === undefined ? {} : { sourceGoal: record.sourceGoal }) }
+      const removal: LocalRemoval = { identity, operationId: input.operationId, localCleanup: 'pending', credentialRefs,
+        name: record.request.name ?? record.request.objective.split('\n')[0]!.slice(0, 120),
+        ...(blocked ? { work: removedWork(record, record.submission === undefined ? undefined : createHash('sha256').update(JSON.stringify(record.submission)).digest('hex')) } : {}) }
+      // This write hides the record even if compatibility writes or local cleanup are interrupted.
+      await this.removals.table('removals').put(id, removal)
+      this.preparing.get(id)?.abort.abort(new Error('Local experiment record removed'))
+      this.cleanupControllers.get(id)?.abort(new Error('Local experiment record removed'))
+      for (const controller of this.requests.get(id) ?? []) controller.abort(new Error('Local experiment record removed'))
+      const job: ExperimentDeletion = { experimentId: id, operationId: input.operationId, cleanupRemote: input.cleanupRemote,
+        started: true, state: 'deleted', nodes: [], updatedAt: identity.deletedAt }
+      await this.store.table('deletions').put(id, job)
+      return job
+    })
+    if (result.state === 'deleted') this.beginLocalCleanup(id)
+    return result
+  }
+
+  private beginLocalCleanup(id: ExperimentId): void {
+    if (this.localCleanupWork.has(id)) return
+    const work = this.finishLocalRemoval(id).catch(async error => {
+      const removal = this.removals.table('removals').get(id)
+      if (removal !== undefined) await this.removals.table('removals').put(id, { ...removal, error: redactObservation(String(error)) })
+    }).finally(() => { this.localCleanupWork.delete(id) })
+    this.localCleanupWork.set(id, work)
+  }
+
+  private async finishLocalRemoval(id: ExperimentId): Promise<void> {
+    await Promise.allSettled([this.preparing.get(id)?.done, this.acceptance.get(id)])
+    await this.serial(async () => {
+      const removal = this.removals.table('removals').get(id)
+      if (removal === undefined || removal.localCleanup === 'complete') return
+      await this.store.table('deleted').put(id, removal.identity)
+      await this.store.table('experiments').delete(id)
+      cleanupLocalInputs(this.uploadRoot, id)
+      cleanupLocalInputs(resolve(resolveDshHome(), 'aspera-observations'), id)
+      const next = { ...removal, localCleanup: 'complete' as const }
+      if (next.work?.submissionHash === undefined && next.work?.nodes.every(node => node.pendingDirectory === undefined) && this.installations.pending(id).length === 0) delete next.work
+      delete next.error
+      if (next.work === undefined) await this.installations.forget(id)
+      await this.removals.table('removals').put(id, next)
+      for (const ref of next.credentialRefs) await this.removeUnusedCredential(ref, id)
+    })
+  }
+
+  /** Recheck deleted tasks using their original runtime and private connections, without submitting or stopping them.
+   * @param id - current server registration. @param signal - optional owner cancellation; otherwise the connection-check deadline applies.
+   * @returns remaining unresolved deleted experiment identities.
+   */
+  async reconcileRemovedWork(id: ExperimentServerId, signal?: AbortSignal): Promise<ExperimentId[]> {
+    const lifetime = signal ?? AbortSignal.timeout(this.connectionCheckTimeoutMs)
+    const server = this.servers().servers.find(value => value.id === id)
+    if (server === undefined) throw new Error('Server is no longer configured')
+    for (const [experimentId, removal] of this.removals.table('removals').entries()) {
+      const work = removal.work
+      if (work === undefined || removal.localCleanup !== 'complete' || !work.nodes.some(node => sameServerEndpoint(node.server, server))) continue
+      try {
+        if (work.submissionHash !== undefined) {
+          const coordinator = work.nodes.find(node => node.server.id === work.coordinatorId)!
+          const result = z.object({ record: clusterRecordSchema }).parse(await this.controlRequest(coordinator.server, coordinator.target, work.protocol,
+            'status', { experimentId }, lifetime))
+          if (createHash('sha256').update(JSON.stringify(result.record.submission)).digest('hex') !== work.submissionHash
+            || !result.record.resourcesReleased || result.record.services.some(service => !service.released)
+            || !['completed', 'failed', 'blocked', 'cancelled', 'interrupted'].includes(result.record.state)) continue
+        }
+        let settled = true
+        for (const node of work.nodes) if (!await this.installations.reconcile(experimentId, node.server.id, this.resolvedTarget(node.target), await this.password(node.server), lifetime)) settled = false
+        for (const node of work.nodes) if (node.pendingDirectory !== undefined) {
+          const path = shellQuote(node.pendingDirectory + '/exited')
+          const exit = await this.driver.remote(node.target, 'if [ -f ' + path + ' ]; then cat ' + path + '; else printf unknown; fi', lifetime, await this.password(node.server))
+          if (!/^\d+\s*$/.test(exit)) settled = false
+        }
+        if (!settled) continue
+        await this.serial(async () => {
+          const current = this.removals.table('removals').get(experimentId)
+          if (current === undefined || JSON.stringify(current.work) !== JSON.stringify(work)) return
+          const { work: _released, ...released } = current
+          await this.removals.table('removals').put(experimentId, released)
+          await this.installations.forget(experimentId)
+          for (const node of work.nodes) await this.removeUnusedCredential(sshPasswordRef(node.server))
+        })
+      } catch (error) {
+        lifetime.throwIfAborted()
+        // An unreachable or mismatched old runtime retains its ownership evidence.
+        void error
+      }
+    }
+    return [...this.removals.table('removals').entries()].filter(([, value]) => value.work?.nodes.some(node => sameServerEndpoint(node.server, server))).map(([key]) => key)
   }
 
   private async token(server: ServerSettings, role: 'coordinator' | 'node'): Promise<string> {
@@ -429,6 +579,7 @@ export class ExperimentFleet {
     const checking: ServerConnectionCheck = { status: 'checking', configuration, startedAt,
       ...(previous?.lastSuccess === undefined ? {} : { lastSuccess: previous.lastSuccess }) }
     const deadline = new AbortController()
+    this.checkControllers.set(id, deadline)
     const timer = setTimeout(() => {
       deadline.abort(new Error(`Connection check timed out after ${this.connectionCheckTimeoutMs / 1000} ${this.connectionCheckTimeoutMs === 1000 ? 'second' : 'seconds'}`))
     }, this.connectionCheckTimeoutMs)
@@ -466,13 +617,14 @@ export class ExperimentFleet {
       const result: ServerProbe = { gpuInfo, allocations: health?.success ? health.data.node.allocations : [],
         ...(inventory === undefined ? {} : { inventory }), environment, environmentReady: readiness.ready,
         ...(!readiness.ready ? { detail: readiness.failures.join('\n') } : observations[0].status === 'rejected' ? { detail: String(observations[0].reason) } : {}) }
+      await this.reconcileRemovedWork(id, signal)
       const checkedAt = Date.now()
       check = { status: 'passed', configuration, startedAt, checkedAt, result, lastSuccess: { checkedAt, result },
         gpu: observations[1].status === 'fulfilled' && gpuInfo.trim() !== '' ? 'passed' : 'unavailable', control: health?.success ? 'passed' : 'unavailable' }
     } catch (error) {
       const message = String(signal.aborted ? signal.reason : error)
       check = { ...checking, status: 'failed', checkedAt: Date.now(), error: password ? message.replaceAll(password, '[redacted]') : message }
-    } finally { clearTimeout(timer) }
+    } finally { clearTimeout(timer); if (this.checkControllers.get(id) === deadline) this.checkControllers.delete(id) }
     return this.serial(async () => {
       const registry = this.servers()
       if (registry.checks?.[id]?.startedAt !== startedAt || !registry.servers.some(value => value.id === id && connectionConfiguration(value) === configuration)) {
@@ -487,11 +639,11 @@ export class ExperimentFleet {
    * Read experiments in their durable display order.
    * @returns independent experiments in most-recent-first order.
    */
-  list(): FleetExperiment[] { return [...this.store.table('experiments').entries()].filter(([id]) => this.store.table('deleted').get(id) === undefined).map(([, record]) => record).sort((a,
+  list(): FleetExperiment[] { return [...this.store.table('experiments').entries()].filter(([id]) => !this.isRemoved(id)).map(([, record]) => record).sort((a,
     b) => b.createdAt - a.createdAt) }
 
   private get(id: ExperimentId): FleetExperiment {
-    const record = this.store.table('deleted').get(id) === undefined ? this.store.table('experiments').get(id) : undefined
+    const record = !this.isRemoved(id) ? this.store.table('experiments').get(id) : undefined
     if (record === undefined) throw new Error('experiment not found')
     return record
   }
@@ -541,7 +693,7 @@ export class ExperimentFleet {
     const input = requestSchema.parse(raw)
     return this.serial(async () => {
       if (this.closing) throw new Error('experiment dispatch is stopping')
-      if (this.store.table('deleted').get(input.experimentId) !== undefined || (sourceGoal !== undefined && [...this.store.table('deleted').entries()].some(([, value]) =>
+      if (this.isRemoved(input.experimentId) || (sourceGoal !== undefined && [...this.store.table('deleted').entries(), ...[...this.removals.table('removals').entries()].map(([id, value]) => [id, value.identity] as const)].some(([, value]) =>
         value.sourceGoal?.sessionId === sourceGoal.sessionId && value.sourceGoal.id === sourceGoal.id && value.sourceGoal.revision === sourceGoal.revision))) throw new Error('Experiment was deleted; copy to a new experiment')
       const previous = this.store.table('experiments').get(input.experimentId) ?? (sourceGoal === undefined ? undefined
         : this.list().find(row => row.sourceGoal?.sessionId === sourceGoal.sessionId
@@ -552,6 +704,9 @@ export class ExperimentFleet {
         return previous
       }
       const registry = this.servers()
+      const unresolved = [...this.removals.table('removals').entries()].find(([, removal]) => removal.work?.nodes.some(node =>
+        registry.servers.some(server => input.serverIds.includes(server.id) && sameServerEndpoint(node.server, server))))
+      if (unresolved !== undefined) throw new Error('Selected nodes have unconfirmed remote work from a deleted experiment; recheck the server before submitting')
       const coordinator = registry.servers.find(server => server.id === input.coordinatorId)
       const conflict = this.list().find(row => row.coordinator.id !== input.coordinatorId && (experimentRemovalBlocker(row) !== undefined || this.preparing.has(row.request.experimentId) || this.deletionWork.has(row.request.experimentId))
         && [row.coordinator.id, ...row.servers.map(server => server.id)].some(id => input.serverIds.includes(id)))
@@ -585,6 +740,7 @@ export class ExperimentFleet {
         state: input.uploads.length > 0 ? 'staging' : 'preparing', sessionId, waitingFor: [], handoverRecorded: false,
         preparation: { protocol: 4, stage: 'inspecting', inventories: [], placements: [] },
         ...(sourceGoal === undefined ? {} : { sourceGoal }) }
+      await this.installations.pin(input.experimentId, [pinnedCoordinator.id, ...servers.map(server => server.id)])
       await this.store.table('experiments').put(input.experimentId, record)
       if (record.state === 'preparing') this.beginPreparation(input.experimentId)
       return record
@@ -632,10 +788,18 @@ export class ExperimentFleet {
       if (current.state !== 'failed') throw new Error('Only interrupted or failed preparation can be retried')
       const serverIds = [...new Set([current.coordinator.id, ...current.servers.map(server => server.id)])]
       const placements = current.preparation.placements
-      if (placements.length !== serverIds.length || serverIds.some(serverId =>
-        !placements.some(placement => placement.serverId === serverId && /\/[a-f0-9]{64}$/.test(placement.releaseRoot)))) {
+      if (!this.installations.material(id) && (placements.length !== serverIds.length || serverIds.some(serverId =>
+        !placements.some(placement => placement.serverId === serverId && /\/[a-f0-9]{64}$/.test(placement.releaseRoot))))) {
         throw new Error('Original release directories are missing from the preparation record; copy this experiment')
       }
+      await this.installations.pin(id, serverIds)
+      for (const server of [...new Map([current.coordinator, ...current.servers].map(server => [server.id, server])).values()]) {
+        if (this.installations.pending(id).includes(server.id)) {
+          const target = server.id === current.coordinator.id ? current.coordinatorTarget : current.targets[current.servers.findIndex(value => value.id === server.id)]!
+          if (!await this.installations.stop(id, server.id, this.resolvedTarget(target), await this.password(server), AbortSignal.timeout(this.connectionCheckTimeoutMs))) throw new Error('Previous installation exit remains unconfirmed; retry is blocked')
+        }
+      }
+      for (const serverId of serverIds) await this.installations.startBudget(id, serverId, true)
       const next = { ...current, state: 'preparing' as const }
       delete next.detail
       await this.store.table('experiments').put(id, next)
@@ -727,14 +891,20 @@ export class ExperimentFleet {
         if (target === undefined) throw new Error('Selected server has no pinned preparation settings')
         return target
       }
-      for (const server of unique) await this.driver.prepareSshHostKey(targetFor(server), signal)
-      const savedDigest = preparation.placements[0]?.releaseRoot.split('/').at(-1)
-      if (savedDigest === undefined) source = await this.driver.snapshotSource(pendingTarget.localRepo, pendingTarget.toolTimeoutMs, signal)
+      for (const server of unique) {
+        await this.installations.startBudget(id, server.id)
+        await this.driver.prepareSshHostKey(targetFor(server), this.installations.signal(id, server.id, signal))
+      }
+      const installationSignal = AbortSignal.any(unique.map(server => this.installations.signal(id, server.id, signal)))
+      const retained = this.installations.material(id)
+      const savedDigest = retained?.digest ?? preparation.placements[0]?.releaseRoot.split('/').at(-1)
+      if (savedDigest === undefined) source = await this.driver.snapshotSource(pendingTarget.localRepo, pendingTarget.toolTimeoutMs, installationSignal)
       const snapshot: DeploymentRelease = source ?? { digest: z.string().regex(/^[a-f0-9]{64}$/).parse(savedDigest), reuse: true }
       if (preparation.placements.some(placement => !placement.releaseRoot.endsWith('/' + snapshot.digest))) throw new Error('Saved server releases differ; copy this experiment')
-      const savedRelease = preparation.placements.find(value => value.serverId === record.coordinator.id)?.releaseRoot
-      const requirements = savedRelease === undefined ? this.driver.environmentRequirements(pendingTarget.localRepo)
-        : await this.driver.installedEnvironmentRequirements(pendingTarget, savedRelease, snapshot.digest, await this.password(record.coordinator), signal)
+      const requirements = source === undefined
+        ? await this.installations.recover(id, snapshot.digest, pendingTarget, await this.password(record.coordinator), installationSignal)
+        : this.driver.environmentRequirements(pendingTarget.localRepo)
+      if (source !== undefined) await this.installations.retain(id, source, requirements)
       const files = record.request.files.map(path => this.localInput(path, pendingTarget.dataRoots))
       for (const file of record.request.uploads) files.push(resolve(this.uploadRoot, id, file.name))
       const inputs: { name: string; sha256: string }[] = []
@@ -753,35 +923,31 @@ export class ExperimentFleet {
         directories: target.storagePlacement === undefined ? undefined : {
           workspace: target.storagePlacement.workspaceRoot, release: target.storagePlacement.releaseRoot, control: target.storagePlacement.controlRoot,
         },
-        observation: await this.driver.inspectEnvironment(target, await this.password(server), signal),
+        observation: await this.driver.inspectEnvironment(target, await this.password(server), operation === 'controller' ? signal : this.installations.signal(id, server.id, signal)),
         pendingCommand: this.get(id).preparation?.environments?.find(value => value.serverId === server.id)?.pendingCommand,
         outputChars: target.preparationOutputChars,
+        installation: operation === 'deployment' ? this.installations.tools(id, server.id, this.resolvedTarget(target), await this.password(server), handle.agent.session.id) : undefined,
         progress: value => this.environmentProgress(id, value),
       })
       for (const server of unique) {
+        await this.installations.startBudget(id, server.id)
         await this.onServer(server.id, signal, async () => {
           const target = this.reuseExecutablePaths(server.id, targetFor(server))
-          if ('reuse' in snapshot && server.id !== record.coordinator.id) {
-            const release = preparation.placements.find(value => value.serverId === server.id)?.releaseRoot
-            if (release === undefined) throw new Error('Saved node release is missing; copy this experiment')
-            const original = await this.driver.installedEnvironmentRequirements(target, release, snapshot.digest, await this.password(server), signal)
-            if (original.node !== requirements.node || original.pnpm !== requirements.pnpm) throw new Error('Saved node release requirements differ; copy this experiment')
-          }
           const result = await environment.ensure(handle.agent, await environmentInput(server, target, 'bootstrap'), this.driver,
             async (candidate, observed) => {
               const checked = checkEnvironment(observed, requirements, candidate.pathEntries)
               if (!checked.ready) throw new Error(checked.failures.join('\n'))
               return checked.toolchain
-            }, signal)
+            }, this.installations.signal(id, server.id, signal))
           record = await this.saveExecutablePaths(id, server.id, result.value.pathEntries)
-        })
+        }, id)
       }
       let inventories = record.preparation?.inventories ?? []
       if (inventories.length === 0) {
         const observations = await Promise.allSettled(unique.map(async server => {
           const directory = server.storagePreference?.mode === 'manual' ? server.storagePreference.directory
             : server.storagePreference === undefined ? server.remoteRoot : undefined
-          return { serverId: server.id, inventory: await this.driver.inspectServerStorage(targetFor(server), directory, await this.password(server), signal) }
+          return { serverId: server.id, inventory: await this.driver.inspectServerStorage(targetFor(server), directory, await this.password(server), this.installations.signal(id, server.id, signal)) }
         }))
         inventories = observations.map(result => { if (result.status === 'rejected') throw result.reason; return result.value })
         record = await this.preparationStage(id, 'selecting-storage', { inventories })
@@ -793,7 +959,7 @@ export class ExperimentFleet {
           const observed = inventories.find(value => value.serverId === server.id)
           if (observed === undefined) throw new Error('Server inventory is missing')
           return { server, inventory: observed.inventory }
-        }), pendingTarget.minimumFreeBytes, signal)
+        }), pendingTarget.minimumFreeBytes, installationSignal)
         await this.ctx.sessionPersistence.flush()
         record = await this.preparationStage(id, 'preparing-storage', { placements })
       }
@@ -833,19 +999,21 @@ export class ExperimentFleet {
         if (placement === undefined) throw new Error('Coordinator storage is missing')
         await this.preparationStage(id, 'deploying')
         const result = await environment.ensure(handle.agent, await environmentInput(record.coordinator, record.coordinatorTarget, 'deployment'), this.driver,
-          async (candidate, observed, operationSignal) => {
+          async (candidate, observed, operationSignal, callId) => {
             const checked = checkEnvironment(observed, requirements, candidate.pathEntries)
             if (!checked.ready) throw new Error(checked.failures.join('\n'))
             const configured = { ...target, pathEntries: checked.toolchain.pathEntries }
             await this.driver.prepareServerStorage(configured, placement, coordinatorPassword, operationSignal)
-            return this.driver.prepareClusterServer(configured, snapshot, coordinatorPassword, operationSignal)
-          }, signal)
+            return this.driver.prepareClusterServer(configured, snapshot, coordinatorPassword, operationSignal,
+              () => this.installations.ensure(id, record.coordinator.id, configured, coordinatorPassword, operationSignal, { sessionId: handle.agent.session.id, callId }))
+          }, this.installations.signal(id, record.coordinator.id, signal))
+        await this.installations.verified(id, record.coordinator.id)
         const prepared = result.value
         target = { ...target, pathEntries: result.pathEntries }
         record = await this.saveExecutablePaths(id, record.coordinator.id, result.pathEntries)
         target = await startRole(record.coordinator, record.coordinatorTarget, prepared, 'coordinator', coordinatorToken, coordinatorPassword)
         return prepared
-      })
+      }, id)
       const preparedNodes: ClusterNode[] = []
       for (const [index, server] of resolvedNodes.entries()) preparedNodes.push(await this.onServer(server.id, signal, async () => {
         const pendingNode = record.targets[index]
@@ -856,19 +1024,21 @@ export class ExperimentFleet {
         const nodePlacement = server.storagePlacement
         const result = server.id === record.coordinator.id ? { value: preparedCoordinator, pathEntries: [...(target.pathEntries ?? [])] }
           : await environment.ensure(handle.agent, await environmentInput(server, pendingNode, 'deployment'), this.driver,
-            async (candidate, observed, operationSignal) => {
+            async (candidate, observed, operationSignal, callId) => {
               const checked = checkEnvironment(observed, requirements, candidate.pathEntries)
               if (!checked.ready) throw new Error(checked.failures.join('\n'))
               const configured = { ...nodeTarget, pathEntries: checked.toolchain.pathEntries }
               await this.driver.prepareServerStorage(configured, nodePlacement, password, operationSignal)
-              return this.driver.prepareClusterServer(configured, snapshot, password, operationSignal)
-            }, signal)
+              return this.driver.prepareClusterServer(configured, snapshot, password, operationSignal,
+                () => this.installations.ensure(id, server.id, configured, password, operationSignal, { sessionId: handle.agent.session.id, callId }))
+            }, this.installations.signal(id, server.id, signal))
+        await this.installations.verified(id, server.id)
         const prepared = result.value
         nodeTarget = { ...nodeTarget, pathEntries: result.pathEntries }
         record = await this.saveExecutablePaths(id, server.id, result.pathEntries)
         nodeTarget = await startRole(server, record.targets[index], prepared, 'node', await this.token(server, 'node'), password)
         return this.driver.describeClusterNode(server, prepared, nodeTarget, password, signal)
-      }))
+      }, id))
       let nodes = preparedNodes
       await this.preparationStage(id, 'checking-network')
       for (const server of resolvedNodes) await this.onServer(server.id, signal, async () => {
@@ -886,7 +1056,7 @@ export class ExperimentFleet {
             return this.driver.resolveTrainingNetwork(id, participants, operationSignal, server.id)
           }, signal)
         nodes = result.value
-      })
+      }, id)
       for (const server of unique) await this.onServer(server.id, signal, async () => {
         const pending = targetFor(server)
         const expected = server.id === record.coordinator.id ? preparedCoordinator : preparedNodes.find(node => node.server.id === server.id)
@@ -905,7 +1075,7 @@ export class ExperimentFleet {
             }
             return verified
           }, signal)
-      })
+      }, id)
       const coordinator = nodes.find(node => node.server.id === resolvedCoordinator.id)?.server ?? resolvedCoordinator
       record = await this.serial(async () => {
         const next = { ...this.get(id), coordinator, servers: nodes.map(node => node.server) }
@@ -963,7 +1133,10 @@ export class ExperimentFleet {
         'submit', submission)) }
       await this.accept(record, receipt)
     } catch (error) {
+      if (this.isRemoved(id)) return
       const current = this.get(id)
+      if (this.closing && this.installations.has(id) && current.submission === undefined) return
+      await this.installations.failed(id, String(error))
       if (current.receipt === undefined) await this.store.table('experiments').put(id, { ...current,
         state: signal.aborted && !this.closing && current.submission === undefined ? 'cancelled' : 'failed', detail: `preparation: ${String(error)}` })
     } finally {
@@ -992,6 +1165,20 @@ export class ExperimentFleet {
 
   private async environmentProgress(id: ExperimentId, value: EnvironmentProgress): Promise<void> {
     await this.serial(async () => {
+      const removed = this.removals.table('removals').get(id)
+      if (removed !== undefined) {
+        if (removed.work !== undefined) {
+          const nodes = removed.work.nodes.map(node => {
+            if (node.server.id !== value.serverId) return node
+            const next = { ...node }
+            if (value.pendingCommand === undefined) delete next.pendingDirectory
+            else next.pendingDirectory = value.pendingCommand.directory
+            return next
+          })
+          await this.removals.table('removals').put(id, { ...removed, work: { ...removed.work, nodes } })
+        }
+        return
+      }
       const current = this.get(id)
       if (current.preparation === undefined) throw new Error('Preparation record is missing')
       const environments = [...(current.preparation.environments ?? []).filter(row => row.serverId !== value.serverId), value]
@@ -1047,6 +1234,7 @@ export class ExperimentFleet {
   private async recordHandover(record: FleetExperiment, receipt: ClusterRecord): Promise<void> {
     const notice = `${CLUSTER_HANDOVER}\n${JSON.stringify(receipt)}`
     const complete = async (agent: Agent, id: string | undefined, revision: number | undefined) => {
+      if (this.isRemoved(record.request.experimentId)) return
       const goal = this.ctx.goals.get(agent)
       if (goal === undefined || goal.id !== id || (goal.phase !== 'complete' && goal.revision !== revision)) return
       if (goal.phase !== 'complete') {
@@ -1074,9 +1262,27 @@ export class ExperimentFleet {
   }
 
   private async call(record: FleetExperiment, operation: string, body: unknown, signal?: AbortSignal): Promise<unknown> {
-    const target = record.coordinatorTarget
-    const response = await this.driver.request({ ...target, remotePort: target.remotePort + 1 }, await this.token(record.coordinator, 'coordinator'),
-      `/aspera/v${record.submission?.protocol ?? 4}/${operation}`, 'POST', body, signal, await this.password(record.coordinator))
+    const id = record.request.experimentId
+    this.get(id)
+    const abort = new AbortController()
+    const controllers = this.requests.get(id) ?? new Set<AbortController>()
+    controllers.add(abort); this.requests.set(id, controllers)
+    try {
+      return await this.controlRequest(record.coordinator, record.coordinatorTarget, record.submission?.protocol ?? 4, operation, body,
+        signal === undefined ? abort.signal : AbortSignal.any([signal, abort.signal]))
+    } catch (error) {
+      if (this.isRemoved(id)) throw new Error('experiment not found')
+      throw error
+    } finally { controllers.delete(abort); if (controllers.size === 0) this.requests.delete(id) }
+  }
+
+  private async controlRequest(server: ServerSettings, target: PinnedDeployment, protocol: number, operation: string, body: unknown, signal?: AbortSignal): Promise<unknown> {
+    signal?.throwIfAborted()
+    const password = await this.password(server)
+    const token = await this.token(server, 'coordinator')
+    signal?.throwIfAborted()
+    const response = await this.driver.request({ ...target, remotePort: target.remotePort + 1 }, token,
+      '/aspera/v' + protocol + '/' + operation, 'POST', body, signal, password)
     if (response.status !== 200) {
       const error = z.object({ error: z.string() }).safeParse(response.value)
       throw new CoordinatorRequestError(response.status, error.success ? error.data.error : `coordinator returned HTTP ${response.status}`)
@@ -1141,6 +1347,14 @@ export class ExperimentFleet {
     })
     await pending.done
     const current = this.get(id)
+    if (this.installations.pending(id).length > 0) {
+      const outcomes = await Promise.allSettled(this.installations.pending(id).map(async serverId => {
+        const server = current.coordinator.id === serverId ? current.coordinator : current.servers.find(server => server.id === serverId)!
+        const target = current.coordinator.id === serverId ? current.coordinatorTarget : current.targets[current.servers.findIndex(server => server.id === serverId)]!
+        return this.installations.stop(id, serverId, this.resolvedTarget(target), await this.password(server), AbortSignal.timeout(this.connectionCheckTimeoutMs))
+      }))
+      if (outcomes.some(result => result.status === 'rejected' || !result.value)) await this.installations.failed(id, 'Cancellation requested; remote installer exit remains unconfirmed')
+    }
     if (current.submission === undefined) return current
     const latest = clusterRecordSchema.parse(await this.call(current, 'cancel', { experimentId: id, submission: current.submission }))
     return this.serial(async () => {
@@ -1215,6 +1429,7 @@ export class ExperimentFleet {
           const call = z.object({ callId: z.string() }).safeParse(event.data)
           const source = call.success ? observationSources(resolve(resolveDshHome(), 'aspera-observations', input.experimentId)).find(source => source.toolCallId === call.data.callId && source.sessionId === record.sessionId) : undefined
           if (source?.commandId !== undefined) row.log = { serverId: source.serverId, commandId: source.commandId }
+          else if (call.success) row.log = this.installations.commandForCall(input.experimentId, record.sessionId, call.data.callId)
         }
         records.push(row); characters += row.data.length
         if (tail) while (records.length > 1 && (characters > 65536 || records.length > input.limit)) characters -= records.shift()!.data.length
@@ -1298,7 +1513,7 @@ export class ExperimentFleet {
     const publish = (page: ObservationPage): ObservationPage => ({ ...page, lines: page.lines.map(line => ({ ...line, text: redactObservation(line.text, secrets) })) })
     const cursor = input.cursor ?? input.before
     if (cursor !== undefined && (cursor.experimentId !== input.experimentId || cursor.serverId !== input.serverId || cursor.sourceId !== input.sourceId || cursor.stream !== input.stream)) throw new Error('Log cursor belongs to another source')
-    if (input.sourceId.startsWith('preparation-')) return publish(readObservation(resolve(resolveDshHome(), 'aspera-observations', input.experimentId), input))
+    if (input.sourceId.startsWith('preparation-') || input.sourceId.startsWith('installation-')) return publish(readObservation(resolve(resolveDshHome(), 'aspera-observations', input.experimentId), input))
     if (input.sourceId === 'legacy-node' || input.sourceId === 'legacy-agent') {
       if (input.sourceId === 'legacy-agent' && record.coordinator.id !== input.serverId) throw new Error('Agent log belongs to the coordinator')
       if (input.stream !== 'all' && input.stream !== 'mixed') throw new Error('Legacy logs do not identify output streams')
@@ -1318,6 +1533,11 @@ export class ExperimentFleet {
         if (next.reset || next.generation !== chunk.generation) throw new Error('Legacy log rotated during reading')
         if (next.nextOffset <= chunk.nextOffset) break
         chunk = next; const bytes = Buffer.from(chunk.data, 'base64'); buffers.push(bytes); size += bytes.length
+      }
+      // Redaction lookbehind can start before the end of a truncated file.
+      if (!reset && chunk.eof && cursor !== undefined && cursor.offset > chunk.nextOffset) {
+        const { cursor: _cursor, before: _before, ...restart } = input
+        return { ...await this.logRead({ ...restart, fromStart: true }, signal), reset: true }
       }
       // Redact the surrounding bytes before slicing so adjacent pages cannot reveal a split credential.
       let bytes = Buffer.from(redactObservation(Buffer.concat(buffers).toString('latin1'), encodedSecrets, true), 'latin1').subarray(prefixBytes)
@@ -1357,6 +1577,23 @@ export class ExperimentFleet {
     catch (error) { if (error instanceof CoordinatorRequestError && error.status === 404) return []; throw error }
   }
 
+  /** @param id - saved experiment. @returns progress bound to its pinned plan and Session; unsupported releases remain unchanged. */
+  async executionProgress(id: ExperimentId): Promise<import('@aspera/experiments').ExecutionProgressRead> {
+    const record = this.get(id)
+    if (record.receipt === undefined) return { supported: false }
+    try {
+      const result = executionProgressReadSchema.parse(await this.call(record, 'execution-progress', { experimentId: id }))
+      const current = this.get(id)
+      const remote = current.latest ?? current.receipt!
+      if (result.progress !== undefined && (result.progress.experimentId !== id || result.progress.planRevision !== remote.plan?.revision
+        || result.progress.sessionId !== (remote.sessionId ?? `aspera-execution-${id}`))) throw new Error('Execution progress belongs to another experiment, plan or Session')
+      return result
+    } catch (error) {
+      if (error instanceof CoordinatorRequestError && error.status === 404 && error.message === 'cluster route not found') return { supported: false }
+      throw error
+    }
+  }
+
   /**
    * Read bounded bytes from one experiment and source.
    * @param id - experiment.
@@ -1381,6 +1618,9 @@ export class ExperimentFleet {
     await Promise.all([...this.preparing.values()].map(pending => pending.done))
     await Promise.allSettled([...this.checks.values(), ...this.deletionWork.values()])
     await Promise.allSettled(this.acceptance.values())
+    await Promise.allSettled(this.localCleanupWork.values())
+    await this.removals.close()
+    await this.installations.close()
     await this.store.close()
   }
 }

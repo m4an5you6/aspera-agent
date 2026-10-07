@@ -27,6 +27,6 @@ export const experimentDeletionSchema = z.object({ experimentId: experimentIdSch
 }).strict()
 
 /** Confirmed batches use stable identities and bounded, unique experiment selections. */
-export const deleteRequestSchema = z.object({ operationId: operationIdSchema, cleanupRemote: z.boolean(),
+export const deleteRequestSchema = z.object({ operationId: operationIdSchema, cleanupRemote: z.boolean(), allowUnconfirmed: z.boolean().default(false),
   experimentIds: z.array(experimentIdSchema).min(1).max(100) }).strict()
   .refine(value => new Set(value.experimentIds).size === value.experimentIds.length, 'Duplicate experiment selection')

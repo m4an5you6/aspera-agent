@@ -24,10 +24,12 @@ export function installStorageReplay(ctx, observedCalls, environmentCalls = []) 
   const turns = new Map()
   ctx.on('llm/stream', async function* (options, next) {
     let input
+    let sourceProbeId
     for (const message of options.messages) for (const block of message.content ?? []) {
       if (block.type !== 'text' || !block.text.startsWith('{')) continue
       try {
         const value = JSON.parse(block.text)
+        if (value.available === true && value.kind === 'npm' && typeof value.id === 'string') sourceProbeId = value.id
         if (value.operation === 'prepare-experiment-environment' && value.verification?.ready !== true) input = value
         if (value.operation === 'prepare-experiment-storage' && value.servers.some(server => server.selected === undefined)) input = value
       }
@@ -35,13 +37,19 @@ export function installStorageReplay(ctx, observedCalls, environmentCalls = []) 
     }
     if (input === undefined) { yield* next(); return }
     const names = (options.tools ?? []).map(tool => tool.name).sort()
-    const expectedTools = ['inspect_server_storage', 'select_experiment_storage', 'inspect_preparation_environment', 'run_preparation_command', 'verify_preparation_environment', 'report_preparation_blocked'].sort()
+    const expectedTools = ['inspect_server_storage', 'select_experiment_storage', 'inspect_preparation_environment', 'run_preparation_command', 'verify_preparation_environment', 'report_preparation_blocked',
+      'inspect_preparation_installation', 'probe_preparation_source', 'switch_preparation_source'].sort()
     if (JSON.stringify(names) !== JSON.stringify(expectedTools)) throw new Error('Preparation tool scope changed: ' + names.join(','))
     if (input.operation === 'prepare-experiment-environment') {
       const key = input.experimentId + '/' + input.serverId + '/' + input.step
       const step = turns.get(key) ?? 0
       turns.set(key, step + 1)
-      const operations = [
+      const operations = input.step === 'deployment' ? [
+        ['inspect_preparation_installation', {}],
+        ['probe_preparation_source', { kind: 'npm', url: 'https://cpu-mirror.example.test/npm/' }],
+        ['switch_preparation_source', { probe_id: sourceProbeId, reason: 'The selected node measured an available pinned package and HTTPS download' }],
+        ['verify_preparation_environment', { path_entries: [] }],
+      ] : [
         ['inspect_preparation_environment', {}],
         ['run_preparation_command', { command: 'fixture install dependencies' }],
         ['run_preparation_command', { command: 'fixture retry installation' }],

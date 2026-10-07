@@ -56,6 +56,38 @@ export function observationSources(root: string): ObservationSource[] {
   })
 }
 
+/** Import a supervised source without replaying rows after an interrupted cursor save.
+ * @param root - experiment-owned local directory. @param source - registered remote attempt.
+ * @param rows - complete ordered records. @param secrets - private credentials to redact.
+ */
+export function importObservation(root: string, source: ObservationSource, rows: ObservationPage['lines'], secrets: readonly string[]): void {
+  registerObservation(root, source)
+  const path = sourcePath(root, source.id, 'jsonl')
+  let last = -1
+  if (existsSync(path) && statSync(path).size > 0) {
+    const size = statSync(path).size
+    const fd = openSync(path, 'r')
+    try {
+      let length = Math.min(size, 65536)
+      for (;;) {
+        const tail = Buffer.alloc(length)
+        readSync(fd, tail, 0, length, size - length)
+        const boundary = tail.lastIndexOf(10, length - 2)
+        if (boundary < 0 && length < size) { length = Math.min(size, length * 2); continue }
+        last = observationLineSchema.parse(JSON.parse(tail.subarray(boundary + 1).toString('utf8').trimEnd())).seq
+        break
+      }
+    } finally { closeSync(fd) }
+  }
+  for (const raw of rows) {
+    const row = observationLineSchema.parse(raw)
+    if (row.seq <= last) continue
+    if (row.seq !== last + 1) throw new Error('Installation output has a missing interval')
+    appendFileSync(path, JSON.stringify({ ...row, text: redactObservation(row.text, secrets) }) + '\n', { mode: 0o600 })
+    last = row.seq
+  }
+}
+
 /** Captures complete command output, with timestamps and stream order, before tool-result truncation. */
 export class ObservationWriter {
   private readonly decoders = { stdout: new StringDecoder('utf8'), stderr: new StringDecoder('utf8') }

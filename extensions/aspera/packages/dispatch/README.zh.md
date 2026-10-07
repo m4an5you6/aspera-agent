@@ -24,13 +24,25 @@ kind: "package-bundle"
 <a id="use-this-package"></a>
 ## 使用本包
 
+生成的 `experimentExecutionProgress` Remote 从各实验的原调度主机读取批准计划的 Agent 上报。旧固定发布不支持时明确返回可用性，读取失败保留诊断，不替换运行时。[步骤进度](../../docs/state-and-api.zh.md#execution-step-progress)定义归属及兼容持久化规则。
+
 [工程启动](../../README.zh.md#start-the-management-page) 在已发布 DSH base/Web bundle 及本包 [cordis.patch.yml](cordis.patch.yml) 之上建立 `aspera` profile，装配接入层及管理页面。构建产物可以脱离 Harness 源码安装，[独立安装验证](../../scripts/test-installed.mjs) 检查同一 profile 和公开类型声明。
 
 `extensionRoot` 选择固定发布，`dataRoots` 允许读取本地输入文件，阶段快照标识私有模型凭据。`minimumFreeBytes` 配置保留空间，默认 1 GiB；`preparationOutputChars` 限制每条命令向模型返回的 stdout 和 stderr，默认各 65536 字符。准备使用所选 SSH 账号的现有权限，不依赖系统包白名单。操作、轮询和下载设置由 [Config](src/index.ts) 校验；随包配置读取 `ASPERA_DATA_ROOTS` 并兼容旧 `ASPERA_MODEL_CREDENTIAL_REFS`。连接检查只读取远端状态，不调用模型或配置依赖，区分 SSH 可达与依赖未就绪，磁盘清单可能缺失。
 
-`connectionCheckTimeoutMs` 为整轮连接检查设置统一截止时间，默认 20000 毫秒。主机密钥探测、环境检查、磁盘、GPU 和控制服务共用取消信号。到期后关闭活动 SSH 连接并保存失败状态，结束后才能再次检查；保留带时间的历史成功信息。准备与安装继续使用独立的 `toolTimeoutMs` 策略。自定义调用者在 `ExperimentFleet.open` 的可选驱动之前传入检查时限；驱动必须响应探测取消，并等待连接清理完成。
+`connectionCheckTimeoutMs` 为整轮连接检查设置统一截止时间，默认 20000 毫秒。主机密钥探测、环境检查、磁盘、GPU 和控制服务共用取消信号。到期后关闭活动 SSH 连接并保存失败状态，结束后才能再次检查；保留带时间的历史成功信息。前台准备命令继续使用 `toolTimeoutMs`。自定义调用者在 `ExperimentFleet.open` 的可选驱动之前传入检查时限；驱动必须响应探测取消，并等待连接清理完成。
 
-服务器使用密码登录和独立用户名。每个创建请求从 `serverIds` 中指定 `coordinatorId`，登记修改不影响提交快照。同一管理 profile 内，不同调度主机的未结束实验不能使用重叠节点。同调度主机继续按远端顺序排队，首次等待确认不分配 GPU。删除空闲服务器保留历史快照与远端文件，移除不再引用的自有凭据。待完成任务和清理未确认会阻止删除。节点使用配置的控制端口，调度服务使用下一端口。记录删除及兼容规则见[管理状态与清理](../../docs/state-and-api.zh.md)。
+在 profile 的 `aspera-dispatch` 项中配置受管安装。每个实验固定以下有限整数限制，无进展时限不能超过总时限。
+
+| 配置 | 默认值 | 范围 |
+| --- | ---: | --- |
+| `installationTotalTimeoutMs` | 1800000 | 每节点的安装恢复，包含诊断、修复、重连和验收 |
+| `installationIdleTimeoutMs` | 300000 | 没有实测下载、包安装或编译进展的连续时长 |
+| `installationMaxRetries` | 2 | 首次尝试之外的安装启动次数，包含换源 |
+
+准备 Agent 诊断停滞的安装，自主探测 HTTPS npm／头文件来源。已保存的 pnpm 慢速下载及请求重试告警按类别和尝试去重，只触发一次诊断；Agent 可继续等待原进程或换源。独立运行且核对身份的安装进程复用原材料和缓存，只有程序验收通过后才发布可用运行目录。显式“重试准备”建立新预算并保留历史；应用升级不会自动重跑失败实验。[安装归属](../../docs/state-and-api.zh.md#persistent-ownership)说明记录及退出未确认的处理。
+
+服务器使用密码登录和独立用户名。每个创建请求从 `serverIds` 中指定 `coordinatorId`，登记修改不影响提交快照。同一管理 profile 内，不同调度主机的未结束实验不能使用重叠节点。同调度主机继续按远端顺序排队，首次等待确认不分配 GPU。显式确认的服务器删除保留关联实验、远端文件及未确认任务需要的凭据。节点使用配置的控制端口，调度服务使用下一端口。离线记录删除、归属核验及兼容规则见[管理状态与清理](../../docs/state-and-api.zh.md)。
 
 本机连接检查和准备会把首次遇到的主机密钥自动登记到所选 `known_hosts` 文件，默认 `~/.ssh/known_hosts`。探测不发送密码或执行远端命令，采用首次使用时信任，并使用跨进程文件锁登记。已有、已撤销或不受支持的身份不会被覆盖。后续密码登录核对已登记的密钥；远端委派连接要求预先安装的密钥。`FleetDriver` 提供方实现 `prepareSshHostKey` 及经过验证的 `cleanupServerStorage`；浏览器和 Host 通过 `@aspera/dispatch/server-usage` 共用移除检查。
 

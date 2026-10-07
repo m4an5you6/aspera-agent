@@ -30,6 +30,7 @@
     "tools": [
       "finish_experiment",
       "get_experiment_commands",
+      "get_experiment_execution_progress",
       "get_experiment_requirements",
       "get_inference_services",
       "list_experiment_files",
@@ -39,6 +40,7 @@
       "read_framework_guidance",
       "record_experiment_execution",
       "report_experiment_progress",
+      "report_experiment_step",
       "run_experiment_command",
       "start_inference_service"
     ],
@@ -54,6 +56,51 @@
     "inputBlocked": true,
     "humanWaitingRejected": true,
     "adapterRequests": 6,
+    "outcome": "blocked",
+    "goalPhases": [
+      "active",
+      "blocked"
+    ]
+  },
+  {
+    "role": "node-execution",
+    "tools": [
+      "finish_experiment",
+      "get_experiment_commands",
+      "get_experiment_execution_progress",
+      "get_experiment_requirements",
+      "get_inference_services",
+      "list_experiment_files",
+      "read_experiment_file",
+      "read_experiment_input",
+      "read_framework_documentation",
+      "read_framework_guidance",
+      "record_experiment_execution",
+      "report_experiment_progress",
+      "report_experiment_step",
+      "run_experiment_command",
+      "start_inference_service"
+    ],
+    "calls": [
+      "read_framework_guidance",
+      "read_experiment_input",
+      "read_experiment_input",
+      "run_experiment_command",
+      "run_experiment_command",
+      "get_experiment_commands",
+      "read_experiment_file",
+      "record_experiment_execution",
+      "finish_experiment"
+    ],
+    "guidanceRead": true,
+    "inputRead": true,
+    "inputBlocked": true,
+    "humanWaitingRejected": true,
+    "nodeLaunches": 1,
+    "commandsAccepted": true,
+    "commandDeduplicated": true,
+    "nodeLogRead": true,
+    "adapterRequests": 10,
     "outcome": "blocked",
     "goalPhases": [
       "active",
@@ -158,6 +205,103 @@
     "outcome": "completed",
     "goalPhases": [
       "active",
+      "active",
+      "complete"
+    ]
+  },
+  {
+    "role": "step-execution",
+    "tools": [
+      "finish_experiment",
+      "get_experiment_commands",
+      "get_experiment_execution_progress",
+      "get_experiment_requirements",
+      "get_inference_services",
+      "list_experiment_files",
+      "read_experiment_file",
+      "read_experiment_input",
+      "read_framework_documentation",
+      "read_framework_guidance",
+      "record_experiment_execution",
+      "report_experiment_progress",
+      "report_experiment_step",
+      "run_experiment_command",
+      "start_inference_service"
+    ],
+    "calls": [
+      "read_framework_guidance",
+      "get_experiment_execution_progress",
+      "finish_experiment",
+      "report_experiment_step",
+      "report_experiment_step",
+      "report_experiment_step",
+      "report_experiment_step",
+      "get_experiment_execution_progress",
+      "report_experiment_step",
+      "run_experiment_command",
+      "get_experiment_commands",
+      "record_experiment_execution",
+      "report_experiment_step",
+      "finish_experiment"
+    ],
+    "guidanceRead": true,
+    "inputRead": false,
+    "inputBlocked": false,
+    "humanWaitingRejected": true,
+    "missingCompletionRejected": true,
+    "staleReportRejected": true,
+    "blockedStepRecorded": true,
+    "nodeLaunches": 1,
+    "adapterRequests": 15,
+    "outcome": "completed",
+    "goalPhases": [
+      "active",
+      "complete"
+    ]
+  },
+  {
+    "role": "step-acceptance-failure",
+    "tools": [
+      "finish_experiment",
+      "get_experiment_commands",
+      "get_experiment_execution_progress",
+      "get_experiment_requirements",
+      "get_inference_services",
+      "list_experiment_files",
+      "read_experiment_file",
+      "read_experiment_input",
+      "read_framework_documentation",
+      "read_framework_guidance",
+      "record_experiment_execution",
+      "report_experiment_progress",
+      "report_experiment_step",
+      "run_experiment_command",
+      "start_inference_service"
+    ],
+    "calls": [
+      "read_framework_guidance",
+      "get_experiment_execution_progress",
+      "finish_experiment",
+      "report_experiment_step",
+      "report_experiment_step",
+      "report_experiment_step",
+      "report_experiment_step",
+      "get_experiment_execution_progress",
+      "report_experiment_step",
+      "record_experiment_execution",
+      "report_experiment_step",
+      "finish_experiment"
+    ],
+    "guidanceRead": true,
+    "inputRead": false,
+    "inputBlocked": false,
+    "humanWaitingRejected": true,
+    "missingCompletionRejected": true,
+    "staleReportRejected": true,
+    "blockedStepRecorded": true,
+    "adapterRequests": 13,
+    "outcome": "failed",
+    "goalPhases": [
       "active",
       "complete"
     ]

@@ -1,7 +1,8 @@
 /** Peer server cards, dated observations and on-demand password reveal. */
 import { useEffect, useRef, useState } from 'react'
 import { Button, Input, Modal, Tag, Tooltip, StateDot, IconTrashOutlineRegular, IconRefreshOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { ServerSettings, ServerProbe } from '@aspera/dispatch/types'
+import type { ServerSettings, ServerProbe, ServerDeletionPreview } from '@aspera/dispatch/types'
+import { ExperimentStatus } from './ExperimentManagement.tsx'
 import { serverRemovalBlockers } from '@aspera/dispatch/server-usage'
 import type { TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import type { ExperimentsController } from './controller.ts'
@@ -55,12 +56,19 @@ function Hardware({ probe, t }: { probe: ServerProbe; t: Props['t'] }) {
 export function ServerCards({ controller, t, state, edit }: Props & { state: ReturnType<ExperimentsController['store']['getSnapshot']>; edit: (server: ServerSettings) => void }) {
   const [removal, setRemoval] = useState<ServerSettings>()
   const [removalError, setRemovalError] = useState<string>()
+  const [removalPreview, setRemovalPreview] = useState<ServerDeletionPreview>()
+  const [previewAttempt, setPreviewAttempt] = useState(0)
+  useEffect(() => {
+    let live = true; setRemovalPreview(undefined); setRemovalError(undefined)
+    if (removal !== undefined) void controller.previewServerRemoval(removal.id).then(value => { if (live) setRemovalPreview(value) },
+      reason => { if (live) { setRemovalError(t('deleteServerFailedRetained')); controller.report(reason, { serverId: removal.id, operation: 'server-delete-preview' }) } })
+    return () => { live = false }
+  }, [controller, removal, previewAttempt, t])
   const blockers = (server: ServerSettings) => serverRemovalBlockers(server.id, state.experiments, state.registry.checks?.[server.id]?.result ?? state.registry.probes?.[server.id], state.deletedIds)
-  const experimentName = (id: string) => state.experiments.find(row => row.request.experimentId === id)?.request.name ?? id
   const remove = async () => {
     if (removal === undefined) return
     try { await controller.removeServer(removal.id); setRemoval(undefined) }
-    catch (error) { setRemovalError(String(error)); controller.notify('serverDeleteFailed', true) }
+    catch (error) { setRemovalError(t('deleteServerFailedRetained')); controller.report(error, { serverId: removal.id, operation: 'server-delete' }) }
   }
   return <>
     {state.registry.servers.length === 0 && <div className={css.emptyState}>{t('noServers')}</div>}
@@ -80,23 +88,31 @@ export function ServerCards({ controller, t, state, edit }: Props & { state: Ret
           {error !== undefined && <details><summary>{t('technicalDetails')}</summary><pre>{error}</pre></details>}</div>}
         <div className={css.serverFacts}><span>{t('linkedExperiments', { count: blocked.length })}</span>
           {check?.checkedAt !== undefined && <time>{t('observedAt', { time: new Date(check.checkedAt).toLocaleString() })}</time>}</div>
+        {state.unconfirmedWork.some(work => work.serverIds.includes(server.id)) && <div className={css.deleteWarning}><div><strong>{t('removedWorkUnconfirmed')}</strong><p>{t('removedWorkHint')}</p>
+          <Button variant="ghost" size="sm" disabled={probing} onClick={() => { void controller.reconcileRemovedWork(server.id).catch(reason => { controller.report(reason, { serverId: server.id, operation: 'release-check' }) }) }}>{t('recheckRemoteWork')}</Button></div></div>}
         {current !== undefined ? <><div className={css.actions}><Tag tone="success">{t('sshPassed')}</Tag><Tag tone={check?.gpu === 'passed' ? 'success' : 'warning'}>{t(check?.gpu === 'passed' ? 'gpuPassed' : 'gpuUnavailable')}</Tag>
           <Tag tone={check?.control === 'passed' ? 'success' : 'neutral'}>{t(check?.control === 'passed' ? 'controlPassed' : 'controlUnavailable')}</Tag></div><Hardware probe={current} t={t} /></>
           : old !== undefined && <details className={css.historicalCheck}><summary>{previous === undefined ? t('currentConnectionUnconfirmed') : t('lastSuccessfulCheck', { time: new Date(previous.checkedAt).toLocaleString() })}</summary><Hardware probe={old} t={t} /></details>}
         {server.inferenceMapping !== undefined && <details className={css.inventory}><summary>{t('publicInferenceSettings')}</summary><p className={css.cleanupPath}>{server.inferenceMapping.url}</p><p>{t('mappedPort')}: {server.inferenceMapping.port}</p></details>}
         <div className={css.serverActions}><Button variant="outline" disabled={probing} onClick={() => { edit(server) }}>{t('edit')}</Button>
           <Button variant="outline" disabled={probing} aria-busy={probing} icon={probing ? <StateDot state="ongoing" /> : <IconRefreshOutlineRegular />}
-            onClick={() => { void controller.probe(server.id).catch(reason => { controller.report(reason) }) }}>{t(probing ? 'checkingConnection' : 'test')}</Button>
-          <Button variant="ghost" className={css.dangerText} disabled={probing || state.removingServers.includes(server.id)} icon={<IconTrashOutlineRegular />}
+            onClick={() => { void controller.probe(server.id).catch(reason => { controller.report(reason, { serverId: server.id, operation: 'probe' }) }) }}>{t(probing ? 'checkingConnection' : 'test')}</Button>
+          <Button variant="ghost" className={css.dangerText} disabled={state.removingServers.includes(server.id)} icon={<IconTrashOutlineRegular />}
             onClick={() => { setRemoval(server); setRemovalError(undefined) }}>{t('deleteServer')}</Button></div>
       </article>
     })}
-    <Modal open={removal !== undefined} onClose={() => { if (removal === undefined || !state.removingServers.includes(removal.id)) setRemoval(undefined) }} title={t('deleteServer')} closeLabel={t('close')} backdropBlur={false} className={css.serverModal}>
-      {removal !== undefined && <div className={css.deleteContent}><h3>{removal.name}</h3><p>{t(blockers(removal).length > 0 ? 'removeServerBlocked' : 'deleteServerHint')}</p>
-        {blockers(removal).map(id => <Button key={id} variant="ghost" onClick={() => { setRemoval(undefined); controller.navigate('list'); controller.select(id) }}>{experimentName(id)}</Button>)}
-        {removalError !== undefined && <details open className={css.operationError}><summary>{t('error')}</summary><p>{removalError}</p></details>}
-        <div className={css.modalActions}><Button variant="ghost" onClick={() => { setRemoval(undefined) }}>{t('discard')}</Button><Button variant="primary" className={css.destructiveButton}
-          disabled={blockers(removal).length > 0 || state.removingServers.includes(removal.id)} onClick={() => { void remove() }}>{t('confirmDeleteServer')}</Button></div></div>}
+    <Modal open={removal !== undefined} onClose={() => { if (removal === undefined || !state.removingServers.includes(removal.id)) setRemoval(undefined) }} title={t('deleteServer')} closeLabel={t('close')} backdropBlur={false} className={css.deleteModal} contentClassName={css.deleteModalScroll}>
+      {removal !== undefined && <><div className={css.deleteContent}><div className={css.deleteObject}><strong>{removal.name}</strong><small className={css.hint}>{removal.username}@{removal.host}:{removal.sshPort}</small></div><p>{t('deleteServerHint')}</p>
+        {removalPreview === undefined ? removalError === undefined ? <div className={css.deleteLoading}><StateDot state="ongoing" /></div> : <Button variant="outline" size="sm" onClick={() => { setPreviewAttempt(value => value + 1) }}>{t('refresh')}</Button> : removalPreview.linkedExperiments.length > 0 && <div><p className={css.hint}>{t('retainedLinkedExperiments', { count: removalPreview.linkedExperiments.length })}</p>
+          {removalPreview.linkedExperiments.map(item => {
+            const row = state.experiments.find(value => value.request.experimentId === item.experimentId)
+            return <Button key={item.experimentId} variant="ghost" className={css.linkedDeleteRecord} onClick={() => { setRemoval(undefined); controller.navigate('list'); controller.select(item.experimentId) }}>
+              <span>{item.name}</span>{row !== undefined && <ExperimentStatus row={row} t={t} />}</Button>
+          })}</div>}
+        <div className={css.deleteInfo}><p>{t('serverDeleteKeepsTasks')}</p></div>
+        {removalError !== undefined && <p className={css.deleteFailure}>{removalError}</p>}
+        </div><div className={css.deleteActions}><Button variant="ghost" disabled={state.removingServers.includes(removal.id)} onClick={() => { setRemoval(undefined) }}>{t('keepRecords')}</Button><Button variant="primary" className={css.destructiveButton}
+          disabled={removalPreview === undefined || state.removingServers.includes(removal.id)} icon={state.removingServers.includes(removal.id) ? <StateDot state="ongoing" /> : <IconTrashOutlineRegular />} onClick={() => { void remove() }}>{t('confirmDeleteServer')}</Button></div></>}
     </Modal>
   </>
 }

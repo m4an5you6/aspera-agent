@@ -6,6 +6,9 @@
         extensionRoot: !!js process.env.ASPERA_EXTENSION_ROOT
         dataRoots: !!js JSON.parse(process.env.ASPERA_DATA_ROOTS || '[]')
         agentCredentialRefs: !!js (process.env.ASPERA_MODEL_CREDENTIAL_REFS || 'DEEPSEEK_API_KEY').split(',').filter(Boolean)
+        installationTotalTimeoutMs: 1800000
+        installationIdleTimeoutMs: 300000
+        installationMaxRetries: 2
     - id: aspera-console
       name: '@aspera/console'
       config:

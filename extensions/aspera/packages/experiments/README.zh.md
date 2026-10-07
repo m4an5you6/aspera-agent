@@ -35,6 +35,8 @@ kind: "package-library"
 <a id="understand-the-implementation"></a>
 ## 了解实现
 
+[execution-progress.ts](src/execution-progress.ts)导出独立第 1 代步骤上报及读取／结果定义。记录绑定实验、批准的计划版本和执行 Session，调用身份及时间由程序提供。[步骤进度](../../docs/state-and-api.zh.md#execution-step-progress)说明持久化、版本冲突及兼容规则，现有队列记录和计划保留原格式。
+
 第 4 代固定简短实验名称及三个阶段的模型配置摘要，保留第 1～3 代读取定义。[records.ts](src/records.ts) 定义实验／阶段／Session 分页以及节点／进程／输出流游标。首次等待计划确认时保持资源释放，确认后才整组分配。
 
 <details>

@@ -103,11 +103,23 @@ export interface ExperimentDeletionPreview {
   eligible: boolean
   reason?: 'active' | 'cleanup-unconfirmed'
   cleanupAvailable: boolean
+  /** Local records can be removed independently of remote cleanup. */
+  recordDeletionAvailable: boolean
   nodes: { serverId: ExperimentServerId; name: string; path: string }[]
 }
 
 /** One confirmed batch operation; the same identity cannot change its cleanup policy. */
-export interface DeleteExperimentsRequest { operationId: string; experimentIds: string[]; cleanupRemote: boolean }
+export interface DeleteExperimentsRequest { operationId: string; experimentIds: string[]; cleanupRemote: boolean; allowUnconfirmed?: boolean }
+
+/** Local configuration deletion retains every linked experiment and its pinned destination. */
+export interface ServerDeletionPreview {
+  serverId: ExperimentServerId
+  linkedExperiments: { experimentId: ExperimentId; name: string; unfinished: boolean }[]
+  unconfirmedExperimentIds: ExperimentId[]
+}
+
+/** Deleted experiments may still own remote resources; these notices contain no credentials. */
+export interface UnconfirmedWorkNotice { experimentId: ExperimentId; name: string; serverIds: ExperimentServerId[] }
 
 /** Minimal durable identity retained after removing management records. */
 export interface DeletedExperiment {
@@ -145,7 +157,15 @@ export interface FleetExperiment {
 }
 
 /** Snapshot delivered over the reconnecting Remote stream. */
-export interface FleetSnapshot { registry: FleetRegistry; experiments: FleetExperiment[]; deletedIds: ExperimentId[]; deletions: ExperimentDeletion[] }
+export type { InstallationPolicy, InstallationProgress, InstallationRound } from './installation-model.ts'
+
+/** An explicit retry keeps experiment identity and starts a distinct recovery budget. */
+export interface PreparationRetryResult { record: FleetExperiment; installations: import('./installation-model.ts').InstallationProgress[] }
+
+/** Snapshot delivered over the reconnecting Remote stream. */
+export interface FleetSnapshot { registry: FleetRegistry; experiments: FleetExperiment[]; deletedIds: ExperimentId[]; deletions: ExperimentDeletion[];
+  installations: import('./installation-model.ts').InstallationProgress[];
+  removedServerIds: ExperimentServerId[]; unconfirmedWork: UnconfirmedWorkNotice[] }
 
 /** Immutable deployment policy; all credential fields are references. */
 export interface PinnedDeployment {

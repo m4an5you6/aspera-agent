@@ -1,10 +1,10 @@
 /** Observation files retain full output, bound reads, and reject foreign cursors. */
 import { randomUUID } from 'node:crypto'
-import { mkdtempSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { afterEach, expect, it } from 'vitest'
 import { observationSourceSchema, observationPolicySchema } from '@aspera/experiments'
-import { ObservationWriter, observationSources, readObservation } from '../src/observations.ts'
+import { importObservation, ObservationWriter, observationSources, readObservation } from '../src/observations.ts'
 import { readMetricSamples, saveMetricSample } from '../src/metrics.ts'
 
 const directories: string[] = []
@@ -83,4 +83,15 @@ it('does not expose a labeled credential spanning a large unterminated line', ()
   writer.append('stdout', 'credential-tail\nvisible output\n'); writer.close()
   const page = readObservation(root, { ...request, fromStart: true })
   expect(page.lines.map(line => line.text).join('')).toBe('Authorization: [redacted]\nvisible output\n')
+})
+
+it('resumes imported installation output after a long final record without replay or lost timestamps', () => {
+  const { root, source } = fixture()
+  const first = { seq: 0, time: 12, stream: 'stdout' as const, text: '编译🙂'.repeat(30000) + '\n' }
+  const second = { seq: 1, time: 34, stream: 'stderr' as const, text: 'Authorization: Bearer private-value\n' }
+  importObservation(root, source, [first], [])
+  importObservation(root, { ...source, complete: true }, [first, second], [])
+  const rows = readFileSync(resolve(root, 'observations-v1/process-a.jsonl'), 'utf8').trimEnd().split('\n').map(line => JSON.parse(line))
+  expect(rows).toEqual([first, { ...second, text: 'Authorization: [redacted]\n' }])
+  expect(() => importObservation(root, source, [{ ...second, seq: 3 }], [])).toThrow('missing interval')
 })

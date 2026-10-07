@@ -146,11 +146,17 @@ export async function checkAsperaDisclosure(page, directory, prefix, activateWin
   await expect.poll(icons).toEqual([1, 0])
   await page.reload()
   await expect(group).toHaveAttribute('aria-expanded', 'false')
+  await group.click()
+  await page.getByRole('button', { name: /^(实验|Experiments)$/ }).click()
+  await page.getByRole('heading', { name: /^(实验|Experiments)$/, exact: true }).waitFor()
+  await group.click()
+  await page.mouse.move(1, 1)
   await activateWindow?.()
   await page.bringToFront()
   await expect.poll(() => page.evaluate(() => document.hasFocus())).toBe(true)
   await page.keyboard.press('Tab')
   await group.focus()
+  await expect(group).toBeFocused()
   console.log('Sidebar keyboard state:', await group.evaluate(element => ({ active: element === document.activeElement,
     focus: element.matches(':focus'), focusVisible: element.matches(':focus-visible'), documentFocus: document.hasFocus(),
     activeTag: document.activeElement?.tagName, activeLabel: document.activeElement?.getAttribute('aria-label') })))

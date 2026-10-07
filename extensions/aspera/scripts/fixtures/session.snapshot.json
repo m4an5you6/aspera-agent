@@ -9,13 +9,50 @@
     "layoutA": true,
     "recordOnlyAfterCleanupFailure": true,
     "survivesReload": true,
-    "batchOwnedCleanup": true
+    "batchOwnedCleanup": true,
+    "offlineLocalDeletion": true,
+    "retainedUnknownOwnership": true,
+    "linkedServerDeletion": true,
+    "compactDialogs": true,
+    "returnPreservesFilter": true
   },
   "serverRegistration": {
     "removedUnusedCoordinator": true,
     "perExperimentCoordinator": true,
     "connectionBusy": true,
-    "activeCoordinatorProtected": true
+    "linkedCoordinatorDeletionAvailable": true
+  },
+  "installationRecovery": {
+    "attempts": 2,
+    "fixedDeadline": true,
+    "sources": {
+      "npm": "https://cpu-mirror.example.test/npm/",
+      "nodeHeaders": "https://nodejs.org/download/release"
+    },
+    "toastOnce": true,
+    "completed": true,
+    "tools": [
+      "inspect_preparation_installation",
+      "probe_preparation_source",
+      "switch_preparation_source",
+      "verify_preparation_environment"
+    ]
+  },
+  "executionOverview": {
+    "actualPlanSteps": 3,
+    "savedNodes": 2,
+    "coreMetrics": 3,
+    "missingMetricsAbsent": true,
+    "reportedTrainingPercentage": 27,
+    "invalidTotalHidden": true,
+    "readFailureRetainsReports": true,
+    "initialReadFailureDistinct": true,
+    "internalFieldsCollapsed": true,
+    "stoppedAnimations": true,
+    "oldReleaseUnrecorded": true,
+    "localizedLabels": true,
+    "responsiveColumns": true,
+    "keyboardDisclosure": true
   },
   "overviewPhases": {
     "planning": [

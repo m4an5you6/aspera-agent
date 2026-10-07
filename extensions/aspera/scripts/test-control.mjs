@@ -118,6 +118,15 @@ try {
   assert.equal(planned.value.record.state, 'awaiting-approval')
   assert.equal(planned.value.record.resourcesReleased, true)
   assert.ok(planned.value.record.planningSessionId)
+  const stepRead = await control.request('execution-progress', { experimentId: id })
+  assert.equal(stepRead.status, 200); assert.equal(stepRead.value.supported, true)
+  assert.equal(stepRead.value.progress.revision, 0)
+  assert.deepEqual(stepRead.value.progress.steps.map(step => step.state), ['pending', 'pending'])
+  const earlyReport = await control.request('report-execution-step', { experimentId: id, planRevision: 1,
+    sessionId: `aspera-execution-${id}`, generation: readFileSync(resolve(directory, 'state/coordinator.generation'), 'utf8'),
+    callId: 'premature-execution', expectedRevision: 0, step: 1, state: 'running' })
+  assert.equal(earlyReport.value.accepted, false)
+  assert.equal(existsSync(resolve(run, 'execution-progress.v1.json')), false)
   assert.equal(planned.value.record.planningSessionId, question.sessionId)
   const events = readFileSync(resolve(run, 'events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse)
   const changes = events.filter(item => item.event.type === 'goal/change').map(item => item.event.data)

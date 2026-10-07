@@ -37,6 +37,8 @@ Host programs compile against installed package declarations. The Typert shim in
 
 Desktop and browser share the page and task service. The remote coordinator owns execution after durable handover; the local carrier does not own GPU processes.
 
+The execution Agent reports approved plan steps to the coordinator; the console reads these reports alongside independent preparation and result evidence. [Step progress](state-and-api.md#execution-step-progress) has its own versioned file and does not change the fixed submission, queue or Session formats. Old experiments retain their original remote release.
+
 ```mermaid
 flowchart TB
   subgraph Local[Local management]
@@ -49,6 +51,7 @@ flowchart TB
     Remote --> Observations[Versioned observations: events / sources / logs / metrics]
     Fleet --> Management[Peer servers / dated checks / deletion journal]
     Management --> Cleanup[Owned paths only / cleanup receipts / tombstones]
+    Management --> Removal[Local deletion / retained remote ownership]
     Fleet --> Models[Private snapshots: preparation / planning / execution]
     Models --> Selection
     Models --> Planner
@@ -59,6 +62,12 @@ flowchart TB
     Inventory --> Selection[Restricted Agent: candidate ID + reason]
     Selection --> Placement[Persist placement before directory creation]
     Placement --> Acceptance[Workspace / isolation / credentials / GPU checks]
+    Fleet --> InstallationJournal[Preparation v1: original material / budgets / attempts]
+    InstallationJournal --> Installer[Detached Linux installer: cache / progress / identity / exit]
+    Preparation --> Sources[Probe HTTPS candidate / switch within saved budget]
+    Sources --> Installer
+    Installer --> Checks
+    Installer --> Observations
     Acceptance --> Network[Mutual node identity and network checks]
   end
   subgraph Coordinator[Selected participant: durable coordinator]
@@ -133,7 +142,7 @@ sequenceDiagram
   Note over Queue,Node: Accepted work continues after the local application quits
 ```
 
-The management profile serializes admission checks. Different coordinators cannot manage unfinished experiments sharing a node; the selected participant is pinned per experiment. Waiting for initial confirmation retains this registration constraint without allocating GPUs. Node controls independently enforce exclusive execution. Terminal record removal uses a durable deletion journal and tombstones; optional SSH cleanup validates saved owners, paths and mounts.
+The management profile serializes admission checks. Different coordinators cannot manage unfinished experiments sharing a node; the selected participant is pinned per experiment. Waiting for initial confirmation retains this registration constraint without allocating GPUs. Node controls independently enforce exclusive execution. Local deletion uses an independent journal and tombstones while retaining unresolved remote ownership; optional SSH cleanup requires confirmed release and validates saved owners, paths and mounts.
 
 -----
 

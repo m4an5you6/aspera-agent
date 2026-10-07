@@ -9,6 +9,7 @@ import { command, launchProfile, openAspera, removeTestDirectory } from './test-
 import { checkModelPickerLayout, checkAsperaDisclosure } from './test-ui-layout.mjs'
 import { checkServerManagement, checkExperimentManagement } from './test-management-ui.mjs'
 import { checkStageLayout, checkOverviewPhase } from './test-stage-layout.mjs'
+import { checkExecutionOverview } from './test-overview.mjs'
 
 import { fixtureOptions, fixtureProvider } from './fixtures/models.mjs'
 
@@ -41,7 +42,7 @@ writeFileSync(resolve(profile, 'cordis.patch.yml'), JSON.stringify([
   { insert: [{ id: 'aspera-test-fixture', name: pathToFileURL(resolve(root, 'scripts/fixtures/web.mjs')).href,
     config: { role: 'web', root: resolve(directory, 'remote'), release: root, profileStartupMs, portLease } }] },
 ]))
-let app; let browser; let page
+let app; let browser; let page; let verified = false
 try {
   app = await launchProfile(root, home, 'aspera', {}, profileStartupMs)
   browser = await chromium.launch({ ...(process.env.ASPERA_BROWSER_EXECUTABLE ? { executablePath: process.env.ASPERA_BROWSER_EXECUTABLE } : { channel: process.env.ASPERA_BROWSER_CHANNEL || 'chrome' }), headless: true })
@@ -101,12 +102,12 @@ try {
   const retired = page.locator('article').filter({ has: page.getByRole('heading', { name: 'Retired coordinator', exact: true }) })
   await expect(retired.getByRole('button', { name: /^(删除服务器|Delete server)$/ })).toBeEnabled()
   await retired.getByRole('button', { name: /^(删除服务器|Delete server)$/ }).click()
-  await page.getByRole('dialog').getByRole('button', { name: /删除此服务器|Delete this server/ }).click()
+  await page.getByRole('dialog').getByRole('button', { name: /^(删除服务器|Delete server)$/ }).click()
   await expect(page.getByRole('heading', { name: 'Retired coordinator', exact: true })).toHaveCount(0)
   const coordinator = page.locator('article').filter({ has: page.getByRole('heading', { name: 'CPU A', exact: true }) })
   await expect(coordinator.getByText(/^(调度主机|Coordinator)$/)).toHaveCount(0)
-  const serverRegistration = { removedUnusedCoordinator: true, perExperimentCoordinator: true, connectionBusy: false, activeCoordinatorProtected: false }
-  async function create(goal, server, mode = 'automatic', upload = false, preparationFails = false) {
+  const serverRegistration = { removedUnusedCoordinator: true, perExperimentCoordinator: true, connectionBusy: false, linkedCoordinatorDeletionAvailable: false }
+  async function create(goal, server, mode = 'automatic', upload = false, preparationFails = false, installationPending = false) {
     await page.getByRole('button', { name: /^(实验|Experiments)$/ }).click()
     await page.getByRole('button', { name: /^(新建实验|New experiment)$/ }).click()
     await page.getByLabel(/^(实验名称|Experiment name)$/).fill(goal)
@@ -116,12 +117,13 @@ try {
     await page.getByRole('menuitem', { name: /CPU Qwen planning/ }).click()
     await page.getByRole('button', { name: /^(执行模型|Execution model)$/ }).click()
     await page.getByRole('menuitem', { name: /CPU Qwen execution/ }).click()
-    await page.getByRole('checkbox', { name: new RegExp(server) }).check()
+    for (const selected of Array.isArray(server) ? server : [server]) await page.getByRole('checkbox', { name: new RegExp(selected) }).check()
     if (mode === 'semi') await page.getByRole('button', { name: /半自动执行|Semi-automatic/ }).click()
     if (upload) await page.locator('input[name=uploads]').setInputFiles({ name: 'data.txt', mimeType: 'text/plain', buffer: Buffer.from('dataset') })
     await page.getByRole('button', { name: /^(提交实验|Submit experiment)$/ }).click()
     await expect(page.getByRole('heading', { name: goal, exact: true })).toBeVisible()
-    if (preparationFails) await expect(page.getByRole('heading', { name: /^(准备未完成|Preparation could not finish)$/ })).toBeVisible()
+    if (installationPending) await expect(page.getByRole('region', { name: /^(运行环境安装|Release installation)$/ })).toBeVisible()
+    else if (preparationFails) await expect(page.getByRole('heading', { name: /^(准备未完成|Preparation could not finish)$/ })).toBeVisible()
     else await expect(page.getByText('本机派发完成，远端实验已接管', { exact: true })).toBeVisible()
   }
   const control = async (action = 'status', id) => {
@@ -148,7 +150,7 @@ try {
   const managementChecks = await checkServerManagement(page, control, resolve(root, '.artifacts'))
   await control('hold-plan')
   await create('CPU semi experiment', 'CPU A', 'semi', true)
-  await expect(page.getByRole('status')).toHaveText(/准备计划|Preparing plan/)
+  await expect(page.locator('header').getByRole('status')).toHaveText(/准备计划|Preparing plan/)
   const planningPipeline = await checkOverviewPhase(page, 1, true)
   await page.screenshot({ path: resolve(root, '.artifacts/web-overview-planning.png'), fullPage: true })
   await control('release-plan')
@@ -163,31 +165,31 @@ try {
   assert.equal(semi.preparation.placements[0].layout, 'separated')
   assert.equal(semi.preparation.placements[0].candidate.persistence, 'unknown')
   await page.screenshot({ path: resolve(root, '.artifacts/web-storage-plan.png'), fullPage: true })
-  await page.getByRole('button', { name: /^(返回|Back)$/ }).click()
+  await page.getByRole('button', { name: /^(返回实验|Back to experiments)$/ }).click()
   await expect(page.getByText(/首次等待计划确认时，不占用训练服务器或 GPU|Initial plan confirmation does not reserve/)).toBeVisible()
   await page.getByRole('button', { name: /关闭本次提醒|Dismiss this reminder/ }).click()
   await page.reload(); await openAspera(page, app.url)
   await expect(page.getByRole('button', { name: /关闭本次提醒|Dismiss this reminder/ })).toHaveCount(0)
   await expect(page.getByLabel(/1 个实验待处理|1 experiments need attention/)).toBeVisible()
   await create('CPU independent experiment', 'CPU B')
-  await expect(page.getByRole('status')).toHaveText(/服务中|Serving/, { timeout: profileStartupMs })
+  await expect(page.locator('header').getByRole('status')).toHaveText(/服务中|Serving/, { timeout: profileStartupMs })
   const executionPipeline = await checkOverviewPhase(page, 2, true)
   await page.screenshot({ path: resolve(root, '.artifacts/web-overview-execution.png'), fullPage: true })
   await page.getByRole('button', { name: /^(服务器|Servers)$/ }).click()
   await coordinator.getByRole('button', { name: /^(删除服务器|Delete server)$/ }).click()
-  await expect(page.getByRole('dialog').getByRole('button', { name: /删除此服务器|Delete this server/ })).toBeDisabled()
+  await expect(page.getByRole('dialog').getByRole('button', { name: /^(删除服务器|Delete server)$/ })).toBeEnabled()
   await expect(page.getByRole('dialog')).toContainText('CPU semi experiment')
   await page.keyboard.press('Escape')
-  serverRegistration.activeCoordinatorProtected = true
-  await page.screenshot({ path: resolve(root, '.artifacts/web-server-removal-protected.png'), fullPage: true })
+  serverRegistration.linkedCoordinatorDeletionAvailable = true
+  await page.screenshot({ path: resolve(root, '.artifacts/web-server-removal-linked.png'), fullPage: true })
   await page.getByRole('button', { name: /^(实验|Experiments)$/ }).click()
   await page.getByRole('button').filter({ has: page.getByText('CPU independent experiment', { exact: true }) }).click()
-  await page.getByRole('button', { name: /^(返回|Back)$/ }).click()
+  await page.getByRole('button', { name: /^(返回实验|Back to experiments)$/ }).click()
   await page.getByRole('button').filter({ has: page.getByText('CPU semi experiment', { exact: true }) }).click()
   await page.getByRole('button', { name: /^(确认此计划|Confirm this plan)$/ }).click()
-  await expect(page.getByRole('status')).toHaveText(/服务中|Serving/, { timeout: profileStartupMs })
+  await expect(page.locator('header').getByRole('status')).toHaveText(/服务中|Serving/, { timeout: profileStartupMs })
   await create('CPU shared experiment', 'CPU A')
-  await expect(page.getByRole('status')).toHaveText(/排队中|Queued/)
+  await expect(page.locator('header').getByRole('status')).toHaveText(/排队中|Queued/)
   const queuedPipeline = await checkOverviewPhase(page, 2, false)
   await expect(page.getByText(/等待服务器|Waiting for servers/)).toBeVisible()
   const saved = await control()
@@ -197,7 +199,7 @@ try {
   assert.equal(separate.latest.state, 'serving')
   assert.notEqual(first.latest.sessionId, separate.latest.sessionId)
   assert.equal(JSON.stringify(saved.experiments).includes('test-fixture-password'), false)
-  await page.getByRole('button', { name: /^(返回|Back)$/ }).click()
+  await page.getByRole('button', { name: /^(返回实验|Back to experiments)$/ }).click()
   await page.getByRole('button').filter({ has: page.getByText('CPU semi experiment', { exact: true }) }).click()
   await page.getByRole('button', { name: /^(运行监控|Runtime monitor)$/ }).click()
   const log = () => page.getByRole('region', { name: /^(进程日志|Process logs)$/ })
@@ -260,20 +262,20 @@ try {
   page = await context.newPage()
   await openAspera(page, app.url)
   await page.getByRole('button').filter({ has: page.getByText('CPU semi experiment', { exact: true }) }).click()
-  await expect(page.getByRole('status')).toHaveText(/服务中|Serving/, { timeout: profileStartupMs })
+  await expect(page.locator('header').getByRole('status')).toHaveText(/服务中|Serving/, { timeout: profileStartupMs })
   await page.getByRole('button', { name: /^(推理服务|Inference services)$/ }).last().click()
   await page.getByRole('button', { name: /^(停止服务|Stop service)$/ }).click()
-  await expect(page.getByRole('status')).toHaveText(/已完成|Completed/)
+  await expect(page.locator('header').getByRole('status')).toHaveText(/已完成|Completed/)
   await expect(page.getByText(/外部访问已停止|External access stopped/, { exact: true })).toBeVisible()
-  await page.getByRole('button', { name: /^(返回|Back)$/ }).click()
+  await page.getByRole('button', { name: /^(返回实验|Back to experiments)$/ }).click()
   await page.getByRole('button').filter({ has: page.getByText('CPU shared experiment', { exact: true }) }).click()
-  await expect(page.getByRole('status')).toHaveText(/服务中|Serving/, { timeout: profileStartupMs })
+  await expect(page.locator('header').getByRole('status')).toHaveText(/服务中|Serving/, { timeout: profileStartupMs })
   await page.getByRole('button', { name: /^(取消实验|Cancel experiment)$/ }).click()
-  await expect(page.getByRole('status')).toHaveText(/已取消|Cancelled/)
-  await page.getByRole('button', { name: /^(返回|Back)$/ }).click()
+  await expect(page.locator('header').getByRole('status')).toHaveText(/已取消|Cancelled/)
+  await page.getByRole('button', { name: /^(返回实验|Back to experiments)$/ }).click()
   await page.getByRole('button').filter({ has: page.getByText('CPU independent experiment', { exact: true }) }).click()
   await control('crash', separate.request.experimentId)
-  await expect(page.getByRole('status')).toHaveText(/失败|Failed/)
+  await expect(page.locator('header').getByRole('status')).toHaveText(/失败|Failed/)
   await page.getByRole('button', { name: /^(推理服务|Inference services)$/ }).last().click()
   await expect(page.getByText('CPU fixture exited unexpectedly', { exact: true })).toBeVisible()
   const crashed = (await control()).experiments.find(row => row.request.experimentId === separate.request.experimentId)
@@ -293,20 +295,20 @@ try {
   const retryPipeline = await checkOverviewPhase(page, 0, true)
   await expect(page.getByRole('button', { name: /^(正在重试…|Retrying…)$/ })).toBeDisabled()
   await page.screenshot({ path: resolve(root, '.artifacts/web-overview-retrying.png'), fullPage: true })
-  await page.getByRole('button', { name: /^(返回|Back)$/ }).click()
+  await page.getByRole('button', { name: /^(返回实验|Back to experiments)$/ }).click()
   await page.getByRole('button', { name: 'CPU preparation recovery', exact: true }).click()
   await expect(page.getByRole('button', { name: /^(正在重试…|Retrying…)$/ })).toBeDisabled()
   await control('release-retry')
   await expect(page.getByText('本机派发完成，远端实验已接管', { exact: true })).toBeVisible()
-  await expect(page.getByRole('status')).toHaveText(/服务中|Serving/, { timeout: profileStartupMs })
+  await expect(page.locator('header').getByRole('status')).toHaveText(/服务中|Serving/, { timeout: profileStartupMs })
   const afterRetry = (await control()).experiments.find(row => row.request.experimentId === beforeRetry.request.experimentId)
   assert.equal(afterRetry.sessionId, beforeRetry.sessionId)
   assert.deepEqual(afterRetry.preparation.placements, beforeRetry.preparation.placements)
   await expect(page.getByRole('button', { name: /^(重试准备|Retry preparation)$/ })).toHaveCount(0)
   await page.getByRole('button', { name: /^(取消实验|Cancel experiment)$/ }).click()
-  await expect(page.getByRole('status')).toHaveText(/已取消|Cancelled/)
+  await expect(page.locator('header').getByRole('status')).toHaveText(/已取消|Cancelled/)
   await create('CPU completed experiment', 'CPU A')
-  await expect(page.getByRole('status')).toHaveText(/已完成|Completed/)
+  await expect(page.locator('header').getByRole('status')).toHaveText(/已完成|Completed/)
   const completedPipeline = await checkOverviewPhase(page, 3, false)
   await page.screenshot({ path: resolve(root, '.artifacts/web-overview-completed.png'), fullPage: true })
   await page.getByRole('button', { name: /^(查看输出文件|View output files)$/ }).click()
@@ -331,18 +333,48 @@ try {
   await questionCard().getByRole('button', { name: /回复并继续|Save reply and continue/ }).click()
   await expect(questionCard()).toHaveCount(0)
   await expect(page.getByLabel(/1 个实验待处理|1 experiments need attention/)).toHaveCount(0)
-  await expect(page.getByRole('status').first()).toHaveText(/服务中|Serving/, { timeout: profileStartupMs })
+  await expect(page.locator('header').getByRole('status')).toHaveText(/服务中|Serving/, { timeout: profileStartupMs })
   const answered = (await control()).experiments.find(row => row.request.experimentId === waiting.request.experimentId)
   assert.equal(answered.latest.sessionId, waiting.latest.sessionId)
   assert.equal(answered.latest.goalId, waiting.latest.goalId)
   assert.equal(answered.latest.questions[0].state, 'answered')
   await page.getByRole('button', { name: /^(取消实验|Cancel experiment)$/ }).click()
-  await expect(page.getByRole('status').first()).toHaveText(/已取消|Cancelled/)
+  await expect(page.locator('header').getByRole('status')).toHaveText(/已取消|Cancelled/)
+  await control('hold-installation')
+  await create('CPU installation recovery', 'CPU A', 'automatic', false, false, true)
+  const recoveryRegion = page.getByRole('region', { name: /^(运行环境安装|Release installation)$/ })
+  const sourceToast = page.getByText(/准备 Agent 已切换下载源|Preparation Agent changed the download source/)
+  await expect(sourceToast).toBeVisible()
+  await expect(recoveryRegion).toContainText('https://cpu-mirror.example.test/npm/')
+  const recoveryBefore = (await control()).installations.find(value => value.round.changes.some(change => change.applied))
+  assert.equal(recoveryBefore.round.attempts.length, 2)
+  assert.equal(recoveryBefore.policy.installationMaxRetries, 2)
+  const beforeToastClose = await page.getByRole('heading', { name: 'CPU installation recovery', exact: true }).boundingBox()
+  await page.screenshot({ path: resolve(root, '.artifacts/web-installation-source-toast.png'), fullPage: true })
+  await page.getByRole('button', { name: '×', exact: true }).click()
+  assert.deepEqual(await page.getByRole('heading', { name: 'CPU installation recovery', exact: true }).boundingBox(), beforeToastClose)
+  await page.screenshot({ path: resolve(root, '.artifacts/web-installation-recovery-light.png'), fullPage: true })
+  await page.reload(); await openAspera(page, app.url)
+  await page.getByRole('button', { name: 'CPU installation recovery', exact: true }).click()
+  await expect(sourceToast).toHaveCount(0)
+  await page.setViewportSize({ width: 820, height: 740 })
+  await page.screenshot({ path: resolve(root, '.artifacts/web-installation-recovery-small.png'), fullPage: true })
+  await page.evaluate(() => { document.body.dataset.dsDarkTheme = '' })
+  await page.screenshot({ path: resolve(root, '.artifacts/web-installation-recovery-dark.png'), fullPage: true })
+  await page.evaluate(() => { delete document.body.dataset.dsDarkTheme })
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await control('release-installation')
+  await expect(page.locator('header').getByRole('status')).toHaveText(/已完成|Completed/)
+  const recovered = (await control()).experiments.find(row => row.request.objective === 'CPU installation recovery')
+  const installationRecovery = { attempts: recoveryBefore.round.attempts.length, fixedDeadline: recoveryBefore.round.attempts.every(attempt => attempt.status.deadline === recoveryBefore.round.deadline),
+    sources: recoveryBefore.round.sources, toastOnce: true, completed: recovered.latest.state === 'completed',
+    tools: (await control()).environmentCalls.filter(call => call.experimentId === recovered.request.experimentId).map(call => call.name) }
   const final = await control()
   const dispatchEvents = final.events.filter(item => item.sessionId === first.sessionId)
+  const overview = await checkExecutionOverview(page, control, create, browser, app.url, resolve(root, '.artifacts'))
   const managementDeletion = await checkExperimentManagement(page, control, resolve(root, '.artifacts'))
   const snapshot = {
-    managementChecks, managementDeletion, serverRegistration,
+    managementChecks, managementDeletion, serverRegistration, installationRecovery, executionOverview: overview.facts,
     overviewPhases: { planning: planningPipeline, approval: approvalPipeline, execution: executionPipeline, queued: queuedPipeline, retry: retryPipeline, completed: completedPipeline, question: questionPipeline },
     stageCards: { preparation: preparationFailureStage, remote: remoteFailureStage, retryRetainsSession: afterRetry.sessionId === beforeRetry.sessionId,
       recoveryHandover: final.events.filter(item => item.sessionId === afterRetry.sessionId && item.event.type === 'user/message'
@@ -365,6 +397,14 @@ try {
   const expected = JSON.parse(readFileSync(snapshotFile, 'utf8'))
   assert.deepEqual(snapshot, expected)
   assert.deepEqual(errors, [])
+  verified = true
+  if (process.argv.includes('--keep-preview')) {
+    await page.getByRole('button', { name: /^(实验|Experiments)$/ }).click()
+    await page.getByRole('textbox', { name: /^(搜索实验|Search experiments)$/ }).fill('CPU overview review')
+    await page.getByRole('button', { name: 'CPU overview review', exact: true }).click()
+    writeFileSync(resolve(root, '.artifacts/overview-preview.json'), JSON.stringify({ url: app.url, directory, experimentId: overview.id, source: 'Production profile with CPU test data' }, null, 2) + '\n')
+    console.log('Production overview preview is running; its local entry is saved in .artifacts/overview-preview.json.')
+  }
   console.log('Real Web: servers/passwords, attachments, independent Goals, plan confirmation, parallelism/queue, handover Session snapshot, UTF-8/reconnect/rotation, download, service access/survival/stop/unexpected exit, cancellation and errors passed.')
 } catch (error) {
   if (page !== undefined && !page.isClosed()) {
@@ -377,6 +417,12 @@ try {
 } finally {
   clearInterval(leaseWatcher)
   if (portReservation.listening) await new Promise(done => { portReservation.close(done) })
-  await browser?.close(); await app?.close()
-  removeTestDirectory(directory, resolve(root, '.artifacts'))
+  await browser?.close()
+  if (!verified || !process.argv.includes('--keep-preview')) {
+    await app?.close()
+    removeTestDirectory(directory, resolve(root, '.artifacts'))
+  } else {
+    const stopPreview = async () => { await app.close(); removeTestDirectory(directory, resolve(root, '.artifacts')); process.exit(0) }
+    process.once('SIGINT', stopPreview); process.once('SIGTERM', stopPreview)
+  }
 }

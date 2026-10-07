@@ -21,12 +21,15 @@ const legacyNodeEngines: Readonly<Record<string, string | undefined>> = {
 /**
  * Read dependency versions from the independent application's release manifest.
  * @param root - source or installed application directory.
+ * @param identity - verified historical release identity, when its manifest predates engines.
  * @returns Node engine range and exact pnpm version.
  */
-export function environmentRequirements(root: string): EnvironmentRequirements {
-  const manifest = z.object({ engines: enginesSchema,
+export function environmentRequirements(root: string, identity?: { extension: string; dsh: string }): EnvironmentRequirements {
+  const manifest = z.object({ engines: enginesSchema.optional(),
     packageManager: z.string().regex(/^pnpm@\d+\.\d+\.\d+$/) }).parse(JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')))
-  return { node: manifest.engines.node, pnpm: manifest.packageManager.slice(5) }
+  const node = manifest.engines?.node ?? (identity === undefined ? undefined : legacyNodeEngines[`${identity.extension}/${identity.dsh}/${manifest.packageManager}`])
+  if (node === undefined) throw new Error('Original release has no recorded Node requirement')
+  return { node, pnpm: manifest.packageManager.slice(5) }
 }
 
 /**

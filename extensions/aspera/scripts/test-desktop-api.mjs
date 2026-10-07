@@ -45,6 +45,24 @@ try {
   })
   assert.equal(result.status, 200, `Upgraded desktop server API returned ${result.status}: ${result.body}`)
   assert.deepEqual(JSON.parse(result.body).result, { ok: true, value: { servers: [] } })
+  const recovery = await page.evaluate(async () => {
+    const method = 'aspera/experimentSnapshot'
+    const response = await fetch(new URL(`api/${method}`, location.href), { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ type: 'client-request', rpcId: 'desktop-installation-api', method, payload: { args: {} } }) })
+    return { status: response.status, body: await response.text() }
+  })
+  assert.equal(recovery.status, 200)
+  assert.deepEqual(JSON.parse(recovery.body).result.value.installations, [], 'The original EXE loads the new installation snapshot')
+  assert.ok(existsSync(resolve(runtime, 'node_modules/@aspera/dispatch/scripts/install-release.py')), 'The independently shipped installer is present')
+  const steps = await page.evaluate(async () => {
+    const method = 'aspera/experimentExecutionProgress'
+    const response = await fetch(new URL(`api/${method}`, location.href), { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ type: 'client-request', rpcId: 'desktop-steps-api', method, payload: { args: { id: '00000000-0000-4000-8000-000000000000' } } }) })
+    return { status: response.status, body: await response.text() }
+  })
+  assert.equal(steps.status, 200, 'The original EXE exposes the generated step progress API')
+  assert.equal(JSON.parse(steps.body).result.ok, false, 'A foreign experiment cannot read step progress')
+  assert.ok(existsSync(resolve(runtime, 'node_modules/@aspera/runtime/lib/execution-steps.js')), 'The updated runtime includes scoped step-report tools')
   await openAspera(page, page.url())
   await page.getByRole('button', { name: /^(服务器|Servers)$/ }).click()
   await page.getByRole('button', { name: /^(添加服务器|Add server)$/ }).click()
@@ -83,5 +101,18 @@ try {
   assert.deepEqual(saved.record.servers[0].storagePreference, { mode: 'auto' })
   assert.deepEqual(saved.record.servers[0].inferenceMapping, { url: 'https://inference.example.test:8443', port: 17000 })
   assert.ok(!JSON.stringify(saved).includes('fixture-password'))
+  const registeredId = saved.record.servers[0].id
+  await page.getByRole('button', { name: /^(删除服务器|Delete server)$/ }).click()
+  await expect(page.getByRole('dialog').getByRole('button', { name: /^(删除服务器|Delete server)$/ })).toBeEnabled()
+  await page.screenshot({ path: resolve(root, '.artifacts/desktop-delete-server.png'), fullPage: true })
+  await page.getByRole('dialog').getByRole('button', { name: /^(删除服务器|Delete server)$/ }).click()
+  await expect(page.getByRole('dialog')).toHaveCount(0)
+  await expect(page.getByText('API regression server', { exact: true })).toHaveCount(0)
+  assert.deepEqual(JSON.parse(readFileSync(resolve(registry, 'servers.json'), 'utf8')).record.servers, [])
+  const marker = resolve(home, 'storages/aspera_removals/removed_servers', registeredId + '.json')
+  assert.ok(existsSync(marker), 'The updated original EXE writes the independent removal journal')
   console.log('Upgraded desktop: real server API, saved server form and version-1 registry passed outside the checkout with a Unicode state path.')
+  console.log('Original EXE: new server-removal preview, compact confirmation and durable removal journal passed.')
+  console.log('Original EXE: installation snapshot and versioned remote installer resources loaded.')
+  console.log('Original EXE: generated execution progress API and scoped step-report runtime loaded.')
 } finally { await app?.close(); removeTestDirectory(directory, tmpdir()) }

@@ -3,9 +3,11 @@ import { createHash } from 'node:crypto'
 import { copyFileSync, existsSync, readFileSync, readdirSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { create } from 'tar'
+import { create, extract } from 'tar'
+import { z } from 'zod'
 import { run } from './transport.ts'
 import { assertPublishedUiCompatibility } from './published-ui.ts'
+import { environmentRequirements } from './environment.ts'
 
 /** Private deployment archive; disposing it never changes installed releases. */
 export interface SourceSnapshot {
@@ -100,4 +102,51 @@ function appendOverrides(source: string, overrides: Record<string, string>): voi
   const path = join(source, 'pnpm-workspace.yaml')
   const settings = readFileSync(path, 'utf8').split('\noverrides:\n')[0]
   writeFileSync(path, settings + '\noverrides:\n' + Object.entries(overrides).map(([name, value]) => `  '${name}': '${value}'\n`).join(''))
+}
+
+/** Verify a recovered archive against the original content identity, including packaged extension files.
+ * @param archive - retained or recovered original archive. @param expected - frozen deployment identity.
+ * @returns original runtime requirements; a self-declared manifest alone is insufficient.
+ */
+export async function verifySourceArchive(archive: string, expected: string): Promise<{ node: string; pnpm: string }> {
+  const directory = mkdtempSync(join(tmpdir(), 'aspera-verify-'))
+  const unpack = async (file: string, cwd: string) => {
+    mkdirSync(cwd, { recursive: true })
+    await extract({ file, cwd, strict: true, filter: (path, entry) => {
+      if (path.startsWith('/') || /^[A-Za-z]:/.test(path) || path.split(/[\\/]/).includes('..') || !('type' in entry) || !['File', 'Directory'].includes(entry.type)) throw new Error('Original archive contains an unsafe entry')
+      return true
+    } })
+  }
+  try {
+    const root = join(directory, 'source')
+    await unpack(archive, root)
+    const admitted = new Set(['experiments.tgz', 'runtime.tgz', 'dispatch.tgz', 'console.tgz', 'patches',
+      'pnpm-lock.yaml', 'package.json', 'pnpm-workspace.yaml', 'setup.mjs', 'LICENSE', '.npmrc', 'aspera-release.json'])
+    if (readdirSync(root).some(file => !admitted.has(file))) throw new Error('Original archive contains an unindexed installation file')
+    if (existsSync(join(root, '.npmrc')) && readFileSync(join(root, '.npmrc'), 'utf8') !== 'registry=https://registry.npmjs.org/\n') throw new Error('Original archive contains unverified npm configuration')
+    const release = z.object({ version: z.literal(1), deploymentId: z.literal(expected), dsh: z.literal('0.2.0-rc.2'), extension: z.literal('0.1.1') })
+      .parse(JSON.parse(readFileSync(join(root, 'aspera-release.json'), 'utf8')))
+    const digest = createHash('sha256')
+    for (const name of ['experiments', 'runtime', 'dispatch', 'console']) {
+      const contents = join(directory, name)
+      await unpack(join(root, `${name}.tgz`), contents)
+      if (readdirSync(contents).some(file => file !== 'package')) throw new Error('Original package contains an unindexed file')
+      const files: string[] = []
+      const walk = (relative: string) => {
+        for (const entry of readdirSync(join(contents, 'package', relative), { withFileTypes: true })) {
+          const path = relative ? `${relative}/${entry.name}` : entry.name
+          if (entry.isDirectory()) walk(path)
+          else if (entry.isFile()) files.push(path)
+          else throw new Error('Original package contains a symbolic link')
+        }
+      }
+      walk('')
+      for (const file of files.sort()) { digest.update(`${name}/${file}\0`); digest.update(readFileSync(join(contents, 'package', file))); digest.update('\0') }
+    }
+    for (const patch of readdirSync(join(root, 'patches')).sort()) { digest.update(`patches/${patch}\0`); digest.update(readFileSync(join(root, 'patches', patch))) }
+    for (const file of ['pnpm-lock.yaml', 'package.json', 'pnpm-workspace.yaml', 'setup.mjs', 'LICENSE']) { digest.update(`${file}\0`); digest.update(readFileSync(join(root, file))) }
+    if (digest.digest('hex') !== expected) throw new Error('Recovered material digest differs from the submitted release')
+    const application = z.object({ dependencies: z.object({ '@deepseek-ai/dsh': z.literal(release.dsh) }) }).parse(JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')))
+    return environmentRequirements(root, { extension: release.extension, dsh: application.dependencies['@deepseek-ai/dsh'] })
+  } finally { rmSync(directory, { recursive: true, force: true }) }
 }

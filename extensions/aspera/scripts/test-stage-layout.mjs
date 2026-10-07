@@ -22,19 +22,22 @@ export async function checkStageLayout(page, directory, preparation) {
   const pipeline = await checkOverviewPhase(page, preparation ? 0 : 2, false)
   if (preparation) await expect(stage.getByRole('heading', { name: /^(准备未完成|Preparation could not finish)$/ })).toBeVisible()
   const original = await page.evaluate(() => ({ width: innerWidth, height: innerHeight, dark: 'dsDarkTheme' in document.body.dataset }))
-  const error = stage.getByRole('alert').locator('details')
+  await expect(stage.getByRole('alert')).toBeVisible()
+  const diagnostics = page.getByRole('region', { name: /^(诊断详情|Diagnostics)$/ })
+  const error = diagnostics.locator('details').first()
   try {
     for (const theme of ['light', 'dark']) {
       await page.evaluate(dark => { if (dark) document.body.dataset.dsDarkTheme = ''; else delete document.body.dataset.dsDarkTheme }, theme === 'dark')
       for (const width of [1440, 680]) {
         await page.setViewportSize({ width, height: 960 })
-        await error.locator('summary').click()
+        await error.locator('summary').first().click()
         await expect(error).toHaveAttribute('open', '')
         assert.ok(await stage.evaluate(element => element.scrollWidth <= element.clientWidth + 1), 'Stage content must fit with diagnostics expanded')
+        assert.ok(await diagnostics.evaluate(element => element.scrollWidth <= element.clientWidth + 1), 'Expanded diagnostics must stay inside the work column')
         assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'Stage content must not widen the window')
         if (preparation) { await retry.scrollIntoViewIfNeeded(); await expect(retry).toBeInViewport() }
         await stage.screenshot({ path: resolve(directory, `stage-${preparation ? 'preparation' : 'remote'}-${theme}-${width}.png`) })
-        await error.locator('summary').click()
+        await error.locator('summary').first().click()
         await expect(error).not.toHaveAttribute('open', '')
       }
     }

@@ -32,14 +32,14 @@ kind: "package-bundle"
 
 `goalContinuationWindow` 是部署设置，默认 `128` 轮；worker patch 通过 `DSH_CLUSTER_GOAL_WINDOW` 配置。续行插件在有限窗口耗尽前通过公开 `Goal.edit` 延长同一 Goal。每次延长都记入日志，并非用户任务预算。连接、探测和模型单次操作超时、循环保护、沙箱和取消仍然生效。
 
-[专属文件清理](src/storage.ts) 在派发端确认资源释放后，仅删除保存的实验工作目录和指定的私有移交文件。清理校验归属标记、实际路径和挂载身份，拒绝嵌套挂载，不遍历目录链接。共享发布、缓存和控制状态保留；中断后从私有清理暂存目录继续。
+[专属文件清理](src/storage.ts) 在派发端确认资源释放后，仅删除保存的实验工作目录和指定的私有移交文件。清理校验归属标记、实际路径和挂载身份，拒绝嵌套挂载，不遍历目录链接。共享发布、缓存和控制状态保留；中断后从私有清理暂存目录继续。可选取消信号关闭进行中的 SSH 命令，本机记录删除无需等待该命令。
 
 -----
 
 <a id="understand-the-implementation"></a>
 ## 了解实现
 
-[observations.ts](src/observations.ts) 管理独立第 1 代来源目录及有界、脱敏的输出记录。[metrics.ts](src/metrics.ts) 采集节点实际资源，上报的训练值保存为独立序列。调度主机访问自身固定节点时使用带认证的本机回环，其他节点仍使用 SSH。读取不释放分配，也不重启失败任务。参见[观测配置与兼容](../../docs/state-and-api.zh.md#logs-outputs-and-services)。
+[observations.ts](src/observations.ts) 管理独立第 1 代来源目录及有界、脱敏的输出记录。安装导入保留远端序号和采集时间，对重复页去重，包括较长的末尾记录。[metrics.ts](src/metrics.ts) 采集节点实际资源，上报的训练值保存为独立序列。调度主机访问自身固定节点时使用带认证的本机回环，其他节点仍使用 SSH。读取不释放分配，也不重启失败任务。参见[观测配置与兼容](../../docs/state-and-api.zh.md#logs-outputs-and-services)。
 
 [phase-model.ts](src/phase-model.ts) 为每个阶段在同一环境中挂载标准 DSH Agent 驱动、独立 LLM 服务及选定的固定版本提供商，并继承 profile 的驱动限制。[phase-agents.ts](src/phase-agents.ts) 与 profile 共享 Agent 发布及发起者跟踪，保留 Goal、记录和取消的正常归属。创建与恢复均校验配置摘要和私有凭据；并行阶段可以为同名提供商使用不同的已保存设置。先释放 Agent，再释放其模型环境。[records.ts](src/records.ts) 分页读取真实阶段事件，节点命令在节点总览日志之外分别保存 stdout/stderr 文件。
 
@@ -51,6 +51,8 @@ kind: "package-bundle"
 [ssh-host-keys.ts](src/ssh-host-keys.ts) 为本机派发提供首次使用时的公钥探测和加锁登记。探测使用内置 SSH 客户端，在认证前断开，不需要 `ssh-keyscan` 进程，并遵守调用方的取消和截止时间。认证连接只读取已登记密钥，不登记新身份；委派节点连接继续使用预先安装的私有信任文件。登记在取消后停止，保留无关条目、哈希主机记录和撤销标记。
 
 [cluster.ts](src/cluster.ts) 注册认证控制路由并管理存储生命周期；[cluster-runtime.ts](src/cluster-runtime.ts) 传输和检查输入、启动独立 Agent profile 并观察服务；[cluster-node.ts](src/cluster-node.ts) 串行处理进程申请和清理证据；[cluster-agent.ts](src/cluster-agent.ts) 只在实验 Agent 范围内安装工具。私有目录位于可写工作目录之外。资源及安全检查在接收、命令和文件路径中执行，不发布独立的服务存在检查入口。
+
+[节点记录归属](../../docs/state-and-api.zh.md#persistent-ownership) 定义执行、日志和服务清理共用的命令键。节点生命周期测试使用已发布 JSON 后端，在模拟重启后重新读取持久化记录，并保留未确认进程的归属。
 
 </details>
 
@@ -66,7 +68,9 @@ kind: "package-bundle"
 <a id="model-experience"></a>
 ## 模型体验
 
-Agent 接收已记入日志的固定要求和批准计划。两种角色都能读取随包发布的技能、允许的 HTTPS 文档和声明的输入字节。规划增加计划保存；执行增加受限命令、日志及文件、实测进度、版本及脚本及环境及参数记录、登记服务管理。完成要求每个节点具有执行记录，以及成功结束的命令或健康的所属服务。无法满足要求时持久保存被阻塞的 Goal。
+Agent 接收已记入日志的固定要求和批准计划。两种角色都能读取随包发布的技能、允许的 HTTPS 文档和声明的输入字节。规划增加计划保存；执行增加受限命令、日志及文件、实测进度、版本及脚本及环境及参数记录、登记服务管理。完成要求具有执行记录、已完成的步骤上报，以及每个节点上成功结束的命令或健康的所属服务。无法满足要求时持久保存被阻塞的 Goal。
+
+执行通过 `get_experiment_execution_progress` 和 `report_experiment_step` 将批准的步骤上报为进行中、已完成或受阻。程序记录执行身份及调用时间。记录版本冲突返回诊断和最新记录，Agent 修正上报而不重跑已结束命令；遗漏步骤上报时，Goal 保持活动直至补齐。上报不能代替命令、节点或结果的独立验收。[步骤持久化](../../docs/state-and-api.zh.md#execution-step-progress)定义归属和迟到消息的拒绝规则。
 
 Agent 范围屏蔽全局工具并禁用插件管理层。全自动在提问服务层拒绝人工等待，包括直接请求；半自动通过持久化远端应答提供方接入已有提问服务。无法解决的选择暂停新的 Agent 工具，节点上的受管进程仍可取消。模型提供方的暂时故障重新激活同一 Goal；明确阻塞和不可恢复故障保存终态原因。回复不能修改提交要求或授予权限。[Megatron](skills/megatron/SKILL.md)、[MS-SWIFT](skills/swift/SKILL.md) 和 [Unsloth](skills/unsloth/SKILL.md) 技能要求明确文档版本、独立环境、短运行和实测评估，不承诺参数最优。
 

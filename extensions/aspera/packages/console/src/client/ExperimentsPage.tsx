@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import {
   Button, Checkbox, IconGoalOutlineRegular, IconPaperclipOutlineRegular,
-  IconPlusOutlineRegular, IconRefreshOutlineRegular, Input, Tag, Modal,
+  IconPlusOutlineRegular, IconRefreshOutlineRegular, IconChevronLeftOutlineRegular, Input, Tag, Modal,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { FleetExperiment, ServerSettings, FleetServerInput } from '@aspera/dispatch/types'
 import { ExperimentList, ExperimentStatus, DeleteExperimentsDialog } from './ExperimentManagement.tsx'
@@ -19,6 +19,7 @@ import type { ExperimentModels } from '@aspera/experiments/types'
 import { experimentAttentionCount, attentionLabel, experimentTodos } from './attention.ts'
 import { ExperimentQuestionCard } from './QuestionCard.tsx'
 import { ExperimentOverview } from './ExperimentOverview.tsx'
+import { ExecutionPlan } from './ExecutionPlan.tsx'
 import type { PropsRenderFactories } from '@deepseek-ai/dsh-client-ui-slots'
 
 /** Actions and observable state owned by the plugin controller. */
@@ -224,6 +225,7 @@ function ExperimentDetail({ controller, t, row, state, onClone, renderFactorySlo
   const [tab, setTab] = useState<'overview' | 'agentRecords' | 'monitoring' | 'files' | 'services'>('overview')
   useEffect(() => { controller.setDetailView(tab) }, [controller, tab])
   const [deleting, setDeleting] = useState<string[]>()
+  const [approving, setApproving] = useState(false)
   const [logDestination, setLogDestination] = useState<{ serverId: string; commandId: string }>()
   const status = row.latest?.state ?? row.state
   const id = row.request.experimentId
@@ -232,8 +234,8 @@ function ExperimentDetail({ controller, t, row, state, onClone, renderFactorySlo
   const title = row.request.name ?? (row.submission?.protocol === 4 ? row.submission.name : row.request.objective.split('\n')[0]?.slice(0, 120))
   const act = (operation: () => Promise<unknown>) => { void operation().catch(error => { controller.report(error) }) }
   return <article className={`${css.detail} ${tab === 'agentRecords' || tab === 'monitoring' ? css.readerDetail : ''}`}>
-    <header className={css.detailHeader}><Button variant="ghost" size="sm" aria-label={t('back')} onClick={() => { controller.select(null) }}>‹</Button><div className={css.detailHeading}><div className={css.titleLine}><h2 title={title}>{title}</h2><span role="status">{retrying ? <Tag tone="info">{t('retrying')}</Tag> : <ExperimentStatus row={row} t={t} />}</span></div>
-      <p className={css.hint}>{row.servers.map(server => server.name).join(' · ')} · {t('coordinator')}: {row.coordinator.name} · {new Date(row.createdAt).toLocaleString()}</p></div>
+    <header className={css.detailHeader}><Button variant="outline" size="sm" className={css.detailBack} icon={<IconChevronLeftOutlineRegular size={16} />} onClick={() => { controller.select(null) }}>{t('backToExperiments')}</Button><div className={css.detailHeading}><div className={css.titleLine}><h2 title={title}>{title}</h2><span role="status">{retrying ? <Tag tone="info">{t('retrying')}</Tag> : <ExperimentStatus row={row} t={t} />}</span></div>
+      <p className={css.hint}>{row.servers.map(server => server.name).join(' · ')} · {t('coordinator')}: {row.coordinator.name} · {new Date(row.createdAt).toLocaleString()}{!state.registry.servers.some(server => server.id === row.coordinator.id) && <span> · {t('serverConfigurationRemoved')}</span>}</p></div>
       <div className={css.actions}><Button variant="ghost" size="sm" onClick={onClone}>{t('clone')}</Button><Button variant="ghost" size="sm" onClick={() => { act(() => controller.refresh()) }}>{t('refresh')}</Button>
         <Button variant="outline" size="sm" disabled={ended} onClick={() => { act(() => controller.cancel(id)) }}>{t('cancel')}</Button><Button variant="ghost" size="sm" className={css.dangerText} onClick={() => { setDeleting([id]) }}>{t('deleteExperiment')}</Button></div>
     </header>
@@ -241,15 +243,16 @@ function ExperimentDetail({ controller, t, row, state, onClone, renderFactorySlo
     <nav className={css.detailTabs}>{(['overview', 'agentRecords', 'monitoring', 'files', 'services'] as const).map(key => <button key={key} aria-current={tab === key ? 'page' : undefined} onClick={() => { setTab(key) }}>{t(key)}</button>)}</nav>
     {tab === 'agentRecords' && <AgentRecords renderFactorySlot={renderFactorySlot} row={row} controller={controller} t={t} onLog={(serverId, commandId) => { setLogDestination({ serverId, commandId }); setTab('monitoring') }} />}
     {tab === 'monitoring' && <RuntimeMonitor row={row} controller={controller} t={t} {...(logDestination === undefined ? {} : { destination: logDestination })} />}
-    {tab === 'overview' && <ExperimentOverview row={row} t={t} retrying={retrying} onRetry={() => { act(() => controller.retry(id)) }} onView={setTab}>
+    {tab === 'overview' && <ExperimentOverview row={row} t={t} retrying={retrying} execution={state.executionReads[id]} installations={state.installations.filter(value => value.experimentId === id)} onRetry={() => { act(() => controller.retry(id)) }} onView={setTab}>
       {row.latest?.questions?.filter(question => question.state === 'open').map(question => <ExperimentQuestionCard key={question.questionId} controller={controller} t={t} question={question}
         records={state.streams[`${id}/events`]?.text.split('\n').filter(line => line.includes(question.sessionId)).join('\n') ?? ''} />)}
       {row.latest?.questions?.some(question => question.state === 'answered') && <p className={css.hint}>{t('replySaved')}</p>}
-      {row.latest?.plan !== undefined && <section className={css.planCard} aria-label={t('plan')}><details data-execution-plan open={status === 'awaiting-approval'}><summary>{t('plan')} · #{row.latest.plan.revision}</summary><p className={css.prewrap}>{row.latest.plan.summary}</p>
-        <ol>{row.latest.plan.steps.map((step, index) => <li key={index}>{step}</li>)}</ol>
-        {row.latest.plan.frameworks.map(framework => <p key={framework.name}><a href={framework.documentation} target="_blank" rel="noreferrer">{framework.name} {framework.version}</a></p>)}
-        {status === 'awaiting-approval' && <div className={css.sectionHeading}><p className={css.hint}>{t('todoResourceHint')}</p><Button variant="primary" onClick={() => { act(() => controller.approve(id, row.latest!.plan!.revision)) }}>{t('approve')}</Button></div>}
-      </details></section>}
+      <ExecutionPlan row={row} t={t} execution={state.executionReads[id]} approving={approving} onApprove={() => {
+        const plan = (row.latest ?? row.receipt)?.plan
+        if (approving || plan === undefined) return
+        setApproving(true)
+        void controller.approve(id, plan.revision).catch(error => { controller.report(error) }).finally(() => { setApproving(false) })
+      }} />
     </ExperimentOverview>}
     {tab === 'services' && <div className={css.overview}>{(row.latest?.services.length ?? 0) === 0 && <p className={css.empty}>{t('serviceEmpty')}</p>}<Services controller={controller} t={t} row={row} /></div>}
     {tab === 'files' && <section className={css.overview} aria-label={t('files')}>

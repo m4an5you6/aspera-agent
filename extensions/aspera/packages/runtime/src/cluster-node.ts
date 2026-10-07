@@ -30,6 +30,10 @@ function commandView(row: z.infer<typeof commandSchema>): ClusterCommandResult {
   return { commandId: row.commandId, state: row.state, exitCode: row.exitCode, released: row.released,
     ...(row.detail === undefined ? {} : { detail: row.detail }) }
 }
+/** A UUID prefix scopes the validated command id to one path-safe record filename. */
+function commandKey(id: ExperimentId, commandId: string): string {
+  return `${id}_${commandId}`
+}
 const storeSpec = defineDomain({ name: 'aspera_node', version: 4, compatibleVersions: [1, 2, 3], layout: 'per-record', tables: {
   allocations: domainTable<ExperimentId, z.infer<typeof allocationSchema>>(allocationSchema),
   commands: domainTable<string, z.infer<typeof commandSchema>>(commandSchema),
@@ -130,7 +134,7 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
       if (current === undefined) throw new Error('managed command record is missing')
       await commands.put(key, { ...current, ...patch })
       for (const [serviceId, service] of services.entries()) {
-        if (`${service.experimentId}/${service.commandId}` !== key) continue
+        if (commandKey(service.experimentId, service.commandId) !== key) continue
         await stopGateway(serviceId)
         await services.put(serviceId, { ...service, updatedAt: Date.now(), released: patch.released === true,
           ...stoppedExposure(service),
@@ -254,7 +258,7 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
     if (operation === 'process-log') {
       const request = processLogRequestSchema.parse(raw)
       const saved = allocations.get(id)
-      if (saved?.node.server.id !== request.serverId || commands.get(`${id}/${request.commandId}`) === undefined) throw new Error('Process log belongs to another experiment or node')
+      if (saved?.node.server.id !== request.serverId || commands.get(commandKey(id, request.commandId)) === undefined) throw new Error('Process log belongs to another experiment or node')
       const cursor = request.cursor
       if (cursor !== undefined && (cursor.experimentId !== id || cursor.serverId !== request.serverId || cursor.commandId !== request.commandId || cursor.stream !== request.stream)) throw new Error('Log cursor belongs to another experiment, node, process or stream')
       const path = processLogPath(id, request.commandId, request.stream)
@@ -273,7 +277,7 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
       for (const [key, service] of rows) {
         if (service.released || ['failed', 'interrupted', 'stopped'].includes(service.state)) continue
         const saved = allocations.get(id)
-        if (saved?.bootId !== config.bootId || !handles.has(`${id}/${service.commandId}`)) {
+        if (saved?.bootId !== config.bootId || !handles.has(commandKey(id, service.commandId))) {
           await serial(async () => {
             const current = services.get(key)
             if (current === undefined || current.released || !['starting', 'healthy', 'unhealthy'].includes(current.state)) return
@@ -296,7 +300,7 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
         await serial(async () => {
           const current = services.get(key)
           if (current === undefined || current.released || !['starting', 'healthy', 'unhealthy'].includes(current.state)
-            || !handles.has(`${id}/${current.commandId}`) || allocations.get(id)?.releasing) return
+            || !handles.has(commandKey(id, current.commandId)) || allocations.get(id)?.releasing) return
           await services.put(key, { ...current, state, ...(external === undefined ? {} : { external }), updatedAt: Date.now() })
         })
       }
@@ -429,11 +433,11 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
       try {
         if (mapping !== undefined) gateways.set(service.id, await openInferenceGateway(service, {
           root: config.root, healthTimeoutMs: config.cleanupTimeoutMs, requestTimeoutMs: config.serviceRequestTimeoutMs, requestBytes: config.serviceRequestBytes,
-        }, () => !closing && handles.has(`${id}/${service.commandId}`) && allocations.get(id)?.releasing === false))
+        }, () => !closing && handles.has(commandKey(id, service.commandId)) && allocations.get(id)?.releasing === false))
         await launchOwned(id, { commandId: service.commandId, command: service.command }, service.deadline)
       } catch (error) {
         await stopGateway(service.id)
-        await services.put(service.id, { ...service, ...stoppedExposure(service), state: 'failed', released: commands.get(`${id}/${service.commandId}`)?.released ?? true, detail: String(error) }); throw error
+        await services.put(service.id, { ...service, ...stoppedExposure(service), state: 'failed', released: commands.get(commandKey(id, service.commandId))?.released ?? true, detail: String(error) }); throw error
       }
       return service
     })
@@ -442,7 +446,7 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
   }
 
   async function stopService(service: InferenceService): Promise<InferenceService> {
-    const key = `${service.experimentId}/${service.commandId}`
+    const key = commandKey(service.experimentId, service.commandId)
     const pending = await serial(async () => {
       const current = services.get(service.id)
       if (current === undefined) throw new Error('managed service record is missing')
@@ -471,7 +475,7 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
       const command = commands.get(key)
       if (command === undefined) throw new Error('managed cleanup record is missing')
       await commands.put(key, { ...command, released: true })
-      for (const [id, service] of services.entries()) if (`${service.experimentId}/${service.commandId}` === key) {
+      for (const [id, service] of services.entries()) if (commandKey(service.experimentId, service.commandId) === key) {
         await services.put(id, { ...service, released: true, updatedAt: Date.now(), state: service.state === 'stopping' ? 'stopped' : 'failed' })
       }
       handles.delete(key); clearTimeout(deadlines.get(key)); deadlines.delete(key)
@@ -485,7 +489,7 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
   async function launchOwned(id: ExperimentId, raw: unknown, serviceDeadline?: number): Promise<ClusterCommandResult> {
       const current = allocation(id)
       const request = clusterCommandSchema.parse(raw)
-      const key = `${id}/${request.commandId}`
+      const key = commandKey(id, request.commandId)
       const previous = commands.get(key)
       if (previous !== undefined) {
         if (previous.command !== request.command) throw new Error('command id is bound to different content')

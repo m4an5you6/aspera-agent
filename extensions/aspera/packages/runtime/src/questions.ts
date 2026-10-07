@@ -1,7 +1,5 @@
 /** Experiment-owned answerer for the existing DSH question service. */
 import { randomUUID } from 'node:crypto'
-import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
@@ -10,6 +8,7 @@ import { UserQuestionError } from '@deepseek-ai/dsh-user-questions'
 import { experimentQuestionSchema, questionItemSchema } from '@aspera/experiments'
 import type { ClusterRuntimeConfig, ClusterPrivate } from './cluster-runtime.ts'
 import { z } from 'zod'
+import { clusterCoordinatorRequest } from './coordinator-request.ts'
 
 /** Mount an answerer without exposing credentials or allowing replies to edit requirements.
  * @param ctx - exact Agent context. @param host - injected worker services. @param agent - question owner. @param runtime - pinned submission. @param config - operation bounds. @param planning - planning role. @param onFailure - terminal infrastructure failure handler.
@@ -24,14 +23,7 @@ export function installExperimentQuestions(ctx: Context, host: Context, agent: A
     return next()
   })
   const control = async (operation: string, body: object, signal: AbortSignal) => {
-    const response = await fetch(`http://127.0.0.1:${runtime.submission.coordinator.remotePort + 1}/aspera/v2/${operation}`, {
-      method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${readFileSync(resolve(config.root, 'secrets/coordinator.token'), 'utf8').trim()}` },
-      body: JSON.stringify({ ...body, experimentId: runtime.submission.experimentId }),
-      signal: AbortSignal.any([signal, AbortSignal.timeout(runtime.toolTimeoutMs)]), redirect: 'error',
-    })
-    const result: unknown = await response.json()
-    if (!response.ok) throw new Error(z.object({ error: z.string() }).parse(result).error)
-    return result
+    return clusterCoordinatorRequest(runtime, config, operation, body, signal)
   }
   ctx.on('user-questions/request', async (request, next) => {
     if (request.agent !== undefined && request.agent !== agent) return next()

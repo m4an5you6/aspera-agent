@@ -7,6 +7,7 @@ import { observationSourceIdSchema } from '@aspera/experiments'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { executableDirectoriesSchema, serverIdSchema } from '@aspera/experiments'
 import type { ExperimentId, ExperimentServerId, ServerEnvironment } from '@aspera/experiments'
@@ -17,6 +18,8 @@ import type { EnvironmentRequirements } from './environment.ts'
 import { SavedReleaseUnavailable } from './cluster-deploy.ts'
 import { ReleaseInstallationPending } from './deploy.ts'
 import type { EnvironmentProgress, PreparationCommand } from './types.ts'
+import type { InstallationTools } from './installation.ts'
+import { installationSourceProbeIdSchema } from './installation-model.ts'
 
 /** Injectable SSH operations are shared by production tools and the profile replay. */
 export interface EnvironmentDriver {
@@ -39,6 +42,7 @@ export interface EnvironmentPreparationInput {
   observation: ServerEnvironment
   pendingCommand?: PreparationCommand
   outputChars: number
+  installation?: InstallationTools
   progress: (value: EnvironmentProgress) => Promise<void>
 }
 
@@ -49,8 +53,9 @@ interface ActivePreparation {
   serverId: ExperimentServerId
   inspect: (signal: AbortSignal) => Promise<object>
   command: (script: string, signal: AbortSignal, callId: string) => Promise<RemoteCommandResult>
-  verify: (pathEntries: string[], signal: AbortSignal) => Promise<object>
+  verify: (pathEntries: string[], signal: AbortSignal, callId: ToolCallId) => Promise<object>
   block: (reason: string) => Promise<void>
+  installation?: InstallationTools
 }
 
 /** Installs preparation tools on the existing DSH Agent, without another model loop. */
@@ -75,11 +80,23 @@ export class EnvironmentPreparation {
     ctx.effect(() => ctx.tools.register(defineTool({ name: 'verify_preparation_environment',
       description: 'Run the application-owned checks for this preparation step. Supply absolute executable directories when tools were installed outside the original SSH PATH. Completion requires a successful provider result.',
       parameters: { server_id: { type: 'string', required: true }, path_entries: { type: 'array', items: { type: 'string' }, required: true } }, output, presentCall,
-      execute: async (args, exec) => JSON.stringify(await this.owner(args.server_id).verify(executableDirectoriesSchema.parse(args.path_entries), exec.signal)) })))
+      execute: async (args, exec) => JSON.stringify(await this.owner(args.server_id).verify(executableDirectoriesSchema.parse(args.path_entries), exec.signal, exec.callId)) })))
     ctx.effect(() => ctx.tools.register(defineTool({ name: 'report_preparation_blocked',
       description: 'End preparation when the selected account cannot meet a requirement. Include the actual diagnostic and the specific cloud-platform or operator action required.',
       parameters: { server_id: { type: 'string', required: true }, reason: { type: 'string', required: true } }, output, presentCall,
       execute: async args => { await this.owner(args.server_id).block(args.reason); return 'Preparation is blocked.' } })))
+    ctx.effect(() => ctx.tools.register(defineTool({ name: 'inspect_preparation_installation',
+      description: 'Read the original supervised installer, real download/compiler progress, remaining budget, exit receipt and log source. Polling does not start another installer or reset limits.',
+      parameters: { server_id: { type: 'string', required: true } }, output, presentCall,
+      execute: async (args, exec) => JSON.stringify(await this.installer(args.server_id).inspect(exec.signal)) })))
+    ctx.effect(() => ctx.tools.register(defineTool({ name: 'probe_preparation_source',
+      description: 'Measure an HTTPS npm registry or Node header distribution on the selected server, using the exact fixed release version and a bounded download. No saved credentials are sent. Use evidence to decide whether to wait, repair the environment or switch sources.',
+      parameters: { server_id: { type: 'string', required: true }, kind: { type: 'string', enum: ['npm', 'nodeHeaders'], required: true }, url: { type: 'string', required: true } }, output, presentCall,
+      execute: async (args, exec) => JSON.stringify(await this.installer(args.server_id).probe(args.kind === 'npm' ? 'npm' : 'nodeHeaders', args.url, exec.signal)) })))
+    ctx.effect(() => ctx.tools.register(defineTool({ name: 'switch_preparation_source',
+      description: 'Autonomously use a successfully probed source for this installation only. Stops the identity-matched old installer and confirms exit before reusing its cache. Counts the new attempt against the existing retry and time budgets. TLS, frozen versions and integrity verification remain required. No user confirmation is needed.',
+      parameters: { server_id: { type: 'string', required: true }, probe_id: { type: 'string', required: true }, reason: { type: 'string', required: true } }, output, presentCall,
+      execute: async (args, exec) => JSON.stringify(await this.installer(args.server_id).switchSource(installationSourceProbeIdSchema.parse(args.probe_id), args.reason, exec.signal, { sessionId: agent.session.id, callId: exec.callId })) })))
     ctx.on('agent/error', ({ agent: owner, error }) => { if (owner === agent) this.reject?.(new Error(String(error))) })
   }
 
@@ -87,6 +104,11 @@ export class EnvironmentPreparation {
     const id = serverIdSchema.parse(raw)
     if (this.active?.serverId !== id) throw new Error('Server is outside the active preparation step')
     return this.active
+  }
+  private installer(raw: string): InstallationTools {
+    const tools = this.owner(raw).installation
+    if (!tools) throw new Error('Installation tools are unavailable outside the current deployment step')
+    return tools
   }
 
   /**
@@ -99,7 +121,7 @@ export class EnvironmentPreparation {
    * @returns checked value and the executable directories used for the check.
    */
   async ensure<T>(agent: Agent, input: EnvironmentPreparationInput, driver: EnvironmentDriver,
-    verify: (target: Target, observation: ServerEnvironment, signal: AbortSignal) => Promise<T>, signal: AbortSignal): Promise<{ value: T; pathEntries: string[] }> {
+    verify: (target: Target, observation: ServerEnvironment, signal: AbortSignal, callId?: ToolCallId) => Promise<T>, signal: AbortSignal): Promise<{ value: T; pathEntries: string[] }> {
     if (this.active !== undefined) throw new Error('Preparation Agent already owns a node step')
     let target = input.target
     let observation = input.observation
@@ -135,14 +157,14 @@ export class EnvironmentPreparation {
       await progress('inspecting-environment', `Previous preparation command exited ${exit.trim()}; rechecking the environment.`)
     }
     await reconcile()
-    const check = async (pathEntries: string[], operationSignal = signal): Promise<object> => {
+    const check = async (pathEntries: string[], operationSignal = signal, callId?: ToolCallId): Promise<object> => {
       const lifetime = AbortSignal.any([signal, operationSignal])
       target = { ...target, pathEntries }
       await progress('verifying-environment')
       let value: T
       try {
         observation = await driver.inspectEnvironment(target, input.password, lifetime)
-        value = await verify(target, observation, lifetime)
+        value = await verify(target, observation, lifetime, callId)
       } catch (error) {
         lifetime.throwIfAborted()
         if (error instanceof SavedReleaseUnavailable || error instanceof ReleaseInstallationPending) throw error
@@ -161,7 +183,7 @@ export class EnvironmentPreparation {
         directories: input.directories,
         observation, verification: initial, pathEntries: target.pathEntries ?? [],
         instruction: accepted !== undefined ? 'This check passed. Retain these observations as context for the next preparation step; no repair is requested.'
-          : 'Prepare this server using its existing SSH account permissions. Repair missing or incompatible Node, pinned pnpm, Python 3, bubblewrap and required user-space dependencies. Prefer application-owned installs; preserve running workloads and sealed releases. Use foreground commands and verify_preparation_environment after repairs. Host kernel/device restrictions require report_preparation_blocked with evidence. Do not change the experiment, storage assignment, credentials, host drivers or isolation requirements. Finish this turn only after verification succeeds or a blocker is reported. Do not complete the dispatch Goal.' }),
+          : 'Prepare this server using its existing SSH account permissions. Inspect the installation and complete logs before repairing network, disk, permissions, tool versions or compiler requirements. You choose download sources autonomously: probe an HTTPS candidate and switch only when its measured result supports that choice. Keep existing caches, original release material, frozen lockfile and checkpoints. Heartbeats and repeated retry text do not mean progress. Installation restarts, including source changes, share the saved retry and total budget. Never read or forward credentials, change global registry settings, disable TLS/integrity, replace sealed releases, stop controllers, change host drivers or disable isolation. Use foreground repair commands within the remaining budget and verify_preparation_environment after repair. Only program verification establishes success. Report concrete permission/kernel/device blockers. Do not complete the dispatch Goal.' }),
     }] })
     // The inbox records context while the loop retains ownership of the first system surface node.
     if (accepted !== undefined) { agent.inject(message); return accepted }
@@ -170,9 +192,9 @@ export class EnvironmentPreparation {
     const handlers: ActivePreparation = {
       serverId: input.serverId,
       inspect: async operationSignal => { observation = await driver.inspectEnvironment(target, input.password, AbortSignal.any([signal, operationSignal])); await progress('inspecting-environment'); return observation },
-      verify: async (paths, operationSignal) => {
+      verify: async (paths, operationSignal, callId) => {
         if (accepted !== undefined || terminal !== undefined) throw new Error('Preparation step has already finished')
-        try { return await check(paths, operationSignal) }
+        try { return await check(paths, operationSignal, callId) }
         catch (error) {
           const failure = error instanceof Error ? error : new Error(String(error))
           stop(failure)
@@ -246,8 +268,13 @@ exit "$status"`, lifetime, input.password, (stream, chunk) => { capture.append(s
       serverId: input.serverId,
       inspect: operationSignal => serial(() => handlers.inspect(operationSignal)),
       command: (script, operationSignal, callId) => serial(() => handlers.command(script, operationSignal, callId)),
-      verify: (paths, operationSignal) => serial(() => handlers.verify(paths, operationSignal)),
+      verify: (paths, operationSignal, callId) => serial(() => handlers.verify(paths, operationSignal, callId)),
       block: reason => serial(() => handlers.block(reason)),
+      installation: input.installation === undefined ? undefined : {
+        inspect: operationSignal => serial(() => input.installation!.inspect(AbortSignal.any([signal, operationSignal]))),
+        probe: (kind, url, operationSignal) => serial(() => input.installation!.probe(kind, url, AbortSignal.any([signal, operationSignal]))),
+        switchSource: (probeId, reason, operationSignal, invocation) => serial(() => input.installation!.switchSource(probeId, reason, AbortSignal.any([signal, operationSignal]), invocation)),
+      },
     }
     const abort = () => { agent.cancel({ kind: 'user' }); this.reject?.(new Error('Environment preparation was cancelled')) }
     signal.addEventListener('abort', abort, { once: true })

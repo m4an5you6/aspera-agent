@@ -1,5 +1,5 @@
 /** Test-only CPU provider: real DSH Sessions, durable scheduling, Web Remotes and profile-launched services. */
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync, appendFileSync, copyFileSync, writeFileSync, readFileSync, existsSync, renameSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -43,8 +43,27 @@ export async function apply(ctx, config) {
   const preparationCommands = []
   const configuredHosts = new Set()
   const restoredPreparations = new Set()
+  const installations = new Map()
+  const overviewModes = new Map()
+  function overviewRecord(record) {
+    const mode = overviewModes.get(record.submission.experimentId)
+    if (mode === undefined) return record
+    const running = ['running', 'partial', 'invalid-total', 'read-failure'].includes(mode.name)
+    const state = running ? 'running' : mode.name === 'blocked' ? 'blocked' : mode.name === 'cancelled' ? 'cancelled' : 'completed'
+    const internal = { run_experiment_command_attempts: 11, run_experiment_command_successes: 0, distinct_run_ids_attempted: 11,
+      goal_rounds_with_same_failure: 5, gpu_probe_completed: 0, environment_created: 0, model_downloaded: 0, dataset_prepared: 0,
+      smoke_run_completed: 0, formal_training_completed: 0, adapter_saved: 0, adapter_reload_verified: 0, artifacts_created_on_node: 0,
+      docs_verified_pages: 3, assigned_nodes: record.submission.nodes.length, gpus_assigned: 0, custom_fixture_metric: 7 }
+    const metrics = mode.name === 'blocked' ? internal : mode.name === 'partial' ? { loss: 0.91 }
+      : { step: 540, total_steps: mode.name === 'invalid-total' ? 0 : 2000, loss: 1.8452, tokens_per_second: 12400, ...internal }
+    return clusterRecordSchema.parse({ ...record, state, revision: record.revision + mode.revision, resourcesReleased: !running,
+      detail: mode.name === 'blocked' ? 'CPU fixture dependency unavailable; inspect the retained diagnostic.\n' + 'A long retained command error with no GPU acceptance. '.repeat(120) : undefined,
+      progress: { phase: mode.name === 'blocked' ? 'CPU fixture stopped while creating the isolated environment.' : 'CPU fixture executing the approved plan.', metrics, updatedAt: mode.updatedAt }, updatedAt: mode.updatedAt })
+  }
+  let installationGate
   let planGate; let retryGate; let hostKeyGate; let failConnection = false; let timeoutConnection = false; let failCleanup = false
   const cleanupCalls = []
+  const controlCalls = []
   let statusFailure
   ctx.effect(() => () => hostKeyGate?.resolve())
   installStorageReplay(ctx, storageCalls, environmentCalls)
@@ -109,7 +128,7 @@ export async function apply(ctx, config) {
       writeFileSync(resolve(workspace, 'result.txt'), 'local output\n')
       appendFileSync(runPath(id, 'node.log'), '训练准备完成\n')
       if (record.submission.objective.includes('failure')) return { state: 'failed', detail: 'CPU fixture dependency failed', resourcesReleased: true }
-      if (record.submission.objective === 'CPU completed experiment') {
+      if (['CPU completed experiment', 'CPU installation recovery', 'CPU overview review'].includes(record.submission.objective)) {
         const output = new ObservationWriter(runPath(id, ''), { version: 1, id: 'process-fixture-service', kind: 'process',
           experimentId: id, serverId: record.submission.nodes[0].server.id, phase: 'execution', sessionId: identity.sessionId,
           commandId: 'fixture-service', label: 'CPU recorded output', createdAt: Date.now(), streams: ['stdout', 'stderr'], complete: false })
@@ -182,7 +201,7 @@ export async function apply(ctx, config) {
     reconcile: record => stop(record.submission.experimentId),
   }
   const queue = new ClusterQueue(store.table('experiments'), executor, error => ctx.logger.error(String(error)))
-  ctx.effect(() => async () => { planGate?.resolve(); retryGate?.resolve(); await queue.close(); await store.close() })
+  ctx.effect(() => async () => { planGate?.resolve(); retryGate?.resolve(); installationGate?.resolve(); await queue.close(); await store.close() })
   await queue.recover()
   const driver = {
     environmentRequirements: () => ({ node: '^22.19.0 || >=24.0.0', pnpm: '11.7.0' }),
@@ -219,36 +238,81 @@ export async function apply(ctx, config) {
     prepareServerStorage: async (_target, placement) => placement.candidate,
     verifyServerStorage: async (_target, placement) => placement.candidate,
     resolveTrainingNetwork: async (_id, participants) => participants.map(value => value.node),
-    snapshotSource: async () => ({ directory: root, archive: 'fixture.tar', archiveHash: 'f'.repeat(64), digest: 'f'.repeat(64), dispose() {} }),
-    prepareClusterServer: async target => {
+    snapshotSource: async () => {
+      const archive = resolve(root, 'fixture.tar')
+      writeFileSync(archive, 'CPU fixture immutable material')
+      return { directory: root, archive, archiveHash: createHash('sha256').update('CPU fixture immutable material').digest('hex'), digest: 'f'.repeat(64), dispose() {} }
+    },
+    prepareClusterServer: async (target, _source, _password, _signal, installation) => {
       const record = fleet.list().find(row => row.preparation?.placements.some(placement => placement.workspaceRoot === target.storagePlacement?.workspaceRoot))
       if (record?.request.objective === 'CPU preparation recovery' && !restoredPreparations.has(record.request.experimentId)) {
         throw new SavedReleaseUnavailable(`CPU fixture release requirements unavailable at ${target.storagePlacement.releaseRoot}`)
       }
+      if (installation) await installation()
+      if (record?.request.objective === 'CPU installation recovery') await installationGate?.promise
       return { state: 'ready', deploymentId: 'f'.repeat(64), preparationId: 'f'.repeat(64), backend: 'bwrap', backendPath: '/fixture/bwrap', sandboxWriteProbe: 'passed', cudaProbe: 'passed', devicePaths: ['/dev/nvidia_fixture'], hiddenPaths: [], workspaceRoot: '/fixture/workspace' }
     },
     ensureClusterRole: async () => {},
     describeClusterNode: async server => ({ server, backendPath: '/fixture/bwrap', devicePaths: ['/dev/nvidia_fixture'], hiddenPaths: [], gpuInfo: 'CPU test provider; GPU validation is separate' }),
     delegateClusterLogin: async () => ({ knownHostsFile: '/fixture/private/known_hosts' }),
     installPrivateFile: async (_target, destination, content) => { const file = path(destination); mkdirSync(dirname(file), { recursive: true }); writeFileSync(file, content) },
-    remote: async (target, script) => script.includes('/exited')
-      ? String(preparationCommands.findLast(command => command.host === target.host)?.exitCode ?? 0)
-      : script.includes('for role in coordinator node') ? '' : 'CPU test provider',
+    remote: async (target, script) => {
+      const installer = / (launch|status|probe|stop) '([^']+\/config.json)'/.exec(script)
+      if (installer) {
+        const [, operation, configPath] = installer
+        const saved = JSON.parse(readFileSync(path(configPath), 'utf8'))
+        if (operation === 'probe') return JSON.stringify({ version: '0.2.0-rc.2', available: true, bytes: 65536, elapsedMs: 100,
+          detail: 'CPU SSH fixture measured the pinned npm package over HTTPS' })
+        if (operation === 'launch' && !installations.has(saved.attemptId)) {
+          const record = fleet.list().find(row => row.request.experimentId === saved.experimentId)
+          const failed = record?.request.objective === 'CPU installation recovery' && ![...installations.values()].some(value => value.experimentId === saved.experimentId)
+          installations.set(saved.attemptId, { version: 1, attemptId: saved.attemptId, experimentId: saved.experimentId, serverId: saved.serverId,
+            digest: saved.digest, archiveHash: saved.archiveHash, deadline: saved.deadline, startedAt: Date.now(), updatedAt: Date.now(), lastProgressAt: Date.now(),
+            state: failed ? 'running' : 'completed', phase: failed ? 'installing-dependencies' : 'installed-release', progress: { bytes: 65536, packages: 5, cpuTicks: 10, ioBytes: 0 },
+            pid: 1000, startTicks: 'cpu-fixture', bootId: 'cpu-fixture', exitCode: failed ? null : 0, exitConfirmed: !failed })
+        }
+        const status = installations.get(saved.attemptId)
+        if (operation === 'stop') { status.state = 'cancelled'; status.exitConfirmed = true; status.exitCode = 1 }
+        const offset = Number(/--offset (\d+)/.exec(script)?.[1] ?? 0)
+        return JSON.stringify(operation === 'status' ? { status, offset: 128, hasMore: false,
+          lines: offset === 0 ? [{ seq: 0, time: status.startedAt, stream: 'stderr', text: status.state === 'running'
+            ? JSON.stringify({ level: 'warn', name: 'pnpm:global', message: 'Tarball download average speed is below the package manager limit; cache retained' })
+            : status.reason ?? 'Pinned dependency installation complete\n' }] : [] } : status)
+      }
+      return script.includes('/exited') ? String(preparationCommands.findLast(command => command.host === target.host)?.exitCode ?? 0)
+        : script.includes('for role in coordinator node') ? '' : 'CPU test provider'
+    },
     copy: async (_target, source, destination) => { const file = path(destination); mkdirSync(dirname(file), { recursive: true }); copyFileSync(source, file) },
     request: async (_target, _token, route, _method, body) => {
       const operation = route.split('/').at(-1)
+      controlCalls.push({ operation, experimentId: body?.experimentId })
       if (operation === 'health') return { status: 200, value: { node: { allocations: queue.list().filter(row => !row.resourcesReleased).map(row => row.submission.experimentId) } } }
       const id = body.experimentId
       if (operation === 'submit') {
         if (!existsSync(path(`${body.coordinator.remoteRoot}/secrets/${id}.json`))) throw new Error('private materials are missing')
         return { status: 200, value: await queue.submit(body) }
       }
-      if (operation === 'status') { if (statusFailure !== undefined) throw new Error(statusFailure); return { status: 200, value: { record: queue.get(id), waitingFor: queue.waitingFor(id) } } }
+      if (operation === 'status') { if (statusFailure !== undefined) throw new Error(statusFailure); return { status: 200, value: { record: overviewRecord(queue.get(id)), waitingFor: queue.waitingFor(id) } } }
       if (operation === 'approve') return { status: 200, value: await queue.approve(id, body.revision) }
       if (operation === 'answer-question') { const { experimentId: _id, ...reply } = body; return { status: 200, value: await queue.answerQuestion(id, reply) } }
       if (operation === 'cancel') return { status: 200, value: await queue.cancel(id, body.submission) }
-      const record = queue.get(id)
+      const record = overviewRecord(queue.get(id))
       if (record === undefined) throw new Error('experiment not found')
+      if (operation === 'execution-progress') {
+        const mode = overviewModes.get(id)
+        if (mode?.name === 'legacy') return { status: 404, value: { error: 'cluster route not found' } }
+        if (mode?.name === 'read-failure') throw new Error('CPU fixture step progress read interrupted')
+        if (record.plan === undefined) return { status: 200, value: { supported: true } }
+        const active = ['running', 'serving'].includes(record.state)
+        const ended = record.state === 'completed'
+        const updatedAt = record.progress?.updatedAt ?? record.updatedAt
+        return { status: 200, value: { supported: true, progress: { version: 1, experimentId: id,
+          planRevision: record.plan.revision, sessionId: record.sessionId ?? `aspera-execution-${id}`, revision: mode?.revision ?? (active || ended ? 2 : 0),
+          ...(active || ended || mode !== undefined ? { updatedAt } : {}), steps: record.plan.steps.map((_text, index) => ({ step: index + 1,
+            state: ended || (active || mode !== undefined) && index === 0 ? 'completed' : mode?.name === 'blocked' && index === 1 ? 'blocked'
+              : (active || mode?.name === 'cancelled') && index === 1 ? 'running' : 'pending',
+            ...(active || ended || mode !== undefined ? { updatedAt, detail: 'CPU fixture Agent step report' } : {}) })) } } }
+      }
       if (body.serverId !== undefined && !record.submission.nodes.some(node => node.server.id === body.serverId)) throw new Error('node is outside this experiment')
       if (operation === 'records' || operation === 'trace-records') return { status: 200, value: await readPhaseRecords(runPath(id, 'events.jsonl'), body, body.phase === 'planning' ? record.planningSessionId : record.sessionId, 65536, operation === 'trace-records') }
       if (operation === 'observation-sources') return { status: 200, value: [
@@ -293,8 +357,21 @@ export async function apply(ctx, config) {
     const url = new URL(req.url, 'http://localhost')
     const id = url.searchParams.get('id')
     const kind = url.pathname.split('/').at(-1)
+    if (kind.startsWith('overview-')) {
+      const name = kind.slice('overview-'.length)
+      if (!['running', 'blocked', 'cancelled', 'completed', 'legacy', 'partial', 'invalid-total', 'read-failure'].includes(name)
+        || queue.get(id)?.submission.objective !== 'CPU overview review') throw new Error('Unknown overview fixture or experiment')
+      overviewModes.set(id, { name, revision: (overviewModes.get(id)?.revision ?? 2) + 1, updatedAt: Date.now() })
+      await fleet.refresh(id)
+    }
     if (kind === 'fail-status') statusFailure = 'SSH connection failed: ECONNREFUSED observations.test'
     if (kind === 'timeout-status') statusFailure = 'The operation was aborted due to timeout'
+    if (kind === 'restore-status') statusFailure = undefined
+    if (kind === 'unconfirm-release') {
+      const record = store.table('experiments').get(id)
+      await store.table('experiments').put(id, { ...record, revision: record.revision + 1, state: 'failed', resourcesReleased: false, detail: 'CPU fixture remote cleanup unconfirmed' })
+      await fleet.refresh(id)
+    }
     if (kind === 'append') appendFileSync(runPath(id, 'node.log'), '断线后继续\n')
     if (kind === 'rotate') writeFileSync(runPath(id, 'node.log'), '轮转后日志\n')
     if (kind === 'observation-append') {
@@ -304,6 +381,8 @@ export async function apply(ctx, config) {
     }
     if (kind === 'crash') children.get(id)?.handle.terminate()
     if (kind === 'restore-release') restoredPreparations.add(id)
+    if (kind === 'hold-installation') installationGate = Promise.withResolvers()
+    if (kind === 'release-installation') installationGate?.resolve()
     if (kind === 'hold-plan') planGate = Promise.withResolvers()
     if (kind === 'release-plan') planGate?.resolve()
     if (kind === 'hold-host-key') hostKeyGate = Promise.withResolvers()
@@ -316,7 +395,7 @@ export async function apply(ctx, config) {
     if (kind === 'hold-retry') retryGate = Promise.withResolvers()
     if (kind === 'release-retry') retryGate?.resolve()
     res.setHeader('content-type', 'application/json')
-    res.end(JSON.stringify({ experiments: fleet.list(), queue: queue.list(), deletedIds: fleet.snapshot().deletedIds, cleanupCalls, events, storageCalls, environmentCalls, preparationCommands }))
+    res.end(JSON.stringify({ ...fleet.snapshot(), queue: queue.list(), cleanupCalls, controlCalls, events, storageCalls, environmentCalls, preparationCommands }))
   } }))
 }
 

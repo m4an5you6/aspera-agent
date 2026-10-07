@@ -85,6 +85,31 @@
 .destructiveButton { background: var(--dsw-alias-state-error-primary) !important; color: var(--dsw-alias-label-primary-inverted) !important; }
 .deleteContent { padding: 0 24px 24px; display: flex; flex-direction: column; gap: 16px; }
 .deleteContent p { margin: 0; }
+.deleteModal { width: 520px; max-width: calc(100vw - 32px); max-height: calc(100dvh - var(--dsh-frame-top-clearance, 0px) - 32px); font: var(--dsw-font-xs-13); }
+.deleteModalScroll { display: flex; flex-direction: column; min-height: 0; overflow: hidden; padding: 0; }
+.deleteModal .deleteContent { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; gap: 15px; padding: 8px 24px 20px; }
+.deleteObjects { max-height: 180px; overflow: auto; flex: none; }
+.deleteObject { display: flex; flex-direction: column; gap: 7px; border: 0.5px solid var(--dsw-alias-border-l2); border-radius: var(--dsw-radius-md); padding: 13px 14px; min-width: 0; }
+.deleteObject + .deleteObject { margin-top: 8px; }
+.deleteObject strong { font: var(--dsw-font-s-strong-14); overflow-wrap: anywhere; }
+.deleteObjectHeading { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-width: 0; }
+.deleteWarning, .deleteInfo { display: flex; align-items: flex-start; gap: 9px; border-radius: var(--dsw-radius-md); padding: 12px; background: color-mix(in srgb, var(--dsw-alias-state-warn-primary) 9%, var(--dsw-alias-bg-layer-1)); }
+.deleteWarning > svg { flex: none; color: var(--dsw-alias-state-warn-label); }
+.deleteWarning strong { font-weight: 500; }
+.deleteWarning p, .deleteInfo p { color: var(--dsw-alias-label-secondary); font: var(--dsw-font-xxs-12); margin-top: 4px; }
+.deleteInfo { background: var(--dsw-alias-bg-layer-1); }
+.deleteCleanupOption { display: flex; flex-direction: column; gap: 8px; padding-top: 15px; border-top: 0.5px solid var(--dsw-alias-border-l2); }
+.deleteCleanupOption > p { margin-left: 25px; }
+.deleteActions { flex: none; display: flex; align-items: center; justify-content: flex-end; gap: 9px; flex-wrap: wrap; padding: 14px 24px 17px; border-top: 0.5px solid var(--dsw-alias-border-l2); }
+.deletePolicy { margin-right: auto; color: var(--dsw-alias-state-business-primary); }
+.deleteFailure { border: 0.5px solid var(--dsw-alias-border-l2); border-radius: var(--dsw-radius-md); padding: 11px 12px; font: var(--dsw-font-xxs-12); }
+.deleteFailure details { margin-top: 8px; color: var(--dsw-alias-label-secondary); }
+.deleteFailure summary { cursor: pointer; }
+.deleteLoading { display: grid; place-items: center; min-height: 80px; }
+.linkedDeleteRecord { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; text-align: left; margin-top: 6px; }
+.linkedDeleteRecord > span { min-width: 0; overflow-wrap: anywhere; }
+.detailBack { display: inline-flex; align-items: center; gap: 6px; flex: none; min-height: 32px; white-space: nowrap; }
+@media (max-width: 520px) { .deleteModal .deleteContent { padding: 8px 18px 18px; } .deleteActions { padding: 12px 18px 15px; } .deletePolicy { flex-basis: 100%; justify-content: start; } }
 .deleteRow { padding: 12px 0; border-bottom: 0.5px solid var(--dsw-alias-border-l2); display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
 .deleteRow strong { font-weight: 500; overflow-wrap: anywhere; }
 .cleanupPath { display: grid; gap: 4px; width: 100%; }
@@ -607,15 +632,67 @@ button.card:focus-visible {
 .workDescription { color: var(--dsw-alias-label-secondary); line-height: 1.7; margin-top: 10px; }
 .workBody { display: flex; flex-direction: column; gap: 12px; padding: 18px 22px 0; }
 .workBody:empty { display: none; }
+.installation { min-width: 0; }
+.installation h4 { margin: 0; font: var(--dsw-font-s-strong-14); }
+.installationNode { padding: 12px 0; border-bottom: 0.5px solid var(--dsw-alias-border-l2); }
+.installationFacts { display: grid; grid-template-columns: minmax(105px, auto) minmax(0, 1fr); gap: 6px 16px; margin: 12px 0; font: var(--dsw-font-xs-13); }
+.installationFacts dt { color: var(--dsw-alias-label-secondary); }
+.installationFacts dd { min-width: 0; margin: 0; }
+.installationSource { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.installationNode summary { cursor: pointer; color: var(--dsw-alias-label-secondary); font: var(--dsw-font-xs-13); }
+.installationNode ol { padding-left: 20px; font: var(--dsw-font-xs-13); }
 .currentActivity { display: grid; gap: 5px; border-left: 2px solid var(--work-color); padding-left: 12px; overflow-wrap: anywhere; }
 .workActions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 18px 22px 20px; }
 .stageMessage { min-width: 0; }
 .stageMessage summary, .nodeRecords summary { cursor: pointer; color: var(--dsw-alias-label-secondary); }
 .stageMessage pre, .nodeRecords pre, .infoColumn pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 240px; margin-top: 12px; }
-.workMetrics dl { display: flex; gap: 20px; flex-wrap: wrap; margin: 0 0 12px; }
-.workMetrics dl > div { display: grid; gap: 6px; }
-.workMetrics dt { color: var(--dsw-alias-label-secondary); }
-.workMetrics dd { margin: 0; font: var(--dsw-font-l-20); }
+.workMetrics dl { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin: 0 0 16px; }
+.workMetrics dl > div { display: grid; align-content: start; gap: 6px; min-width: 0; }
+.workMetrics dl > div + div { border-left: 0.5px solid var(--dsw-alias-border-l2); padding-left: 16px; }
+.workMetrics dt { color: var(--dsw-alias-label-secondary); font: var(--dsw-font-xs-13); }
+.workMetrics dd { margin: 0; font: var(--dsw-font-xl-24); font-weight: 500; overflow-wrap: anywhere; }
+.workMetrics dd small { color: var(--dsw-alias-label-secondary); font: var(--dsw-font-xs-13); }
+.trainingProgress { height: 4px; border-radius: var(--dsw-radius-sm); overflow: hidden; background: var(--dsw-alias-border-l2); }
+.trainingProgress > span { display: block; height: 100%; background: var(--dsw-alias-state-business-primary); }
+.progressCaption { display: flex; justify-content: space-between; gap: 12px; margin-top: 8px; color: var(--dsw-alias-label-secondary); font: var(--dsw-font-xxs-12); }
+.reportTime { color: var(--dsw-alias-label-secondary); font: var(--dsw-font-xxs-12); margin: 0; }
+.executionPlan { min-width: 0; }
+.executionPlan h3 { font: var(--dsw-font-s-strong-14); margin: 0; }
+.stepSource { color: var(--dsw-alias-label-secondary); font: var(--dsw-font-xxs-12); margin: 8px 0 16px; }
+.executionPlan .executionSteps { list-style: none; margin: 0; padding: 0; border: 0.5px solid var(--dsw-alias-border-l2); border-radius: var(--dsw-radius-lg); overflow: hidden; }
+.executionSteps > li { display: flex; gap: 12px; align-items: start; padding: 16px 18px; }
+.executionSteps > li + li { border-top: 0.5px solid var(--dsw-alias-border-l2); }
+.executionStepIcon { display: grid; place-items: center; flex: none; width: 24px; height: 24px; border: 0.5px solid var(--dsw-alias-border-l2); border-radius: 50%; color: var(--dsw-alias-label-secondary); font: var(--dsw-font-xxs-12); }
+.executionSteps [data-step-state='completed'] .executionStepIcon { color: var(--dsw-alias-state-success-primary); border-color: transparent; background: var(--dsw-alias-state-success-tertiary); }
+.executionSteps [data-step-state='blocked'] .executionStepIcon { color: var(--dsw-alias-state-warn-label); border-color: transparent; background: var(--dsw-alias-state-warn-tertiary); }
+.executionSteps [aria-busy='true'] .executionStepIcon { color: var(--dsw-alias-state-business-primary); border-color: transparent; background: color-mix(in srgb, var(--dsw-alias-state-business-primary) 8%, var(--dsw-alias-bg-layer-0)); }
+.executionStepCopy { flex: 1; min-width: 0; }
+.executionStepHeading { display: flex; justify-content: space-between; gap: 14px; align-items: baseline; }
+.executionStepHeading > span { font-weight: 500; line-height: 1.6; overflow-wrap: anywhere; }
+.executionStepHeading small { flex: none; color: var(--dsw-alias-label-secondary); font: var(--dsw-font-xxs-12); }
+.executionStepCopy p, .executionStepCopy time { display: block; font: var(--dsw-font-xxs-12); color: var(--dsw-alias-label-secondary); margin-top: 5px; overflow-wrap: anywhere; }
+.executionStepCopy p { white-space: pre-wrap; line-height: 1.6; }
+.executionSteps [data-step-state='blocked'] .executionStepHeading small { color: var(--dsw-alias-state-warn-label); }
+.executionSteps [data-step-state='completed'] .executionStepHeading small { color: var(--dsw-alias-state-success-primary); }
+.planContents { margin-top: 14px; font: var(--dsw-font-xs-13); }
+.planContents summary { cursor: pointer; color: var(--dsw-alias-link); }
+.planContents p { margin-top: 12px; }
+.planApproval { display: flex; flex-direction: column; gap: 12px; align-items: start; margin-top: 14px; }
+.progressReadNotice { padding: 10px 12px; border-left: 2px solid var(--dsw-alias-state-warn-primary); background: var(--dsw-alias-state-warn-tertiary); color: var(--dsw-alias-state-warn-label); font: var(--dsw-font-xxs-12); margin-bottom: 12px; }
+.issueSummary { margin-top: 10px; font: var(--dsw-font-xs-13); color: var(--dsw-alias-state-warn-label); overflow-wrap: anywhere; }
+.diagnosticsArea { min-width: 0; outline: none; }
+.diagnosticsArea:empty { display: none; }
+.diagnosticsArea:focus-visible { outline: var(--dsw-focus-ring-width) solid var(--dsw-alias-state-business-primary); outline-offset: 4px; }
+.diagnostics { border: 0.5px solid var(--dsw-alias-border-l2); border-radius: var(--dsw-radius-lg); padding: 16px 18px; min-width: 0; }
+.diagnostics summary { cursor: pointer; font-weight: 500; }
+.diagnostics summary small { display: inline; margin-left: 12px; font: var(--dsw-font-xxs-12); color: var(--dsw-alias-label-secondary); }
+.diagnosticBody { display: flex; flex-direction: column; gap: 14px; padding-top: 16px; min-width: 0; }
+.diagnosticBody details summary { font: var(--dsw-font-xs-13); color: var(--dsw-alias-label-secondary); }
+.diagnosticBody pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 300px; margin-top: 12px; }
+.diagnosticMetrics { display: grid; gap: 0; margin: 0; font: var(--dsw-font-xs-13); }
+.diagnosticMetrics > div { display: flex; justify-content: space-between; gap: 14px; padding: 9px 0; border-bottom: 0.5px solid var(--dsw-alias-border-l2); }
+.diagnosticMetrics dt { min-width: 0; color: var(--dsw-alias-label-secondary); overflow-wrap: anywhere; }
+.diagnosticMetrics dd { margin: 0; font-variant-numeric: tabular-nums; }
 .planArea { display: flex; flex-direction: column; gap: 16px; outline: none; }
 .planArea:empty { display: none; }
 .planArea:focus-visible { outline: var(--dsw-focus-ring-width) solid var(--dsw-alias-state-business-primary); outline-offset: 4px; }
@@ -628,6 +705,10 @@ button.card:focus-visible {
 .nodeHeader { display: flex; justify-content: space-between; align-items: center; gap: 14px; padding: 14px 16px; }
 .nodeHeader h4 { font: var(--dsw-font-s-strong-14); margin: 0 0 4px; }
 .nodeStatus { display: flex; align-items: center; gap: 6px; color: var(--dsw-alias-label-secondary); font: var(--dsw-font-xxs-12); }
+.stageNode > .nodeStatus { padding: 0 14px 14px; }
+.nodeGpu { margin: 0 14px 12px; font: var(--dsw-font-xxs-12); }
+.nodeGpu > span { color: var(--dsw-alias-label-secondary); }
+.nodeGpu p { margin-top: 5px; overflow-wrap: anywhere; white-space: pre-wrap; line-height: 1.6; }
 .nodeRecords { background: var(--dsw-alias-bg-layer-1); border-top: 0.5px solid var(--dsw-alias-border-l2); padding: 12px 16px; }
 .nodeChecks { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 12px; }
 .nodeChecks > span { display: flex; align-items: center; gap: 4px; padding: 5px 7px; font: var(--dsw-font-xxs-12); color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-bg-layer-0); border: 0.5px solid var(--dsw-alias-border-l2); border-radius: var(--dsw-radius-sm); }
@@ -667,14 +748,21 @@ button.card:focus-visible {
 @media (max-width: 640px) {
   .detailHeader { align-items: flex-start; flex-wrap: wrap; }
   .detailHeading { flex-basis: 100%; }
-  .detail .pipeline { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
-  .pipeline li, .pipeline li + li { padding: 0 0 12px; }
+  .detail .pipeline { gap: 8px; }
+  .pipeline li, .pipeline li + li { padding: 0 0 12px; flex-direction: column; align-items: start; gap: 8px; }
+  .stepCopy { font: var(--dsw-font-xxs-12); }
   .infoColumn { grid-template-columns: 1fr; }
   .infoSection + .infoSection { border-top: 0.5px solid var(--dsw-alias-border-l2); padding-top: 20px; }
   .nodeHeader { flex-wrap: wrap; }
   .workHeader { padding: 16px; }
   .workBody { padding: 16px 16px 0; }
   .workActions { padding: 16px; }
+  .workMetrics dl { gap: 10px; }
+  .workMetrics dl > div + div { padding-left: 10px; }
+  .workMetrics dd { font: var(--dsw-font-l-20); }
+  .executionSteps > li { padding: 14px; gap: 10px; }
+  .executionStepHeading { flex-wrap: wrap; gap: 4px 12px; }
+  .diagnostics summary small { display: block; margin: 6px 0 0 16px; }
 }
 .inspectorContent pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; font: var(--dsw-font-xs-13); }
 .prewrap { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; }

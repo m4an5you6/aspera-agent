@@ -37,6 +37,8 @@ Host 程序依赖已安装包的类型声明。[types/typert-protocol.d.ts](../t
 
 桌面端与浏览器共用页面和任务服务。持久接管后，远端调度主机管理执行；本机桌面壳不管理 GPU 进程。
 
+执行 Agent 向调度主机上报批准计划的步骤，页面同时读取这些记录和独立的准备／结果验收证据。[步骤进度](state-and-api.zh.md#execution-step-progress)使用独立版本文件，不改变固定的提交、队列或 Session 格式。旧实验保留原远端发布。
+
 ```mermaid
 flowchart TB
   subgraph Local[Local management]
@@ -49,6 +51,7 @@ flowchart TB
     Remote --> Observations[Versioned observations: events / sources / logs / metrics]
     Fleet --> Management[Peer servers / dated checks / deletion journal]
     Management --> Cleanup[Owned paths only / cleanup receipts / tombstones]
+    Management --> Removal[Local deletion / retained remote ownership]
     Fleet --> Models[Private snapshots: preparation / planning / execution]
     Models --> Selection
     Models --> Planner
@@ -59,6 +62,12 @@ flowchart TB
     Inventory --> Selection[Restricted Agent: candidate ID + reason]
     Selection --> Placement[Persist placement before directory creation]
     Placement --> Acceptance[Workspace / isolation / credentials / GPU checks]
+    Fleet --> InstallationJournal[Preparation v1: original material / budgets / attempts]
+    InstallationJournal --> Installer[Detached Linux installer: cache / progress / identity / exit]
+    Preparation --> Sources[Probe HTTPS candidate / switch within saved budget]
+    Sources --> Installer
+    Installer --> Checks
+    Installer --> Observations
     Acceptance --> Network[Mutual node identity and network checks]
   end
   subgraph Coordinator[Selected participant: durable coordinator]
@@ -133,7 +142,7 @@ sequenceDiagram
   Note over Queue,Node: Accepted work continues after the local application quits
 ```
 
-管理 profile 串行校验提交。不同调度主机不能管理使用重叠节点的未结束实验，调度节点按实验固定。首次等待确认仍受此登记限制，但不分配 GPU。节点控制服务独立校验执行独占。结束记录通过持久删除进度及删除标记移除，可选 SSH 清理验证已保存的归属、路径和挂载。
+管理 profile 串行校验提交。不同调度主机不能管理使用重叠节点的未结束实验，调度节点按实验固定。首次等待确认仍受此登记限制，但不分配 GPU。节点控制服务独立校验执行独占。本机删除使用独立进度及删除标记，并保留未确认的远端归属；可选 SSH 清理要求释放已确认，并验证保存的归属、路径及挂载。
 
 -----
 

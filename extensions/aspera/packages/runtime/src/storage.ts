@@ -24,10 +24,11 @@ async function storageRequest(target: Target, operation: 'inspectStorage' | 'pre
 
 /** Remove an ended experiment's owned files over its pinned SSH connection.
  * @param target - saved SSH account. @param placement - saved mount and owner. @param privateNames - registered secret basenames.
- * @param password - private credential. @returns after the remote helper confirms complete cleanup.
+ * @param password - private credential. @param signal - abort the SSH helper without assuming remote cleanup succeeded.
+ * @returns after the remote helper confirms complete cleanup.
  */
-export async function cleanupServerStorage(target: Target, placement: StoragePlacement, privateNames: string[], password?: string): Promise<void> {
-  const result = await storageRequest(target, 'cleanupStorage', { placement: storagePlacementSchema.parse(placement), privateNames }, password)
+export async function cleanupServerStorage(target: Target, placement: StoragePlacement, privateNames: string[], password?: string, signal?: AbortSignal): Promise<void> {
+  const result = await storageRequest(target, 'cleanupStorage', { placement: storagePlacementSchema.parse(placement), privateNames }, password, signal)
   if (typeof result !== 'object' || result === null || !('cleaned' in result) || result.cleaned !== true) throw new Error('Remote cleanup was not confirmed')
 }
 

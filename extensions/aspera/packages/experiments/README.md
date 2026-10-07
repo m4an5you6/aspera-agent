@@ -35,6 +35,8 @@ Questions and replies are serialized with queue mutations. Persist an open quest
 <a id="understand-the-implementation"></a>
 ## Understand the implementation
 
+[execution-progress.ts](src/execution-progress.ts) exports independent version-1 step-report and read/result schemas. Reports bind an experiment, approved plan revision and execution Session; the program supplies call identity and time. [Step progress](../../docs/state-and-api.md#execution-step-progress) owns persistence, revision conflicts and compatibility. Existing queue records and plans retain their format.
+
 Generation 4 freezes the short experiment name and three model configuration summaries while retaining generation-1–3 readers. [records.ts](src/records.ts) defines experiment/phase/Session paging and node/process/stream cursors. The initial plan confirmation keeps resources released; whole-group allocation starts after approval.
 
 <details>

@@ -21,6 +21,8 @@ import { observationReadSchema, observationSourceSchema, metricReadSchema, metri
 import { observationSources, readObservation } from './observations.ts'
 import { readMetricSamples } from './metrics.ts'
 import { readTraceAttachment } from './trace-attachments.ts'
+import { executionStepReportSchema } from '@aspera/experiments'
+import { ExecutionProgressStore } from './execution-progress.ts'
 
 const storeSpec = defineDomain({ name: 'aspera_queue', version: 4, compatibleVersions: [1, 2, 3], layout: 'per-record',
   tables: { experiments: domainTable<ExperimentId, ClusterRecord>(clusterRecordSchema) } })
@@ -60,6 +62,7 @@ export async function applyClusterRole(ctx: Context, config: ClusterRoleConfig):
     return
   }
   const token = readFileSync(config.tokenFile, 'utf8').trim()
+  const executionProgress = new ExecutionProgressStore(config.root)
   if (token.length < 32) throw new Error('cluster token must contain at least 32 characters')
   const node = config.role === 'node' ? await createClusterNode(ctx, { ...config, bootId: randomUUID() }) : undefined
   const store = config.role === 'coordinator' ? await ctx.storage.domain.open(storeSpec) : undefined
@@ -157,6 +160,13 @@ export async function applyClusterRole(ctx: Context, config: ClusterRoleConfig):
           path.slice('/aspera/v1/'.length), input)); return
       }
       if (path === '/aspera/v1/status') { respond(200, { record, waitingFor: queue.waitingFor(input.experimentId) }); return }
+      if (path === '/aspera/v1/execution-progress') {
+        const progress = executionProgress.read(record)
+        respond(200, { supported: true, ...(progress === undefined ? {} : { progress }) }); return
+      }
+      if (path === '/aspera/v1/report-execution-step') {
+        respond(200, executionProgress.report(record, executionStepReportSchema.parse(body))); return
+      }
       const operation = path.slice('/aspera/v1/'.length)
       if (operation === 'observation-capabilities') { respond(200, { version: 1, completeEvents: true, logs: true, metrics: true }); return }
       if (operation === 'observation-sources') {

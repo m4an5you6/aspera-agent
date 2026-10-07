@@ -50,11 +50,13 @@ cat ${shellQuote(release + '/aspera-release.json')}`, signal, password)
  * @param source - immutable source.
  * @param password - selected SSH password.
  * @param signal - preparation cancellation.
+ * @param installation - supervised installer supplied by resumable fleet preparation.
  * @returns probed node.
  */
 export async function prepareClusterServer(target: DeploymentConfig, source: DeploymentRelease, password: string | undefined,
-  signal: AbortSignal): Promise<PreparedEnvironment> {
-  if ('reuse' in source) {
+  signal: AbortSignal, installation?: () => Promise<void>): Promise<PreparedEnvironment> {
+  if (installation !== undefined) await installation()
+  else if ('reuse' in source) {
     const release = target.storagePlacement?.releaseRoot ?? `${target.remoteRoot}/releases/${source.digest}`
     await verifySavedRelease(target, release, source.digest, password, signal)
   } else await installSource(target, source, signal, password)

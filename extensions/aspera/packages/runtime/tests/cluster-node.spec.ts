@@ -3,15 +3,18 @@ const budget = { maxRuntimeSeconds: 3600, maxServiceSeconds: 3600, maxCommands: 
 const deadline = Date.now() + 3600000
 /** Node ownership tests use isolated files and explicitly settled managed-process doubles. */
 import { randomUUID } from 'node:crypto'
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, renameSync } from 'node:fs'
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, renameSync, readdirSync, readFileSync, existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { createServer } from 'node:net'
 import { createServer as createHttpServer } from 'node:http'
-import type { Context } from '@deepseek-ai/cordis'
+import { Context } from '@deepseek-ai/cordis'
+import Storage from '@deepseek-ai/dsh-storage'
+import { DomainFacility } from '@deepseek-ai/dsh-storage-domain'
+import { JsonStorageBackend } from '@deepseek-ai/dsh-storage-json'
 import { afterEach, expect, it, vi } from 'vitest'
 import { createClusterNode } from '../src/cluster-node.ts'
-import { clusterNodeSchema, experimentIdSchema, processLogPageSchema, experimentProcessSchema } from '@aspera/experiments'
+import { clusterNodeSchema, experimentIdSchema, processLogPageSchema, experimentProcessSchema, observationPolicySchema } from '@aspera/experiments'
 import type { StoragePlacement } from '@aspera/experiments'
 import { placement } from '../../experiments/tests/fixtures.ts'
 import { verifyStorage } from '../scripts/storage.mjs'
@@ -32,7 +35,16 @@ async function fixture() {
   mkdirSync(resolve('.artifacts'), { recursive: true })
   const absolute = mkdtempSync(resolve('.artifacts', 'cluster-node-'))
   const root = process.platform === 'win32' ? absolute.slice(2).replaceAll('\\', '/') : absolute
-  const tables = new Map<string, Map<string, unknown>>()
+  const storageContext = new Context()
+  await storageContext.plugin(Storage)
+  const storageRoot = resolve(absolute, 'storage')
+  const backend = new JsonStorageBackend(storageRoot)
+  storageContext.effect(() => {
+    const unregister = storageContext.storage.backend.register('json', backend)
+    return async () => { unregister(); await backend.close() }
+  })
+  const facility = new DomainFacility(storageContext, { backend: 'json', routes: {} })
+  storageContext.effect(() => storageContext.storage.mount('domain', facility))
   const disposers: (() => Promise<void>)[] = []
   const handles: { stdout: PassThrough; stderr: PassThrough; settle: () => void; terminate: ReturnType<typeof vi.fn>; waitForExit: ReturnType<typeof vi.fn<() => Promise<boolean>>> }[] = []
   const spawn = vi.fn((_spec: import('@deepseek-ai/dsh-subprocess').SubprocessSpawnSpec) => {
@@ -44,26 +56,62 @@ async function fixture() {
     return { stdout, stderr, done: done.promise, terminate, waitForExit }
   })
   const confine = vi.fn(async (argv: string[], _options: unknown) => ({ argv }))
-  const ctx = fromAny<Context, object>({ storage: { domain: { open: async () => ({ table: (name: string) => {
-    let table = tables.get(name); if (table === undefined) { table = new Map(); tables.set(name, table) }
-    return { get: (key: string) => table.get(key), entries: () => table.entries(), put: async (key: string,
-      value: unknown) => { table.set(key, value) } }
-  }, close: async () => {} }) } }, subprocess: { spawn }, sandbox: { confine },
+  const ctx = fromAny<Context, object>({ storage: { domain: facility }, subprocess: { spawn }, sandbox: { confine },
   effect: (setup: () => () => Promise<void>) => { disposers.push(setup()) }, logger: { error: vi.fn(), debug: vi.fn() },
   })
   const config = { root, backendPath: '/usr/bin/bwrap', hiddenPaths: [], bootId: 'boot-1', chunkBytes: 1024, fileLimit: 10, cleanupTimeoutMs: 1000,
-    serviceRequestTimeoutMs: 1000, serviceRequestBytes: 1024, devicePaths: ['/dev/nvidia0'] }
+    serviceRequestTimeoutMs: 1000, serviceRequestBytes: 1024, devicePaths: ['/dev/nvidia0'],
+    observations: observationPolicySchema.parse({ intervalMs: 60000 }) }
+  const restart = async (confirmed = false) => {
+    const image = confirmed ? [] : ['allocations', 'commands', 'services'].flatMap(table => {
+      const directory = resolve(storageRoot, 'aspera_node', table)
+      return existsSync(directory) ? readdirSync(directory).map(name => {
+        const path = resolve(directory, name)
+        return { path, bytes: readFileSync(path) }
+      }) : []
+    })
+    for (const handle of handles) { if (!confirmed) handle.waitForExit.mockResolvedValue(false); handle.settle() }
+    for (const dispose of disposers.splice(0).reverse()) await dispose()
+    // A crashed controller cannot persist acknowledgements from its test-handle teardown.
+    for (const { path, bytes } of image) writeFileSync(path, bytes)
+    return createClusterNode(ctx, { ...config, bootId: 'boot-2' })
+  }
+  cleanup.push(async () => {
+    for (const handle of handles) handle.settle()
+    for (const dispose of disposers.reverse()) await dispose()
+    await facility.closeAll()
+    await storageContext.fiber.dispose()
+    rmSync(absolute, { recursive: true, force: true })
+  })
   const handler = await createClusterNode(ctx, config)
   const node = clusterNodeSchema.parse({ server: { id: randomUUID(), name: 'node', username: 'trainer', host: 'gpu', sshPort: 22,
     remotePort: 43019, remoteRoot: root, authMode: 'password' }, devicePaths: ['/dev/nvidia0'],
   backendPath: '/usr/bin/bwrap', hiddenPaths: [], gpuInfo: 'GPU 0' })
-  cleanup.push(async () => {
-    for (const handle of handles) handle.settle()
-    for (const dispose of disposers.reverse()) await dispose()
-    rmSync(absolute, { recursive: true, force: true })
-  })
-  return { handler, node, handles, confine, spawn, ctx, config }
+  return { handler, node, handles, confine, spawn, ctx, config, storageRoot, restart }
 }
+it('starts schema-valid run ids using the published per-record backend and isolates repeated ids across experiments', async () => {
+  const f = await fixture(); const id = experimentIdSchema.parse('2614d34b-7b4a-4d8c-9ac6-5fca6e369221')
+  await f.handler('allocate', { experimentId: id, deploymentId: 'a'.repeat(64), protocol: 2, node: f.node })
+  const names = ['probe_env', 'probe-env', 'abc123', '1', 'SftSmoke01', randomUUID(), 'x'.repeat(80)]
+  for (const commandId of names) {
+    const request = { experimentId: id, commandId, command: 'fixture command' }
+    await expect(f.handler('run', request)).resolves.toMatchObject({ commandId, state: 'running' })
+    await expect(f.handler('run', request)).resolves.toMatchObject({ commandId })
+    f.handles.at(-1)!.settle()
+  }
+  expect(f.spawn).toHaveBeenCalledTimes(names.length)
+  for (const commandId of ['a/b', '..', 'x'.repeat(81)]) await expect(f.handler('run', { experimentId: id, commandId, command: 'fixture' })).rejects.toThrow()
+  expect(f.spawn).toHaveBeenCalledTimes(names.length)
+  await expect(f.handler('release', { experimentId: id })).resolves.toEqual({ released: true })
+  const nextId = experimentIdSchema.parse(randomUUID())
+  await f.handler('allocate', { experimentId: nextId, deploymentId: 'a'.repeat(64), protocol: 2, node: f.node })
+  await expect(f.handler('run', { experimentId: nextId, commandId: 'probe_env', command: 'different experiment' })).resolves.toMatchObject({ commandId: 'probe_env' })
+  const records = readdirSync(resolve(f.storageRoot, 'aspera_node/commands'))
+  expect(records).toHaveLength(names.length + 1)
+  expect(records.every(name => /^[a-zA-Z0-9_-]+\.json$/.test(name))).toBe(true)
+  expect(records.map(name => JSON.parse(readFileSync(resolve(f.storageRoot, 'aspera_node/commands', name), 'utf8')).record.experimentId)
+    .filter(experimentId => experimentId === nextId)).toHaveLength(1)
+})
 it('deduplicates commands and keeps the node allocated until cancellation settles the managed range', async () => {
   const f = await fixture(); const id = experimentIdSchema.parse(randomUUID()); const another = experimentIdSchema.parse(randomUUID())
   await f.handler('allocate', { experimentId: id, deploymentId: 'a'.repeat(64), budget, deadline, node: f.node })
@@ -152,7 +200,7 @@ it('holds ambiguous allocations after node restart and never launches a retry', 
   const allocation = { experimentId: id, deploymentId: 'a'.repeat(64), budget, deadline, node: f.node }
   await f.handler('allocate', allocation)
   await f.handler('run', { experimentId: id, commandId: 'training', command: 'python train.py' })
-  const restarted = await createClusterNode(f.ctx, { ...f.config, bootId: 'boot-2' })
+  const restarted = await f.restart()
   await expect(restarted('allocate', allocation)).rejects.toThrow('interrupted')
   expect(await restarted('release', { experimentId: id })).toMatchObject({ released: false })
   expect(f.spawn).toHaveBeenCalledOnce()
@@ -163,7 +211,7 @@ it('releases a restarted allocation only when every recorded process was already
   await f.handler('run', { experimentId: id, commandId: 'smoke', command: 'python smoke.py' })
   f.handles[0]!.settle()
   await vi.waitFor(async () => { expect(await f.handler('status', { experimentId: id })).toMatchObject([{ released: true }]) })
-  const restarted = await createClusterNode(f.ctx, { ...f.config, bootId: 'boot-2' })
+  const restarted = await f.restart(true)
   expect(await restarted('release', { experimentId: id })).toEqual({ released: true })
   expect(f.spawn).toHaveBeenCalledOnce()
 })
@@ -248,7 +296,7 @@ it('holds an unverified service after node restart and never restarts its comman
   await f.handler('allocate', { experimentId: id, deploymentId: 'a'.repeat(64), budget, deadline, node: f.node })
   const request = { experimentId: id, id: randomUUID(), command: 'python serve.py', modelPath: 'model', port: await loopbackPort(), healthPath: '/health' }
   await f.handler('register-service', request)
-  const restarted = await createClusterNode(f.ctx, { ...f.config, bootId: 'boot-2' })
+  const restarted = await f.restart()
   expect(await restarted('services', { experimentId: id })).toMatchObject([{ state: 'interrupted', released: false }])
   expect(await restarted('release', { experimentId: id })).toEqual(expect.objectContaining({ released: false }))
   expect(f.spawn).toHaveBeenCalledOnce()

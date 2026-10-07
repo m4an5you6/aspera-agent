@@ -1,5 +1,5 @@
 /** Compact experiment management and explicit deletion confirmation. */
-import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { Button, Checkbox, Input, Menu, Modal, Tag, Toast, Tooltip, StateDot,
   IconEllipsisOutlineRegular, IconTrashOutlineRegular, IconWarningOutlineRegular,
   IconClockOutlineRegular, IconCheckCircleOutlineRegular, IconCloseCircleFillRegular } from '@deepseek-ai/dsh-client-ui-primitives'
@@ -37,7 +37,8 @@ export function ManagementFeedback({ controller, useExperiments, t }: Experiment
     icon={<IconWarningOutlineRegular />} holdMs={8000} onDone={() => { controller.dismissErrorNotice() }}
     actions={[{ label: t('technicalDetails'), onClick: () => { setDetails(error.message); controller.dismissErrorNotice() } }, { label: '×', onClick: () => { controller.dismissErrorNotice() } }]} /></>
   if (details !== undefined) return <Modal open title={t('technicalDetails')} closeLabel={t('close')} onClose={() => { setDetails(undefined) }}><div className={css.deleteContent}><pre className={css.prewrap}>{details}</pre></div></Modal>
-  return toast === null ? null : <Toast key={toast.sequence} text={t(toast.key)} {...(toast.failed ? { icon: <IconWarningOutlineRegular /> } : { tone: 'success' as const })}
+  return toast === null ? null : <Toast key={`${toast.key}-${toast.sequence}`} text={t(toast.key)} {...(toast.failed ? { icon: <IconWarningOutlineRegular /> } : { tone: 'success' as const })}
+    {...(toast.detail === undefined ? {} : { actions: [{ label: t('sourceSwitchReason'), onClick: () => { setDetails(toast.detail); controller.clearToast() } }, { label: '×', onClick: () => { controller.clearToast() } }] })}
     onDone={() => { controller.clearToast() }} />
 }
 
@@ -46,53 +47,66 @@ export function DeleteExperimentsDialog({ controller, t, ids, close }: Props & {
   const live = useSyncExternalStore(controller.store.subscribe, controller.store.getSnapshot)
   const [preview, setPreview] = useState<ExperimentDeletionPreview[]>()
   const [cleanup, setCleanup] = useState(false)
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string>()
+  const [busy, setBusy] = useState<'records' | 'remote'>()
+  const [error, setError] = useState(false)
+  const [previewAttempt, setPreviewAttempt] = useState(0)
   const [results, setResults] = useState<ExperimentDeletion[]>([])
   const operation = useRef(controller.newId())
+  const sequence = useRef(0)
   useEffect(() => {
     let mounted = true
-    void controller.previewDeletion(ids).then(value => { if (mounted) setPreview(value) }, reason => { if (mounted) setError(String(reason)) })
-    return () => { mounted = false }
-  }, [controller, ids])
+    void controller.previewDeletion(ids).then(value => { if (mounted) setPreview(value) }, reason => {
+      if (mounted) { setError(true); controller.report(reason, { operation: 'delete-preview' }) }
+    })
+    return () => { mounted = false; sequence.current++ }
+  }, [controller, ids, previewAttempt])
   const submit = async () => {
     if (busy || preview === undefined) return
-    setBusy(true); setError(undefined)
+    const request = ++sequence.current
+    setBusy(cleanup ? 'remote' : 'records'); setError(false)
     try {
       const result = await controller.deleteExperiments(preview.map(row => row.experimentId), cleanup, operation.current)
+      if (request !== sequence.current) return
       setResults(result)
       const remaining = preview.filter(row => !result.some(value => value.experimentId === row.experimentId && value.state === 'deleted'))
       setPreview(remaining)
       if (result.every(row => row.state === 'deleted')) close()
-    } catch (reason) { setError(String(reason)) }
-    finally { setBusy(false) }
+    } catch (reason) {
+      if (request === sequence.current) { setError(true); controller.report(reason, { operation: cleanup ? 'delete-cleanup' : 'delete-records' }) }
+    }
+    finally { if (request === sequence.current) setBusy(undefined) }
   }
-  const stop = async (id: string) => {
-    setBusy(true)
-    try { await controller.cancel(id); setPreview(await controller.previewDeletion(preview?.map(row => row.experimentId) ?? ids)) }
-    catch (reason) { setError(String(reason)) }
-    finally { setBusy(false) }
+  const recordsOnly = () => {
+    sequence.current++; setBusy(undefined); setCleanup(false); setResults([]); setError(false); operation.current = controller.newId()
   }
-  return <Modal open onClose={() => { if (!busy) close() }} title={t('deleteExperiments')} closeLabel={t('close')} backdropBlur={false} className={css.serverModal} contentClassName={css.serverModalContent}>
+  const remaining = results.filter(row => row.state !== 'deleted')
+  return <Modal open onClose={() => { if (busy !== 'records') close() }} title={t('deleteExperiments')} closeLabel={t('close')} backdropBlur={false} className={css.deleteModal} contentClassName={css.deleteModalScroll}>
     <div className={css.deleteContent}>
+      {preview === undefined && !error && <div className={css.deleteLoading}><StateDot state="ongoing" /></div>}
+      <div className={css.deleteObjects}>{preview?.map(row => {
+        const record = live.experiments.find(value => value.request.experimentId === row.experimentId)
+        return <div key={row.experimentId} className={css.deleteObject}><div className={css.deleteObjectHeading}><strong>{row.name}</strong>{record !== undefined && <ExperimentStatus row={record} t={t} />}</div>
+          <small className={css.hint}>{record?.servers.map(server => server.name).join(' · ')} · {t(row.eligible ? 'resourcesReleased' : 'resourceReleaseUnconfirmed')}</small></div>
+      })}</div>
       <p>{t('deleteRecordsHint')}</p>
-      {preview === undefined && error === undefined && <StateDot state="ongoing" />}
-      {preview?.map(row => <div key={row.experimentId} className={css.deleteRow}>
-        <strong>{row.name}</strong>
-        {!row.eligible && <><p className={css.hint}>{t(row.reason === 'cleanup-unconfirmed' ? 'deleteCleanupUnconfirmed' : 'deleteStopFirst')}</p>
-          <Button variant="outline" size="sm" disabled={busy} onClick={() => { void stop(row.experimentId) }}>{t('cancel')}</Button></>}
-        {cleanup && row.nodes.map(node => <p className={css.cleanupPath} key={node.serverId}>{node.name} · {t(live.deletions.find(job => job.experimentId === row.experimentId)?.nodes.find(value => value.serverId === node.serverId)?.state === 'cleaned' ? 'cleanupDone' : busy ? 'deleting' : 'cleanupPending')}<code>{node.path}</code></p>)}
-      </div>)}
-      <Checkbox label={t('cleanupRemoteFiles')} checked={cleanup} disabled={busy || preview?.some(row => row.eligible && !row.cleanupAvailable)}
+      {preview?.some(row => !row.eligible) && <div className={css.deleteWarning}><IconWarningOutlineRegular size={18} /><div><strong>{t('remoteWorkMayContinue')}</strong><p>{t('localDeleteDoesNotStop')}</p></div></div>}
+      <div className={css.deleteCleanupOption}>
+      <Checkbox label={t('cleanupRemoteFiles')} checked={cleanup} disabled={busy !== undefined || preview === undefined || preview.some(row => !row.cleanupAvailable)}
         onChange={value => { setCleanup(value); operation.current = controller.newId() }} />
-      <p className={css.hint}>{t('cleanupScopeHint')}</p>
-      {preview?.some(row => !row.cleanupAvailable) && <p className={css.hint}>{t('cleanupUnavailable')}</p>}
-      {results.filter(row => row.state !== 'deleted').map(row => <details key={row.experimentId} className={css.operationError}><summary>{t('deletionIncomplete')}</summary><p>{row.detail}</p></details>)}
-      {error !== undefined && <details className={css.operationError} open><summary>{t('error')}</summary><p>{error}</p></details>}
-      <div className={css.modalActions}><Button variant="ghost" disabled={busy} onClick={close}>{t('discard')}</Button>
-        <Button variant="primary" className={css.destructiveButton} disabled={busy || !preview?.some(row => row.eligible)} icon={busy ? <StateDot state="ongoing" /> : <IconTrashOutlineRegular />}
-          onClick={() => { void submit() }}>{t(busy ? 'deleting' : cleanup ? 'confirmDeleteAndCleanup' : 'confirmDeleteRecords')}</Button></div>
+      <p className={css.hint}>{t(preview?.some(row => !row.cleanupAvailable) ? 'cleanupUnavailableNow' : 'cleanupScopeHint')}</p>
+      {cleanup && preview?.flatMap(row => row.nodes.map(node => {
+        const progress = live.deletions.find(job => job.experimentId === row.experimentId)?.nodes.find(value => value.serverId === node.serverId)
+        return <p className={css.cleanupPath} key={row.experimentId + node.serverId}>{node.name} · {t(progress?.state === 'cleaned' ? 'cleanupDone' : progress?.detail !== undefined ? 'cleanupIncomplete' : busy ? 'deleting' : 'cleanupPending')}<code>{node.path}</code></p>
+      }))}
+      </div>
+      {(remaining.length > 0 || error) && <div className={css.deleteFailure}><p>{t(cleanup ? 'cleanupFailedRetained' : 'deleteFailedRetained')}</p>
+        {preview === undefined && error && <Button variant="outline" size="sm" onClick={() => { setError(false); setPreviewAttempt(value => value + 1) }}>{t('refresh')}</Button>}
+        {remaining.map(row => row.detail !== undefined && <details key={row.experimentId}><summary>{t('technicalDetails')}</summary><p className={css.prewrap}>{row.detail}</p></details>)}</div>}
     </div>
+    <div className={css.deleteActions}>{cleanup && (remaining.length > 0 || busy === 'remote' || error) && <Button variant="ghost" size="sm" className={css.deletePolicy} onClick={recordsOnly}>{t('switchRecordsOnly')}</Button>}
+      <Button variant="ghost" disabled={busy === 'records'} onClick={close}>{t('keepRecords')}</Button>
+      <Button variant="primary" className={css.destructiveButton} disabled={busy !== undefined || preview === undefined || preview.length === 0 || (cleanup && preview.some(row => !row.cleanupAvailable))}
+        icon={busy ? <StateDot state="ongoing" /> : <IconTrashOutlineRegular />} onClick={() => { void submit() }}>{t(busy ? 'deleting' : cleanup ? remaining.length > 0 ? 'retryCleanup' : 'confirmDeleteAndCleanup' : 'confirmDeleteRecords')}</Button></div>
   </Modal>
 }
 
@@ -109,8 +123,11 @@ function RowMenu({ row, controller, t, clone, remove }: Props & { row: FleetExpe
 /** @param props - saved records and navigation. @returns the approved compact table with shared status semantics. */
 export function ExperimentList({ controller, t, rows, onClone, pendingOnly, onPendingChange }: Props & { rows: FleetExperiment[]; onClone: (row: FleetExperiment) => void; pendingOnly: boolean; onPendingChange: (pending: boolean) => void }) {
   const management = useSyncExternalStore(controller.store.subscribe, controller.store.getSnapshot)
-  const [search, setSearch] = useState('')
-  const [filter, setFilter] = useState<'all' | 'pending' | 'attention' | 'active' | 'ended'>(pendingOnly ? 'pending' : 'all')
+  const [search, setSearch] = useState(controller.listReading.search)
+  const [filter, setFilter] = useState<'all' | 'pending' | 'attention' | 'active' | 'ended'>(pendingOnly ? 'pending' : controller.listReading.filter)
+  const list = useRef<HTMLDivElement>(null)
+  useLayoutEffect(() => { if (list.current !== null) list.current.scrollTop = controller.listReading.scrollTop }, [controller])
+  useEffect(() => { controller.listReading.search = search; controller.listReading.filter = filter }, [controller, search, filter])
   const [selected, setSelected] = useState<string[]>([])
   const [deleting, setDeleting] = useState<string[]>()
   useEffect(() => { if (pendingOnly) setFilter('pending') }, [pendingOnly])
@@ -127,7 +144,7 @@ export function ExperimentList({ controller, t, rows, onClone, pendingOnly, onPe
     { id: 'active', key: 'inProgress', count: rows.filter(active).length }, { id: 'ended', key: 'endedExperiments', count: rows.filter(ended).length },
   ]
   const tabs = [filters[0]!, { id: 'pending' as const, key: 'pending' as const, count: rows.filter(pending).length }, ...filters.slice(1)]
-  return <div className={css.list}>
+  return <div className={css.list} ref={list} onScroll={event => { controller.listReading.scrollTop = event.currentTarget.scrollTop }}>
     <div className={css.listSummary}>{filters.map(item => <button key={item.id} aria-pressed={filter === item.id} onClick={() => { changeFilter(item.id) }}>
       <span>{t(item.key)}</span><strong>{item.count}</strong></button>)}</div>
     <div className={css.listToolbar}><div className={css.filterTabs}>{tabs.map(item => <Button key={item.id} size="sm" variant="ghost" aria-pressed={filter === item.id}

@@ -4,6 +4,9 @@ import { fromAny } from '@total-typescript/shoehorn'
 import { expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import { SessionId } from '@deepseek-ai/dsh-session'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import type { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { experimentIdSchema, serverIdSchema } from '@aspera/experiments'
 import { EnvironmentPreparation, UnconfirmedPreparationCommand } from '../src/environment-preparation.ts'
 import type { EnvironmentDriver, EnvironmentPreparationInput } from '../src/environment-preparation.ts'
@@ -13,7 +16,7 @@ import { readyEnvironment } from './environment-fixture.ts'
 
 interface RegisteredTool {
   name: string
-  execute: (args: Record<string, unknown>, exec: { signal: AbortSignal }) => Promise<string>
+  execute: (args: Record<string, unknown>, exec: { signal: AbortSignal; callId: ToolCallId }) => Promise<string>
 }
 
 function fixture() {
@@ -31,7 +34,7 @@ function fixture() {
   const append = vi.fn()
   const inject = vi.fn()
   const followup = vi.fn(() => { interval = run() })
-  const agent = fromAny<Agent, object>({ session: { append }, inject, followup, status: 'idle',
+  const agent = fromAny<Agent, object>({ session: { id: SessionId(randomUUID()), append }, inject, followup, status: 'idle',
     cancel: vi.fn(), whenIdle: () => interval })
   const ctx = fromAny<Context, object>({
     effect: (body: () => unknown) => body(), on: () => () => {},
@@ -48,7 +51,7 @@ function fixture() {
   const call = (name: string, args: Record<string, unknown> = {}, signal = abort.signal) => {
     const tool = registered.get(name)
     if (tool === undefined) throw new Error('fixture tool is absent')
-    return tool.execute({ server_id: input.serverId, ...args }, { signal })
+    return tool.execute({ server_id: input.serverId, ...args }, { signal, callId: brandString<ToolCallId>(randomUUID()) })
   }
   return { preparation, agent, input, driver, result, abort, append, inject, followup, progress, call,
     loop: (body: () => Promise<void>) => { run = body },
@@ -61,6 +64,32 @@ it('records successful checks without requesting a model turn', async () => {
   expect(f.followup).not.toHaveBeenCalled()
   expect(f.append).not.toHaveBeenCalled()
   expect(f.inject).toHaveBeenCalledOnce()
+  expect(JSON.stringify(f.inject.mock.calls)).not.toContain(f.input.password)
+})
+
+it('returns installation diagnosis to the existing Agent and requires verification after an autonomous source change', async () => {
+  const f = fixture()
+  let repaired = false
+  const probeId = randomUUID()
+  const inspect = vi.fn(async () => ({ phase: 'download', reason: 'no progress', remainingMs: 1000 }))
+  const probe = vi.fn(async () => ({ id: probeId, available: true, bytes: 65536 }))
+  const switchSource = vi.fn(async () => { repaired = true; return { installed: true } })
+  f.input.operation = 'deployment'
+  f.input.installation = { inspect, probe, switchSource }
+  f.loop(async () => {
+    await f.call('inspect_preparation_installation')
+    const measured = JSON.parse(await f.call('probe_preparation_source', { kind: 'npm', url: 'https://mirror.example.test/' }))
+    await f.call('switch_preparation_source', { probe_id: measured.id, reason: 'Measured registry download succeeds' })
+    expect(f.progress.at(-1)?.phase).not.toBe('environment-ready')
+    await f.call('verify_preparation_environment', { path_entries: [] })
+  })
+  const verify = vi.fn(async () => { if (!repaired) throw new Error('Installation idle timeout; original cache retained'); return 'checked original release' })
+  expect((await f.ensure(verify)).value).toBe('checked original release')
+  expect(f.followup).toHaveBeenCalledOnce()
+  expect(probe).toHaveBeenCalledOnce()
+  expect(switchSource).toHaveBeenCalledOnce()
+  expect(JSON.stringify(switchSource.mock.calls)).toContain(f.agent.session.id)
+  expect(verify).toHaveBeenCalledTimes(2)
   expect(JSON.stringify(f.inject.mock.calls)).not.toContain(f.input.password)
 })
 

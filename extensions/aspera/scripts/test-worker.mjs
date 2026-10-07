@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { randomUUID, createHash } from 'node:crypto'
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { setupWorkerProfile } from '@aspera/runtime'
@@ -39,11 +39,15 @@ try {
     modelCredentialFile: modelFile, toolTimeoutMs: 1000, agentModel: fixtureSelections.preparation }))
   writeFileSync(resolve(run, 'approved-plan.json'), JSON.stringify({ revision: 1, summary: 'Approved local replay', steps: ['Record a version', 'Report unavailable GPU'], frameworks: [], createdAt: 1 }))
   const snapshots = []
-  for (const scenario of [{ planning: true, http: true }, { planning: false, http: true }, { planning: true, renewRounds: 132 }, { planning: true, transient: true }]) {
+  for (const scenario of [{ planning: true, http: true }, { planning: false, http: true }, { planning: false, http: true, nodeCommands: true }, { planning: true, renewRounds: 132 }, { planning: true, transient: true },
+    { planning: false, http: true, nodeCommands: true, stepReports: true, stepCommands: true },
+    { planning: false, http: true, nodeCommands: true, stepReports: true, stepCommands: false }]) {
     const { planning, renewRounds, transient } = scenario
-    const home = resolve(directory, transient ? 'recovery-home' : renewRounds ? 'renew-home' : planning ? 'plan-home' : 'execution-home')
+    const caseName = scenario.stepReports ? scenario.stepCommands ? 'step-execution' : 'step-acceptance-failure' : scenario.nodeCommands ? 'node' : transient ? 'recovery' : renewRounds ? 'renew' : planning ? 'plan' : 'execution'
+    const home = resolve(directory, caseName + '-home')
     await setupWorkerProfile(home, release)
-    const observed = resolve(directory, transient ? 'recovery-observed.json' : renewRounds ? 'renew-observed.json' : planning ? 'plan-observed.json' : 'execution-observed.json')
+    const observed = resolve(directory, caseName + '-observed.json')
+    if (scenario.stepReports) rmSync(resolve(run, 'execution-progress.v1.json'), { force: true })
     const config = { id, serverId, observed, ...scenario }
     const wire = api.begin(config)
     const profile = resolve(home, 'profiles/aspera-worker')
@@ -64,10 +68,15 @@ try {
     const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL') }, renewRounds ? 180000 : 60000)
     try {
       await once(child, 'exit')
-      if (wire.error) throw wire.error
+      if (wire.error) throw new Error('Worker HTTP replay failed: ' + output.slice(-6000), { cause: wire.error })
       assert.equal(timedOut, false, output.slice(-6000))
       const outcome = JSON.parse(readFileSync(resolve(run, planning ? 'planning-outcome.json' : 'outcome.json'), 'utf8'))
-      assert.equal(outcome.state, planning ? 'completed' : 'blocked', output.slice(-6000) + '\n' + JSON.stringify(outcome))
+      assert.equal(outcome.state, scenario.stepReports ? scenario.stepCommands ? 'completed' : 'failed' : planning ? 'completed' : 'blocked', output.slice(-6000) + '\n' + JSON.stringify(outcome))
+      if (scenario.stepReports) {
+        const progress = JSON.parse(readFileSync(resolve(run, 'execution-progress.v1.json'), 'utf8'))
+        assert.equal(progress.revision, 5); assert.deepEqual(progress.steps.map(step => step.state), ['completed', 'completed'])
+        if (!scenario.stepCommands) assert.match(outcome.detail, /verified settled commands/)
+      }
       const observations = JSON.parse(readFileSync(observed, 'utf8'))
       assert.equal(observations.guidanceRead, true)
       assert.equal(wire.requests > 0, scenario.http === true)
@@ -82,7 +91,7 @@ try {
         const windows = changes.filter(item => item.event.data.operation === 'edit').map(item => item.event.data.goal.maxGoalRounds)
         assert.ok(windows.length >= 66, JSON.stringify(changes.slice(0, 4)))
         snapshots.push({ role: 'continuation', rounds: observations.rounds, sameGoal: true, sameSession: true, windows, outcome: outcome.state })
-      } else snapshots.push({ role: transient ? 'recovery' : source, ...observations, ...(scenario.http ? { adapterRequests: wire.requests } : {}), outcome: outcome.state,
+      } else snapshots.push({ role: scenario.stepReports ? caseName : scenario.nodeCommands ? 'node-execution' : transient ? 'recovery' : source, ...observations, ...(scenario.http ? { adapterRequests: wire.requests } : {}), outcome: outcome.state,
         goalPhases: changes.map(item => item.event.data.goal?.phase) })
     } finally {
       clearTimeout(timer)

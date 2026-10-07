@@ -25,6 +25,8 @@ import { installGoalContinuation } from './continuation.ts'
 import { installExperimentQuestions } from './questions.ts'
 import { serverRunRoot } from './storage.ts'
 import { openPhaseModelContext } from './phase-model.ts'
+import { installExecutionSteps } from './execution-steps.ts'
+import type { ExecutionProgressRead } from '@aspera/experiments'
 
 const output = { schema: { type: 'string' as const }, render: (_args: object, value: string) => [{ type: 'text' as const, text: value }] }
 const presentCall = (args: object) => ({ card: 'generic' as const, title: 'Aspera node operation', kind: 'other' as const, rawInput: args })
@@ -116,6 +118,12 @@ export async function runClusterAgent(ctx: Context, config: ClusterRuntimeConfig
   let handle: AgentHandle
   let settling = false
   let planSaved = false
+  let executionProgress: ((signal: AbortSignal) => Promise<ExecutionProgressRead>) | undefined
+  const missingSteps = async (signal: AbortSignal): Promise<number[]> => {
+    const value = await executionProgress?.(signal)
+    if (value?.progress === undefined) throw new Error('Execution step records are unavailable; read get_experiment_execution_progress before completing')
+    return value.progress.steps.filter(step => step.state !== 'completed').map(step => step.step)
+  }
   const finish = (state: 'completed' | 'blocked' | 'failed', detail?: string) => {
     if (settling) return
     settling = true
@@ -135,12 +143,19 @@ export async function runClusterAgent(ctx: Context, config: ClusterRuntimeConfig
       installModelSelection(agentCtx, { current: selection, assembled: undefined })
       agentCtx.tools.restrict({ allow: [] })
       installKnowledge(agentCtx, runtime, config)
-      if (!planning) installNodeTools(agentCtx, runtime, config)
+      if (!planning) {
+        installNodeTools(agentCtx, runtime, config)
+        executionProgress = installExecutionSteps(agentCtx, runtime, config, sessionId, readFileSync(resolve(config.root, 'state/coordinator.generation'), 'utf8'))
+      }
       installExperimentQuestions(agentCtx, ctx, agent, runtime, config, planning, error => { finish('failed', `Operator question could not be delivered: ${String(error)}`) })
       agentCtx.effect(() => agentCtx.tools.register(defineTool({ name: planning ? 'save_experiment_plan' : 'finish_experiment',
         description: planning ? 'Save a version-specific plan, without running commands. JSON: summary, steps (strings), frameworks ([{name, version, documentation: HTTPS URL}]). The objective and servers stay fixed. Completion returns the plan for user confirmation in semi mode.' : 'Finish the execution Goal only after verifying real results. Use blocked for an unmet requirement. Registered healthy inference services survive completion; ordinary commands must be settled.',
         parameters: { status: { type: 'string', enum: ['completed', 'blocked'], required: true }, detail: { type: 'string' }, plan_json: { type: 'string' } }, output, presentCall,
-        execute: async args => {
+        execute: async (args, execution) => {
+          if (!planning && args.status === 'completed') {
+            const missing = await missingSteps(execution.signal)
+            if (missing.length > 0) return JSON.stringify({ state: 'active', detail: `Steps ${missing.join(', ')} lack completed reports. Read get_experiment_execution_progress and report the actual step results before completing; do not rerun settled commands.` })
+          }
           if (planning && args.status === 'completed') {
             const plan = planSchema.parse({ ...z.object({ summary: z.string(), steps: z.array(z.string()), frameworks: planSchema.shape.frameworks }).strict().parse(JSON.parse(args.plan_json ?? '{}')), revision: 1, createdAt: Date.now() })
             writeClusterReceipt(config.root, id, { plan, sessionId }, 'plan.json'); planSaved = true
@@ -158,6 +173,8 @@ export async function runClusterAgent(ctx: Context, config: ClusterRuntimeConfig
     let services: InferenceService[] = []
     if (state === 'completed' && planning && !planSaved) { state = 'failed'; detail = 'Planning completed without a durable plan.' }
     if (state === 'completed' && !planning) {
+      const missing = await missingSteps(AbortSignal.timeout(runtime.toolTimeoutMs))
+      if (missing.length > 0) { state = 'failed'; detail = `Completion lacks reported results for approved-plan steps ${missing.join(', ')}.` }
       const evidence = resolve(root, 'executions.jsonl')
       const entries = existsSync(evidence) ? readFileSync(evidence, 'utf8').trim().split('\n').filter(Boolean)
         .map(line => executionEntrySchema.parse(JSON.parse(line))) : []
@@ -198,6 +215,7 @@ export async function runClusterAgent(ctx: Context, config: ClusterRuntimeConfig
   handle.agent.followup(createUserMessage({ source: { kind: 'aspera', experimentId: id }, content: [{ type: 'text', text:
     `${planning ? 'Prepare a plan only. You cannot launch commands in this role.' : 'Execute the approved plan on every selected node as one joint experiment.'}\n`
     + `Requirements: ${JSON.stringify(runtime.submission)}\nApproved plan: ${approved}\n`
+    + (planning ? '' : 'Read get_experiment_execution_progress before starting. Report every approved-plan step as running before work, completed after checking its results, or blocked with a concrete reason. Use the returned revision for each report and re-read on a revision conflict. Step reports are Agent claims; command and result acceptance still decides completion. Finish only after every plan step has a completed report. Never repeat a settled command merely to repair a missing report. ')
     + 'Read shipped framework guidance and the exact version documentation. Choose parameters, prepare an isolated environment inside each experiment workspace, write scripts and verify a short run before long training. Record actual versions, scripts, dependencies, parameters, artifacts and evaluation with the execution tool. '
     + 'For multiple nodes, preserve stable ranks, shared rendezvous and verify a real collective communication test. Never reduce the node group or change explicit training requirements. '
     + (runtime.submission.strategy.mode === 'semi' ? 'When independent investigation cannot resolve a choice, use ask_user_question to pause for a desktop reply. A reply cannot change explicit requirements or grant permissions. ' : 'Human waiting is disabled. Decide unspecified parameters within the constraints, retry recoverable errors and use short measured runs to adjust. ')
