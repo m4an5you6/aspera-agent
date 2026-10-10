@@ -39,6 +39,10 @@ Host 程序依赖已安装包的类型声明。[types/typert-protocol.d.ts](../t
 
 执行 Agent 向调度主机上报批准计划的步骤，页面同时读取这些记录和独立的准备／结果验收证据。[步骤进度](state-and-api.zh.md#execution-step-progress)使用独立版本文件，不改变固定的提交、队列或 Session 格式。旧实验保留原远端发布。
 
+准备 Agent 诊断 GPU 授权差异并请求按身份修复控制进程。提供方负责实际探测、空闲接入限制、确认退出和复验；交接不接受 Agent 的完成声明作为验收。[控制进程就绪](state-and-api.zh.md#controller-readiness)说明原发布兼容和中断修复恢复。
+
+准备与正式命令共用[执行沙箱](../packages/runtime/README.zh.md#understand-the-implementation)。权限拒绝的原始诊断返回准备 Session，由 Agent 修复账号环境或说明具体云平台操作；仍由程序复验判定就绪。
+
 ```mermaid
 flowchart TB
   subgraph Local[Local management]
@@ -57,7 +61,7 @@ flowchart TB
     Models --> Planner
     Models --> Executor
     Fleet --> Preparation[Local DSH Agent: inspect / configure / repair]
-    Preparation --> Checks[Provider verification: versions / sandbox availability]
+    Preparation --> Checks[Provider verification: versions / execution namespaces]
     Checks --> Inventory[Read-only SSH: mounts / space / interfaces]
     Inventory --> Selection[Restricted Agent: candidate ID + reason]
     Selection --> Placement[Persist placement before directory creation]

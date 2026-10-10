@@ -38,13 +38,25 @@ export function installStorageReplay(ctx, observedCalls, environmentCalls = []) 
     if (input === undefined) { yield* next(); return }
     const names = (options.tools ?? []).map(tool => tool.name).sort()
     const expectedTools = ['inspect_server_storage', 'select_experiment_storage', 'inspect_preparation_environment', 'run_preparation_command', 'verify_preparation_environment', 'report_preparation_blocked',
-      'inspect_preparation_installation', 'probe_preparation_source', 'switch_preparation_source'].sort()
+      'inspect_preparation_installation', 'probe_preparation_source', 'switch_preparation_source', 'repair_preparation_controller'].sort()
     if (JSON.stringify(names) !== JSON.stringify(expectedTools)) throw new Error('Preparation tool scope changed: ' + names.join(','))
     if (input.operation === 'prepare-experiment-environment') {
       const key = input.experimentId + '/' + input.serverId + '/' + input.step
       const step = turns.get(key) ?? 0
       turns.set(key, step + 1)
-      const operations = input.step === 'deployment' ? [
+      const sandboxRefused = input.verification?.diagnostic?.stage === 'sandbox-launch' && input.verification?.diagnostic?.requiresPlatformAction
+      const operations = sandboxRefused ? input.serverName.includes('claim') ? [
+        ['inspect_preparation_environment', {}],
+      ] : [
+        ['inspect_preparation_environment', {}],
+        ['run_preparation_command', { command: 'fixture repair sandbox configuration' }],
+        ['verify_preparation_environment', { path_entries: [] }],
+        ...(input.serverName.includes('blocked') ? [['report_preparation_blocked', { reason: 'The container still denies mounting /proc with the required user namespace. The cloud platform must provide these permissions before revalidation.' }]] : []),
+      ] : input.step === 'controller' && input.controllerRepairAvailable ? [
+        ['inspect_preparation_environment', {}],
+        ['repair_preparation_controller', {}],
+        ['verify_preparation_environment', { path_entries: [] }],
+      ] : input.step === 'deployment' ? [
         ['inspect_preparation_installation', {}],
         ['probe_preparation_source', { kind: 'npm', url: 'https://cpu-mirror.example.test/npm/' }],
         ['switch_preparation_source', { probe_id: sourceProbeId, reason: 'The selected node measured an available pinned package and HTTPS download' }],
@@ -63,7 +75,7 @@ export function installStorageReplay(ctx, observedCalls, environmentCalls = []) 
         return
       }
       const [name, args] = operation
-      environmentCalls.push({ experimentId: input.experimentId, serverId: input.serverId, name })
+      environmentCalls.push({ experimentId: input.experimentId, serverId: input.serverId, step: input.step, name })
       yield { type: 'block-start', index: 0, blockType: 'tool-call' }
       yield { type: 'block-end', index: 0, block: { type: 'tool-call', id: ToolCallId(randomUUID()), name, arguments: JSON.stringify({ server_id: input.serverId, ...args }) } }
       yield { type: 'usage', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }

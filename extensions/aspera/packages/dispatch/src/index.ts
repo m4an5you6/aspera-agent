@@ -18,6 +18,7 @@ import { installationPolicySchema } from './installation-model.ts'
 import { claimErrorNotice, type ErrorNoticeScope } from './error-notices.ts'
 import { ExperimentDownloads } from './downloads.ts'
 import { sshPasswordRef } from './ssh-account.ts'
+import { resolveSshConnectionPolicy } from './transport.ts'
 import type { ExperimentPasswordStatus, ExperimentSshAccount, FleetCreateRequest, FleetExperiment, FleetRegistry, FleetServerInput, FleetSnapshot } from './types.ts'
 export type * from './types.ts'
 
@@ -29,12 +30,16 @@ export interface Config {
   agentCredentialRefs: string[]
   toolTimeoutMs: number
   connectionCheckTimeoutMs: number
+  sshHandshakeTimeoutMs: number
+  sshHandshakeMaxRetries: number
+  sshHandshakeRetryDelayMs: number
   pollIntervalMs: number
   downloadTtlMs: number
   minimumFreeBytes: number
   installationTotalTimeoutMs: number
   installationIdleTimeoutMs: number
   installationMaxRetries: number
+  controllerRepairMaxAttempts: number
 }
 /** Validated Host policy supplied by the independent profile. */
 export const Config: z<Config> = z.object({
@@ -43,12 +48,16 @@ export const Config: z<Config> = z.object({
   agentCredentialRefs: z.array(z.string()).default(['DEEPSEEK_API_KEY']),
   toolTimeoutMs: z.number().step(1).min(1000).default(300000),
   connectionCheckTimeoutMs: z.number().step(1).min(1000).default(20000),
+  sshHandshakeTimeoutMs: z.number().step(1).min(1).max(2_147_483_647).default(15000),
+  sshHandshakeMaxRetries: z.number().step(1).min(0).max(Number.MAX_SAFE_INTEGER).default(2),
+  sshHandshakeRetryDelayMs: z.number().step(1).min(0).max(2_147_483_647).default(500),
   pollIntervalMs: z.number().step(1).min(100).default(1000),
   downloadTtlMs: z.number().step(1).min(1000).default(60000),
   minimumFreeBytes: z.number().step(1).min(1).default(1073741824),
   installationTotalTimeoutMs: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(1_800_000),
   installationIdleTimeoutMs: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(300_000),
   installationMaxRetries: z.number().step(1).min(0).max(Number.MAX_SAFE_INTEGER).default(2),
+  controllerRepairMaxAttempts: z.number().step(1).min(0).max(Number.MAX_SAFE_INTEGER).default(2),
 })
 
 /** Experiment API shared by the independent page and Agent tool consumers. */
@@ -232,7 +241,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     localRepo: config.extensionRoot, dataRoots: config.dataRoots, preparationOutputChars: config.preparationOutputChars,
     agentCredentialRefs: config.agentCredentialRefs, tokenRef: 'ASPERA_COORDINATOR', toolTimeoutMs: config.toolTimeoutMs,
     controlPollIntervalMs: config.pollIntervalMs, minimumFreeBytes: config.minimumFreeBytes }), config.connectionCheckTimeoutMs,
-    undefined, installationPolicySchema.parse(config))
+    undefined, installationPolicySchema.parse(config), { maxAttempts: config.controllerRepairMaxAttempts }, resolveSshConnectionPolicy(config))
   new AsperaRemote(ctx, fleet, new ExperimentDownloads(ctx, fleet, config.downloadTtlMs), config)
   const output = { schema: { type: 'string' as const }, render: (_args: object, value: string) => [{ type: 'text' as const, text: value }] }
   const presentCall = (args: object) => ({ card: 'generic' as const, title: 'Aspera experiment', kind: 'other' as const, rawInput: args })

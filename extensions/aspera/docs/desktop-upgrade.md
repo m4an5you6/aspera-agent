@@ -9,6 +9,7 @@ Aspera `0.1.1` retains the existing Harness home and external plugin management.
 ## Contents
 
 - [Profile changes](#profile-changes)
+- [Controller readiness](#controller-readiness)
 
 -----
 
@@ -18,3 +19,10 @@ Aspera `0.1.1` retains the existing Harness home and external plugin management.
 The profile ownership marker advances from version 1 to 2. Upgrade validates the old package junction before unlinking it, backs up `cordis.patch.yml` as `cordis.patch.v1.yml`, removes application-generated management restrictions, and separates the application overlay from user settings. A changed junction or unowned package directory stops startup for inspection. Existing experiment, credential, workspace and Session stores are retained.
 
 External packages are installed in the writable profile; the fixed runtime lives in `runtime.asar`. Restart after installing or changing a plugin. Runtime file watching remains disabled. Do not run both versions against the same Harness home or reopen the legacy executable after profile upgrade.
+
+-----
+
+<a id="controller-readiness"></a>
+## Controller readiness
+
+The matching resource update adds GPU identity checks and preparation-owned idle controller repair while retaining the current executable. Keep original remote releases and submitted experiments. Controllers with unknown startup authorization or without safe maintenance support require the reported release/stop action; their sealed releases are not overwritten. Interrupted repairs retain independent receipts and their attempt limit. See the [controller readiness upgrade](../../../docs/upgrade-guide/v0.2.0-rc.2/aspera-controller-readiness/guide.md).

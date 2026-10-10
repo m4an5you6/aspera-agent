@@ -7,6 +7,7 @@ import type { ClusterExecutor, ClusterOutcome } from '../src/cluster-queue.ts'
 import { clusterSubmissionSchema, clusterSubmissionV2Schema, clusterSubmissionV3Schema, legacyClusterSubmissionSchema, clusterRecordSchema, serverIdSchema, experimentQuestionSchema, needsExperimentAttention } from '../src/cluster-protocol.ts'
 import type { ClusterRecord, ExperimentId, ExperimentServerId } from '../src/cluster-protocol.ts'
 import { experimentIdSchema } from '../src/cluster-protocol.ts'
+import { controllerRepairIdSchema } from '../src/controller-protocol.ts'
 import { inventory, placement, modelSnapshots } from './fixtures.ts'
 
 const queues: ClusterQueue[] = []
@@ -60,6 +61,15 @@ async function pendingQuestion(mode: 'semi' | 'automatic' = 'semi') {
   return { ...f, input, question, reply }
 }
 
+it('fences new admission during idle maintenance and rejects waiting or active work', async () => {
+  const f = fixture(); const id = controllerRepairIdSchema.parse(randomUUID()); const input = submission([serverIdSchema.parse(randomUUID())])
+  await Promise.all([f.queue.beginMaintenance(id), f.queue.beginMaintenance(id)])
+  await expect(f.queue.submit(input)).rejects.toThrow('maintenance')
+  await expect(f.queue.cancelMaintenance(controllerRepairIdSchema.parse(randomUUID()))).rejects.toThrow('identity changed')
+  await f.queue.cancelMaintenance(id)
+  await f.queue.submit(input)
+  await expect(f.queue.beginMaintenance(id)).rejects.toThrow('occupied')
+})
 it('persists one answer across concurrent retries and resumes the same allocation and identities', async () => {
   const f = await pendingQuestion()
   const before = f.queue.get(f.input.experimentId)!

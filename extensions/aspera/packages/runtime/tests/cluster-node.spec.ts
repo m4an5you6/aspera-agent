@@ -4,7 +4,7 @@ const deadline = Date.now() + 3600000
 /** Node ownership tests use isolated files and explicitly settled managed-process doubles. */
 import { randomUUID } from 'node:crypto'
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, renameSync, readdirSync, readFileSync, existsSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { resolve, posix } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { createServer } from 'node:net'
 import { createServer as createHttpServer } from 'node:http'
@@ -13,11 +13,16 @@ import Storage from '@deepseek-ai/dsh-storage'
 import { DomainFacility } from '@deepseek-ai/dsh-storage-domain'
 import { JsonStorageBackend } from '@deepseek-ai/dsh-storage-json'
 import { afterEach, expect, it, vi } from 'vitest'
+import { z } from 'zod'
 import { createClusterNode } from '../src/cluster-node.ts'
 import { clusterNodeSchema, experimentIdSchema, processLogPageSchema, experimentProcessSchema, observationPolicySchema } from '@aspera/experiments'
 import type { StoragePlacement } from '@aspera/experiments'
 import { placement } from '../../experiments/tests/fixtures.ts'
 import { verifyStorage } from '../scripts/storage.mjs'
+import { probeControllerGpu } from '../src/controller.ts'
+import { controllerStatusSchema } from '@aspera/experiments'
+vi.mock('../src/controller.ts', async importOriginal => ({ ...await importOriginal<typeof import('../src/controller.ts')>(),
+  probeControllerGpu: vi.fn(async () => ({ gpus: [{ uuid: 'GPU-11111111-1111-1111-1111-111111111111', name: 'CPU fixture GPU', devicePath: '/dev/nvidia0' }], devicePaths: ['/dev/nvidia0'] })) }))
 vi.mock('../scripts/storage.mjs', () => ({ verifyStorage: vi.fn((value: StoragePlacement) => value.candidate) }))
 const cleanup: (() => Promise<void>)[] = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
@@ -32,6 +37,8 @@ async function loopbackPort(hold = false): Promise<number> {
   return address.port
 }
 async function fixture() {
+  vi.mocked(probeControllerGpu).mockReset()
+  vi.mocked(probeControllerGpu).mockResolvedValue({ gpus: [{ uuid: 'GPU-11111111-1111-1111-1111-111111111111', name: 'CPU fixture GPU', devicePath: '/dev/nvidia0' }], devicePaths: ['/dev/nvidia0'] })
   mkdirSync(resolve('.artifacts'), { recursive: true })
   const absolute = mkdtempSync(resolve('.artifacts', 'cluster-node-'))
   const root = process.platform === 'win32' ? absolute.slice(2).replaceAll('\\', '/') : absolute
@@ -60,6 +67,7 @@ async function fixture() {
   effect: (setup: () => () => Promise<void>) => { disposers.push(setup()) }, logger: { error: vi.fn(), debug: vi.fn() },
   })
   const config = { root, backendPath: '/usr/bin/bwrap', hiddenPaths: [], bootId: 'boot-1', chunkBytes: 1024, fileLimit: 10, cleanupTimeoutMs: 1000,
+    deploymentId: 'a'.repeat(64), gpuSnapshot: { gpus: [{ uuid: 'GPU-11111111-1111-1111-1111-111111111111', name: 'CPU fixture GPU', devicePath: '/dev/nvidia0' }], devicePaths: ['/dev/nvidia0'] },
     serviceRequestTimeoutMs: 1000, serviceRequestBytes: 1024, devicePaths: ['/dev/nvidia0'],
     observations: observationPolicySchema.parse({ intervalMs: 60000 }) }
   const restart = async (confirmed = false) => {
@@ -89,6 +97,38 @@ async function fixture() {
   backendPath: '/usr/bin/bwrap', hiddenPaths: [], gpuInfo: 'GPU 0' })
   return { handler, node, handles, confine, spawn, ctx, config, storageRoot, restart }
 }
+it('atomically fences allocation during identity-bound idle maintenance', async () => {
+  const f = await fixture(); const health = await f.handler('health', {})
+  const controller = z.object({ controller: controllerStatusSchema }).parse(health).controller
+  const owner = { operationId: randomUUID(), bootId: controller.bootId, policyDigest: controller.policyDigest }
+  await expect(f.handler('maintenance-begin', { ...owner, bootId: 'old-controller' })).rejects.toThrow('identity changed')
+  const [first, duplicate] = await Promise.all([f.handler('maintenance-begin', owner), f.handler('maintenance-begin', owner)])
+  expect(first).toEqual(duplicate)
+  await expect(f.handler('allocate', { experimentId: randomUUID(), deploymentId: 'a'.repeat(64), protocol: 2, node: f.node })).rejects.toThrow('maintenance')
+  await expect(f.handler('maintenance-cancel', { ...owner, operationId: randomUUID() })).rejects.toThrow('another operation')
+  await f.handler('maintenance-cancel', owner)
+  await f.handler('allocate', { experimentId: randomUUID(), deploymentId: 'a'.repeat(64), protocol: 2, node: f.node })
+  await expect(f.handler('maintenance-begin', owner)).rejects.toThrow('occupied')
+})
+it('refuses protocol-4 allocation after the physical GPU changes without starting a command', async () => {
+  const f = await fixture(); const current = structuredClone(f.config.gpuSnapshot); const id = experimentIdSchema.parse(randomUUID())
+  current.gpus[0]!.uuid = 'GPU-22222222-2222-2222-2222-222222222222'
+  vi.mocked(probeControllerGpu).mockResolvedValueOnce(current)
+  await expect(f.handler('allocate', { experimentId: id, deploymentId: 'a'.repeat(64), protocol: 4,
+    node: { ...f.node, server: { ...f.node.server, storagePlacement: placement(f.node.server.id, id, f.config.root) },
+      gpuInfo: 'GPU 0 (UUID: GPU-11111111-1111-1111-1111-111111111111)' } })).rejects.toThrow('hardware changed')
+  expect(f.spawn).not.toHaveBeenCalled()
+})
+it.each([true, false])('serializes concurrent allocation and maintenance with maintenance first=%s', async maintenanceFirst => {
+  const f = await fixture(); const status = z.object({ controller: controllerStatusSchema }).parse(await f.handler('health', {})).controller
+  const owner = { operationId: randomUUID(), bootId: status.bootId, policyDigest: status.policyDigest }
+  const allocation = { experimentId: randomUUID(), deploymentId: 'a'.repeat(64), protocol: 2, node: f.node }
+  const operations = maintenanceFirst ? [['maintenance-begin', owner], ['allocate', allocation]] as const
+    : [['allocate', allocation], ['maintenance-begin', owner]] as const
+  const results = await Promise.allSettled(operations.map(([operation, body]) => f.handler(operation, body)))
+  expect(results[0]!.status).toBe('fulfilled'); expect(results[1]!.status).toBe('rejected')
+  expect(f.spawn).not.toHaveBeenCalled()
+})
 it('starts schema-valid run ids using the published per-record backend and isolates repeated ids across experiments', async () => {
   const f = await fixture(); const id = experimentIdSchema.parse('2614d34b-7b4a-4d8c-9ac6-5fca6e369221')
   await f.handler('allocate', { experimentId: id, deploymentId: 'a'.repeat(64), protocol: 2, node: f.node })
@@ -185,8 +225,9 @@ it('binds v3 storage to its node, experiment and release and confines caches to 
   expect(argv.join('\n')).toContain('--tmpfs\n' + f.config.root)
   expect(argv.join('\n')).toContain('--tmpfs\n/other-owned-storage')
   expect(argv.slice(argv.indexOf('--bind'), argv.indexOf('--bind') + 3)).toEqual(['--bind', resolve(storage.workspaceRoot), resolve(storage.workspaceRoot)])
-  expect(argv.join('\n')).toContain('HF_HOME\n' + resolve(storage.workspaceRoot, 'cache/huggingface'))
-  expect(argv.join('\n')).toContain('UV_PROJECT_ENVIRONMENT\n' + resolve(storage.workspaceRoot, 'env'))
+  expect(argv.join('\n')).toContain('HF_HOME\n' + posix.join(resolve(storage.workspaceRoot), 'cache/huggingface'))
+  expect(argv.join('\n')).toContain('UV_PROJECT_ENVIRONMENT\n' + posix.join(resolve(storage.workspaceRoot), 'env'))
+  for (const flag of ['--unshare-user', '--unshare-pid', '--unshare-ipc', '--unshare-uts', '--new-session', '--clearenv']) expect(argv).toContain(flag)
 })
 
 it('refuses an allocation that omits the policy discriminator as well as the legacy limits', async () => {

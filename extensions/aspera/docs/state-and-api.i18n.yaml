@@ -9,14 +9,17 @@
   en: 2df75c75f4d3a33d
   zh: f93d6e425a9b5104
 /state-and-apis/table-of-contents:
-  en: 36becc6ca58e4482
-  zh: 9cf870f0ddeb7a47
+  en: 9f405f89338b20af
+  zh: 1360a4a29c824ed3
 /state-and-apis/persistent-ownership:
   en: f5a37bcd00507ae0
   zh: 9b15c1583565cc87
 /state-and-apis/receipts-and-goals:
-  en: e3c1202667f7bd54
-  zh: 1ad5a767934d8515
+  en: d601d8518499c543
+  zh: 3be02e8401b15c8d
+/state-and-apis/controller-readiness-and-recovery:
+  en: d8600923311c2639
+  zh: 90b49296769c94a5
 /state-and-apis/api-consumers:
   en: fe77395122ea544e
   zh: 350b1665e7da9231

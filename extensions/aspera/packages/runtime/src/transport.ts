@@ -9,11 +9,14 @@ import type { CommandResult, RemoteCommandResult } from './command-result.ts'
 export { RemoteCommandError, SshConnectionError } from './command-result.ts'
 export type { CommandResult, RemoteCommandResult } from './command-result.ts'
 export { prepareSshHostKey } from './ssh-host-keys.ts'
+export { resolveSshConnectionPolicy, sshConnectionPolicySchema } from './ssh-connection.ts'
+export type { SshConnectionPolicy } from './ssh-connection.ts'
+import type { SshConnectionPolicy } from './ssh-connection.ts'
 /** Receives complete SSH pipe chunks before bounded command-result capture. */
 export type CommandOutputSink = (stream: 'stdout' | 'stderr', chunk: string) => void
 
 /** Deployment address and SSH identity selected by the trusted profile. */
-export interface Target {
+export interface Target extends Partial<SshConnectionPolicy> {
   readonly host: string
   readonly sshPort: number
   readonly username?: string | undefined

@@ -47,11 +47,12 @@ await setupWorkerProfile(home, release)
 writeFileSync(resolve(home, 'profiles/aspera-worker/cordis.patch.yml'), JSON.stringify([{ insert: [{ id: 'control-readiness',
   name: pathToFileURL(resolve(release, 'scripts/fixtures/worker.mjs')).href, config: { ready } }] }]))
 let control
-async function start() {
+async function start(withGpu = false) {
   if (existsSync(ready)) unlinkSync(ready)
   const child = spawn(process.execPath, [resolve(release, 'node_modules/@deepseek-ai/dsh/lib/bin.js'), '--profile', 'aspera-worker'],
     { cwd: directory, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, DSH_HOME: home,
       DSH_EXPERIMENT_ROLE: 'coordinator', DSH_CLUSTER_ROOT: root, DSH_EXPERIMENT_PORT: '0', DSH_EXPERIMENT_DEPLOYMENT_ID: deploymentId,
+      DSH_EXPERIMENT_GPU_SNAPSHOT: withGpu ? JSON.stringify({ gpus: [{ uuid: 'GPU-11111111-1111-1111-1111-111111111111', name: 'CPU XML fixture', devicePath: '/dev/nvidia5' }], devicePaths: ['/dev/nvidia5'] }) : '',
       DSH_EXPERIMENT_TOKEN_FILE: resolve(directory, 'secrets/coordinator.token'), DSH_EXPERIMENT_MODEL_CREDENTIAL_FILE: modelFile,
       DSH_CLUSTER_POLL_MS: '100', DSH_CLUSTER_CLEANUP_MS: '1000', DSH_TELEMETRY_DISABLED: '1', DEEPSEEK_API_KEY: '' } })
   const exited = once(child, 'exit'); let output = ''
@@ -77,15 +78,27 @@ async function start() {
   } catch (error) { await close(); throw error }
 }
 try {
-  control = await start()
+  control = await start(true)
   assert.equal((await control.request('health', undefined, false)).status, 401)
-  assert.equal((await control.request('health')).value.role, 'coordinator')
+  const healthy = (await control.request('health')).value
+  assert.equal(healthy.role, 'coordinator')
+  assert.equal(healthy.controller.policy.gpu.gpus[0].devicePath, '/dev/nvidia5')
+  assert.ok(healthy.features.includes('controller-maintenance-v1'))
+  const maintenance = { operationId: randomUUID(), bootId: healthy.controller.bootId, policyDigest: healthy.controller.policyDigest }
+  assert.equal((await control.request('maintenance-begin', maintenance, false)).status, 401)
+  assert.equal((await control.request('maintenance-begin', { ...maintenance, bootId: 'stale-process' })).status, 400)
+  const fences = await Promise.all([control.request('maintenance-begin', maintenance), control.request('maintenance-begin', maintenance)])
+  assert.ok(fences.every(response => response.status === 200 && response.value.maintenance === maintenance.operationId))
+  assert.equal((await control.request('maintenance-cancel', { ...maintenance, operationId: randomUUID() })).status, 400)
   server.remotePort = control.port - 1
   submission.coordinator.remotePort = server.remotePort
   const privatePath = resolve(directory, 'secrets', id + '.json')
   const materials = JSON.parse(readFileSync(privatePath, 'utf8'))
   materials.submission = submission
   writeFileSync(privatePath, JSON.stringify(materials))
+  const fenced = await control.request('submit', submission)
+  assert.equal(fenced.status, 400); assert.match(fenced.value.error, /maintenance/)
+  assert.equal((await control.request('maintenance-cancel', maintenance)).status, 200)
   const receipt = await control.request('submit', submission)
   assert.equal(receipt.status, 200); assert.equal(receipt.value.handover, '本机派发完成，远端实验已接管')
   // Planning includes a fresh profile boot; use the profile smoke's 60-second bound.
@@ -117,6 +130,8 @@ try {
   }
   assert.equal(planned.value.record.state, 'awaiting-approval')
   assert.equal(planned.value.record.resourcesReleased, true)
+  const occupied = await control.request('maintenance-begin', maintenance)
+  assert.equal(occupied.status, 400); assert.match(occupied.value.error, /occupied/)
   assert.ok(planned.value.record.planningSessionId)
   const stepRead = await control.request('execution-progress', { experimentId: id })
   assert.equal(stepRead.status, 200); assert.equal(stepRead.value.supported, true)
@@ -147,6 +162,7 @@ try {
   assert.deepEqual(snapshot, JSON.parse(readFileSync(resolve(release, 'scripts/fixtures/control.snapshot.json'), 'utf8')))
   assert.equal((await control.request('answer-question', reply)).status, 400)
   await control.close(); control = await start()
+  assert.equal((await control.request('health')).value.controller.policy.gpu, undefined)
   assert.equal((await control.request('status', { experimentId: id })).value.record.state, 'awaiting-approval')
   unlinkSync(resolve(run, 'inputs/data.txt'))
   const duplicate = await control.request('submit', submission)
@@ -167,5 +183,5 @@ try {
   assert.equal((await control.request('cancel', { experimentId: id })).value.state, 'cancelled')
   assert.equal((await control.request('answer-question', reply)).status, 400)
   assert.equal((await control.request('submit', submission)).value.state, 'cancelled')
-  console.log('Production coordinator: authentication, material admission, complete handover, durable read-only plan, restart, receipt retry, identity conflict, orphan refusal and cancellation passed.')
+  console.log('Production coordinator: authenticated maintenance, atomic admission fence, occupied-task refusal, material admission, durable planning, restart, receipt recovery and cancellation passed.')
 } finally { await control?.close(); removeTestDirectory(directory, resolve(release, '.artifacts')) }

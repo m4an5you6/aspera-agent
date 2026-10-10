@@ -15,7 +15,9 @@ import { remote, remoteResult, RemoteCommandError, shellQuote } from './transpor
 import type { Target, RemoteCommandResult } from './transport.ts'
 import { inspectEnvironment } from './environment.ts'
 import type { EnvironmentRequirements } from './environment.ts'
-import { SavedReleaseUnavailable } from './cluster-deploy.ts'
+import { SavedReleaseUnavailable, ControllerDiagnostic } from './cluster-deploy.ts'
+import { SandboxVerificationError } from './sandbox-verification.ts'
+import type { ControllerRepairTools } from './controller-repair.ts'
 import { ReleaseInstallationPending } from './deploy.ts'
 import type { EnvironmentProgress, PreparationCommand } from './types.ts'
 import type { InstallationTools } from './installation.ts'
@@ -43,6 +45,7 @@ export interface EnvironmentPreparationInput {
   pendingCommand?: PreparationCommand
   outputChars: number
   installation?: InstallationTools
+  controller?: ControllerRepairTools
   progress: (value: EnvironmentProgress) => Promise<void>
 }
 
@@ -56,6 +59,7 @@ interface ActivePreparation {
   verify: (pathEntries: string[], signal: AbortSignal, callId: ToolCallId) => Promise<object>
   block: (reason: string) => Promise<void>
   installation?: InstallationTools
+  repair: (signal: AbortSignal) => Promise<object>
 }
 
 /** Installs preparation tools on the existing DSH Agent, without another model loop. */
@@ -85,6 +89,11 @@ export class EnvironmentPreparation {
       description: 'End preparation when the selected account cannot meet a requirement. Include the actual diagnostic and the specific cloud-platform or operator action required.',
       parameters: { server_id: { type: 'string', required: true }, reason: { type: 'string', required: true } }, output, presentCall,
       execute: async args => { await this.owner(args.server_id).block(args.reason); return 'Preparation is blocked.' } })))
+    ctx.effect(() => ctx.tools.register(defineTool({ name: 'repair_preparation_controller',
+      description: 'Request an identity-bound repair of the controller assigned to this preparation step. The program checks task, command and inference-service release, fences admission, confirms process exit and restarts the fixed release with verified GPU authorization. Never supply a PID or device grant. Afterwards call verify_preparation_environment; this tool does not establish preparation completion.',
+      parameters: { server_id: { type: 'string', required: true } }, output,
+      presentCall: args => ({ ...presentCall(args), title: 'Aspera controller repair' }),
+      execute: async (args, exec) => JSON.stringify(await this.owner(args.server_id).repair(exec.signal)) })))
     ctx.effect(() => ctx.tools.register(defineTool({ name: 'inspect_preparation_installation',
       description: 'Read the original supervised installer, real download/compiler progress, remaining budget, exit receipt and log source. Polling does not start another installer or reset limits.',
       parameters: { server_id: { type: 'string', required: true } }, output, presentCall,
@@ -125,6 +134,7 @@ export class EnvironmentPreparation {
     if (this.active !== undefined) throw new Error('Preparation Agent already owns a node step')
     let target = input.target
     let observation = input.observation
+    let verification: object | undefined
     let pending = input.pendingCommand
     let accepted: { value: T; pathEntries: string[] } | undefined
     let terminal: Error | undefined
@@ -151,6 +161,7 @@ export class EnvironmentPreparation {
     }
     const reconcile = async (lifetime = signal) => {
       if (pending === undefined) return
+      if (pending.directory.includes('/controller-repairs/') && input.controller !== undefined) await input.controller.reconcile(pending.directory, lifetime)
       const exit = await driver.remote(target, `if [ -f ${shellQuote(pending.directory + '/exited')} ]; then cat ${shellQuote(pending.directory + '/exited')}; else printf unknown; fi`, lifetime, input.password)
       if (!/^\d+\s*$/.test(exit)) throw new UnconfirmedPreparationCommand(`Remote preparation command has no confirmed exit: ${pending.directory}. Inspect that command before retrying; it will not be started again.`)
       pending = undefined
@@ -164,24 +175,31 @@ export class EnvironmentPreparation {
       let value: T
       try {
         observation = await driver.inspectEnvironment(target, input.password, lifetime)
+        if (observation.sandboxExitCode !== 0) throw new SandboxVerificationError('sandbox-launch',
+          observation.programs.find(program => program.name === 'bwrap')?.path ?? '',
+          { exitCode: observation.sandboxExitCode, stdout: '', stderr: observation.diagnostics })
         value = await verify(target, observation, lifetime, callId)
       } catch (error) {
         lifetime.throwIfAborted()
         if (error instanceof SavedReleaseUnavailable || error instanceof ReleaseInstallationPending) throw error
         if (error instanceof RemoteCommandError && !error.result.exitConfirmed) throw error
-        await progress('configuring-environment', String(error))
-        return { ready: false, error: String(error) }
+        await progress(error instanceof SandboxVerificationError ? 'repairing-environment' : 'configuring-environment', String(error))
+        verification = { ready: false, error: String(error), ...(error instanceof ControllerDiagnostic || error instanceof SandboxVerificationError ? { diagnostic: error.diagnostic } : {}) }
+        return verification
       }
       await progress('environment-ready')
       accepted = { value, pathEntries }
-      return { ready: true, result: value }
+      verification = { ready: true, result: value }
+      return verification
     }
     const initial = await check([...(target.pathEntries ?? [])])
     const message = createUserMessage({ source: { kind: 'aspera', experimentId: input.experimentId }, content: [{
       type: 'text', text: JSON.stringify({ operation: 'prepare-experiment-environment', experimentId: input.experimentId, step: input.operation,
         serverId: input.serverId, serverName: input.serverName, requirements: input.requirements,
         directories: input.directories,
-        observation, verification: initial, pathEntries: target.pathEntries ?? [],
+        observation, verification: initial, pathEntries: target.pathEntries ?? [], controllerRepairAvailable: input.controller !== undefined,
+        sandboxInstruction: 'Shell inspection exercises the execution namespaces before installation or storage selection. Deployment verification uses the full launch, device grants, hidden directories and cleared environment. Preserve these requirements during repair. For a proc mount or namespace permission refusal, inspect the exact stderr and request the required cloud-platform permissions if this account cannot restore them; never remove isolation flags, bind the host proc filesystem, or claim completion without provider verification.',
+        controllerInstruction: input.controller === undefined ? undefined : 'Inspect GPU identities and controller authorization with inspect_preparation_environment. For a repairable controller difference call repair_preparation_controller; the program authorizes maintenance and restart. Never stop a controller through shell commands. Afterwards call verify_preparation_environment. Unknown ownership, unsupported legacy maintenance and unconfirmed exits require a concrete blocker, not another stop attempt.',
         instruction: accepted !== undefined ? 'This check passed. Retain these observations as context for the next preparation step; no repair is requested.'
           : 'Prepare this server using its existing SSH account permissions. Inspect the installation and complete logs before repairing network, disk, permissions, tool versions or compiler requirements. You choose download sources autonomously: probe an HTTPS candidate and switch only when its measured result supports that choice. Keep existing caches, original release material, frozen lockfile and checkpoints. Heartbeats and repeated retry text do not mean progress. Installation restarts, including source changes, share the saved retry and total budget. Never read or forward credentials, change global registry settings, disable TLS/integrity, replace sealed releases, stop controllers, change host drivers or disable isolation. Use foreground repair commands within the remaining budget and verify_preparation_environment after repair. Only program verification establishes success. Report concrete permission/kernel/device blockers. Do not complete the dispatch Goal.' }),
     }] })
@@ -191,7 +209,27 @@ export class EnvironmentPreparation {
     const stop = (error: Error) => { terminal = error; this.reject?.(error) }
     const handlers: ActivePreparation = {
       serverId: input.serverId,
-      inspect: async operationSignal => { observation = await driver.inspectEnvironment(target, input.password, AbortSignal.any([signal, operationSignal])); await progress('inspecting-environment'); return observation },
+      inspect: async operationSignal => { const lifetime = AbortSignal.any([signal, operationSignal]); observation = await driver.inspectEnvironment(target, input.password, lifetime); await progress('inspecting-environment');
+        return { ...observation, latestVerification: verification, ...(input.controller === undefined ? {} : { controller: await input.controller.inspect(lifetime) }) } },
+      repair: async operationSignal => {
+        if (input.controller === undefined) throw new Error('Controller repair is unavailable outside its assigned preparation step')
+        if (accepted !== undefined || terminal !== undefined) throw new Error('Preparation step has already finished')
+        const lifetime = AbortSignal.any([signal, operationSignal]); await reconcile(lifetime)
+        await progress('repairing-environment')
+        try {
+          const result = await input.controller.repair(lifetime, async directory => { pending = { directory }; await progress('repairing-environment') })
+          await reconcile(lifetime)
+          return result
+        } catch (error) {
+          await progress('repairing-environment', String(error))
+          if (pending !== undefined) {
+            try { await reconcile(lifetime) } catch (unconfirmed) {
+              const failure = new UnconfirmedPreparationCommand(`Controller repair is unconfirmed: ${String(unconfirmed)}`); stop(failure); throw failure
+            }
+          }
+          return { repaired: false, error: String(error), ...(error instanceof ControllerDiagnostic ? { diagnostic: error.diagnostic } : {}) }
+        }
+      },
       verify: async (paths, operationSignal, callId) => {
         if (accepted !== undefined || terminal !== undefined) throw new Error('Preparation step has already finished')
         try { return await check(paths, operationSignal, callId) }
@@ -269,6 +307,7 @@ exit "$status"`, lifetime, input.password, (stream, chunk) => { capture.append(s
       inspect: operationSignal => serial(() => handlers.inspect(operationSignal)),
       command: (script, operationSignal, callId) => serial(() => handlers.command(script, operationSignal, callId)),
       verify: (paths, operationSignal, callId) => serial(() => handlers.verify(paths, operationSignal, callId)),
+      repair: operationSignal => serial(() => handlers.repair(operationSignal)),
       block: reason => serial(() => handlers.block(reason)),
       installation: input.installation === undefined ? undefined : {
         inspect: operationSignal => serial(() => input.installation!.inspect(AbortSignal.any([signal, operationSignal]))),

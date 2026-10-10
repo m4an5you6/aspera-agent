@@ -28,6 +28,8 @@ kind: "package-bundle"
 
 通过角色配置选择 `coordinator`、`node`、`planner` 或 `agent`。部署固定控制根目录、令牌、发布和实验 ID。[Config](src/index.ts) 配置轮询、清理、网络探测时限、文件／字节限制及文档访问。[网络探测](src/network-probes.ts) 不分配 GPU，通过接收端身份检查连通性，超时、取消及关闭时清理监听器。节点先隐藏控制目录及其他已登记实验根目录，再绑定当前工作目录。
 
+控制健康接口通过 `controller-readiness-v1` 提供启动身份、规范化授权和当前占用。经过认证的 `controller-maintenance-v1` 操作原子拒绝仍被占用的角色，并暂停接受新任务。`gpuSnapshot` 保存启动时的 UUID 与设备映射；节点分配将其与当前 NVIDIA XML 身份及可访问的字符设备比较。仅有 HTTP 健康响应不能授权复用。[控制进程准备](../../docs/state-and-api.zh.md#controller-readiness) 定义修复归属、旧进程检查和独立验收。
+
 普通命令不能脱离取消清理。协议 `4` 不限制任务总时长或命令数量，旧分配保留原限制。[存储准备](scripts/storage.mjs) 检查 Linux 挂载、空间、归属和写入能力；未知持久性保持未知。实验 profile 和日志位于所选存储，队列状态及凭据保留在私有目录。缓存／环境变量使用可写工作目录。登记服务保留整组资源，必须通过实际 HTTP 健康检查，失败后不自动重启。[推理网关](src/inference-gateway.ts) 管理显式映射的对外监听和私有服务密钥，详见[服务记录与访问](../../docs/state-and-api.zh.md#logs-outputs-and-services)。节点 profile 设置 `serviceRequestTimeoutMs`（300000）限制上游空闲时间，`serviceRequestBytes`（16777216）限制请求体大小。
 
 `goalContinuationWindow` 是部署设置，默认 `128` 轮；worker patch 通过 `DSH_CLUSTER_GOAL_WINDOW` 配置。续行插件在有限窗口耗尽前通过公开 `Goal.edit` 延长同一 Goal。每次延长都记入日志，并非用户任务预算。连接、探测和模型单次操作超时、循环保护、沙箱和取消仍然生效。
@@ -46,7 +48,11 @@ kind: "package-bundle"
 <details>
 <summary>实现细节</summary>
 
+[experiment-sandbox.ts](src/experiment-sandbox.ts)管理准备与正式命令共用的 Linux 启动参数：用户／PID／IPC／UTS 命名空间、私有 `/proc`、限定设备授权、隐藏的控制／存储目录、清空的环境及工作目录内缓存。发布目录在沙箱内不可见，因此准备探测以内联程序执行。命名空间或 proc 挂载被拒绝时，以原始诊断阻止接入，不自动选择更弱的沙箱。
+
 [transport.ts](src/transport.ts) 为密码和密钥 SSH 命令提供独立 stdout/stderr、退出状态、超时／取消信息及退出确认证据。`remote` 保留成功返回 stdout 的接口；`remoteResult` 返回非零命令结果供诊断，连接失败仍报告错误。已验证程序目录应用于后续所有命令。SSH 断开不能证明远端进程已经结束。
+
+密码命令、上传和接收端请求可按已解析的[连接策略](src/ssh-connection.ts)在认证前重连。每个失败客户端关闭后才建立下一个连接；尝试和等待共用一次操作的截止时间及取消信号。主机密钥和认证失败直接结束。认证后发生命令通道或接收端错误时，不自动重试，缺少远端退出证据的结果仍为未确认。密钥 OpenSSH 操作保留原退出回执行为。
 
 [ssh-host-keys.ts](src/ssh-host-keys.ts) 为本机派发提供首次使用时的公钥探测和加锁登记。探测使用内置 SSH 客户端，在认证前断开，不需要 `ssh-keyscan` 进程，并遵守调用方的取消和截止时间。认证连接只读取已登记密钥，不登记新身份；委派节点连接继续使用预先安装的私有信任文件。登记在取消后停止，保留无关条目、哈希主机记录和撤销标记。
 

@@ -37,6 +37,26 @@ it('returns shell observations even when none of the required tools exists', asy
   expect(checkEnvironment(observed, requirements).ready).toBe(false)
 })
 
+it('detects a proc mount denial with execution namespaces before admitting the toolchain', async () => {
+  vi.mocked(remoteResult).mockImplementation(async (_target, command) => {
+    const denied = command.includes('--unshare-user')
+    return { exitCode: 0, signal: null, timedOut: false, cancelled: false, exitConfirmed: true,
+      stdout: 'ASPERA_HOME=/root\nASPERA_SYSTEM=Linux\nASPERA_ARCH=x86_64\nASPERA_ID=uid=0\n'
+        + 'ASPERA_PATH_node=/usr/bin/node\nASPERA_VERSION_node=v24.1.0\n'
+        + 'ASPERA_PATH_pnpm=/usr/bin/pnpm\nASPERA_VERSION_pnpm=11.7.0\n'
+        + 'ASPERA_PATH_python3=/usr/bin/python3\nASPERA_VERSION_python3=Python 3.12.0\n'
+        + 'ASPERA_PATH_bwrap=/usr/bin/bwrap\nASPERA_VERSION_bwrap=bubblewrap 0.6.1\n'
+        + `ASPERA_SANDBOX=${denied ? 1 : 0}\n`,
+      stderr: denied ? "bwrap: Can't mount proc on /newroot/proc: Operation not permitted\n" : '' }
+  })
+  const observed = await inspectEnvironment(target)
+  expect(observed.sandboxExitCode).toBe(1)
+  const checked = checkEnvironment(observed, requirements)
+  expect(checked).toMatchObject({ ready: false })
+  if (checked.ready) throw new Error('Unsupported execution namespaces were admitted')
+  expect(checked.failures.join('\n')).toContain("Can't mount proc")
+})
+
 it('pins discovered executable directories for subsequent non-interactive connections', () => {
   const observation = readyEnvironment()
   observation.programs[0]!.path = '/opt/aspera/node/bin/node'

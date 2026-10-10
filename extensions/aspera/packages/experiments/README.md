@@ -30,6 +30,8 @@ Earlier queued tasks sharing a server precede later tasks. Waiting for approval 
 
 Questions and replies are serialized with queue mutations. Persist an open question before pausing, save one validated reply before delivery, and use the original question revision for retries. Cancellation expires open questions; recovery reports interrupted work rather than launching a new Agent. [State and APIs](../../docs/state-and-api.md) defines compatibility and reply identities.
 
+Coordinator maintenance uses the same serialization as admission. `beginMaintenance` requires no waiting, planning, execution or serving tasks and no unconfirmed resources; its operation identity prevents another caller from removing the fence. [controller-protocol.ts](src/controller-protocol.ts) validates GPU observations, process identities and authenticated maintenance requests without changing experiment submissions or Session data.
+
 -----
 
 <a id="understand-the-implementation"></a>

@@ -13,6 +13,10 @@ export { ObservationWriter, observationSources, readObservation, redactObservati
 export { readTraceAttachment } from './trace-attachments.ts'
 export type { ClusterPrivate } from './cluster-runtime.ts'
 export type { ClusterRoleConfig } from './cluster.ts'
+export { controllerPolicyDigest } from './controller.ts'
+export { gpuIdentityQueryScript } from './gpu-query.ts'
+export { experimentIsolationArgs, experimentSandboxArgv } from './experiment-sandbox.ts'
+export type { ExperimentSandboxSpec } from './experiment-sandbox.ts'
 
 /** Validated role configuration supplied by the profile. */
 export interface Config extends ClusterRoleConfig {}
@@ -22,6 +26,7 @@ export const Config: z<Config> = z.object({
   root: z.string().required(), tokenFile: z.string().required(), deploymentId: z.string().required(),
   backendPath: z.string().default('/usr/bin/bwrap'), hiddenPaths: z.array(z.string()).default([]),
   devicePaths: z.array(z.string()).default([]), experimentId: z.string(),
+  gpuSnapshot: z.union([z.const(undefined), z.object({ gpus: z.array(z.object({ uuid: z.string(), name: z.string(), devicePath: z.string() })), devicePaths: z.array(z.string()) })]),
   chunkBytes: z.number().step(1).min(1024).max(65536).default(65536),
   fileLimit: z.number().step(1).min(1).default(1000),
   cleanupTimeoutMs: z.number().step(1).min(1000).default(30000),

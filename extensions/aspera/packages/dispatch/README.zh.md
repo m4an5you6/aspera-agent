@@ -32,6 +32,8 @@ kind: "package-bundle"
 
 `connectionCheckTimeoutMs` 为整轮连接检查设置统一截止时间，默认 20000 毫秒。主机密钥探测、环境检查、磁盘、GPU 和控制服务共用取消信号。到期后关闭活动 SSH 连接并保存失败状态，结束后才能再次检查；保留带时间的历史成功信息。前台准备命令继续使用 `toolTimeoutMs`。自定义调用者在 `ExperimentFleet.open` 的可选驱动之前传入检查时限；驱动必须响应探测取消，并等待连接清理完成。
 
+密码 SSH 连接使用 `sshHandshakeTimeoutMs`（默认 15000）、`sshHandshakeMaxRetries`（默认 2）和 `sshHandshakeRetryDelayMs`（默认 500）。认证前发生临时超时、重置或断开时，可在原操作截止时间内重连；等待间隔乘以重试序号。认证、主机密钥失败，或认证后的任何失败，均停止且不重复操作。这些本机设置应用于已有准备的重试，不改写保存的发布、提交或安装回执。自定义调用者可在 `ExperimentFleet.open` 的控制进程修复策略之后传入已解析的连接策略。
+
 在 profile 的 `aspera-dispatch` 项中配置受管安装。每个实验固定以下有限整数限制，无进展时限不能超过总时限。
 
 | 配置 | 默认值 | 范围 |
@@ -55,6 +57,8 @@ kind: "package-bundle"
 <a id="understand-the-implementation"></a>
 ## 了解实现
 
+[环境验收](src/deploy.ts)通过完整执行沙箱检查工作目录写入、目录隔离、凭据隐藏及 CUDA 访问。Shell 探测在 Node 安装前检查所需命名空间。已确认的拒绝将检查项、退出码及原始 stdout/stderr 通过[准备工具](src/environment-preparation.ts)返回；原准备 Agent 可以修复账号配置并请求复验。容器或宿主权限阻塞须说明具体的云平台操作。移除隔离参数、挂载宿主 `/proc` 或 Agent 声称完成都不能证明就绪。
+
 只读观测在返回完整事件、已登记日志、附件或实测采样前校验实验、节点和 Session 归属。准备命令先完整记录输出，再限制工具结果长度。提示指纹按管理 profile 持久保存；关闭 Toast 不清除失败或清理状态。[观测接口](../../docs/state-and-api.zh.md#logs-outputs-and-services) 定义游标和历史版本可用性。安装及发布移交通过 `@aspera/dispatch/compatibility` 校验固定版本的已发布 DSH 渲染适配。
 
 模型提交通过 DSH 提供商目录解析三个显式选择。[models.ts](src/models.ts) 保存私有 API 设置和独立凭据引用，重试读取这些快照。DeepSeek 及支持的 pi-ai 密钥接口使用固定适配器。保留历史 `agentCredentialRefs` 配置的读取；第 4 代仅移交已接收阶段快照引用的凭据。
@@ -77,6 +81,8 @@ kind: "package-bundle"
 
 <a id="model-experience"></a>
 ## 模型体验
+
+GPU 与控制进程检查使用实际身份和启动授权。准备 Agent 可以请求限定范围的控制进程修复工具；程序复验和最终交接检查判定就绪。空闲维护先阻止新任务，再按身份重启。`controllerRepairMaxAttempts` 默认两次，由独立恢复回执保留。[控制进程就绪](../../docs/state-and-api.zh.md#controller-readiness)定义占用、未知退出和原发布兼容。自定义 `FleetDriver` 提供方实现 `inspectController`。
 
 派发工具列出不含凭据的服务器、提交明确的服务器组并读取实验状态。所选准备模型在同一 Session 中通过有日志的工具修复失败检查，SSH 凭据不进入模型输入。非零退出返回诊断，退出未确认则阻止重复修改。Agent 文字不能替代工作目录写入、隔离、凭据隐藏、GPU 和网络验收。已通过的检查进入 Agent 收件箱而不唤醒模型，由循环在首条系统消息之后纳入上下文。要求和回执使用现有 Session 事件；**本机派发完成，远端实验已接管**仅在保存回执后出现，ID 和版本比较防止完成已编辑的 Goal。
 

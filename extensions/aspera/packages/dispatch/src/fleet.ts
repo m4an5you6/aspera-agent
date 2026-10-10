@@ -22,7 +22,8 @@ import {
   serverSettingsSchema, inspectServerStorage, prepareServerStorage, verifyServerStorage, cleanupServerStorage, serviceAccessInfoSchema,
 } from '@aspera/runtime'
 import type { ClusterChunk, ClusterFile, ClusterNode, ClusterPrivate, ClusterRecord, ClusterServer, ExperimentId, ExperimentServerId, ServerSettings, ServerProbe } from '@aspera/runtime'
-import { copy, remote, remoteResult, request, shellQuote, prepareSshHostKey } from './transport.ts'
+import { copy, remote, remoteResult, request, shellQuote, prepareSshHostKey, resolveSshConnectionPolicy } from './transport.ts'
+import type { SshConnectionPolicy, Target } from './transport.ts'
 import { installPrivateFile } from './deploy.ts'
 import type { DeploymentConfig, PreparedEnvironment } from './deploy.ts'
 import { snapshotSource } from './snapshot.ts'
@@ -37,9 +38,11 @@ import { cleanupLocalInputs } from './cleanup.ts'
 import type { ServerConnectionCheck, DeletedExperiment, ExperimentDeletion, ExperimentDeletionPreview, DeleteExperimentsRequest, FleetSnapshot, ServerDeletionPreview } from './types.ts'
 import { removalStoreSpec, removedWork, sameServerEndpoint } from './removals.ts'
 import type { LocalRemoval } from './removals.ts'
-import { delegateClusterLogin, describeClusterNode, ensureClusterRole, prepareClusterServer } from './cluster-deploy.ts'
+import { delegateClusterLogin, describeClusterNode, ensureClusterRole, prepareClusterServer, inspectController } from './cluster-deploy.ts'
 import type { DeploymentRelease } from './cluster-deploy.ts'
 import { EnvironmentPreparation, UnconfirmedPreparationCommand } from './environment-preparation.ts'
+import { ControllerRepair, controllerRepairPolicySchema } from './controller-repair.ts'
+import { gpuInventoryText, normalizedSet } from '@aspera/experiments'
 import type { EnvironmentPreparationInput } from './environment-preparation.ts'
 import type { EnvironmentProgress } from './types.ts'
 import { environmentRequirements, installedEnvironmentRequirements, inspectEnvironment, checkEnvironment } from './environment.ts'
@@ -81,6 +84,7 @@ export interface FleetDriver {
   snapshotSource: typeof snapshotSource
   prepareClusterServer: typeof prepareClusterServer
   ensureClusterRole: typeof ensureClusterRole
+  inspectController: typeof inspectController
   describeClusterNode: typeof describeClusterNode
   delegateClusterLogin: typeof delegateClusterLogin
   installPrivateFile: typeof installPrivateFile
@@ -98,7 +102,7 @@ export interface FleetDriver {
   resolveTrainingNetwork: typeof resolveTrainingNetwork
 }
 
-const productionDriver: FleetDriver = { prepareSshHostKey, snapshotSource, prepareClusterServer, ensureClusterRole, describeClusterNode,
+const productionDriver: FleetDriver = { prepareSshHostKey, snapshotSource, prepareClusterServer, ensureClusterRole, inspectController, describeClusterNode,
   delegateClusterLogin, installPrivateFile, remote, remoteResult, inspectEnvironment, environmentRequirements, installedEnvironmentRequirements, copy, request, inspectServerStorage, prepareServerStorage, verifyServerStorage, cleanupServerStorage, resolveTrainingNetwork }
 
 class CoordinatorRequestError extends Error {
@@ -125,7 +129,8 @@ export class ExperimentFleet {
   private constructor(private readonly ctx: Context, private readonly store: Store, private readonly removals: Domain<typeof removalStoreSpec>,
     private readonly deployment: (server: ServerSettings) => PinnedDeployment,
     private readonly connectionCheckTimeoutMs: number, private readonly driver: FleetDriver,
-    private readonly installations: InstallationRecovery) {}
+    private readonly installations: InstallationRecovery, private readonly controllerRepairMaxAttempts: number,
+    private readonly sshConnectionPolicy: SshConnectionPolicy) {}
 
   /**
    * Open durable records and reconcile interrupted local preparation.
@@ -133,15 +138,21 @@ export class ExperimentFleet {
    * @param deployment - resolves shared policy against a selected server.
    * @param connectionCheckTimeoutMs - total connection-check deadline, independent of preparation command timeouts.
    * @param driver - release and transport provider; the default uses password SSH.
+   * @param installationPolicy - supervised installer budgets.
+   * @param controllerRepairPolicy - per-server and per-role restart limit.
+   * @param sshConnectionPolicy - local handshake and reconnection limits; saved releases and submissions remain fixed.
    * @returns effect-owned fleet service.
    */
   static async open(ctx: Context, deployment: (server: ServerSettings) => PinnedDeployment,
     connectionCheckTimeoutMs: number, driver: FleetDriver = productionDriver,
-    installationPolicy: InstallationPolicy = installationPolicySchema.parse({})): Promise<ExperimentFleet> {
+    installationPolicy: InstallationPolicy = installationPolicySchema.parse({}),
+    controllerRepairPolicy = controllerRepairPolicySchema.parse({}),
+    sshConnectionPolicy = resolveSshConnectionPolicy({})): Promise<ExperimentFleet> {
     const store = await ctx.storage.domain.open(storeSpec)
     const removals = await ctx.storage.domain.open(removalStoreSpec)
     const installations = await InstallationRecovery.open(ctx, installationPolicy, driver)
-    const fleet = new ExperimentFleet(ctx, store, removals, deployment, connectionCheckTimeoutMs, driver, installations)
+    const fleet = new ExperimentFleet(ctx, store, removals, deployment, connectionCheckTimeoutMs, driver, installations,
+      controllerRepairPolicySchema.parse(controllerRepairPolicy).maxAttempts, resolveSshConnectionPolicy(sshConnectionPolicy))
     ctx.effect(() => () => fleet.close(), 'experiment fleet: local preparations')
     if (store.table('registry').get('servers') === undefined) {
       await store.table('registry').put('servers', { servers: [] })
@@ -188,7 +199,20 @@ export class ExperimentFleet {
         const target = record.coordinator.id === id ? record.coordinatorTarget : record.targets[record.servers.findIndex(value => value.id === id)]
         if (server === undefined || target === undefined) throw new Error('Pending preparation command has no saved server')
         const directory = environment.pendingCommand.directory
-        const exit = await this.driver.remote(target, `if [ -f ${shellQuote(directory + '/exited')} ]; then cat ${shellQuote(directory + '/exited')}; else printf unknown; fi`, signal, await this.password(server))
+        let exit = await this.driver.remote(target, `if [ -f ${shellQuote(directory + '/exited')} ]; then cat ${shellQuote(directory + '/exited')}; else printf unknown; fi`, signal, await this.password(server))
+        if (!/^\d+\s*$/.test(exit) && record.request.experimentId === ownerId && directory.includes('/controller-repairs/')) {
+          const role = /\/controller-repairs\/(node|coordinator)\//.exec(directory)?.[1]
+          if (role !== 'node' && role !== 'coordinator') throw new UnconfirmedPreparationCommand('Saved controller repair role is unavailable')
+          const configured = this.resolvedTarget(target)
+          const digest = server.storagePlacement?.releaseRoot.split('/').at(-1)
+          if (digest === undefined || !/^[a-f0-9]{64}$/.test(digest)) throw new UnconfirmedPreparationCommand('Original controller repair release is unavailable')
+          const password = await this.password(server)
+          const prepared = await this.driver.prepareClusterServer(configured, { digest, reuse: true }, password, signal)
+          const repair = new ControllerRepair({ experimentId: ownerId, serverId: id, role, target: configured, prepared,
+            token: await this.token(server, role), password, maxAttempts: this.controllerRepairMaxAttempts }, this.driver)
+          await repair.reconcile(directory, signal)
+          exit = await this.driver.remote(target, `cat ${shellQuote(directory + '/exited')}`, signal, password)
+        }
         if (!/^\d+\s*$/.test(exit)) throw new UnconfirmedPreparationCommand(`Server preparation is still unconfirmed at ${directory}; inspect that command before retrying.`)
         const { pendingCommand: _pending, ...settled } = environment
         await this.environmentProgress(record.request.experimentId, { ...settled, detail: `Previous command exited ${exit.trim()}; environment must be rechecked.` })
@@ -401,7 +425,7 @@ export class ExperimentFleet {
         const names = server.id !== record.coordinator.id ? [] : [`${id}.json`, `${id}-model.json`,
           ...record.servers.flatMap(value => [`${id}-${value.id}.known_hosts`, ...(value.identityFile === undefined ? [] : [`${id}-${value.id}.identity`])])]
         const password = await this.password(server)
-        try { await this.driver.cleanupServerStorage(target, placement, names, password, signal) } catch (error) {
+        try { await this.driver.cleanupServerStorage(this.connectionTarget(target), placement, names, password, signal) } catch (error) {
           const detail = password ? String(error).replaceAll(password, '[redacted]') : String(error)
           job = { ...job, nodes: job.nodes.map(value => value.serverId === node.serverId ? { ...value, detail } : value) }
           throw new Error(detail)
@@ -489,7 +513,10 @@ export class ExperimentFleet {
       const next = { ...removal, localCleanup: 'complete' as const }
       if (next.work?.submissionHash === undefined && next.work?.nodes.every(node => node.pendingDirectory === undefined) && this.installations.pending(id).length === 0) delete next.work
       delete next.error
-      if (next.work === undefined) await this.installations.forget(id)
+      if (next.work === undefined) {
+        cleanupLocalInputs(resolve(resolveDshHome(), 'aspera-controller-repairs'), id)
+        await this.installations.forget(id)
+      }
       await this.removals.table('removals').put(id, next)
       for (const ref of next.credentialRefs) await this.removeUnusedCredential(ref, id)
     })
@@ -519,7 +546,7 @@ export class ExperimentFleet {
         for (const node of work.nodes) if (!await this.installations.reconcile(experimentId, node.server.id, this.resolvedTarget(node.target), await this.password(node.server), lifetime)) settled = false
         for (const node of work.nodes) if (node.pendingDirectory !== undefined) {
           const path = shellQuote(node.pendingDirectory + '/exited')
-          const exit = await this.driver.remote(node.target, 'if [ -f ' + path + ' ]; then cat ' + path + '; else printf unknown; fi', lifetime, await this.password(node.server))
+          const exit = await this.driver.remote(this.connectionTarget(node.target), 'if [ -f ' + path + ' ]; then cat ' + path + '; else printf unknown; fi', lifetime, await this.password(node.server))
           if (!/^\d+\s*$/.test(exit)) settled = false
         }
         if (!settled) continue
@@ -528,6 +555,7 @@ export class ExperimentFleet {
           if (current === undefined || JSON.stringify(current.work) !== JSON.stringify(work)) return
           const { work: _released, ...released } = current
           await this.removals.table('removals').put(experimentId, released)
+          cleanupLocalInputs(resolve(resolveDshHome(), 'aspera-controller-repairs'), experimentId)
           await this.installations.forget(experimentId)
           for (const node of work.nodes) await this.removeUnusedCredential(sshPasswordRef(node.server))
         })
@@ -885,11 +913,11 @@ export class ExperimentFleet {
       if (preparation === undefined) throw new Error('Storage preparation is missing')
       const unique = [...new Map([record.coordinator, ...record.servers].map(server => [server.id, server])).values()]
       const targetFor = (server: ServerSettings): PinnedDeployment => {
-        if (server.id === record.coordinator.id) return record.coordinatorTarget
+        if (server.id === record.coordinator.id) return this.connectionTarget(record.coordinatorTarget)
         const index = record.servers.findIndex(value => value.id === server.id)
         const target = record.targets[index]
         if (target === undefined) throw new Error('Selected server has no pinned preparation settings')
-        return target
+        return this.connectionTarget(target)
       }
       for (const server of unique) {
         await this.installations.startBudget(id, server.id)
@@ -918,12 +946,12 @@ export class ExperimentFleet {
       }
       record = await this.preparationStage(id, preparation.stage, { inputs })
       const environmentInput = async (server: ServerSettings, target: PinnedDeployment, operation: EnvironmentPreparationInput['operation']): Promise<EnvironmentPreparationInput> => ({
-        experimentId: id, serverId: server.id, serverName: server.name, target, requirements, operation,
+        experimentId: id, serverId: server.id, serverName: server.name, target: this.connectionTarget(target), requirements, operation,
         controlRoot: target.remoteRoot, password: await this.password(server),
         directories: target.storagePlacement === undefined ? undefined : {
           workspace: target.storagePlacement.workspaceRoot, release: target.storagePlacement.releaseRoot, control: target.storagePlacement.controlRoot,
         },
-        observation: await this.driver.inspectEnvironment(target, await this.password(server), operation === 'controller' ? signal : this.installations.signal(id, server.id, signal)),
+        observation: await this.driver.inspectEnvironment(this.connectionTarget(target), await this.password(server), operation === 'controller' ? signal : this.installations.signal(id, server.id, signal)),
         pendingCommand: this.get(id).preparation?.environments?.find(value => value.serverId === server.id)?.pendingCommand,
         outputChars: target.preparationOutputChars,
         installation: operation === 'deployment' ? this.installations.tools(id, server.id, this.resolvedTarget(target), await this.password(server), handle.agent.session.id) : undefined,
@@ -983,16 +1011,19 @@ export class ExperimentFleet {
       let target = this.resolvedTarget(record.coordinatorTarget)
       const coordinatorPassword = await this.password(record.coordinator)
       const coordinatorToken = await this.token(record.coordinator, 'coordinator')
+      const controllerAcceptances = new Map<string, ControllerRepair>()
       const startRole = async (server: ServerSettings, pending: PinnedDeployment, prepared: PreparedEnvironment, role: 'coordinator' | 'node', token: string, password: string | undefined) => {
-        const result = await environment.ensure(handle.agent, await environmentInput(server, pending, 'controller'), this.driver,
+        const repair = new ControllerRepair({ experimentId: id, serverId: server.id, role, target: this.resolvedTarget(pending), prepared,
+          token, password, maxAttempts: this.controllerRepairMaxAttempts }, this.driver)
+        const result = await environment.ensure(handle.agent, { ...await environmentInput(server, pending, 'controller'), controller: repair }, this.driver,
           async (candidate, observed, operationSignal) => {
             const checked = checkEnvironment(observed, requirements, candidate.pathEntries)
             if (!checked.ready) throw new Error(checked.failures.join('\n'))
-            await this.driver.ensureClusterRole({ ...this.resolvedTarget(pending), pathEntries: checked.toolchain.pathEntries }, prepared, role, token, password, operationSignal)
-            return checked.toolchain
+            return repair.verify(operationSignal, checked.toolchain.pathEntries)
           }, signal)
-        record = await this.saveExecutablePaths(id, server.id, result.value.pathEntries)
-        return { ...this.resolvedTarget(pending), pathEntries: result.value.pathEntries }
+        record = await this.saveExecutablePaths(id, server.id, result.pathEntries)
+        controllerAcceptances.set(`${server.id}-${role}`, repair)
+        return { target: { ...this.resolvedTarget(pending), pathEntries: result.pathEntries }, prepared: result.value }
       }
       const preparedCoordinator = await this.onServer(record.coordinator.id, signal, async () => {
         const placement = resolvedCoordinator.storagePlacement
@@ -1011,8 +1042,9 @@ export class ExperimentFleet {
         const prepared = result.value
         target = { ...target, pathEntries: result.pathEntries }
         record = await this.saveExecutablePaths(id, record.coordinator.id, result.pathEntries)
-        target = await startRole(record.coordinator, record.coordinatorTarget, prepared, 'coordinator', coordinatorToken, coordinatorPassword)
-        return prepared
+        const started = await startRole(record.coordinator, record.coordinatorTarget, prepared, 'coordinator', coordinatorToken, coordinatorPassword)
+        target = started.target
+        return started.prepared
       }, id)
       const preparedNodes: ClusterNode[] = []
       for (const [index, server] of resolvedNodes.entries()) preparedNodes.push(await this.onServer(server.id, signal, async () => {
@@ -1036,8 +1068,9 @@ export class ExperimentFleet {
         const prepared = result.value
         nodeTarget = { ...nodeTarget, pathEntries: result.pathEntries }
         record = await this.saveExecutablePaths(id, server.id, result.pathEntries)
-        nodeTarget = await startRole(server, record.targets[index], prepared, 'node', await this.token(server, 'node'), password)
-        return this.driver.describeClusterNode(server, prepared, nodeTarget, password, signal)
+        const started = await startRole(server, record.targets[index], prepared, 'node', await this.token(server, 'node'), password)
+        nodeTarget = started.target
+        return this.driver.describeClusterNode(server, started.prepared)
       }, id))
       let nodes = preparedNodes
       await this.preparationStage(id, 'checking-network')
@@ -1061,7 +1094,7 @@ export class ExperimentFleet {
         const pending = targetFor(server)
         const expected = server.id === record.coordinator.id ? preparedCoordinator : preparedNodes.find(node => node.server.id === server.id)
         if (expected === undefined) throw new Error('Node has no verified deployment')
-        await environment.ensure(handle.agent, await environmentInput(server, pending, 'deployment'), this.driver,
+        const final = await environment.ensure(handle.agent, await environmentInput(server, pending, 'deployment'), this.driver,
           async (candidate, observed, operationSignal) => {
             if (JSON.stringify(candidate.pathEntries) !== JSON.stringify(pending.pathEntries)) {
               throw new Error('Final acceptance must use the executable directories saved for the running controller')
@@ -1070,11 +1103,17 @@ export class ExperimentFleet {
             if (!checked.ready) throw new Error(checked.failures.join('\n'))
             const verified = await this.driver.prepareClusterServer({ ...this.resolvedTarget(pending), pathEntries: checked.toolchain.pathEntries },
               { digest: snapshot.digest, reuse: true }, await this.password(server), operationSignal)
-            if (verified.backendPath !== expected.backendPath || JSON.stringify(verified.devicePaths) !== JSON.stringify(expected.devicePaths)) {
-              throw new Error('Sandbox executable or GPU allocation changed after controller startup')
-            }
             return verified
           }, signal)
+        if (server.id === record.coordinator.id) {
+          const started = await startRole(server, pending, final.value, 'coordinator', await this.token(server, 'coordinator'), await this.password(server))
+          target = started.target
+        }
+        if (nodes.some(node => node.server.id === server.id)) {
+          const started = await startRole(server, pending, final.value, 'node', await this.token(server, 'node'), await this.password(server))
+          nodes = nodes.map(node => node.server.id === server.id ? { ...node, backendPath: started.prepared.backendPath,
+            devicePaths: normalizedSet(started.prepared.devicePaths), hiddenPaths: normalizedSet(started.prepared.hiddenPaths), gpuInfo: gpuInventoryText(started.prepared.gpu) } : node)
+        }
       }, id)
       const coordinator = nodes.find(node => node.server.id === resolvedCoordinator.id)?.server ?? resolvedCoordinator
       record = await this.serial(async () => {
@@ -1120,6 +1159,7 @@ export class ExperimentFleet {
       const runtime: ClusterPrivate = { submission, connections, modelCredentialFile, toolTimeoutMs: target.toolTimeoutMs,
         agentModel: selection }
       await this.driver.installPrivateFile(target, `${target.remoteRoot}/secrets/${id}.json`, JSON.stringify(runtime), signal, coordinatorPassword)
+      for (const acceptance of controllerAcceptances.values()) await acceptance.verifyAcceptance(signal)
       record = await this.serial(async () => {
         const next = { ...this.get(id), submission }
         await this.store.table('experiments').put(id, next)
@@ -1149,10 +1189,15 @@ export class ExperimentFleet {
 
   private resolvedTarget(target: PinnedDeployment): DeploymentConfig {
     if (target.remoteRoot === undefined) throw new Error('Server directories have not been resolved')
-    return { ...target, remoteRoot: target.remoteRoot }
+    return this.connectionTarget({ ...target, remoteRoot: target.remoteRoot })
+  }
+
+  private connectionTarget<T extends Target>(target: T): T & SshConnectionPolicy {
+    return { ...target, ...this.sshConnectionPolicy }
   }
 
   private reuseExecutablePaths(serverId: ExperimentServerId, target: PinnedDeployment): PinnedDeployment {
+    target = this.connectionTarget(target)
     if (target.pathEntries !== undefined) return target
     for (const record of this.list()) {
       const saved = record.coordinator.id === serverId ? record.coordinatorTarget : record.targets[record.servers.findIndex(server => server.id === serverId)]
@@ -1281,7 +1326,7 @@ export class ExperimentFleet {
     const password = await this.password(server)
     const token = await this.token(server, 'coordinator')
     signal?.throwIfAborted()
-    const response = await this.driver.request({ ...target, remotePort: target.remotePort + 1 }, token,
+    const response = await this.driver.request(this.connectionTarget({ ...target, remotePort: target.remotePort + 1 }), token,
       '/aspera/v' + protocol + '/' + operation, 'POST', body, signal, password)
     if (response.status !== 200) {
       const error = z.object({ error: z.string() }).safeParse(response.value)

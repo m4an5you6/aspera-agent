@@ -32,6 +32,8 @@ The [workspace startup](../../README.md#start-the-management-page) creates an `a
 
 `connectionCheckTimeoutMs` sets one deadline for the complete connection check, defaulting to 20000 milliseconds. Host-key discovery, environment inspection, disk, GPU and control probes share its cancellation signal. Expiry closes active SSH connections and records a failed check before another check can start; dated successful observations remain available. Foreground preparation commands retain `toolTimeoutMs`. Custom fleet callers pass the check deadline to `ExperimentFleet.open` before the optional driver; drivers must honor probe cancellation and await connection cleanup.
 
+Password SSH connections use `sshHandshakeTimeoutMs` (default 15000), `sshHandshakeMaxRetries` (default 2) and `sshHandshakeRetryDelayMs` (default 500). A transient timeout, reset or disconnect before authentication can reconnect within the original operation deadline; the delay is multiplied by the retry number. Authentication and host-key failures, or any failure after authentication, stop without replaying the operation. These local settings apply when existing preparation is retried and do not rewrite its saved release, submission or installation receipts. Custom fleet callers can pass the resolved policy after the controller-repair policy to `ExperimentFleet.open`.
+
 Configure supervised installation in the profile's `aspera-dispatch` entry. Each experiment freezes these finite integer limits; the idle limit cannot exceed the total limit.
 
 | Configuration | Default | Scope |
@@ -55,6 +57,8 @@ Retries read requirements from the original release. If both its application and
 <a id="understand-the-implementation"></a>
 ## Understand the implementation
 
+[Environment verification](src/deploy.ts) runs workspace writes, directory isolation, credential hiding and CUDA access through the complete execution sandbox. Shell inspection exercises its required namespaces before Node installation. A confirmed refusal returns its check, exit code and unchanged stdout/stderr through [preparation tools](src/environment-preparation.ts); the original Agent may repair account configuration and request revalidation. Container or host permission blockers require a concrete cloud-platform action. Removing isolation flags, mounting the host `/proc` or an Agent's completion statement cannot establish readiness.
+
 Read-only observations validate experiment, node and Session ownership before returning complete events, registered logs, attachments or measured samples. Preparation captures full command output before limiting tool results. Notice fingerprints persist per management profile; dismissing a Toast leaves failure and cleanup state intact. [Observation APIs](../../docs/state-and-api.md#logs-outputs-and-services) define cursors and legacy availability. Installation and release transfer verify the fixed published DSH rendering adapters through `@aspera/dispatch/compatibility`.
 
 Model admission resolves the three explicit choices through the DSH provider directory. [models.ts](src/models.ts) stores private API settings and independent credential references; retries load those snapshots. DeepSeek and supported pi-ai key routes use pinned adapters. Legacy `agentCredentialRefs` remains a configuration-read field; generation 4 transfers only credentials referenced by the admitted phase snapshots.
@@ -77,6 +81,8 @@ Model admission resolves the three explicit choices through the DSH provider dir
 
 <a id="model-experience"></a>
 ## Model Experience
+
+GPU and controller checks use actual identities and startup authorization. The preparation Agent can request the scoped controller repair tool; program verification and final handover checks establish readiness. Idle maintenance fences new tasks before an identity-bound restart. `controllerRepairMaxAttempts` defaults to two and is retained in independent recovery receipts. [Controller readiness](../../docs/state-and-api.md#controller-readiness) defines occupancy, unknown exits and original-release compatibility. Custom `FleetDriver` providers implement `inspectController`.
 
 Dispatch tools list non-secret servers, submit an explicit server group and read experiment status. The selected preparation model repairs failed checks through logged tools in the same Session; SSH credentials stay outside model input. Nonzero commands return diagnostics, while unconfirmed exits block repeated mutations. Agent text cannot replace workspace-write, isolation, credential-hiding, GPU and network verification. Passed checks enter the Agent inbox without waking the model; the loop admits their context after its initial system message. Requirements and receipts use existing Session events. **本机派发完成，远端实验已接管** appears only after receipt persistence; ID/revision comparison prevents completing an edited Goal.
 

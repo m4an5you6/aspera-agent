@@ -5,6 +5,9 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { z } from 'zod'
+import { controllerStatusSchema, gpuInventorySchema, parseGpuInventory, gpuInventoryText, normalizedSet, normalizedGpuInventory } from '@aspera/experiments'
+import { controllerPolicyDigest, gpuIdentityQueryScript } from '@aspera/runtime'
+import type { ControllerStatus } from '@aspera/experiments'
 import type { ClusterNode, ClusterServer } from '@aspera/runtime'
 import { installPrivateFile, installSource, validateEnvironment } from './deploy.ts'
 import type { DeploymentConfig, PreparedEnvironment } from './deploy.ts'
@@ -17,6 +20,75 @@ export type DeploymentRelease = SourceSnapshot | { readonly digest: string; read
 
 /** A saved release cannot be reconstructed by changing the experiment's immutable identity. */
 export class SavedReleaseUnavailable extends Error {}
+
+/** Failed controller checks retain structured, model-visible differences. */
+export class ControllerDiagnostic extends Error {
+  constructor(readonly diagnostic: { code: 'configuration-outdated' | 'hardware-changed' | 'unavailable' | 'unknown' | 'occupied';
+    role: 'node' | 'coordinator'; detail: string; controller?: ControllerStatus; expected?: object }) {
+    super(JSON.stringify(diagnostic))
+  }
+}
+
+/** @param controller - authenticated status. @param target - selected server. @param prepared - accepted device inventory.
+ * @param role - expected resident role. @returns validated status or a specific repair diagnostic.
+ */
+export function verifyController(controller: ControllerStatus, target: DeploymentConfig, prepared: PreparedEnvironment,
+  role: 'node' | 'coordinator'): ControllerStatus {
+  const expected = { backendPath: prepared.backendPath, devicePaths: normalizedSet(prepared.devicePaths), hiddenPaths: normalizedSet(prepared.hiddenPaths), gpu: prepared.gpu }
+  const fail = (code: ControllerDiagnostic['diagnostic']['code'], detail: string): never => { throw new ControllerDiagnostic({ code, role, detail, controller, expected }) }
+  if (controller.role !== role || controller.root !== target.remoteRoot) fail('unknown', 'Control process role or directory differs from this server')
+  if (controller.legacy && controller.deploymentId !== prepared.deploymentId) fail('unknown', 'A legacy controller can only serve its verified original release; release its tasks before starting the selected release')
+  if (controller.maintenance !== undefined) fail('occupied', `Control process is held by maintenance ${controller.maintenance}`)
+  if (controller.policy.backendPath !== expected.backendPath || JSON.stringify(normalizedSet(controller.policy.devicePaths)) !== JSON.stringify(expected.devicePaths)
+    || JSON.stringify(normalizedSet(controller.policy.hiddenPaths)) !== JSON.stringify(expected.hiddenPaths)) {
+    fail('configuration-outdated', 'The control process authorization differs from the verified environment')
+  }
+  if (controller.policy.gpu === undefined) fail('unknown', 'The original controller has no GPU identity evidence; release its tasks and stop or upgrade it before preparing a new experiment')
+  if (JSON.stringify(normalizedGpuInventory(controller.policy.gpu!)) !== JSON.stringify(normalizedGpuInventory(prepared.gpu))) fail('configuration-outdated', 'The control process retained another GPU identity or device mapping')
+  if (role === 'node') {
+    if (controller.actualGpu === undefined) fail('unavailable', controller.gpuError ?? 'Actual GPU access could not be confirmed')
+    if (JSON.stringify(normalizedGpuInventory(controller.actualGpu!)) !== JSON.stringify(normalizedGpuInventory(prepared.gpu))) fail('hardware-changed', 'GPU hardware changed during preparation; recheck this node')
+  }
+  return controller
+}
+
+/** @param target - selected SSH account and control root. @param role - assigned role. @param token - private control credential.
+ * @param password - private SSH credential. @param signal - inspection lifetime. @returns current public status; unknown legacy policies retain read-only evidence.
+ */
+export async function inspectController(target: DeploymentConfig, role: 'node' | 'coordinator', token: string,
+  password: string | undefined, signal: AbortSignal): Promise<ControllerStatus> {
+  const response = await request({ ...target, remotePort: target.remotePort + (role === 'coordinator' ? 1 : 0) }, token, '/aspera/v1/health', 'GET', undefined, signal, password)
+  const parsed = z.object({ controller: controllerStatusSchema, features: z.array(z.string()) }).safeParse(response.value)
+  if (response.status === 200 && parsed.success && parsed.data.features.includes('controller-readiness-v1')) {
+    return { ...parsed.data.controller, ...(!parsed.data.features.includes('controller-maintenance-v1') ? { legacy: true } : {}) }
+  }
+  const legacy = await remote(target, `python3 -c ${shellQuote(`import glob,json,pathlib,stat,subprocess
+p=pathlib.Path(${JSON.stringify(target.remoteRoot + '/state/' + role + '.pid')})
+if not p.exists(): print(json.dumps({'running':False}))
+else:
+ pid=int(p.read_text().strip()); base=pathlib.Path('/proc')/str(pid)
+ if not base.exists(): print(json.dumps({'running':False}))
+ else:
+  entries=dict(item.split(b'=',1) for item in (base/'environ').read_bytes().split(b'\\0') if b'=' in item)
+  allowed=['DSH_EXPERIMENT_ROLE','DSH_CLUSTER_ROOT','DSH_EXPERIMENT_DEPLOYMENT_ID','DSH_EXPERIMENT_DEVICES','DSH_EXPERIMENT_BWRAP','DSH_EXPERIMENT_HIDDEN_PATHS_JSON','DSH_EXPERIMENT_GPU_SNAPSHOT']
+  devices=[p for pattern in ['/dev/nvidia[0-9]*','/dev/nvidiactl','/dev/nvidia-uvm','/dev/nvidia-uvm-tools','/dev/nvidia-modeset','/dev/nvidia-caps/nvidia-cap*'] for p in glob.glob(pattern) if stat.S_ISCHR(pathlib.Path(p).stat().st_mode)]
+  query_result=subprocess.run(['python3','-c',${JSON.stringify(gpuIdentityQueryScript)},'${target.toolTimeoutMs / 1000}'],capture_output=True,text=True,timeout=${target.toolTimeoutMs / 1000})
+  if query_result.returncode!=0: raise RuntimeError(query_result.stderr)
+  query=query_result.stdout
+  print(json.dumps({'running':True,'pid':pid,'processStart':(base/'stat').read_text().rsplit(')',1)[1].split()[19],'hostBootId':pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip(),'devices':devices,'query':query,'configuration':{key:entries.get(key.encode(),b'').decode() for key in allowed}}))`)}`, signal, password)
+  const observation = z.object({ running: z.literal(true), pid: z.number().int().positive(), processStart: z.string(), hostBootId: z.string(),
+    devices: z.array(z.string()), query: z.string(), configuration: z.record(z.string(), z.string()) }).safeParse(JSON.parse(legacy))
+  if (response.status === 200 && observation.success && observation.data.configuration.DSH_EXPERIMENT_GPU_SNAPSHOT) {
+    const value = observation.data; const saved = value.configuration
+    const policy = { backendPath: saved.DSH_EXPERIMENT_BWRAP ?? '', hiddenPaths: z.array(z.string()).parse(JSON.parse(saved.DSH_EXPERIMENT_HIDDEN_PATHS_JSON ?? 'null')),
+      devicePaths: normalizedSet((saved.DSH_EXPERIMENT_DEVICES ?? '').split(',').filter(Boolean)), gpu: gpuInventorySchema.parse(JSON.parse(saved.DSH_EXPERIMENT_GPU_SNAPSHOT!)) }
+    return controllerStatusSchema.parse({ version: 1, role: saved.DSH_EXPERIMENT_ROLE, deploymentId: saved.DSH_EXPERIMENT_DEPLOYMENT_ID,
+      root: saved.DSH_CLUSTER_ROOT, pid: value.pid, processStart: value.processStart, hostBootId: value.hostBootId,
+      bootId: `legacy:${value.hostBootId}:${value.pid}:${value.processStart}`, policy, policyDigest: controllerPolicyDigest(policy), legacy: true,
+      actualGpu: parseGpuInventory(value.query, value.devices), occupied: { experiments: [], allocations: [], commands: [], services: [] } })
+  }
+  throw new ControllerDiagnostic({ code: 'unknown', role, detail: `Original controller lacks verifiable GPU authorization or safe maintenance support. Release its tasks and stop or upgrade it without replacing its sealed release. Read-only observations: ${legacy}` })
+}
 
 /**
  * Check an original release before configuring its account, without requiring Node.
@@ -83,8 +155,12 @@ export async function ensureClusterRole(target: DeploymentConfig, prepared: Prep
   if (control.remotePort > 65535) throw new Error('coordinator port exceeds 65535')
   try {
     const health = await request(control, token, '/aspera/v1/health', 'GET', undefined, signal, password)
-    if (health.status === 200 && compatible(health.value)) return
-  } catch (error) { signal.throwIfAborted(); void error }
+    if (health.status === 200 && compatible(health.value)) {
+      const status = z.object({ controller: controllerStatusSchema }).safeParse(health.value)
+      verifyController(status.success ? status.data.controller : await inspectController(target, role, token, password, signal), target, prepared, role)
+      return
+    }
+  } catch (error) { signal.throwIfAborted(); if (error instanceof ControllerDiagnostic) throw error }
   const root = target.remoteRoot
   const release = target.storagePlacement?.releaseRoot ?? `${root}/releases/${prepared.deploymentId}`
   const pidFile = `${root}/state/${role}.pid`
@@ -103,6 +179,7 @@ ln ${shellQuote(incomingToken)} ${shellQuote(root + '/secrets/' + role + '.token
     DSH_EXPERIMENT_MODEL_CREDENTIAL_FILE: `${root}/secrets/${role}-model.json`,
     DSH_EXPERIMENT_LOG_FILE: `${root}/logs/${role}.log`, DSH_EXPERIMENT_DEPLOYMENT_ID: prepared.deploymentId,
     DSH_EXPERIMENT_DEVICES: prepared.devicePaths.join(','), DSH_EXPERIMENT_BWRAP: prepared.backendPath,
+    DSH_EXPERIMENT_GPU_SNAPSHOT: JSON.stringify(prepared.gpu),
     DSH_EXPERIMENT_HIDDEN_PATHS_JSON: JSON.stringify(prepared.hiddenPaths), DSH_EXPERIMENT_PORT: String(control.remotePort),
   }
   const executablePath = target.pathEntries?.length ? `export PATH=${shellQuote(target.pathEntries.join(':'))}:"$PATH"\n` : ''
@@ -123,7 +200,11 @@ echo "$!" > ${shellQuote(pidFile)}`, signal, password)
     signal.throwIfAborted()
     try {
       const health = await request(control, token, '/aspera/v1/health', 'GET', undefined, signal, password)
-      if (health.status === 200 && compatible(health.value)) return
+      if (health.status === 200 && compatible(health.value)) {
+        const status = z.object({ controller: controllerStatusSchema }).safeParse(health.value)
+        verifyController(status.success ? status.data.controller : await inspectController(target, role, token, password, signal), target, prepared, role)
+        return
+      }
       lastError = new Error(`control HTTP ${health.status}`)
     } catch (error) { lastError = error }
     const alive = await remote(target, `kill -0 "$(cat ${shellQuote(pidFile)})" 2>/dev/null && printf active || true`, signal, password)
@@ -160,13 +241,9 @@ export async function delegateClusterLogin(coordinator: DeploymentConfig, server
  * Capture prepared node facts for immutable admission.
  * @param server - selected node.
  * @param prepared - checked runtime.
- * @param target - connection target.
- * @param password - SSH password.
- * @param signal - cancellation.
  * @returns non-secret node inventory.
  */
-export async function describeClusterNode(server: ClusterServer, prepared: PreparedEnvironment, target: DeploymentConfig,
-  password: string | undefined, signal: AbortSignal): Promise<ClusterNode> {
+export async function describeClusterNode(server: ClusterServer, prepared: PreparedEnvironment): Promise<ClusterNode> {
   return { server, backendPath: prepared.backendPath, devicePaths: [...prepared.devicePaths], hiddenPaths: [...prepared.hiddenPaths],
-    gpuInfo: await remote(target, 'nvidia-smi -L', signal, password) }
+    gpuInfo: gpuInventoryText(prepared.gpu) }
 }

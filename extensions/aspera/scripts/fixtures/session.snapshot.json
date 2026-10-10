@@ -38,6 +38,62 @@
       "verify_preparation_environment"
     ]
   },
+  "controllerRecovery": {
+    "tools": [
+      "inspect_preparation_environment",
+      "repair_preparation_controller",
+      "verify_preparation_environment"
+    ],
+    "stoppedRoles": [
+      "node"
+    ],
+    "diagnosticsLogged": true,
+    "verified": true
+  },
+  "sshHandshakeRecovery": {
+    "connectionAttempts": 3,
+    "commandCount": 1,
+    "diagnosticsLogged": true,
+    "credentialsHidden": true,
+    "verified": true
+  },
+  "sandboxPreparation": {
+    "repair": {
+      "tools": [
+        "inspect_preparation_environment",
+        "run_preparation_command",
+        "verify_preparation_environment"
+      ],
+      "diagnosticsLogged": true,
+      "toolDiagnosticsLogged": true,
+      "credentialsHidden": true,
+      "handoverRecorded": true,
+      "ready": true
+    },
+    "blocked": {
+      "tools": [
+        "inspect_preparation_environment",
+        "run_preparation_command",
+        "verify_preparation_environment",
+        "report_preparation_blocked"
+      ],
+      "diagnosticsLogged": true,
+      "toolDiagnosticsLogged": true,
+      "credentialsHidden": true,
+      "handoverRecorded": false,
+      "ready": false
+    },
+    "claim": {
+      "tools": [
+        "inspect_preparation_environment"
+      ],
+      "diagnosticsLogged": true,
+      "toolDiagnosticsLogged": true,
+      "credentialsHidden": true,
+      "handoverRecorded": false,
+      "ready": false
+    }
+  },
   "executionOverview": {
     "actualPlanSteps": 3,
     "savedNodes": 2,

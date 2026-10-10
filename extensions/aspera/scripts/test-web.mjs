@@ -130,8 +130,9 @@ try {
     // Fixture mutations use fresh connections across the browser's offline transition.
     const response = await page.request.get(new URL(`/aspera-test/${action}${id === undefined ? '' : '?id=' + id}`, app.url).href,
       { headers: { connection: 'close' } })
-    assert.equal(response.status(), 200)
-    return response.json()
+    const value = await response.json()
+    assert.equal(response.status(), 200, JSON.stringify(value))
+    return value
   }
   await control('hold-host-key')
   const checkConnection = coordinator.getByRole('button', { name: /^(检查连接|检查中…|Check connection|Checking…)$/ })
@@ -373,8 +374,69 @@ try {
   const dispatchEvents = final.events.filter(item => item.sessionId === first.sessionId)
   const overview = await checkExecutionOverview(page, control, create, browser, app.url, resolve(root, '.artifacts'))
   const managementDeletion = await checkExperimentManagement(page, control, resolve(root, '.artifacts'))
+  await control('controller-recovery')
+  let controllerRecovered
+  await expect(async () => {
+    controllerRecovered = (await control()).experiments.find(row => row.request.objective === 'CPU controller recovery')
+    if (controllerRecovered?.state === 'failed') throw new Error(controllerRecovered.detail)
+    assert.equal(controllerRecovered?.handoverRecorded, true)
+  }).toPass({ timeout: 40000 })
+  const controllerState = await control()
+  const controllerRecovery = {
+    tools: controllerState.environmentCalls.filter(call => call.experimentId === controllerRecovered.request.experimentId && call.step === 'controller').map(call => call.name),
+    stoppedRoles: controllerState.controllerStops.map(stop => stop.role),
+    diagnosticsLogged: controllerState.events.some(item => item.sessionId === controllerRecovered.sessionId && item.event.type === 'user/message' && JSON.stringify(item.event.data).includes('configuration-outdated')),
+    verified: controllerRecovered.preparation.environments.every(environment => environment.phase === 'environment-ready'),
+  }
+  assert.deepEqual(controllerRecovery, { tools: ['inspect_preparation_environment', 'repair_preparation_controller', 'verify_preparation_environment'], stoppedRoles: ['node'], diagnosticsLogged: true, verified: true })
+  await control('ssh-handshake-recovery')
+  let handshakeRecovered
+  await expect(async () => {
+    handshakeRecovered = (await control()).experiments.find(row => row.request.objective === 'CPU SSH handshake recovery')
+    if (handshakeRecovered?.state === 'failed') throw new Error(handshakeRecovered.detail)
+    assert.equal(handshakeRecovered?.handoverRecorded, true)
+  }).toPass({ timeout: 40000 })
+  const handshakeState = await control()
+  const handshakeEvents = handshakeState.events.filter(item => item.sessionId === handshakeRecovered.sessionId)
+  const sshHandshakeRecovery = { ...handshakeState.sshHandshakeRecovery,
+    diagnosticsLogged: handshakeEvents.some(item => item.event.type === 'user/message' && JSON.stringify(item.event.data).includes('CPU SSH handshake recovered')),
+    credentialsHidden: !JSON.stringify(handshakeEvents).includes('cpu-only-handshake-password'),
+    verified: handshakeRecovered.preparation.environments.every(environment => environment.phase === 'environment-ready') }
+  assert.deepEqual(sshHandshakeRecovery, { connectionAttempts: 3, commandCount: 1, diagnosticsLogged: true, credentialsHidden: true, verified: true })
+  const sandboxPreparation = {}
+  for (const scenario of ['repair', 'blocked', 'claim']) {
+    await control('sandbox-' + scenario)
+    let experiment
+    await expect(async () => {
+      experiment = (await control()).experiments.find(row => row.request.objective === 'CPU sandbox ' + scenario)
+      if (scenario === 'repair') {
+        if (experiment?.state === 'failed') throw new Error(experiment.detail)
+        assert.equal(experiment?.handoverRecorded, true)
+      } else assert.equal(experiment?.state, 'failed')
+    }).toPass({ timeout: 40000 })
+    const state = await control()
+    const logged = state.events.filter(item => item.sessionId === experiment.sessionId)
+    const tools = state.environmentCalls.filter(call => call.experimentId === experiment.request.experimentId).map(call => call.name)
+    sandboxPreparation[scenario] = {
+      tools,
+      diagnosticsLogged: logged.some(item => item.event.type === 'user/message' && JSON.stringify(item.event.data).includes("Can't mount proc")),
+      toolDiagnosticsLogged: logged.some(item => item.event.type.includes('tool') && JSON.stringify(item.event.data).includes('requiresPlatformAction')),
+      credentialsHidden: !JSON.stringify(logged).includes('cpu-only-sandbox-password'),
+      handoverRecorded: experiment.handoverRecorded === true,
+      ready: experiment.preparation.environments.every(environment => environment.phase === 'environment-ready'),
+    }
+    assert.deepEqual(tools, scenario === 'claim' ? ['inspect_preparation_environment']
+      : ['inspect_preparation_environment', 'run_preparation_command', 'verify_preparation_environment', ...(scenario === 'blocked' ? ['report_preparation_blocked'] : [])])
+    assert.equal(sandboxPreparation[scenario].diagnosticsLogged, true)
+    assert.equal(sandboxPreparation[scenario].toolDiagnosticsLogged, true)
+    assert.equal(sandboxPreparation[scenario].credentialsHidden, true)
+    assert.equal(sandboxPreparation[scenario].handoverRecorded, scenario === 'repair')
+    assert.equal(sandboxPreparation[scenario].ready, scenario === 'repair')
+    if (scenario === 'blocked') assert.ok(experiment.detail.includes('cloud platform'))
+    if (scenario === 'claim') assert.ok(experiment.detail.includes('without passing environment verification'))
+  }
   const snapshot = {
-    managementChecks, managementDeletion, serverRegistration, installationRecovery, executionOverview: overview.facts,
+    managementChecks, managementDeletion, serverRegistration, installationRecovery, controllerRecovery, sshHandshakeRecovery, sandboxPreparation, executionOverview: overview.facts,
     overviewPhases: { planning: planningPipeline, approval: approvalPipeline, execution: executionPipeline, queued: queuedPipeline, retry: retryPipeline, completed: completedPipeline, question: questionPipeline },
     stageCards: { preparation: preparationFailureStage, remote: remoteFailureStage, retryRetainsSession: afterRetry.sessionId === beforeRetry.sessionId,
       recoveryHandover: final.events.filter(item => item.sessionId === afterRetry.sessionId && item.event.type === 'user/message'

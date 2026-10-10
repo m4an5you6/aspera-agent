@@ -10,6 +10,7 @@ Aspera 扩展 `0.1.1` 使用远端协议 `4` 和本地 fleet 存储第 `6` 代�
 
 - [持久归属](#persistent-ownership)
 - [回执与 Goal](#receipts-and-goals)
+- [控制进程就绪与恢复](#controller-readiness)
 - [接口使用方](#api-consumers)
 - [执行步骤进度](#execution-step-progress)
 - [日志、产物和服务](#logs-outputs-and-services)
@@ -67,6 +68,17 @@ Host 先持久保存完整回执，再追加接管消息并完成派发 Goal。�
 半自动确认绑定显示的计划版本。同一版本重复确认是幂等操作，不同版本会失败。提交的要求不能原地修改；新的要求通过新实验重新确认。全自动策略确认与用户确认分别记录。
 
 半自动问题绑定实验、Session、工具调用和固定的问题版本。调度服务先持久保存问题，再暂停 Goal；已有受管进程继续受到监控。回复先校验并保存，再交付原调用并恢复同一 Goal。相同回复重试是幂等操作；冲突、过期问题以及已取消或中断的任务不能恢复执行。重启将待回复问题报告为中断并使其过期，不重放工具。
+
+-----
+
+<a id="controller-readiness"></a>
+## 控制进程就绪与恢复
+
+准备 Agent 在原 Session 中调用环境探测、`repair_preparation_controller` 和复验。程序比较实际 GPU UUID、可访问字符设备和控制进程启动授权；集合排序避免顺序不同产生误报。交接重新核对全部验收过的控制进程身份和配置摘要，新节点分配时独立再次探测硬件。已提交的 GPU 要求变化时，复制实验而不改写记录。
+
+经过认证的健康接口声明 `controller-readiness-v1` 和 `controller-maintenance-v1`。维护操作检查调度端等待及活动任务、节点分配、命令和推理服务，再原子阻止新任务接入。修复工具自行解析 PID、Linux 启动身份、宿主启动身份、路径和固定发布，等待身份匹配的进程退出及端口释放后启动该发布。占用、未知及旧维护接口情形保留具体阻塞。限定进程字段仅允许在启动 GPU 证据和原发布匹配时只读复用；缺少证据不视为兼容。
+
+修复回执位于 `$DSH_HOME/aspera-controller-repairs/<experiment>/<server>-<role>.v1.json`；远端停止和退出证据属于实验运行目录。版本 1 固定 `controllerRepairMaxAttempts` 默认的两次上限、进程身份、阶段、结果及带时间的验收记录。恢复在再次修改前核对回执；确认停止或验证新进程后可继续，结果未决时仍然阻塞。本机删除保留未决归属回执，确认释放后才清理；可选的远端清理随专属运行目录删除停止回执。独立格式保留 fleet 第 6 代、远端协议 4 和 Session 格式。`FleetDriver` 提供方在已有部署操作之外实现经过认证的 `inspectController`。
 
 -----
 

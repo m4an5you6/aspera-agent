@@ -26,6 +26,7 @@ async function fixture() {
   const commands: string[] = []
   const uploaded: Buffer[] = []
   const requests: { path: string | undefined; auth: string | undefined; body: string }[] = []
+  let connections = 0
   let notifyCommand = () => {}
   const commandStarted = new Promise<void>((resolve) => { notifyCommand = resolve })
   const receiver = httpServer((req, res) => {
@@ -39,6 +40,7 @@ async function fixture() {
     })
   })
   const server = new ssh2.Server({ hostKeys: [privateKey] }, (client) => {
+    connections++
     clients.add(client)
     closed.push(new Promise<void>(resolve => client.once('close', () => { clients.delete(client); resolve() })))
     // Rejected host keys and aborted clients intentionally terminate the handshake.
@@ -55,6 +57,7 @@ async function fixture() {
           const channel = accept()
           commands.push(info.command)
           notifyCommand()
+          if (info.command.includes('fixture-disconnect')) { client.end(); return }
           if (info.command.includes('hold')) return
           channel.write('remote output')
           if (info.command.includes('fixture-fail')) channel.stderr.write('package download failed')
@@ -104,7 +107,44 @@ async function fixture() {
     host: '127.0.0.1', username: 'ubuntu', sshPort: sshAddress.port, remotePort: httpAddress.port,
     authMode: 'password', identityFile: join(root, 'unused-key'), knownHostsFile, toolTimeoutMs: 10_000,
   }
-  return { root, target, password, methods, commands, uploaded, requests, commandStarted }
+  return { root, target, password, methods, commands, uploaded, requests, commandStarted, connections: () => connections }
+}
+
+async function handshakeProxy(f: Awaited<ReturnType<typeof fixture>>, blocked: number, reset: boolean) {
+  let connections = 0
+  const firstClosed = Promise.withResolvers<void>()
+  const sockets = new Set<Socket>()
+  const closed: Promise<void>[] = []
+  const own = (socket: Socket) => {
+    sockets.add(socket)
+    closed.push(new Promise<void>(resolve => socket.once('close', () => { sockets.delete(socket); resolve() })))
+    socket.on('error', () => {}) // Reconnection deliberately resets unauthenticated sockets.
+  }
+  const server = tcpServer(socket => {
+    own(socket)
+    connections++
+    if (connections === 1) socket.once('close', () => firstClosed.resolve())
+    if (connections <= blocked) {
+      if (reset) socket.destroy()
+      return
+    }
+    const upstream = connect(f.target.sshPort, '127.0.0.1')
+    own(upstream)
+    socket.once('close', () => upstream.destroy())
+    upstream.once('close', () => socket.destroy())
+    socket.pipe(upstream).pipe(socket)
+  })
+  onTestFinished(async () => {
+    for (const socket of sockets) socket.destroy()
+    await Promise.all([...closed, new Promise<void>(resolve => server.close(() => { resolve() }))])
+  })
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  if (address === null || typeof address === 'string') throw new Error('Missing handshake proxy address')
+  const knownHostsFile = join(f.root, 'proxy-known-hosts')
+  const keys = await readFile(f.target.knownHostsFile!, 'utf8')
+  await writeFile(knownHostsFile, keys.replace(`[127.0.0.1]:${f.target.sshPort}`, `[127.0.0.1]:${address.port}`))
+  return { target: { ...f.target, sshPort: address.port, knownHostsFile }, connections: () => connections, firstClosed: firstClosed.promise }
 }
 
 it('uses the exact password for commands without trying a saved key', async () => {
@@ -136,6 +176,7 @@ it('rejects a wrong password without falling back to keys or exposing its value'
   await expect(remote(f.target, 'echo ready', undefined, 'wrong-secret')).rejects.toThrow('SSH password login failed')
   expect(f.methods).toEqual(['password'])
   expect(f.commands).toEqual([])
+  expect(f.connections()).toBe(1)
 })
 
 it('rejects a changed host key before sending the password', async () => {
@@ -143,6 +184,7 @@ it('rejects a changed host key before sending the password', async () => {
   await writeFile(f.target.knownHostsFile!, `[127.0.0.1]:${f.target.sshPort} ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAAQ==\n`)
   await expect(remote(f.target, 'echo ready', undefined, f.password)).rejects.toThrow('does not match known_hosts')
   expect(f.methods).toEqual([])
+  expect(f.connections()).toBe(1)
 })
 
 it('rejects an unknown server before opening a connection', async () => {
@@ -276,4 +318,83 @@ it('marks an interrupted SSH command as unconfirmed instead of treating the disc
   await f.commandStarted
   abort.abort()
   expect(await pending).toMatchObject({ cancelled: true, timedOut: false, exitConfirmed: false, exitCode: null })
+})
+
+it('reconnects before authentication and runs the command exactly once after two failed handshakes', async () => {
+  const f = await fixture()
+  const proxy = await handshakeProxy(f, 2, true)
+  const result = await remoteResult({ ...proxy.target, sshHandshakeMaxRetries: 2, sshHandshakeRetryDelayMs: 0 }, 'echo ready', undefined, f.password)
+  expect(result).toMatchObject({ stdout: 'remote output', exitCode: 0, exitConfirmed: true })
+  expect(proxy.connections()).toBe(3)
+  expect(f.methods).toEqual(['password'])
+  expect(f.commands).toEqual(["sh -c 'echo ready'"])
+})
+
+it('reconnects after a handshake timeout while preserving the operation deadline', async () => {
+  const f = await fixture()
+  const proxy = await handshakeProxy(f, 1, false)
+  const result = await remoteResult({ ...proxy.target, toolTimeoutMs: 20000, sshHandshakeTimeoutMs: 2000,
+    sshHandshakeMaxRetries: 1, sshHandshakeRetryDelayMs: 0 }, 'echo ready', undefined, f.password)
+  expect(result.exitConfirmed).toBe(true)
+  expect(proxy.connections()).toBe(2)
+  expect(f.commands).toEqual(["sh -c 'echo ready'"])
+})
+
+it.each([0, 1])('stops after the configured %i handshake reconnections without sending a command', async retries => {
+  const f = await fixture()
+  const proxy = await handshakeProxy(f, Number.POSITIVE_INFINITY, true)
+  await expect(remoteResult({ ...proxy.target, sshHandshakeMaxRetries: retries, sshHandshakeRetryDelayMs: 0 }, 'echo ready', undefined, f.password))
+    .rejects.toMatchObject({ name: 'SshConnectionError', message: expect.stringContaining(`${retries + 1} connection attempt`) })
+  expect(proxy.connections()).toBe(retries + 1)
+  expect(f.methods).toEqual([])
+  expect(f.commands).toEqual([])
+})
+
+it('expires the original operation deadline during reconnect backoff without opening another connection', async () => {
+  const f = await fixture()
+  const proxy = await handshakeProxy(f, Number.POSITIVE_INFINITY, true)
+  await expect(remoteResult({ ...proxy.target, toolTimeoutMs: 2000, sshHandshakeMaxRetries: 2,
+    sshHandshakeRetryDelayMs: 5000 }, 'echo ready', undefined, f.password))
+    .rejects.toMatchObject({ name: 'SshConnectionError', result: { timedOut: true, exitConfirmed: false } })
+  expect(proxy.connections()).toBe(1)
+  expect(f.commands).toEqual([])
+})
+
+it('cancels reconnection without opening another connection or sending a command', async () => {
+  const f = await fixture()
+  const proxy = await handshakeProxy(f, Number.POSITIVE_INFINITY, true)
+  const abort = new AbortController()
+  const pending = remoteResult({ ...proxy.target, sshHandshakeMaxRetries: 2, sshHandshakeRetryDelayMs: 5000 }, 'echo ready', abort.signal, f.password)
+  const rejected = expect(pending).rejects.toMatchObject({ name: 'SshConnectionError', result: { cancelled: true, exitConfirmed: false } })
+  await proxy.firstClosed
+  abort.abort(new Error('Cancelled by the connection check deadline'))
+  await rejected
+  expect(proxy.connections()).toBe(1)
+  expect(f.commands).toEqual([])
+})
+
+it('retains an unconfirmed command outcome without replaying after authentication', async () => {
+  const f = await fixture()
+  await expect(remoteResult({ ...f.target, sshHandshakeMaxRetries: 2, sshHandshakeRetryDelayMs: 0 }, 'fixture-disconnect', undefined, f.password))
+    .rejects.toMatchObject({ name: 'SshConnectionError', result: { exitConfirmed: false } })
+  expect(f.connections()).toBe(1)
+  expect(f.commands).toEqual(["sh -c 'fixture-disconnect'"])
+})
+
+it.each(['upload', 'request'] as const)('reconnects before an authenticated %s without duplicating its operation', async operation => {
+  const f = await fixture()
+  const proxy = await handshakeProxy(f, 1, true)
+  const target = { ...proxy.target, sshHandshakeMaxRetries: 1, sshHandshakeRetryDelayMs: 0 }
+  if (operation === 'upload') {
+    const source = join(f.root, 'reconnect-source')
+    await writeFile(source, 'private transfer')
+    await copy(target, source, '/private/reconnect', undefined, f.password)
+    expect(Buffer.concat(f.uploaded).toString()).toBe('private transfer')
+  } else {
+    const result = await request(target, 'receiver-token', '/experiment/v1/submit', 'POST', { objective: 'train' }, undefined, f.password)
+    expect(result.status).toBe(200)
+    expect(f.requests).toHaveLength(1)
+  }
+  expect(proxy.connections()).toBe(2)
+  expect(f.methods).toEqual(['password'])
 })

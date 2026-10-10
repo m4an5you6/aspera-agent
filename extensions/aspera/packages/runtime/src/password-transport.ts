@@ -2,12 +2,14 @@
 import { createReadStream } from 'node:fs'
 import { request as httpRequest } from 'node:http'
 import { pipeline } from 'node:stream/promises'
+import { setTimeout as delay } from 'node:timers/promises'
 import ssh2 from 'ssh2'
 import type { Client, ClientChannel, SFTPWrapper } from 'ssh2'
 import type { Target } from './transport.ts'
 import { RemoteCommandError, SshConnectionError } from './command-result.ts'
 import type { RemoteCommandResult } from './command-result.ts'
 import { verifiedHostKeys } from './ssh-host-keys.ts'
+import { resolveSshConnectionPolicy } from './ssh-connection.ts'
 
 async function withPassword<T>(
   target: Target, password: string | undefined, timeoutMs: number, signal: AbortSignal | undefined,
@@ -19,43 +21,72 @@ async function withPassword<T>(
   }
   const timeout = AbortSignal.timeout(timeoutMs)
   const lifetime = signal === undefined ? timeout : AbortSignal.any([signal, timeout])
+  const policy = resolveSshConnectionPolicy(target)
   const { keys, algorithms } = await verifiedHostKeys(target, lifetime)
-  lifetime.throwIfAborted()
-  const client = new ssh2.Client()
-  let rejectedKey = false
-  let started = false
-  const closed = new Promise<void>(resolve => client.once('close', () => { resolve() }))
-  let abort = () => {}
-  const stopped = new Promise<never>((_resolve, reject) => {
-    abort = () => { reject(lifetime.reason instanceof Error ? lifetime.reason : new Error('SSH operation cancelled')) }
-    lifetime.addEventListener('abort', abort, { once: true })
-    client.on('error', (error: Error & { level?: string }) => {
-      reject(new Error(rejectedKey ? 'SSH server key does not match known_hosts'
-        : error.level === 'client-authentication'
-          ? 'SSH password login failed; check the username, password and server password-login policy'
-          : `SSH connection failed: ${error.message}`))
+  for (let retry = 0; ; retry++) {
+    lifetime.throwIfAborted()
+    const client = new ssh2.Client()
+    let rejectedKey = false
+    let started = false
+    let authenticated = false
+    let retryable = false
+    let failureRecorded = false
+    let failure: unknown
+    const closed = new Promise<void>(resolve => client.once('close', () => { resolve() }))
+    let abort = () => {}
+    const stopped = new Promise<never>((_resolve, reject) => {
+      const fail = (error: Error, reconnect: boolean) => {
+        if (failureRecorded) return
+        failureRecorded = true
+        retryable = reconnect && !authenticated && !rejectedKey && !lifetime.aborted
+        reject(error)
+      }
+      abort = () => { fail(lifetime.reason instanceof Error ? lifetime.reason : new Error('SSH operation cancelled'), false) }
+      lifetime.addEventListener('abort', abort, { once: true })
+      client.on('error', (error: Error & { level?: string; code?: string }) => {
+        const reconnect = error.level === 'client-timeout' || error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT'
+          || error.message === 'Connection lost before handshake'
+        fail(new Error(rejectedKey ? 'SSH server key does not match known_hosts'
+          : error.level === 'client-authentication'
+            ? 'SSH password login failed; check the username, password and server password-login policy'
+            : `SSH connection failed: ${error.message}`), error.level !== 'client-authentication' && reconnect)
+      })
+      client.once('close', () => { fail(new Error('SSH connection closed before the operation completed'), true) })
     })
-    client.once('close', () => { reject(new Error('SSH connection closed before the operation completed')) })
-  })
-  const ready = new Promise<void>(resolve => client.once('ready', () => { resolve() }))
-  try {
-    client.connect({
-      host: target.host, port: target.sshPort, username: target.username, password,
-      authHandler: ['password'], tryKeyboard: false, readyTimeout: Math.min(timeoutMs, 15_000),
-      algorithms: { serverHostKey: algorithms },
-      hostVerifier: (key: Buffer) => {
-        const trusted = keys.has(key.toString('base64'))
-        rejectedKey = !trusted
-        return trusted
-      },
-    })
-    started = true
-    await Promise.race([ready, stopped])
-    return await Promise.race([operation(client, lifetime), stopped])
-  } finally {
-    lifetime.removeEventListener('abort', abort)
-    client.destroy()
-    if (started) await closed
+    const ready = new Promise<void>(resolve => client.once('ready', () => { authenticated = true; resolve() }))
+    try {
+      client.connect({
+        host: target.host, port: target.sshPort, username: target.username, password,
+        authHandler: ['password'], tryKeyboard: false, readyTimeout: Math.min(timeoutMs, policy.sshHandshakeTimeoutMs),
+        algorithms: { serverHostKey: algorithms },
+        hostVerifier: (key: Buffer) => {
+          const trusted = keys.has(key.toString('base64'))
+          rejectedKey = !trusted
+          return trusted
+        },
+      })
+      started = true
+      await Promise.race([ready, stopped])
+      lifetime.throwIfAborted()
+      return await Promise.race([operation(client, lifetime), stopped])
+    } catch (error) {
+      failure = error
+    } finally {
+      lifetime.removeEventListener('abort', abort)
+      client.destroy()
+      if (started) await closed
+    }
+    lifetime.throwIfAborted()
+    if (!retryable || retry >= policy.sshHandshakeMaxRetries) {
+      if (!authenticated && !rejectedKey && retryable) throw new Error(`SSH connection failed after ${retry + 1} connection attempt${retry === 0 ? '' : 's'}: ${String(failure)}`)
+      throw failure
+    }
+    try {
+      await delay(Math.min(policy.sshHandshakeRetryDelayMs * (retry + 1), 2_147_483_647), undefined, { signal: lifetime })
+    } catch (error) {
+      lifetime.throwIfAborted()
+      throw error
+    }
   }
 }
 

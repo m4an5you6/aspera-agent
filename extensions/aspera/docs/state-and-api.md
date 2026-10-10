@@ -10,6 +10,7 @@ Aspera extension `0.1.1` uses remote protocol `4` and local fleet storage genera
 
 - [Persistent ownership](#persistent-ownership)
 - [Receipts and Goals](#receipts-and-goals)
+- [Controller readiness and recovery](#controller-readiness)
 - [API consumers](#api-consumers)
 - [Execution step progress](#execution-step-progress)
 - [Logs, outputs and services](#logs-outputs-and-services)
@@ -67,6 +68,17 @@ The Host persists the complete receipt before appending the handover message and
 Semi-mode confirmation references the displayed plan revision. Duplicate confirmation of that revision is idempotent; a different revision fails. Submitted requirements cannot be edited in place. New requirements use a new experiment and approval. Automatic policy confirmation is stored separately from user confirmation.
 
 A semi-mode question binds its experiment, Session, tool call and immutable question revision. The coordinator persists it before the Goal pauses; active managed processes remain monitored. A reply is validated and saved before delivery to the original call and resumption of the same Goal. Identical reply retries are idempotent; conflicts, expired questions and cancelled or interrupted tasks cannot resume execution. Restart reports pending questions as interrupted and expires them rather than replaying the tool.
+
+-----
+
+<a id="controller-readiness"></a>
+## Controller readiness and recovery
+
+The preparation Agent calls environment inspection, `repair_preparation_controller` and verification in its original Session. Program checks compare actual GPU UUIDs, accessible character devices and the controller's startup authorization; sorted sets avoid order-dependent differences. Handover rechecks every accepted controller identity and policy digest, and new node allocation independently probes hardware again. A changed submitted GPU requirement requires a copied experiment rather than rewritten records.
+
+Authenticated health advertises `controller-readiness-v1` and `controller-maintenance-v1`. Maintenance checks queued and active coordinator tasks, node allocations, commands and inference services, then atomically fences admission. The repair tool derives the PID, Linux start identity, host boot identity, paths and fixed release itself. It waits for identity-bound process exit and port release before starting that release. Busy, unknown and legacy maintenance cases retain concrete blockers. Whitelisted legacy process settings allow read-only reuse only when startup GPU evidence and the original release match; missing evidence never counts as compatibility.
+
+Repair receipts live under `$DSH_HOME/aspera-controller-repairs/<experiment>/<server>-<role>.v1.json`; remote stop and exit evidence belongs to the experiment's run directory. Version 1 pins the default two-attempt limit from `controllerRepairMaxAttempts`, process identities, stages, outcomes and timestamped acceptance. Recovery checks these receipts before another mutation; a confirmed stop or verified replacement can resume, while ambiguous outcomes remain blocked. Local deletion retains unresolved ownership journals until release is confirmed; optional remote cleanup removes stop receipts with the owned run. This independent format leaves fleet generation 6, remote protocol 4 and Session format unchanged. `FleetDriver` implementations provide authenticated `inspectController` alongside existing deployment operations.
 
 -----
 

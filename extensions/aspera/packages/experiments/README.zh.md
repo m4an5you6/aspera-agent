@@ -30,6 +30,8 @@ kind: "package-library"
 
 问题和回复与队列修改串行处理。暂停前保存未回答问题，交付前保存一份经校验的回复，重试使用原问题版本。取消使未回答问题过期，恢复过程报告中断而不启动新的 Agent。[状态与接口](../../docs/state-and-api.zh.md)定义兼容性和回复身份。
 
+调度进程维护与任务接收共用串行机制。`beginMaintenance` 要求不存在等待、计划、执行或服务中的任务，也没有未确认释放的资源；操作身份阻止其他调用者解除维护状态。[controller-protocol.ts](src/controller-protocol.ts) 校验 GPU 观测、进程身份和经过认证的维护请求，不改变实验提交或 Session 数据。
+
 -----
 
 <a id="understand-the-implementation"></a>

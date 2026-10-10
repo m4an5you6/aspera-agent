@@ -3,10 +3,12 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { resolve, join, dirname } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { create, extract } from 'tar'
 import { chromium } from '@playwright/test'
 import { snapshotSource, verifySourceArchive } from '../packages/dispatch/lib/snapshot.js'
 import { command, launchProfile, openAspera, removeTestDirectory } from './test-app.mjs'
+import { checkGpuIdentityQuery } from './test-controller-query.mjs'
 
 const root = resolve(import.meta.dirname, '..')
 const installRoot = mkdtempSync(join(tmpdir(), 'aspera-installed-'))
@@ -46,6 +48,14 @@ try {
     }
     assert.ok(existsSync(resolve(packageRoot, 'LICENSE')))
   }
+  const { gpuIdentityQueryScript } = await import(pathToFileURL(resolve(installRoot, 'node_modules/@aspera/runtime/lib/gpu-query.js')).href)
+  const { parseGpuInventory } = await import(pathToFileURL(resolve(installRoot, 'node_modules/@aspera/experiments/lib/controller-protocol.js')).href)
+  checkGpuIdentityQuery(gpuIdentityQueryScript, parseGpuInventory)
+  const { experimentSandboxArgv } = await import(pathToFileURL(resolve(installRoot, 'node_modules/@aspera/runtime/lib/experiment-sandbox.js')).href)
+  const sandboxArgs = experimentSandboxArgv({ backendPath: '/usr/bin/bwrap', workspaceRoot: '/fixture/workspace',
+    devicePaths: ['/dev/nvidia3'], hiddenPaths: ['/fixture/control'] }, ['true'])
+  for (const flag of ['--unshare-user', '--unshare-pid', '--unshare-ipc', '--unshare-uts', '--clearenv']) assert.ok(sandboxArgs.includes(flag))
+  assert.deepEqual(sandboxArgs.slice(-2), ['--', 'true'])
   writeFileSync(resolve(installRoot, 'consumer.mts'), `import type { FleetCreateRequest } from '@aspera/dispatch/types'\nimport { TYPERT_REMOTE } from '@aspera/dispatch/remote'\nimport { serverRemovalBlockers } from '@aspera/dispatch/server-usage'\nimport { prepareSshHostKey } from '@aspera/runtime/transport'\nimport { clusterSubmissionSchema, executionProgressReadSchema } from '@aspera/experiments'\nimport type { ExecutionProgressRead } from '@aspera/experiments/types'\nimport { setupWorkerProfile } from '@aspera/runtime'\nconst model = {provider:'qwen-chat',model:'qwen-test'}\nconst request: FleetCreateRequest = {experimentId:'draft',objective:'train',serverIds:[],coordinatorId:'node',mode:'semi',models:{preparation:model,planning:model,execution:model},uploads:[{name:'data.json',size:0}]}\nconst progress: ExecutionProgressRead = executionProgressReadSchema.parse({supported:false})\nvoid [request, progress, TYPERT_REMOTE, serverRemovalBlockers, prepareSshHostKey, clusterSubmissionSchema, setupWorkerProfile]\n`)
   await command(process.execPath, [resolve(root, 'node_modules/typescript/bin/tsc'), 'consumer.mts', '--noEmit', '--strict', '--skipLibCheck', '--module', 'NodeNext', '--target', 'ES2024'], installRoot)
   const repacked = await snapshotSource(installRoot, 120000)

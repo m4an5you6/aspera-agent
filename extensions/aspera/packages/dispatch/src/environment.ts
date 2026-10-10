@@ -8,6 +8,7 @@ import type { ServerEnvironment, PreparedToolchain } from '@aspera/experiments'
 import { remote, remoteResult, RemoteCommandError, shellQuote } from './transport.ts'
 import type { Target } from './transport.ts'
 import { SavedReleaseUnavailable, verifySavedRelease } from './cluster-deploy.ts'
+import { experimentIsolationArgs } from '@aspera/runtime'
 
 /** Runtime requirements owned by the source release manifest. */
 export interface EnvironmentRequirements { node: string; pnpm: string }
@@ -84,7 +85,7 @@ for program in node pnpm python3 bwrap; do
   fi
 done
 if command -v bwrap >/dev/null 2>&1; then
-  bwrap --ro-bind / / --dev /dev --unshare-pid --proc /proc --die-with-parent -- true
+  bwrap ${experimentIsolationArgs().map(shellQuote).join(' ')} -- true
   sandbox_status=$?
 else sandbox_status=127; fi
 printf 'ASPERA_SANDBOX=%s\\n' "$sandbox_status"

@@ -13,6 +13,7 @@ import type { EnvironmentDriver, EnvironmentPreparationInput } from '../src/envi
 import type { EnvironmentProgress } from '../src/types.ts'
 import type { RemoteCommandResult } from '../src/transport.ts'
 import { readyEnvironment } from './environment-fixture.ts'
+import { SandboxVerificationError } from '../src/sandbox-verification.ts'
 
 interface RegisteredTool {
   name: string
@@ -203,6 +204,37 @@ it('reports platform restrictions without accepting an unverified sandbox', asyn
   expect(f.driver.remoteResult).not.toHaveBeenCalled()
 })
 
+it('gives the original Agent the exact sandbox refusal and requires revalidation after repair', async () => {
+  const f = fixture(); f.input.operation = 'deployment'
+  let repaired = false
+  const refused = new SandboxVerificationError('sandbox-launch', '/usr/bin/bwrap', {
+    exitCode: 1, stdout: '', stderr: "bwrap: Can't mount proc on /newroot/proc: Operation not permitted\n" })
+  vi.mocked(f.driver.remoteResult).mockImplementation(async () => { repaired = true; return f.result })
+  f.loop(async () => {
+    const inspection = JSON.parse(await f.call('inspect_preparation_environment'))
+    expect(inspection.latestVerification).toMatchObject({ ready: false, diagnostic: {
+      requiresPlatformAction: true, stderr: refused.diagnostic.stderr } })
+    await f.call('run_preparation_command', { command: 'repair compatible account configuration' })
+    expect(f.progress.at(-1)?.phase).not.toBe('environment-ready')
+    await f.call('verify_preparation_environment', { path_entries: [] })
+  })
+  const verify = vi.fn(async () => { if (!repaired) throw refused; return 'full sandbox verified' })
+  expect((await f.ensure(verify)).value).toBe('full sandbox verified')
+  expect(verify).toHaveBeenCalledTimes(2)
+  const context = JSON.stringify(f.followup.mock.calls)
+  expect(context).toContain("Can't mount proc")
+  expect(context).not.toContain(f.input.password)
+})
+
+it('blocks a container permission refusal when an Agent declares completion without verification', async () => {
+  const f = fixture()
+  f.loop(async () => {})
+  await expect(f.ensure(async () => { throw new SandboxVerificationError('sandbox-launch', '/usr/bin/bwrap', {
+    exitCode: 1, stdout: '', stderr: "bwrap: Can't mount proc on /newroot/proc: Operation not permitted" }) }))
+    .rejects.toThrow('without passing environment verification')
+  expect(f.progress.some(value => value.phase === 'environment-ready')).toBe(false)
+})
+
 it('retains an unconfirmed mutation and refuses to repeat it on retry', async () => {
   const f = fixture()
   vi.mocked(f.driver.remoteResult).mockResolvedValue({ ...f.result, exitCode: null, timedOut: true, exitConfirmed: false })
@@ -228,6 +260,27 @@ it('requires its command exit record even if the SSH shell reported an exit', as
   expect(f.progress.at(-1)?.pendingCommand).toBeDefined()
 })
 
+it('requires the original Agent to call verification after a scoped controller repair', async () => {
+  const f = fixture(); f.input.operation = 'controller'; let repaired = false
+  const repair = vi.fn(async () => { repaired = true; return { repaired: true, verificationRequired: true } })
+  f.input.controller = { inspect: async () => ({ ready: false, requested: ['/dev/nvidia5'], granted: ['/dev/nvidia2'] }), repair, reconcile: async () => {} }
+  f.loop(async () => {
+    const inspected = JSON.parse(await f.call('inspect_preparation_environment'))
+    expect(inspected.controller.granted).toEqual(['/dev/nvidia2'])
+    await expect(f.call('repair_preparation_controller', { server_id: randomUUID() })).rejects.toThrow('outside')
+    await f.call('repair_preparation_controller')
+    expect(f.progress.at(-1)?.phase).not.toBe('environment-ready')
+    await f.call('verify_preparation_environment', { path_entries: [] })
+  })
+  await expect(f.ensure(async () => { if (!repaired) throw new Error('GPU authorization mismatch'); return 'verified GPU' })).resolves.toMatchObject({ value: 'verified GPU' })
+  expect(repair).toHaveBeenCalledOnce()
+})
+it('rejects controller repair claims without program verification', async () => {
+  const f = fixture(); f.input.operation = 'controller'
+  f.input.controller = { inspect: async () => ({}), repair: async () => ({ repaired: true }), reconcile: async () => {} }
+  f.loop(async () => { await f.call('repair_preparation_controller') })
+  await expect(f.ensure(async () => { throw new Error('GPU authorization mismatch') })).rejects.toThrow('without passing')
+})
 it('permits controller diagnostics while keeping the original controller alive', async () => {
   const f = fixture()
   f.input.operation = 'controller'

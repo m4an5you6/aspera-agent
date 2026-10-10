@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 import type { ExperimentTable } from './table.ts'
 import { CLUSTER_HANDOVER, clusterSubmissionSchema, experimentQuestionSchema, answerExperimentQuestionSchema, questionBindingSchema } from './cluster-protocol.ts'
 import type { ClusterRecord, ClusterSubmission, ExperimentId, ExperimentServerId, ExperimentPlan, ExperimentQuestion } from './cluster-protocol.ts'
+import type { ControllerRepairId } from './controller-protocol.ts'
 
 /** Execution outcome; unavailable cleanup retains the complete allocation. */
 export interface ClusterOutcome {
@@ -40,6 +41,7 @@ export class ClusterQueue {
   private chain: Promise<void> = Promise.resolve()
   private readonly active = new Map<ExperimentId, { abort: AbortController; done: Promise<void> }>()
   private closing = false
+  private maintenance: ControllerRepairId | undefined
   private pumping: Promise<void> | undefined
   private pumpAgain = false
 
@@ -73,6 +75,34 @@ export class ClusterQueue {
    * @returns saved receipt, when present.
    */
   get(id: ExperimentId): ClusterRecord | undefined { return this.table.get(id) }
+
+  /** @returns tasks or unconfirmed resources that prevent coordinator maintenance. */
+  maintenanceOccupancy(): string[] {
+    return this.list().filter(record => !['completed', 'blocked', 'failed', 'cancelled', 'interrupted'].includes(record.state)
+      || !record.resourcesReleased || record.services.some(service => !service.released)
+      || this.active.has(record.submission.experimentId)).map(record => record.submission.experimentId)
+  }
+
+  /** @returns the operation holding the atomic coordinator admission fence. */
+  get maintenanceOperation(): ControllerRepairId | undefined { return this.maintenance }
+
+  /** @param operationId - maintenance owner. @returns the atomic idle fence; refuses queued and active work. */
+  async beginMaintenance(operationId: ControllerRepairId): Promise<void> {
+    await this.serial(async () => {
+      if (this.maintenance !== undefined && this.maintenance !== operationId) throw new Error('Coordinator maintenance belongs to another operation')
+      const occupied = this.maintenanceOccupancy()
+      if (occupied.length !== 0) throw new Error(`Coordinator is occupied: ${occupied.join(', ')}`)
+      this.maintenance = operationId
+    })
+  }
+
+  /** @param operationId - original maintenance owner. @returns confirmed removal of its admission fence. */
+  async cancelMaintenance(operationId: ControllerRepairId): Promise<void> {
+    await this.serial(async () => {
+      if (this.maintenance !== operationId) throw new Error('Coordinator maintenance identity changed')
+      this.maintenance = undefined
+    })
+  }
 
   private required(id: ExperimentId): ClusterRecord {
     const record = this.table.get(id)
@@ -112,6 +142,7 @@ export class ClusterQueue {
     const payloadHash = createHash('sha256').update(JSON.stringify(submission)).digest('hex')
     const record = await this.serial(async () => {
       if (this.closing) throw new Error('coordinator is stopping')
+      if (this.maintenance !== undefined) throw new Error('coordinator is in controller maintenance')
       const previous = this.table.get(submission.experimentId)
       if (previous !== undefined) {
         if (previous.payloadHash !== payloadHash) throw new Error('experiment id is already bound to different requirements')
@@ -143,9 +174,10 @@ export class ClusterQueue {
   }
 
   private kick(): void {
-    if (this.closing) return
+    if (this.closing || this.maintenance !== undefined) return
     if (this.pumping !== undefined) { this.pumpAgain = true; return }
     this.pumping = this.serial(async () => {
+      if (this.maintenance !== undefined) return
       for (const record of this.list()) {
         if (record.state !== 'preparing') continue
         const planning = await this.save(record, { state: 'planning' })

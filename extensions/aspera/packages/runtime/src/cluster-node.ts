@@ -13,11 +13,15 @@ import type { ClusterCommandResult, ClusterNode, ExperimentId, InferenceService 
 import { clusterFiles, clusterPath, readClusterChunk } from '@aspera/experiments'
 import { clusterFileHash } from './cluster-runtime.ts'
 import { serverRunRoot } from './storage.ts'
+import { experimentSandboxArgv } from './experiment-sandbox.ts'
 import { verifyStorage } from '../scripts/storage.mjs'
 import { NetworkProbes } from './network-probes.ts'
 import { openInferenceGateway } from './inference-gateway.ts'
 import type { InferenceGateway } from './inference-gateway.ts'
 import { processLogRequestSchema } from '@aspera/experiments'
+import { controllerBootIdSchema, controllerMaintenanceSchema, gpuIdentities, normalizedSet, normalizedGpuInventory } from '@aspera/experiments'
+import type { ControllerStatus, ControllerRepairId, GpuInventory } from '@aspera/experiments'
+import { probeControllerGpu, controllerPolicyDigest, controllerProcessIdentity } from './controller.ts'
 
 const allocationObject = z.object({ experimentId: experimentIdSchema, deploymentId: deploymentIdSchema,
   node: z.union([clusterNodeSchema, legacyClusterNodeSchema]).transform((node): ClusterNode => node), protocol: z.union([z.literal(2), z.literal(3), z.literal(4)]).optional(), budget: budgetSchema.optional(), deadline: z.number().int().optional(), released: z.boolean(), releasing: z.boolean().default(false), bootId: z.string() }).strict()
@@ -49,6 +53,8 @@ import { NodeMetricSampler, saveMetricSample, readMetricSamples } from './metric
 export interface ClusterNodeConfig {
   root: string
   bootId: string
+  deploymentId: string
+  gpuSnapshot?: GpuInventory
   backendPath: string
   hiddenPaths: string[]
   chunkBytes: number
@@ -73,6 +79,14 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
   const allocations = store.table('allocations')
   const commands = store.table('commands')
   const services = store.table('services')
+  let maintenance: ControllerRepairId | undefined
+  const policy: ControllerStatus['policy'] = { backendPath: config.backendPath, hiddenPaths: normalizedSet(config.hiddenPaths),
+    devicePaths: normalizedSet(config.devicePaths), ...(config.gpuSnapshot === undefined ? {} : { gpu: config.gpuSnapshot }) }
+  const policyDigest = controllerPolicyDigest(policy)
+  const occupied = (): ControllerStatus['occupied'] => ({ experiments: [],
+    allocations: [...allocations.entries()].filter(([, row]) => !row.released).map(([id]) => id),
+    commands: [...commands.entries()].filter(([, row]) => !row.released).map(([id]) => id),
+    services: [...services.entries()].filter(([, row]) => !row.released).map(([id]) => id) })
   const observationPolicy = observationPolicySchema.parse(config.observations)
   const gateways = new Map<string, InferenceGateway>()
   const stopGateway = async (id: string) => {
@@ -160,7 +174,26 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
 
   return async (operation: string, raw: unknown): Promise<unknown> => {
     if (operation.startsWith('probe-network-')) return network.request(operation, raw)
-    if (operation === 'health') return { allocations: [...allocations.entries()].filter(([, row]) => !row.released).map(([id]) => id) }
+    if (operation === 'health') {
+      let actualGpu: GpuInventory | undefined; let gpuError: string | undefined
+      try { actualGpu = await probeControllerGpu(ctx, config.root, config.cleanupTimeoutMs) }
+      catch (error) { gpuError = String(error) }
+      const controller: ControllerStatus = { version: 1, role: 'node', bootId: controllerBootIdSchema.parse(config.bootId),
+        deploymentId: config.deploymentId, root: config.root, ...controllerProcessIdentity(), policy, policyDigest,
+        occupied: occupied(), ...(maintenance === undefined ? {} : { maintenance }),
+        ...(actualGpu === undefined ? { gpuError } : { actualGpu }) }
+      return { allocations: controller.occupied.allocations, controller }
+    }
+    if (operation === 'maintenance-begin' || operation === 'maintenance-cancel') return serial(async () => {
+      const request = controllerMaintenanceSchema.parse(raw)
+      if (request.bootId !== config.bootId || request.policyDigest !== policyDigest) throw new Error('Controller identity changed; inspect before repairing')
+      if (maintenance !== undefined && maintenance !== request.operationId) throw new Error('Controller maintenance belongs to another operation')
+      if (operation === 'maintenance-cancel') { maintenance = undefined; return { cancelled: true } }
+      const busy = occupied()
+      if (Object.values(busy).some(ids => ids.length !== 0) || handles.size !== 0) throw new Error(`Controller is occupied: ${JSON.stringify(busy)}`)
+      maintenance = request.operationId
+      return { maintenance, bootId: config.bootId, policyDigest }
+    })
     const input = z.object({ experimentId: experimentIdSchema }).loose().parse(raw)
     const id = input.experimentId
     if (operation === 'observation-sources') {
@@ -179,6 +212,7 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
     }
     if (operation === 'allocate') return serial(async () => {
       if (closing) throw new Error('node is stopping')
+      if (maintenance !== undefined) throw new Error('node is in controller maintenance')
 
       const request = allocationRequestSchema.parse(raw)
       if (request.protocol === 3 || request.protocol === 4) {
@@ -202,6 +236,16 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
       if (config.hiddenPaths.some(path => !request.node.hiddenPaths.includes(path))) throw new Error('private directories differ from node policy')
       mkdirSync(resolve(serverRunRoot(request.node.server, id), 'workspace'), { recursive: true, mode: 0o700 })
       if (request.node.devicePaths.some(path => !config.devicePaths.includes(path))) throw new Error('node request exceeds its granted GPU devices')
+      if (request.protocol === 4) {
+        const actual = await probeControllerGpu(ctx, config.root, config.cleanupTimeoutMs)
+        if (config.gpuSnapshot === undefined) throw new Error('Controller GPU identity policy is unavailable; repeat preparation')
+        const identity = JSON.stringify(normalizedSet(actual.gpus.map(gpu => gpu.uuid.toLowerCase())))
+        if (JSON.stringify(gpuIdentities(request.node.gpuInfo)) !== identity
+          || JSON.stringify(normalizedGpuInventory(config.gpuSnapshot)) !== JSON.stringify(normalizedGpuInventory(actual))
+          || request.node.devicePaths.some(path => !actual.devicePaths.includes(path))) {
+          throw new Error(`GPU hardware changed after preparation; copy this experiment. Requested devices: ${JSON.stringify(request.node.devicePaths)}; actual: ${JSON.stringify(actual)}`)
+        }
+      }
       await allocations.put(id, { ...request, released: false, releasing: false, bootId: config.bootId })
       return { allocated: true }
     })
@@ -509,23 +553,14 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
         observation = new ObservationWriter(runRoot(id), { version: 1, experimentId: id, serverId: current.node.server.id,
           id: observationSourceIdSchema.parse(`process-${request.commandId}`), kind: 'process', phase: 'execution', commandId: request.commandId,
           label: request.commandId, createdAt: Date.now(), streams: ['stdout', 'stderr'], complete: false })
-        const argv = [current.node.backendPath, '--ro-bind', '/', '/', '--unshare-user', '--unshare-pid', '--unshare-ipc',
-          '--unshare-uts', '--die-with-parent', '--new-session', '--dev', '/dev', '--proc', '/proc', '--tmpfs', '/tmp', '--clearenv',
-          '--setenv', 'PATH', '/usr/local/bin:/usr/bin:/bin', '--setenv', 'HOME', workspace(id), '--setenv', 'PYTHONUNBUFFERED', '1']
-        for (const path of current.node.devicePaths) argv.push('--dev-bind', path, path)
         const hidden = [...config.hiddenPaths, ...current.node.hiddenPaths, config.root]
         const storageRoots = resolve(config.root, 'state', 'storage-roots')
         if (existsSync(storageRoots)) for (const name of readdirSync(storageRoots)) {
           const owner = z.object({ namespaceRoot: z.string() }).parse(JSON.parse(readFileSync(resolve(storageRoots, name, '.aspera-owner.json'), 'utf8')))
           hidden.push(owner.namespaceRoot)
         }
-        const roots = [...new Set(hidden)].sort((a, b) => a.length - b.length)
-        for (const path of roots.filter(path => !roots.some(parent => path !== parent && path.startsWith(parent + '/')))) argv.push('--tmpfs', path)
-        for (const [name, value] of Object.entries({ XDG_CACHE_HOME: resolve(workspace(id), 'cache'), HF_HOME: resolve(workspace(id), 'cache', 'huggingface'),
-          PIP_CACHE_DIR: resolve(workspace(id), 'cache', 'pip'), UV_CACHE_DIR: resolve(workspace(id), 'cache', 'uv'),
-          TORCH_HOME: resolve(workspace(id), 'cache', 'torch'), UV_PROJECT_ENVIRONMENT: resolve(workspace(id), 'env'),
-          CONDA_PKGS_DIRS: resolve(workspace(id), 'cache', 'conda'), CONDA_ENVS_PATH: resolve(workspace(id), 'envs'), TMPDIR: resolve(workspace(id), 'tmp') })) argv.push('--setenv', name, value)
-        argv.push('--bind', workspace(id), workspace(id), '--chdir', workspace(id), '--', 'bash', '-c', request.command)
+        const argv = experimentSandboxArgv({ backendPath: current.node.backendPath, workspaceRoot: workspace(id),
+          devicePaths: current.node.devicePaths, hiddenPaths: hidden }, ['bash', '-c', request.command])
         handle = ctx.subprocess.spawn({ argv, cwd: workspace(id),
           env: { HOME: workspace(id), PYTHONUNBUFFERED: '1' }, graceMs: config.cleanupTimeoutMs,
           stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' } })

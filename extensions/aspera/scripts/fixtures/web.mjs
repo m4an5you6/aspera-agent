@@ -15,7 +15,11 @@ import { readPhaseRecords } from '../../packages/runtime/lib/records.js'
 import { ObservationWriter, observationSources, readObservation } from '../../packages/runtime/lib/observations.js'
 import { freemem, totalmem } from 'node:os'
 import { openInferenceGateway } from '../../packages/runtime/lib/inference-gateway.js'
-import { SavedReleaseUnavailable } from '../../packages/dispatch/lib/cluster-deploy.js'
+import { SavedReleaseUnavailable, verifyController } from '../../packages/dispatch/lib/cluster-deploy.js'
+import { controllerPolicyDigest } from '@aspera/runtime'
+import { sshPasswordRef } from '../../packages/dispatch/lib/ssh-account.js'
+import { fixtureSelections } from './models.mjs'
+import { createHandshakeFixture } from './ssh-handshake.mjs'
 
 export const inject = ['storage', 'storageDomain', 'agents', 'agentLoop', 'goals', 'credentials', 'agentDefaultModel', 'sessionPersistence', 'subprocess', 'webServer', 'llm', 'settings']
 
@@ -40,8 +44,21 @@ export async function apply(ctx, config) {
   const events = []
   const storageCalls = []
   const environmentCalls = []
+  const controllerStates = new Map(); const controllerFailures = new Set(); const controllerStops = []
+  const gpu = { gpus: [{ uuid: 'GPU-11111111-1111-1111-1111-111111111111', name: 'CPU fixture GPU', devicePath: '/dev/nvidia0' }], devicePaths: ['/dev/nvidia0'] }
+  const controllerKey = (target, role) => target.host + ':' + target.remoteRoot + ':' + role
+  const newController = (target, role, prepared) => {
+    const policy = { backendPath: prepared.backendPath, hiddenPaths: prepared.hiddenPaths, devicePaths: prepared.devicePaths, gpu: prepared.gpu }
+    return { version: 1, role, bootId: randomUUID(), deploymentId: prepared.deploymentId, root: target.remoteRoot, pid: 1000,
+      processStart: '123', hostBootId: 'cpu-host-boot', policy, policyDigest: controllerPolicyDigest(policy),
+      occupied: { experiments: [], allocations: [], commands: [], services: [] }, actualGpu: prepared.gpu }
+  }
   const preparationCommands = []
   const configuredHosts = new Set()
+  const repairedSandboxes = new Set()
+  let handshakeFixture
+  let handshakeProbe
+  ctx.effect(() => async () => { await handshakeFixture?.close() })
   const restoredPreparations = new Set()
   const installations = new Map()
   const overviewModes = new Map()
@@ -206,7 +223,12 @@ export async function apply(ctx, config) {
   const driver = {
     environmentRequirements: () => ({ node: '^22.19.0 || >=24.0.0', pnpm: '11.7.0' }),
     installedEnvironmentRequirements: async () => ({ node: '^22.19.0 || >=24.0.0', pnpm: '11.7.0' }),
-    inspectEnvironment: async target => ({
+    inspectEnvironment: async (target, _password, signal) => {
+      if (target.host === 'ssh-handshake.fixture') {
+        handshakeProbe ??= handshakeFixture.probe(target, signal)
+        await handshakeProbe
+      }
+      return {
       home: '/home/trainer', system: 'Linux', architecture: 'x86_64', identity: 'uid=1000(trainer)',
       programs: [
         { name: 'node', path: '/usr/bin/node', version: 'v24.1.0' },
@@ -214,13 +236,19 @@ export async function apply(ctx, config) {
         { name: 'python3', path: '/usr/bin/python3', version: 'Python 3.12.0' },
         { name: 'bwrap', path: configuredHosts.has(target.host) ? '/fixture/bwrap' : '', version: configuredHosts.has(target.host) ? 'bubblewrap fixture' : '' },
       ].map(program => configuredHosts.has(target.host) ? program : { ...program, path: '', version: '' }),
-      sandboxExitCode: configuredHosts.has(target.host) ? 0 : 127, diagnostics: 'CPU environment fixture',
-    }),
+      sandboxExitCode: target.host.startsWith('sandbox-') && !repairedSandboxes.has(target.host) ? 1 : configuredHosts.has(target.host) ? 0 : 127,
+      diagnostics: target.host.startsWith('sandbox-') && !repairedSandboxes.has(target.host)
+        ? "bwrap: Can't mount proc on /newroot/proc: Operation not permitted"
+        : target.host === 'ssh-handshake.fixture' ? 'CPU SSH handshake recovered after 3 connection attempts' : 'CPU environment fixture',
+      }
+    },
     remoteResult: async (target, script, _signal, _password, output) => {
       const installed = script.includes('fixture retry installation')
+      const sandboxRepair = script.includes('fixture repair sandbox configuration')
+      if (sandboxRepair && target.host === 'sandbox-repair.fixture') repairedSandboxes.add(target.host)
       if (installed) configuredHosts.add(target.host)
-      const result = { stdout: installed ? 'Required tools installed' : 'Package metadata loaded', stderr: installed ? '' : 'Fixture download failed',
-        exitCode: installed ? 0 : 1, signal: null, timedOut: false, cancelled: false, exitConfirmed: true }
+      const result = { stdout: sandboxRepair ? 'CPU sandbox configuration checked' : installed ? 'Required tools installed' : 'Package metadata loaded', stderr: installed || sandboxRepair ? '' : 'Fixture download failed',
+        exitCode: installed || sandboxRepair ? 0 : 1, signal: null, timedOut: false, cancelled: false, exitConfirmed: true }
       preparationCommands.push({ host: target.host, ...result })
       output?.('stdout', Buffer.from(result.stdout)); output?.('stderr', Buffer.from(result.stderr))
       return result
@@ -250,13 +278,28 @@ export async function apply(ctx, config) {
       }
       if (installation) await installation()
       if (record?.request.objective === 'CPU installation recovery') await installationGate?.promise
-      return { state: 'ready', deploymentId: 'f'.repeat(64), preparationId: 'f'.repeat(64), backend: 'bwrap', backendPath: '/fixture/bwrap', sandboxWriteProbe: 'passed', cudaProbe: 'passed', devicePaths: ['/dev/nvidia_fixture'], hiddenPaths: [], workspaceRoot: '/fixture/workspace' }
+      return { state: 'ready', deploymentId: 'f'.repeat(64), preparationId: 'f'.repeat(64), backend: 'bwrap', backendPath: '/fixture/bwrap', sandboxWriteProbe: 'passed', cudaProbe: 'passed', devicePaths: ['/dev/nvidia0'], hiddenPaths: [], workspaceRoot: '/fixture/workspace', gpu }
     },
-    ensureClusterRole: async () => {},
-    describeClusterNode: async server => ({ server, backendPath: '/fixture/bwrap', devicePaths: ['/dev/nvidia_fixture'], hiddenPaths: [], gpuInfo: 'CPU test provider; GPU validation is separate' }),
+    ensureClusterRole: async (target, prepared, role) => {
+      const key = controllerKey(target, role)
+      if (!controllerStates.has(key)) controllerStates.set(key, newController(target, role, prepared))
+      const record = fleet.list().find(row => row.preparation?.placements.some(placement => placement.workspaceRoot === target.storagePlacement?.workspaceRoot))
+      if (record?.request.objective === 'CPU controller recovery' && role === 'node' && !controllerFailures.has(record.request.experimentId)) {
+        controllerFailures.add(record.request.experimentId)
+        const state = controllerStates.get(key); state.policy = { ...state.policy, devicePaths: ['/dev/nvidia2'] }; state.policyDigest = controllerPolicyDigest(state.policy)
+      }
+      verifyController(controllerStates.get(key), target, prepared, role)
+    },
+    inspectController: async (target, role) => structuredClone(controllerStates.get(controllerKey(target, role))),
+    describeClusterNode: async server => ({ server, backendPath: '/fixture/bwrap', devicePaths: ['/dev/nvidia0'], hiddenPaths: [], gpuInfo: 'CPU test provider only (UUID: GPU-11111111-1111-1111-1111-111111111111)' }),
     delegateClusterLogin: async () => ({ knownHostsFile: '/fixture/private/known_hosts' }),
     installPrivateFile: async (_target, destination, content) => { const file = path(destination); mkdirSync(dirname(file), { recursive: true }); writeFileSync(file, content) },
     remote: async (target, script) => {
+      if (script.includes('pidfd_send_signal')) {
+        const entry = [...controllerStates.entries()].find(([, state]) => state.root === target.remoteRoot && state.maintenance !== undefined)
+        if (entry === undefined) throw new Error('CPU controller stop has no identity-bound maintenance owner')
+        controllerStops.push({ role: entry[1].role, operationId: entry[1].maintenance }); controllerStates.delete(entry[0]); return ''
+      }
       const installer = / (launch|status|probe|stop) '([^']+\/config.json)'/.exec(script)
       if (installer) {
         const [, operation, configPath] = installer
@@ -284,6 +327,12 @@ export async function apply(ctx, config) {
     },
     copy: async (_target, source, destination) => { const file = path(destination); mkdirSync(dirname(file), { recursive: true }); copyFileSync(source, file) },
     request: async (_target, _token, route, _method, body) => {
+      if (route.endsWith('/maintenance-begin')) {
+        const role = route.includes('/node/') ? 'node' : 'coordinator'; const state = controllerStates.get(controllerKey(_target, role))
+        if (state?.bootId !== body.bootId || state.policyDigest !== body.policyDigest) throw new Error('CPU maintenance identity changed')
+        state.maintenance = body.operationId
+        return { status: 200, value: { maintenance: state.maintenance, bootId: state.bootId, policyDigest: state.policyDigest } }
+      }
       const operation = route.split('/').at(-1)
       controlCalls.push({ operation, experimentId: body?.experimentId })
       if (operation === 'health') return { status: 200, value: { node: { allocations: queue.list().filter(row => !row.resourcesReleased).map(row => row.submission.experimentId) } } }
@@ -354,6 +403,7 @@ export async function apply(ctx, config) {
   fleet.retry = async id => { await retryGate?.promise; return retry(id) }
   new AsperaRemote(ctx, fleet, new ExperimentDownloads(ctx, fleet, 60000), policy)
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: '/aspera-test', handler: async (req, res) => {
+    try {
     const url = new URL(req.url, 'http://localhost')
     const id = url.searchParams.get('id')
     const kind = url.pathname.split('/').at(-1)
@@ -367,6 +417,36 @@ export async function apply(ctx, config) {
     if (kind === 'fail-status') statusFailure = 'SSH connection failed: ECONNREFUSED observations.test'
     if (kind === 'timeout-status') statusFailure = 'The operation was aborted due to timeout'
     if (kind === 'restore-status') statusFailure = undefined
+    if (kind === 'controller-recovery') {
+      const base = fleet.servers().servers[0]
+      const { storagePlacement: _placement, remoteRoot: _root, ...connection } = base
+      const server = { ...connection, id: randomUUID(), name: 'CPU maintenance', host: 'cpu-maintenance' }
+      await ctx.credentials.set(sshPasswordRef(server), 'cpu-only-controller-password')
+      await fleet.saveServer(server)
+      await fleet.create({ experimentId: randomUUID(), name: 'CPU controller recovery', objective: 'CPU controller recovery', serverIds: [server.id], coordinatorId: server.id, models: fixtureSelections, mode: 'semi' })
+    }
+    if (kind === 'ssh-handshake-recovery') {
+      handshakeFixture = await createHandshakeFixture(root)
+      const base = fleet.servers().servers[0]
+      const { storagePlacement: _placement, remoteRoot: _root, ...connection } = base
+      const server = { ...connection, id: randomUUID(), name: 'CPU SSH recovery', host: 'ssh-handshake.fixture' }
+      configuredHosts.add(server.host)
+      await ctx.credentials.set(sshPasswordRef(server), 'cpu-only-handshake-password')
+      await fleet.saveServer(server)
+      await fleet.create({ experimentId: randomUUID(), name: 'CPU SSH handshake recovery', objective: 'CPU SSH handshake recovery', serverIds: [server.id], coordinatorId: server.id, models: fixtureSelections, mode: 'semi' })
+    }
+    if (kind.startsWith('sandbox-')) {
+      const scenario = kind.slice('sandbox-'.length)
+      if (!['repair', 'blocked', 'claim'].includes(scenario)) throw new Error('Unknown sandbox fixture')
+      const base = fleet.servers().servers[0]
+      const { storagePlacement: _placement, remoteRoot: _root, ...connection } = base
+      const server = { ...connection, id: randomUUID(), name: 'CPU sandbox ' + scenario, host: kind + '.fixture' }
+      await ctx.credentials.set(sshPasswordRef(server), 'cpu-only-sandbox-password')
+      configuredHosts.add(server.host)
+      await fleet.saveServer(server)
+      await fleet.create({ experimentId: randomUUID(), name: 'CPU sandbox ' + scenario, objective: 'CPU sandbox ' + scenario,
+        serverIds: [server.id], coordinatorId: server.id, models: fixtureSelections, mode: 'semi' })
+    }
     if (kind === 'unconfirm-release') {
       const record = store.table('experiments').get(id)
       await store.table('experiments').put(id, { ...record, revision: record.revision + 1, state: 'failed', resourcesReleased: false, detail: 'CPU fixture remote cleanup unconfirmed' })
@@ -395,7 +475,12 @@ export async function apply(ctx, config) {
     if (kind === 'hold-retry') retryGate = Promise.withResolvers()
     if (kind === 'release-retry') retryGate?.resolve()
     res.setHeader('content-type', 'application/json')
-    res.end(JSON.stringify({ ...fleet.snapshot(), queue: queue.list(), cleanupCalls, controlCalls, events, storageCalls, environmentCalls, preparationCommands }))
+    res.end(JSON.stringify({ ...fleet.snapshot(), queue: queue.list(), cleanupCalls, controlCalls, events, storageCalls, environmentCalls, preparationCommands, controllerStops,
+      sshHandshakeRecovery: handshakeFixture?.facts() }))
+    } catch (error) {
+      res.writeHead(400, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ error: String(error) }))
+    }
   } }))
 }
 

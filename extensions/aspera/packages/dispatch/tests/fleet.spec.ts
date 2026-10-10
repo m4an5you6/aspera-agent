@@ -1,7 +1,7 @@
 import { fromAny } from '@total-typescript/shoehorn'
 /** Independent dispatch identities, pinned destinations, and durable receipt recovery. */
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
@@ -14,7 +14,7 @@ import { ExperimentFleet } from '../src/fleet.ts'
 import { fleetExperimentV5Schema } from '../src/fleet-schema-v5.ts'
 import { preparationRecordSchema } from '../src/installation-model.ts'
 import type { FleetExperiment } from '../src/types.ts'
-import { request, remote, prepareSshHostKey } from '../src/transport.ts'
+import { request, remote, prepareSshHostKey, resolveSshConnectionPolicy } from '../src/transport.ts'
 import { snapshotSource } from '../src/snapshot.ts'
 import { prepareClusterServer } from '../src/cluster-deploy.ts'
 import { installPrivateFile } from '../src/deploy.ts'
@@ -23,6 +23,7 @@ import type { NetworkParticipant } from '../src/network-selection.ts'
 import { modelSelections } from '../../experiments/tests/fixtures.ts'
 import { readyEnvironment } from './environment-fixture.ts'
 import { inspectEnvironment } from '../src/environment.ts'
+import { controllerFixture, preparedFixture } from './controller-fixture.ts'
 vi.mock('../src/environment.ts', async importOriginal => ({
   ...await importOriginal<typeof import('../src/environment.ts')>(),
   environmentRequirements: () => ({ node: '^22.19.0 || >=24.0.0', pnpm: '11.7.0' }),
@@ -45,8 +46,9 @@ vi.mock('../src/transport.ts', async importOriginal => ({ ...await importOrigina
 vi.mock('../src/deploy.ts', async importOriginal => ({ ...await importOriginal<typeof import('../src/deploy.ts')>(), installPrivateFile: vi.fn() }))
 vi.mock('../src/snapshot.ts', () => ({ snapshotSource: vi.fn() }))
 vi.mock('../src/cluster-deploy.ts', async importOriginal => ({ ...await importOriginal<typeof import('../src/cluster-deploy.ts')>(), prepareClusterServer: vi.fn(), ensureClusterRole: vi.fn(),
+  inspectController: vi.fn(async (target, role) => controllerFixture(target, role)),
   describeClusterNode: vi.fn(async (server: unknown) => ({ server, devicePaths: ['/dev/nvidia0'],
-    backendPath: '/usr/bin/bwrap', hiddenPaths: [], gpuInfo: 'GPU 0' })),
+    backendPath: '/usr/bin/bwrap', hiddenPaths: [], gpuInfo: 'CPU fixture (UUID: GPU-11111111-1111-1111-1111-111111111111)' })),
   delegateClusterLogin: vi.fn(async () => ({ knownHostsFile: '/private/known_hosts' })),
 }))
 const fleets: ExperimentFleet[] = []
@@ -66,10 +68,7 @@ beforeEach(() => {
   writeFileSync(archive, 'CPU fixture immutable material')
   vi.mocked(snapshotSource).mockResolvedValue({ digest: 'a'.repeat(64), archive, directory,
     archiveHash: createHash('sha256').update('CPU fixture immutable material').digest('hex'), dispose: () => {} })
-  vi.mocked(prepareClusterServer).mockResolvedValue({ state: 'ready', deploymentId: 'a'.repeat(64),
-    preparationId: 'a'.repeat(64), backend: 'bwrap',
-    sandboxWriteProbe: 'passed', cudaProbe: 'passed', workspaceRoot: '/runs/workspace', devicePaths: ['/dev/nvidia0'],
-    backendPath: '/usr/bin/bwrap', hiddenPaths: [] })
+  vi.mocked(prepareClusterServer).mockResolvedValue(preparedFixture())
 })
 
 function receipt(submission: ClusterSubmission) {
@@ -119,8 +118,8 @@ async function fixture() {
   const deployment = (server: Parameters<Parameters<typeof ExperimentFleet.open>[1]>[0]) => ({ ...server, localRepo,
     dataRoots: [], preparationOutputChars: 65536, tokenRef: 'TOKEN', agentCredentialRefs: [], controlPollIntervalMs: 1000,
     toolTimeoutMs: 30000, minimumFreeBytes: 1024 })
-  const open = async () => { const fleet = await ExperimentFleet.open(ctx,
-    deployment, 20000); fleets.push(fleet); return fleet }
+  const open = async (policy = resolveSshConnectionPolicy({})) => { const fleet = await ExperimentFleet.open(ctx,
+    deployment, 20000, undefined, undefined, undefined, policy); fleets.push(fleet); return fleet }
   const fleet = await open()
   const a = clusterServerSchema.parse({ id: randomUUID(), name: 'Coordinator', host: 'gpu-a', username: 'trainer',
     sshPort: 22, remotePort: 43019, remoteRoot: '/runs', authMode: 'password' })
@@ -167,6 +166,22 @@ it('registers a selected server host key before a model-free connection check', 
   expect(vi.mocked(prepareSshHostKey)).toHaveBeenCalledOnce()
   expect(f.fleet.list()).toEqual([])
   expect(f.saved.size).toBe(0)
+})
+
+it('applies current local SSH limits without rewriting an existing experiment destination or release', async () => {
+  const f = await fixture()
+  const created = await f.fleet.create({ experimentId: randomUUID(), models: modelSelections, objective: 'Retain the release during connection recovery',
+    serverIds: [f.a.id], coordinatorId: f.a.id, mode: 'semi' })
+  const id = created.request.experimentId
+  await vi.waitFor(() => { expect(f.fleet.list().find(row => row.request.experimentId === id)?.state).toBe('submitted') })
+  const before = structuredClone(f.fleet.list().find(row => row.request.experimentId === id)!.coordinatorTarget)
+  const policy = resolveSshConnectionPolicy({ sshHandshakeTimeoutMs: 7000, sshHandshakeMaxRetries: 1, sshHandshakeRetryDelayMs: 250 })
+  const reopened = await f.open(policy)
+  await reopened.refresh(id)
+  expect(vi.mocked(request).mock.lastCall?.[0]).toMatchObject(policy)
+  expect(reopened.list().find(row => row.request.experimentId === id)!.coordinatorTarget).toEqual(before)
+  await reopened.probe(f.a.id)
+  expect(vi.mocked(inspectEnvironment).mock.lastCall?.[0]).toMatchObject({ ...policy, toolTimeoutMs: 20000 })
 })
 
 it('keeps failed experiment destinations when removing their unused coordinator registration', async () => {
@@ -782,9 +797,12 @@ it('switches to local deletion while an unreachable cleanup request is pending',
 
 it('retains unknown ownership across new server IDs and only clears matching terminal release evidence', async () => {
   const f = await fixture(); const row = await finished(f); const id = row.request.experimentId
+  const controllerJournals = resolve(process.env.DSH_HOME!, 'aspera-controller-repairs', id)
+  expect(existsSync(controllerJournals)).toBe(true)
   f.records.set(id, { ...row, latest: { ...row.latest!, state: 'running', resourcesReleased: false } })
   await f.fleet.deleteExperiments({ experimentIds: [id], operationId: randomUUID(), cleanupRemote: false, allowUnconfirmed: true })
   await vi.waitFor(() => { expect(f.tables.get('removals')?.get(id)).toMatchObject({ localCleanup: 'complete' }) })
+  expect(existsSync(controllerJournals)).toBe(true)
   await f.fleet.removeServer(f.a.id, true)
   const replacement = clusterServerSchema.parse({ ...f.a, id: randomUUID(), username: 'another-user' })
   await f.fleet.saveServer(replacement)
@@ -796,6 +814,7 @@ it('retains unknown ownership across new server IDs and only clears matching ter
   expect(await f.fleet.reconcileRemovedWork(replacement.id)).toEqual([id])
   vi.mocked(request).mockResolvedValueOnce({ status: 200, value: { record: row.latest } })
   expect(await f.fleet.reconcileRemovedWork(replacement.id)).toEqual([])
+  expect(existsSync(controllerJournals)).toBe(false)
   expect(f.fleet.snapshot().unconfirmedWork).toEqual([])
   expect(JSON.stringify(f.fleet.snapshot())).not.toContain('test-only-secret')
 })

@@ -39,6 +39,10 @@ Desktop and browser share the page and task service. The remote coordinator owns
 
 The execution Agent reports approved plan steps to the coordinator; the console reads these reports alongside independent preparation and result evidence. [Step progress](state-and-api.md#execution-step-progress) has its own versioned file and does not change the fixed submission, queue or Session formats. Old experiments retain their original remote release.
 
+The preparation Agent diagnoses GPU authorization differences and requests identity-bound controller repair. Providers own actual probing, idle admission fencing, confirmed exit and verification; handover cannot accept an Agent's completion statement. [Controller readiness](state-and-api.md#controller-readiness) describes original-release compatibility and interrupted repair recovery.
+
+Preparation and managed commands share the [execution sandbox](../packages/runtime/README.md#understand-the-implementation). Permission refusals return exact diagnostics to the original preparation Session for account repair or a concrete cloud-platform action; program revalidation still owns readiness.
+
 ```mermaid
 flowchart TB
   subgraph Local[Local management]
@@ -57,7 +61,7 @@ flowchart TB
     Models --> Planner
     Models --> Executor
     Fleet --> Preparation[Local DSH Agent: inspect / configure / repair]
-    Preparation --> Checks[Provider verification: versions / sandbox availability]
+    Preparation --> Checks[Provider verification: versions / execution namespaces]
     Checks --> Inventory[Read-only SSH: mounts / space / interfaces]
     Inventory --> Selection[Restricted Agent: candidate ID + reason]
     Selection --> Placement[Persist placement before directory creation]

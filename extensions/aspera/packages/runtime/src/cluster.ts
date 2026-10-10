@@ -23,6 +23,9 @@ import { readMetricSamples } from './metrics.ts'
 import { readTraceAttachment } from './trace-attachments.ts'
 import { executionStepReportSchema } from '@aspera/experiments'
 import { ExecutionProgressStore } from './execution-progress.ts'
+import { controllerBootIdSchema, controllerMaintenanceSchema, controllerStatusSchema, gpuInventorySchema, normalizedSet } from '@aspera/experiments'
+import type { ControllerStatus, GpuInventory } from '@aspera/experiments'
+import { controllerPolicyDigest, controllerProcessIdentity } from './controller.ts'
 
 const storeSpec = defineDomain({ name: 'aspera_queue', version: 4, compatibleVersions: [1, 2, 3], layout: 'per-record',
   tables: { experiments: domainTable<ExperimentId, ClusterRecord>(clusterRecordSchema) } })
@@ -35,6 +38,7 @@ export interface ClusterRoleConfig extends ClusterRuntimeConfig {
   backendPath: string
   hiddenPaths: string[]
   devicePaths: string[]
+  gpuSnapshot?: GpuInventory
   experimentId?: string
   networkProbeLifetimeMs: number
   serviceRequestTimeoutMs: number
@@ -47,6 +51,7 @@ export interface ClusterRoleConfig extends ClusterRuntimeConfig {
  * @param config - role, private paths, and explicit operation bounds.
  */
 export async function applyClusterRole(ctx: Context, config: ClusterRoleConfig): Promise<void> {
+  if (config.gpuSnapshot !== undefined) config.gpuSnapshot = gpuInventorySchema.parse(config.gpuSnapshot)
   if (!isAbsolute(config.root) || !isAbsolute(config.tokenFile)) throw new Error('cluster root and token file must be absolute')
   mkdirSync(resolve(config.root, 'runs'), { recursive: true, mode: 0o700 })
   if (config.role === 'agent' || config.role === 'planner') {
@@ -64,7 +69,11 @@ export async function applyClusterRole(ctx: Context, config: ClusterRoleConfig):
   const token = readFileSync(config.tokenFile, 'utf8').trim()
   const executionProgress = new ExecutionProgressStore(config.root)
   if (token.length < 32) throw new Error('cluster token must contain at least 32 characters')
-  const node = config.role === 'node' ? await createClusterNode(ctx, { ...config, bootId: randomUUID() }) : undefined
+  const bootId = controllerBootIdSchema.parse(randomUUID())
+  const policy: ControllerStatus['policy'] = { backendPath: config.backendPath, hiddenPaths: normalizedSet(config.hiddenPaths),
+    devicePaths: normalizedSet(config.devicePaths), ...(config.gpuSnapshot === undefined ? {} : { gpu: config.gpuSnapshot }) }
+  const policyDigest = controllerPolicyDigest(policy)
+  const node = config.role === 'node' ? await createClusterNode(ctx, { ...config, bootId }) : undefined
   const store = config.role === 'coordinator' ? await ctx.storage.domain.open(storeSpec) : undefined
   const queue = store === undefined ? undefined : new ClusterQueue(store.table('experiments'), new RemoteClusterExecutor(ctx, config),
     (error) => { ctx.logger.error(`experiment coordinator: ${String(error)}`) })
@@ -91,8 +100,14 @@ export async function applyClusterRole(ctx: Context, config: ClusterRoleConfig):
       if (!/^\/aspera\/v[1234]\//.test(requestedPath)) { respond(404, { error: 'unsupported control protocol' }); return }
       const path = requestedPath.replace(/^\/aspera\/v[234]\//, '/aspera/v1/')
       if (req.method === 'GET' && path === '/aspera/v1/health') {
-        respond(200, { protocol: 4, role: config.role, deploymentId: config.deploymentId, features: ['public-inference-v1'],
-          ...(node === undefined ? {} : { node: await node('health', {}) }) })
+        const nodeHealth = node === undefined ? undefined : z.object({ allocations: z.array(z.string()), controller: controllerStatusSchema }).parse(await node('health', {}))
+        const controller: ControllerStatus = nodeHealth?.controller ?? { version: 1, role: 'coordinator', bootId,
+          deploymentId: config.deploymentId, root: config.root, ...controllerProcessIdentity(), policy, policyDigest,
+          occupied: { experiments: queue?.maintenanceOccupancy() ?? [], allocations: [], commands: [], services: [] },
+          ...(queue?.maintenanceOperation === undefined ? {} : { maintenance: queue.maintenanceOperation }) }
+        respond(200, { protocol: 4, role: config.role, deploymentId: config.deploymentId,
+          features: ['public-inference-v1', 'controller-readiness-v1', 'controller-maintenance-v1'], controller,
+          ...(nodeHealth === undefined ? {} : { node: { allocations: nodeHealth.allocations } }) })
         return
       }
       if (req.method !== 'POST') { respond(405, { error: 'POST required' }); return }
@@ -111,6 +126,13 @@ export async function applyClusterRole(ctx: Context, config: ClusterRoleConfig):
         return
       }
       if (queue === undefined) throw new Error('coordinator is unavailable')
+      if (path === '/aspera/v1/maintenance-begin' || path === '/aspera/v1/maintenance-cancel') {
+        const input = controllerMaintenanceSchema.parse(body)
+        if (input.bootId !== bootId || input.policyDigest !== policyDigest) throw new Error('Controller identity changed; inspect before repairing')
+        if (path.endsWith('maintenance-begin')) await queue.beginMaintenance(input.operationId)
+        else await queue.cancelMaintenance(input.operationId)
+        respond(200, { maintenance: queue.maintenanceOperation, bootId, policyDigest }); return
+      }
       if (path === '/aspera/v1/submit') {
         const submission = clusterSubmissionSchema.parse(body)
         if (queue.get(submission.experimentId) === undefined) {

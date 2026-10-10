@@ -9,8 +9,11 @@
   en: 7780ac634c12227c
   zh: a72b3bd9ded9219e
 /desktop-upgrade/contents:
-  en: 6d316c012ba9672b
-  zh: f4a5bcc0316b4583
+  en: 59fe4aa239a2cf5d
+  zh: f3ef5cb5dd01f981
 /desktop-upgrade/profile-changes:
-  en: aefc789f5527f8b1
-  zh: 10aa3e9c7dba6870
+  en: bcad6511ea715424
+  zh: 40da9a56b7b4c3c9
+/desktop-upgrade/controller-readiness:
+  en: c859eaa34bf1d5f3
+  zh: a8ef821fe196b3b4

@@ -6,8 +6,11 @@ import { join } from 'node:path'
 import type { SourceSnapshot } from './snapshot.ts'
 import { copy, remote, RemoteCommandError, shellQuote } from './transport.ts'
 import type { Target } from './transport.ts'
-import type { StoragePlacement, InferenceMapping } from '@aspera/experiments'
-import { verifyServerStorage } from '@aspera/runtime'
+import type { StoragePlacement, InferenceMapping, GpuInventory, ControllerStatus } from '@aspera/experiments'
+import { parseGpuInventory, normalizedSet } from '@aspera/experiments'
+import { experimentSandboxArgv, gpuIdentityQueryScript, verifyServerStorage } from '@aspera/runtime'
+import { SandboxVerificationError } from './sandbox-verification.ts'
+import type { SandboxVerificationStage } from './sandbox-verification.ts'
 import { z } from 'zod'
 
 /** Trusted deployment configuration shared by the dispatch tools. */
@@ -35,6 +38,9 @@ export interface PreparedEnvironment {
   readonly devicePaths: readonly string[]
   readonly hiddenPaths: readonly string[]
   readonly workspaceRoot: string
+  readonly gpu: GpuInventory
+  /** Credential-free resident identity attached only after controller acceptance. */
+  readonly controller?: ControllerStatus
 }
 
 /** An earlier release installer has not reported that its process exited. */
@@ -45,7 +51,7 @@ function paths(config: DeploymentConfig, digest: string) {
   const storage = config.storagePlacement
   return {
     root, release: storage?.releaseRoot ?? `${root}/releases/${digest}`, archive: `${storage?.namespaceRoot ?? root}/incoming/${digest}.tar`,
-    workspace: storage?.workspaceRoot ?? `${root}/workspace`, outside: `${root}/probe-outside`,
+    workspace: storage?.workspaceRoot ?? `${root}/workspace`,
     tokenFile: `${root}/secrets/receiver.token`, modelCredentials: `${root}/secrets/model-${digest}.yaml`, state: `${root}/state`,
     logs: `${root}/logs`, tools: `${root}/tools`,
   }
@@ -62,7 +68,7 @@ export async function installSource(config: DeploymentConfig, snapshot: SourceSn
   password?: string): Promise<void> {
   const p = paths(config, snapshot.digest)
   if (config.storagePlacement !== undefined) await verifyServerStorage(config, config.storagePlacement, password, signal, statSync(snapshot.archive).size)
-  await remote(config, `umask 077; mkdir -p ${[p.archive.slice(0, p.archive.lastIndexOf('/')), p.release.slice(0, p.release.lastIndexOf('/')), p.workspace, p.outside, `${p.root}/secrets`, p.state, p.logs, p.tools].map(shellQuote).join(' ')}`, signal, password)
+  await remote(config, `umask 077; mkdir -p ${[p.archive.slice(0, p.archive.lastIndexOf('/')), p.release.slice(0, p.release.lastIndexOf('/')), p.workspace, `${p.root}/secrets`, p.state, p.logs, p.tools].map(shellQuote).join(' ')}`, signal, password)
   await copy(config, snapshot.archive, p.archive, signal, password)
   const script = `set -eu
 umask 077
@@ -127,50 +133,66 @@ export async function validateEnvironment(
   config: DeploymentConfig, digest: string, signal?: AbortSignal, password?: string,
 ): Promise<PreparedEnvironment> {
   const p = paths(config, digest)
-  const script = `set -eu
-workspace=${shellQuote(p.workspace)}
-outside=${shellQuote(p.outside)}
+  const discovery = await remote(config, `set -eu
 bwrap_bin=$(command -v bwrap || true)
 test -n "$bwrap_bin" || { echo 'bubblewrap is missing from the verified executable directories' >&2; exit 1; }
-"$bwrap_bin" --ro-bind / / --dev /dev --unshare-pid --proc /proc --die-with-parent -- true
-devices=''
-gpu_count=0
-private_paths=${shellQuote(p.root + '/secrets\n' + p.state)}
-if [ -d "$HOME/.ssh" ]; then private_paths="$private_paths
-$HOME/.ssh"; fi
-for dev in /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools /dev/nvidia-modeset /dev/nvidia-caps/nvidia-cap*; do
-  if [ -c "$dev" ]; then
-    case "$dev" in /dev/nvidia[0-9]*) gpu_count=$((gpu_count + 1));; esac
-    if [ -z "$devices" ]; then devices="$dev"; else devices="$devices,$dev"; fi
-  fi
-done
-test "$gpu_count" -ge 1 || { echo 'no allocated NVIDIA character device' >&2; exit 1; }
-set -- --ro-bind / / --dev /dev --unshare-pid --proc /proc --die-with-parent --tmpfs /tmp --bind "$workspace" "$workspace"
-old_ifs="$IFS"; IFS=,
-for dev in $devices; do set -- "$@" --dev-bind "$dev" "$dev"; done
-IFS='
-'
-for path in $private_paths; do set -- "$@" --tmpfs "$path"; done
-IFS="$old_ifs"
-secret_probe=${shellQuote(p.root + '/secrets/probe-private')}
+python3 -c ${shellQuote(`import glob,json,pathlib,stat,sys
+root=pathlib.Path(${JSON.stringify(p.root)})
+hidden=[str(root/'secrets'),str(root/'state')]
+ssh=pathlib.Path.home()/'.ssh'
+if ssh.is_dir(): hidden.append(str(ssh))
+namespaces=${JSON.stringify(config.storagePlacement === undefined ? [] : [config.storagePlacement.namespaceRoot])}
+owners=root/'state'/'storage-roots'
+if owners.is_dir():
+ for entry in owners.iterdir(): namespaces.append(json.loads((entry/'.aspera-owner.json').read_text())['namespaceRoot'])
+devices=sorted(set(path for pattern in ['/dev/nvidia[0-9]*','/dev/nvidiactl','/dev/nvidia-uvm','/dev/nvidia-uvm-tools','/dev/nvidia-modeset','/dev/nvidia-caps/nvidia-cap*'] for path in glob.glob(pattern) if stat.S_ISCHR(pathlib.Path(path).stat().st_mode)))
+if not any(path[len('/dev/nvidia'):].isdigit() for path in devices): raise RuntimeError('no allocated NVIDIA character device')
+print(json.dumps({'backendPath':sys.argv[1],'devicePaths':devices,'hiddenPaths':hidden,'namespaceRoots':sorted(set(namespaces))}))`)} "$bwrap_bin"`, signal, password)
+  const absolute = z.string().startsWith('/')
+  const observed = z.object({ backendPath: absolute, devicePaths: z.array(absolute), hiddenPaths: z.array(absolute), namespaceRoots: z.array(absolute) }).parse(JSON.parse(discovery))
+  const spec = { backendPath: observed.backendPath, workspaceRoot: p.workspace, devicePaths: observed.devicePaths,
+    hiddenPaths: [...observed.hiddenPaths, p.root, ...observed.namespaceRoots] }
+  const launch = (command: readonly string[]) => experimentSandboxArgv(spec, command).map(shellQuote).join(' ')
+  const script = `set -eu
+printf 'ASPERA_VERIFY_STAGE=sandbox-launch\\n' >&2
+${launch(['true'])}
+umask 077
+secret_probe=${shellQuote(p.root + '/secrets/probe-' + randomUUID())}
 printf 'private' > "$secret_probe"
 trap 'rm -f -- "$secret_probe"' EXIT
-"$bwrap_bin" "$@" -- node ${shellQuote(p.release + '/node_modules/@aspera/runtime/scripts/probe-sandbox.mjs')} "$workspace" "$outside"
-"$bwrap_bin" "$@" -- test ! -e "$secret_probe"
-"$bwrap_bin" "$@" -- nvidia-smi -L
-"$bwrap_bin" "$@" -- python3 ${shellQuote(p.release + '/node_modules/@aspera/runtime/scripts/probe-gpu.py')}
-printf 'DSH_DEVICES=%s\\nDSH_BWRAP=%s\\n' "$devices" "$bwrap_bin"
-node --input-type=module -e 'console.log("DSH_HIDDEN=" + JSON.stringify(process.argv[1].split("\\n")))' "$private_paths"`
-  const output = await remote(config, script, signal, password)
+test -f ${shellQuote(p.release + '/.ready')}
+sandbox_probe=$(cat ${shellQuote(p.release + '/node_modules/@aspera/runtime/scripts/probe-sandbox.mjs')})
+gpu_probe=$(cat ${shellQuote(p.release + '/node_modules/@aspera/runtime/scripts/probe-gpu.py')})
+printf 'ASPERA_VERIFY_STAGE=workspace-isolation\\n' >&2
+${launch(['node', '--input-type=module', '-e'])} "$sandbox_probe" probe-sandbox ${shellQuote(p.workspace)} /usr
+${launch(['test', '!', '-e', p.release + '/.ready'])}
+printf 'ASPERA_VERIFY_STAGE=credential-isolation\\n' >&2
+${launch(['test', '!', '-e'])} "$secret_probe"
+printf 'ASPERA_VERIFY_STAGE=gpu-access\\n' >&2
+${launch(['nvidia-smi', '-L'])}
+${launch(['python3', '-c'])} "$gpu_probe"
+printf 'DSH_DEVICES=%s\\nDSH_BWRAP=%s\\nDSH_HIDDEN=%s\\n' ${shellQuote(observed.devicePaths.join(','))} ${shellQuote(observed.backendPath)} ${shellQuote(JSON.stringify(observed.hiddenPaths))}`
+  const gpuScript = `\nprintf 'DSH_GPU_BEGIN\\n'\npython3 -c ${shellQuote(gpuIdentityQueryScript)} ${shellQuote(String(config.toolTimeoutMs / 1000))}\nprintf 'DSH_GPU_END\\n'`
+  let output: string
+  try { output = await remote(config, script + gpuScript, signal, password) }
+  catch (error) {
+    signal?.throwIfAborted()
+    if (!(error instanceof RemoteCommandError) || !error.result.exitConfirmed || error.result.cancelled || error.result.timedOut) throw error
+    const stages: SandboxVerificationStage[] = ['sandbox-launch', 'workspace-isolation', 'credential-isolation', 'gpu-access']
+    const stage = stages.filter(value => error.result.stderr.includes('ASPERA_VERIFY_STAGE=' + value)).at(-1) ?? 'sandbox-launch'
+    throw new SandboxVerificationError(stage, observed.backendPath, error.result)
+  }
   const match = /^DSH_DEVICES=(.+)$/m.exec(output)
   const backend = /^DSH_BWRAP=(.+)$/m.exec(output)
   const hidden = /^DSH_HIDDEN=(.+)$/m.exec(output)
+  const gpuQuery = /^DSH_GPU_BEGIN\r?\n([\s\S]*?)\r?\nDSH_GPU_END$/m.exec(output)?.[1]
   if (match?.[1] === undefined || backend?.[1] === undefined || hidden?.[1] === undefined) {
     throw new Error('remote sandbox/GPU probe did not report its backend and granted devices')
   }
   return {
     state: 'ready', deploymentId: digest, preparationId: digest, backend: 'bwrap',
-    backendPath: backend[1], devicePaths: match[1].split(','), hiddenPaths: z.array(z.string()).parse(JSON.parse(hidden[1])), workspaceRoot: p.workspace,
+    backendPath: backend[1], devicePaths: normalizedSet(match[1].split(',')), hiddenPaths: z.array(z.string()).parse(JSON.parse(hidden[1])), workspaceRoot: p.workspace,
+    gpu: parseGpuInventory(gpuQuery ?? '', match[1].split(',')),
     sandboxWriteProbe: 'passed', cudaProbe: 'passed',
   }
 }
