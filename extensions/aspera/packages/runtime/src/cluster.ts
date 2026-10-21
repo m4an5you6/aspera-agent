@@ -26,6 +26,8 @@ import { ExecutionProgressStore } from './execution-progress.ts'
 import { controllerBootIdSchema, controllerMaintenanceSchema, controllerStatusSchema, gpuInventorySchema, normalizedSet } from '@aspera/experiments'
 import type { ControllerStatus, GpuInventory } from '@aspera/experiments'
 import { controllerPolicyDigest, controllerProcessIdentity } from './controller.ts'
+import { inspectExperimentFinalization } from '../scripts/completion-files.mjs'
+import { finalizationPolicySchema } from './finalization-policy.ts'
 
 const storeSpec = defineDomain({ name: 'aspera_queue', version: 4, compatibleVersions: [1, 2, 3], layout: 'per-record',
   tables: { experiments: domainTable<ExperimentId, ClusterRecord>(clusterRecordSchema) } })
@@ -106,7 +108,7 @@ export async function applyClusterRole(ctx: Context, config: ClusterRoleConfig):
           occupied: { experiments: queue?.maintenanceOccupancy() ?? [], allocations: [], commands: [], services: [] },
           ...(queue?.maintenanceOperation === undefined ? {} : { maintenance: queue.maintenanceOperation }) }
         respond(200, { protocol: 4, role: config.role, deploymentId: config.deploymentId,
-          features: ['public-inference-v1', 'controller-readiness-v1', 'controller-maintenance-v1'], controller,
+          features: ['public-inference-v1', 'controller-readiness-v1', 'controller-maintenance-v1', 'managed-environments-v1', 'managed-environment-reuse-v1', 'managed-environment-cleanup-v1', 'managed-environment-install-v2', 'managed-environment-install-v3', 'completion-evidence-v1', 'experiment-finalization-v2', 'storage-governance-v1', 'historical-environment-borrow-v1', 'managed-materials-v1', 'purpose-storage-0.1.0'], controller,
           ...(nodeHealth === undefined ? {} : { node: { allocations: nodeHealth.allocations } }) })
         return
       }
@@ -135,10 +137,12 @@ export async function applyClusterRole(ctx: Context, config: ClusterRoleConfig):
       }
       if (path === '/aspera/v1/submit') {
         const submission = clusterSubmissionSchema.parse(body)
+        if (existsSync(resolve(config.root, 'state/interruption-fences', `${submission.experimentId}.json`))) throw new Error('Experiment interruption prevents submission')
         if (queue.get(submission.experimentId) === undefined) {
           refuseOrphan(submission.experimentId)
           await validateClusterAdmission(config, submission)
         }
+        if (existsSync(resolve(config.root, 'state/interruption-fences', `${submission.experimentId}.json`))) throw new Error('Experiment interruption prevents submission')
         respond(200, await queue.submit(submission))
         return
       }
@@ -155,6 +159,8 @@ export async function applyClusterRole(ctx: Context, config: ClusterRoleConfig):
       }
       const record = queue.get(input.experimentId)
       if (record === undefined) { respond(404, { error: 'experiment not found' }); return }
+      if (['/aspera/v1/approve', '/aspera/v1/open-question', '/aspera/v1/answer-question', '/aspera/v1/consume-question', '/aspera/v1/report-execution-step'].includes(path)
+        && existsSync(resolve(config.root, 'state/interruption-fences', `${input.experimentId}.json`))) throw new Error('Experiment interruption prevents new operations')
       if (path === '/aspera/v1/open-question') { respond(200, await queue.openQuestion(input.experimentId, input.question)); return }
       if (path === '/aspera/v1/answer-question') {
         const { experimentId: _id, ...reply } = input
@@ -182,6 +188,10 @@ export async function applyClusterRole(ctx: Context, config: ClusterRoleConfig):
           path.slice('/aspera/v1/'.length), input)); return
       }
       if (path === '/aspera/v1/status') { respond(200, { record, waitingFor: queue.waitingFor(input.experimentId) }); return }
+      if (path === '/aspera/v1/finalization-status') {
+        respond(200, inspectExperimentFinalization({ runRoot: clusterRunRoot(config.root, input.experimentId), experimentId: input.experimentId,
+          serverId: record.submission.coordinator.id, maxBytes: finalizationPolicySchema.parse(config.finalization ?? {}).evidenceBytes, maxEntries: config.fileLimit })); return
+      }
       if (path === '/aspera/v1/execution-progress') {
         const progress = executionProgress.read(record)
         respond(200, { supported: true, ...(progress === undefined ? {} : { progress }) }); return

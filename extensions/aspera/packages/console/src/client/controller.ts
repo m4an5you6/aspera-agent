@@ -1,5 +1,5 @@
 import type { ExperimentDeletion, ExperimentDeletionPreview, ServerDeletionPreview, UnconfirmedWorkNotice } from '@aspera/dispatch/types'
-type ManagementMessage = 'experimentsDeleted' | 'deletionIncomplete' | 'serverDeleted' | 'serverDeleteFailed' | 'installationSourceChanged'
+type ManagementMessage = 'experimentsDeleted' | 'deletionIncomplete' | 'serverDeleted' | 'serverDeleteFailed' | 'installationSourceChanged' | 'cacheCleanupComplete' | 'cacheCleanupBlocked' | 'storageFallbackApplied'
 import type {} from '@aspera/dispatch/remote'
 import type {} from '@deepseek-ai/dsh-api-gateway/client'
 /** Independent experiment selection, incremental reads, and browser actions. */
@@ -8,6 +8,8 @@ import type { ClusterFile, ServerSettings, ServerProbe, FleetExperiment, FleetRe
 import type { InstallationProgress } from '@aspera/dispatch/types'
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import { randomUUID } from '@deepseek-ai/dsh-util-crypto'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import type { EnvironmentOperationId } from '@aspera/experiments/types'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import type { Config } from '../config.ts'
 import type { ServiceAccessInfo } from '@aspera/experiments/types'
@@ -18,6 +20,8 @@ import { experimentTodos } from './attention.ts'
 import { errorIdentity } from './error-identity.ts'
 import type { ObservationSource, ObservationRead, ObservationPage, MetricRead, MetricSample } from '@aspera/experiments/types'
 import type { ExecutionProgressRead } from '@aspera/experiments/types'
+import type { ExperimentInterruptionStatus } from '@aspera/experiments/types'
+import type { ExperimentStorageUsage, ExperimentCachePreview, ExperimentCacheResult } from '@aspera/experiments/types'
 
 /** A failed refresh retains the last exact-plan snapshot and its arrival time. */
 export interface ExecutionProgressView { value?: ExecutionProgressRead; error?: string; receivedAt?: number }
@@ -60,7 +64,11 @@ export interface ExperimentsSnapshot {
   unconfirmedWork: UnconfirmedWorkNotice[]
   installations: InstallationProgress[]
   executionReads: Record<string, ExecutionProgressView>
-  toast: { key: ManagementMessage; sequence: number; failed: boolean; detail?: string } | null
+  interruptions: ExperimentInterruptionStatus[]
+  interrupting: string[]
+  settlingTasks: string[]
+  toast: { key: ManagementMessage; sequence: number; failed: boolean; detail?: string; peakBytes?: number; storage?: { experimentId: string; serverId: string } } | null
+  storageFocus: { experimentId: string; serverId: string; sequence: number } | null
   error: string | null
   sourceErrors: Record<string, string>
   errorNotice: { message: string; identity: string; sequence: number } | null
@@ -70,8 +78,8 @@ export interface ExperimentsSnapshot {
 export class ExperimentsController {
   /** Observable page data; execution ownership remains on the Host. */
   readonly store = createSnapshotStore<ExperimentsSnapshot>({ view: 'list', preferences: readPreferences(), modelDirectory: null, modelsLoading: false, modelsError: null, settingsOpen: false,
-    registry: { servers: [] }, experiments: [], selectedId: null,
-    probes: {}, probeErrors: {}, streams: {}, files: [], filesTruncated: false, retrying: [], probing: [], removingServers: [], deletedIds: [], deletions: [], unconfirmedWork: [], installations: [], executionReads: {}, toast: null, error: null, sourceErrors: {}, errorNotice: null })
+    registry: { servers: [] }, experiments: [], selectedId: null, storageFocus: null,
+    probes: {}, probeErrors: {}, streams: {}, files: [], filesTruncated: false, retrying: [], probing: [], removingServers: [], deletedIds: [], deletions: [], unconfirmedWork: [], installations: [], executionReads: {}, interruptions: [], interrupting: [], settlingTasks: [], toast: null, error: null, sourceErrors: {}, errorNotice: null })
   /** List reading state survives opening details within this panel. */
   readonly listReading = { search: '', filter: 'all' as 'all' | 'pending' | 'attention' | 'active' | 'ended', scrollTop: 0 }
   private readonly announcedErrors = new Set<string>()
@@ -85,6 +93,8 @@ export class ExperimentsController {
   private readonly deleted = new Set<string>()
   private readonly removedServers = new Set<string>()
   private readonly preparationRetries = new Map<string, Promise<void>>()
+  private readonly interruptionRequests = new Map<string, Promise<void>>()
+  private readonly taskSettlements = new Map<string, Promise<void>>()
   private readonly serverChecks = new Map<string, Promise<void>>()
   private readonly serverRemovals = new Map<string, Promise<void>>()
   private readonly serverRevisions = new Map<string, number>()
@@ -125,6 +135,31 @@ export class ExperimentsController {
   }
   /** @param request - phase and cursor. @returns a bounded record page. */
   records(request: AgentRecordRequest): Promise<AgentRecordPage> { return this.remote.experimentTrace(request).then(unwrap) }
+  /** @param id - original experiment. @param operationId - supplementary Session owner. @param request - bounded cursor. @returns offline review events. */
+  reviewRecords(id: string, operationId: string, request: Omit<AgentRecordRequest, 'experimentId' | 'phase'>): Promise<AgentRecordPage> {
+    return this.remote.experimentCompletionReviewTrace(id, operationId, request).then(unwrap)
+  }
+  private readonly reviewRequests = new Map<string, Promise<void>>()
+  /** @param id - released evidence-only failure. @returns acknowledgement of Host-owned supplementation without retraining. */
+  reviewCompletion(id: string): Promise<void> {
+    const pending = this.reviewRequests.get(id)
+    if (pending !== undefined) return pending
+    const operation = this.remote.reviewExperimentCompletion(id).then(unwrap).then(review => { this.acceptReview(id, review) })
+      .finally(() => { this.reviewRequests.delete(id) })
+    this.reviewRequests.set(id, operation); return operation
+  }
+  /** @param id - supplementary operation. @returns after its Agent and reads stop, preserving the original task. */
+  async cancelCompletionReview(id: string): Promise<void> { this.acceptReview(id, unwrap(await this.remote.cancelExperimentCompletionReview(id))) }
+  private acceptReview(id: string, review: import('@aspera/experiments/types').CompletionReview | undefined): void {
+    if (this.disposed || this.deleted.has(id) || review === undefined) return
+    if (review.experimentId !== id) throw new Error('Completion review belongs to another experiment')
+    const row = this.store.getSnapshot().experiments.find(row => row.request.experimentId === id)
+    if (row !== undefined && (row.completionReview?.revision ?? -1) <= review.revision) this.replace({ ...row, completionReview: review })
+  }
+  /** @param id - selected experiment. @returns durable local copy health and original source times. */
+  archiveStatus(id: string): Promise<import('@aspera/experiments/types').ExperimentArchiveStatus> { return this.remote.experimentArchiveStatus(id).then(unwrap) }
+  /** @param id - selected experiment. @returns copy health after scheduling a read-only backfill. */
+  syncArchive(id: string): Promise<import('@aspera/experiments/types').ExperimentArchiveStatus> { return this.remote.syncExperimentArchive(id).then(unwrap) }
   /** @param id - experiment. @param phase - saved Session role. @param seq - owning event. @param attachmentId - recorded image or file. @returns a browser-owned blob URL. */
   async traceImage(id: string, phase: 'preparation' | 'planning' | 'execution', seq: number, attachmentId: string): Promise<string> {
     const parts: BlobPart[] = []; let offset = 0; let mediaType = ''
@@ -154,6 +189,49 @@ export class ExperimentsController {
   processLog(request: ProcessLogRequest): Promise<ProcessLogPage> { return this.remote.experimentProcessLog(request).then(unwrap) }
   /** @returns polling and memory limits shared by record and log views. */
   displayLimits(): Required<Config> { return this.config }
+  /** @param id - selected task. @returns lightweight finalization facts; connection errors remain separate from local-copy success. */
+  async finalizationStatus(id: string): Promise<import('@aspera/experiments/types').ExperimentFinalizationStatus> {
+    const result = unwrap(await this.remote.experimentFinalizationStatus(id))
+    if (this.deleted.has(id) || result.experimentId !== id) throw new Error('Finalization observation belongs to a deleted or different experiment')
+    return result
+  }
+  /** @param id - retained experiment. @returns actual storage observations or an explicitly offline copy. */
+  storageUsage(id: string): Promise<ExperimentStorageUsage> {
+    return this.remote.experimentStorageUsage(id).then(unwrap).then(value => {
+      for (const node of value.nodes) {
+        const event = node.arrangement
+        if (event === undefined || this.deleted.has(id) || this.announcedSources.has(event.eventId)) continue
+        this.announcedSources.add(event.eventId)
+        void this.remote.claimErrorNotice({ experimentId: id, serverId: node.serverId, phase: 'preparation', operation: 'storage-fallback', identity: event.eventId }).then(unwrap).then(first => {
+          if (!first || this.disposed || this.deleted.has(id)) return
+          this.sourceQueue.push({ key: 'storageFallbackApplied', sequence: ++this.sourceSequence, failed: false,
+            peakBytes: event.estimatedPeakBytes, detail: event.reason, storage: { experimentId: id, serverId: node.serverId } })
+          if (this.store.getSnapshot().toast === null) this.clearToast()
+        }).catch(error => { this.announcedSources.delete(event.eventId); void error })
+      }
+      return value
+    })
+  }
+  /** @param experimentId - retained experiment. @param serverId - node owning the applied storage event. */
+  openStorageDetails(experimentId: string, serverId: string): void {
+    if (this.disposed || this.deleted.has(experimentId)) return
+    this.select(experimentId)
+    this.patch({ view: 'list', storageFocus: { experimentId, serverId, sequence: ++this.sourceSequence } })
+  }
+  /** Clear a consumed storage-detail destination after the dialog closes. */
+  clearStorageFocus(): void { this.patch({ storageFocus: null }) }
+  /** @param id - retained experiment. @param serverId - assigned node. @param cursor - previous scan cursor. @returns fresh bounded account-side measurements. */
+  refreshStorage(id: string, serverId: string, cursor?: string): Promise<ExperimentStorageUsage> { return this.remote.refreshExperimentStorage(id, serverId, cursor).then(unwrap) }
+  /** @param id - retained experiment. @returns checked candidates without deleting files. */
+  cachePreview(id: string): Promise<ExperimentCachePreview> { return this.remote.previewExperimentCacheCleanup(id).then(unwrap) }
+  /** @param preview - candidate identities. @param operationId - stable retry identity. @returns per-node cleanup results. */
+  async cleanupCache(preview: ExperimentCachePreview, operationId: string, selection?: Record<string, string[]>): Promise<ExperimentCacheResult> {
+    const result = unwrap(await this.remote.cleanupExperimentCache({ experimentId: preview.experimentId, operationId: brandString<EnvironmentOperationId>(operationId),
+      nodes: preview.nodes.filter(node => node.eligible && node.candidates.length > 0 && (selection === undefined || (selection[node.serverId]?.length ?? 0) > 0))
+        .map(node => ({ serverId: node.serverId, fingerprint: node.fingerprint, ...(selection === undefined ? {} : { candidateIds: selection[node.serverId] }) })) }))
+    if (!this.deleted.has(preview.experimentId)) this.notify(result.nodes.every(node => node.state === 'completed') ? 'cacheCleanupComplete' : 'cacheCleanupBlocked', result.nodes.some(node => node.state !== 'completed'))
+    return result
+  }
 
   /** @returns profile-configured initial node control port; the coordinator uses the following port. */
   initialControlPort(): number { return this.config.defaultControlPort }
@@ -170,10 +248,19 @@ export class ExperimentsController {
     const selectedId = this.store.getSnapshot().selectedId
     for (const key of this.decoders.keys()) if (this.deleted.has(key.split('/')[0]!)) this.decoders.delete(key)
     const streams = Object.fromEntries(Object.entries(this.store.getSnapshot().streams).filter(([key]) => !this.deleted.has(key.split('/')[0]!)))
+    const interruptions = new Map(this.store.getSnapshot().interruptions.filter(value => !this.deleted.has(value.experimentId)).map(value => [value.experimentId, value]))
+    for (const next of snapshot.interruptions) {
+      if (this.deleted.has(next.experimentId)) continue
+      const previous = interruptions.get(next.experimentId)
+      if (previous !== undefined && (previous.updatedAt > next.updatedAt
+        || previous.operationId === next.operationId && previous.phase === 'released' && next.phase !== 'released')) continue
+      interruptions.set(next.experimentId, next)
+    }
     this.patch({ registry: { ...snapshot.registry, servers: snapshot.registry.servers.filter(server => !this.removedServers.has(server.id)) },
       experiments: this.store.getSnapshot().experiments.filter(row => !this.deleted.has(row.request.experimentId)),
       streams, deletedIds: [...this.deleted], deletions: snapshot.deletions, unconfirmedWork: snapshot.unconfirmedWork,
       installations: snapshot.installations.filter(value => !this.deleted.has(value.experimentId)),
+      interruptions: [...interruptions.values()],
       executionReads: Object.fromEntries(Object.entries(this.store.getSnapshot().executionReads).filter(([id]) => !this.deleted.has(id))),
       ...(selectedId !== null && this.deleted.has(selectedId) ? { selectedId: null, files: [], filesTruncated: false } : {}) })
     for (const record of snapshot.experiments) this.replace(record)
@@ -304,6 +391,14 @@ export class ExperimentsController {
     const current = this.store.getSnapshot().experiments
     const previous = current.find(value => value.request.experimentId === row.request.experimentId)
     if ((previous?.latest?.revision ?? 0) > (row.latest?.revision ?? 0)) return
+    if (previous?.completionReview !== undefined && previous.completionReview.originalRevision === (row.latest ?? row.receipt)?.revision
+      && previous.completionReview.revision > (row.completionReview?.revision ?? -1)) row = { ...row, completionReview: previous.completionReview }
+    if (previous?.completionAssessment !== undefined && previous.completionAssessment.originalRevision === (row.latest ?? row.receipt)?.revision
+      && previous.completionAssessment.operationId === row.completionReview?.operationId
+      && previous.completionAssessment.revision > (row.completionAssessment?.revision ?? -1)) row = { ...row, completionAssessment: previous.completionAssessment }
+    const interrupted = this.store.getSnapshot().interruptions.find(value => value.experimentId === row.request.experimentId)
+    if (interrupted?.phase === 'released' && previous !== undefined
+      && !['completed', 'failed', 'blocked', 'cancelled', 'interrupted'].includes(row.latest?.state ?? row.state)) return
     const experiments = [row, ...current.filter(value => value.request.experimentId !== row.request.experimentId)]
     this.patch({ experiments: experiments.sort((a, b) => b.createdAt - a.createdAt) })
   }
@@ -463,28 +558,70 @@ export class ExperimentsController {
   previewDeletion(ids: string[]): Promise<ExperimentDeletionPreview[]> { return this.remote.previewExperimentDeletion(ids).then(unwrap) }
   /** @param id - server configuration. @returns the experiments retained by deletion. */
   previewServerRemoval(id: string): Promise<ServerDeletionPreview> { return this.remote.previewServerRemoval(id).then(unwrap) }
-  /** @param id - saved server. @returns after read-only ownership checks and a fresh local snapshot. */
-  async reconcileRemovedWork(id: string): Promise<void> { await this.probe(id); await this.refresh() }
+  /** @param id - saved server. @returns after program-owned task settlement and a fresh local snapshot. */
+  async reconcileRemovedWork(id: string): Promise<void> { unwrap(await this.remote.reconcileRemovedWork(id)); await this.refresh() }
+  /** @param id - retained remote task. @param mode - exit verification or explicit interruption. @returns after the Host accepts the persistent operation. */
+  settleRemoteTask(id: string, mode: 'reconcile' | 'interrupt'): Promise<void> {
+    const current = this.taskSettlements.get(id)
+    if (current !== undefined) return current
+    const operation = Promise.resolve().then(() => this.remote.settleRemoteTask({ taskId: id, mode })).then(result => {
+      const status = unwrap(result)
+      if (this.disposed) return
+      const rows = this.store.getSnapshot().unconfirmedWork
+      const prior = rows.find(row => row.experimentId === id)
+      if (prior !== undefined && (prior.updatedAt ?? 0) <= status.updatedAt) this.patch({ unconfirmedWork: status.released
+        ? rows.filter(row => row.experimentId !== id) : rows.map(row => row.experimentId === id ? status : row) })
+    }).finally(() => {
+      this.taskSettlements.delete(id)
+      if (!this.disposed) this.patch({ settlingTasks: [...this.taskSettlements.keys()] })
+    })
+    this.taskSettlements.set(id, operation); this.patch({ settlingTasks: [...this.taskSettlements.keys()] })
+    return operation
+  }
   /** @param ids - confirmed records. @param cleanupRemote - explicit file cleanup. @param operationId - retained retry identity. @returns individual outcomes. */
   async deleteExperiments(ids: string[], cleanupRemote: boolean, operationId: string): Promise<ExperimentDeletion[]> {
     const results = unwrap(await this.remote.deleteExperiments({ experimentIds: ids, cleanupRemote, operationId, allowUnconfirmed: !cleanupRemote }))
     const newlyDeleted = results.some(result => result.state === 'deleted' && !this.deleted.has(result.experimentId))
     for (const result of results) if (result.state === 'deleted') this.deleted.add(result.experimentId)
     this.receive({ registry: this.store.getSnapshot().registry, experiments: this.store.getSnapshot().experiments,
-      deletedIds: [], removedServerIds: [], unconfirmedWork: this.store.getSnapshot().unconfirmedWork, deletions: results, installations: this.store.getSnapshot().installations })
+      deletedIds: [], removedServerIds: [], unconfirmedWork: this.store.getSnapshot().unconfirmedWork, deletions: results, installations: this.store.getSnapshot().installations,
+      interruptions: this.store.getSnapshot().interruptions })
     if (newlyDeleted) this.notify('experimentsDeleted')
     return results
   }
   /** @param key - localized operation outcome. @param failed - whether to show warning treatment. */
   notify(key: ManagementMessage, failed = false): void { this.patch({ toast: { key, failed, sequence: (this.store.getSnapshot().toast?.sequence ?? 0) + 1 } }) }
   /** Clear only the displayed operation notification. */
-  clearToast(): void { this.patch({ toast: this.sourceQueue.shift() ?? null }) }
+  clearToast(): void {
+    let next = this.sourceQueue.shift()
+    while (next?.storage !== undefined && this.deleted.has(next.storage.experimentId)) next = this.sourceQueue.shift()
+    this.patch({ toast: next ?? null })
+  }
 
   /**
    * Cancel the saved experiment while retaining unconfirmed allocations.
    * @param id - experiment whose cancellation is recorded remotely.
    */
   async cancel(id: string): Promise<void> { this.replace(unwrap(await this.remote.cancelExperiment(id))) }
+  /** @param id - selected experiment. @returns acknowledgement; Host work continues after page navigation. */
+  interrupt(id: string): Promise<void> {
+    const existing = this.interruptionRequests.get(id)
+    if (existing !== undefined) return existing
+    const operation = Promise.resolve().then(() => this.remote.interruptExperiment(id)).then(result => {
+      const status = unwrap(result)
+      if (this.disposed || this.deleted.has(id)) return
+      if (status.experimentId !== id) throw new Error('Interruption acknowledgement belongs to another experiment')
+      const current = this.store.getSnapshot().interruptions.find(value => value.experimentId === id)
+      if (current !== undefined && (current.updatedAt > status.updatedAt || current.operationId === status.operationId && current.phase === 'released' && status.phase !== 'released')) return
+      this.patch({ interruptions: [...this.store.getSnapshot().interruptions.filter(value => value.experimentId !== id), status] })
+    }).finally(() => {
+      this.interruptionRequests.delete(id)
+      this.patch({ interrupting: [...this.interruptionRequests.keys()] })
+    })
+    this.interruptionRequests.set(id, operation)
+    this.patch({ interrupting: [...this.interruptionRequests.keys()] })
+    return operation
+  }
   /** Resume a failed preparation, sharing one pending request per experiment across page navigation.
    * @param id - immutable experiment identity. @returns completion of the accepted retry request.
    */

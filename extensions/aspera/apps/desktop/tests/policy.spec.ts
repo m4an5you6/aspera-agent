@@ -31,6 +31,48 @@ describe('desktop window and private channel', () => {
 })
 
 describe('desktop profile installation', () => {
+  it('gives the desktop lifecycle plugin a complete package identity on first launch', () => {
+    const root = mkdtempSync(resolve(tmpdir(), 'aspera-profile-'))
+    try {
+      const runtime = resolve(root, 'runtime'); const home = resolve(root, 'home')
+      const profile = prepareDesktopProfile(home, runtime, resolve(runtime, 'host.js'))
+      const file = resolve(profile, 'package.json')
+      expect(JSON.parse(readFileSync(file, 'utf8'))).toMatchObject({ name: 'aspera-desktop-profile', version: '0.1.1' })
+      const complete = readFileSync(file, 'utf8')
+      prepareDesktopProfile(home, runtime, resolve(runtime, 'host.js'))
+      expect(readFileSync(file, 'utf8')).toBe(complete)
+    } finally { clean(root) }
+  })
+  it('fills missing package identity in an existing profile without changing user settings', () => {
+    const root = mkdtempSync(resolve(tmpdir(), 'aspera-profile-'))
+    try {
+      const runtime = resolve(root, 'runtime'); const home = resolve(root, 'home')
+      const profile = resolve(home, 'profiles/aspera-desktop')
+      mkdirSync(profile, { recursive: true })
+      writeFileSync(resolve(profile, 'aspera-desktop-profile.json'), JSON.stringify({ version: 2, runtime: resolve(runtime, 'node_modules') }))
+      const manifest = { name: 'aspera-desktop-profile', private: true, dependencies: { 'user-plugin': '2.0.0' },
+        scripts: { check: 'user-command' }, dsh: { profile: { bundles: ['@aspera/dispatch', 'user-plugin'] } }, userField: { retained: true } }
+      writeFileSync(resolve(profile, 'package.json'), JSON.stringify(manifest))
+      const patch = '- id: user-plugin\n  config:\n    value: retained\n'
+      writeFileSync(resolve(profile, 'cordis.patch.yml'), patch)
+      prepareDesktopProfile(home, runtime, resolve(runtime, 'host.js'))
+      expect(JSON.parse(readFileSync(resolve(profile, 'package.json'), 'utf8'))).toEqual({ ...manifest, version: '0.1.1' })
+      expect(readFileSync(resolve(profile, 'cordis.patch.yml'), 'utf8')).toBe(patch)
+      expect(JSON.parse(readFileSync(resolve(profile, 'aspera-desktop-profile.json'), 'utf8')).version).toBe(2)
+    } finally { clean(root) }
+  })
+  it.each([{ name: 7 }, { version: 7 }, { name: '' }, { version: '' }])('refuses malformed explicit package identity: %j', identity => {
+    const root = mkdtempSync(resolve(tmpdir(), 'aspera-profile-'))
+    try {
+      const runtime = resolve(root, 'runtime'); const home = resolve(root, 'home')
+      const profile = resolve(home, 'profiles/aspera-desktop')
+      mkdirSync(profile, { recursive: true })
+      const raw = JSON.stringify({ ...identity, dsh: { profile: { bundles: ['@aspera/dispatch'] } } })
+      writeFileSync(resolve(profile, 'package.json'), raw)
+      expect(() => prepareDesktopProfile(home, runtime, resolve(runtime, 'host.js'))).toThrow()
+      expect(readFileSync(resolve(profile, 'package.json'), 'utf8')).toBe(raw)
+    } finally { clean(root) }
+  })
   it('retains user patches and installed packages after a portable app moves', () => {
     const root = mkdtempSync(resolve(tmpdir(), 'aspera-profile-'))
     try {
@@ -39,7 +81,7 @@ describe('desktop profile installation', () => {
       const profile = prepareDesktopProfile(home, old, resolve(old, 'host.js'))
       expect(existsSync(resolve(profile, 'node_modules'))).toBe(false)
       mkdirSync(resolve(profile, 'node_modules/test-plugin'), { recursive: true })
-      const manifest = { dependencies: { 'test-plugin': '1.0.0' }, dsh: { profile: { bundles: ['@aspera/dispatch', 'test-plugin'] } } }
+      const manifest = { name: 'user-profile', version: '3.2.1', dependencies: { 'test-plugin': '1.0.0' }, dsh: { profile: { bundles: ['@aspera/dispatch', 'test-plugin'] } } }
       writeFileSync(resolve(profile, 'package.json'), JSON.stringify(manifest))
       const patch = readFileSync(resolve(profile, 'cordis.patch.yml'), 'utf8') + '\n# user configuration\n'
       writeFileSync(resolve(profile, 'cordis.patch.yml'), patch)
@@ -48,6 +90,7 @@ describe('desktop profile installation', () => {
       expect(readFileSync(resolve(profile, 'cordis.patch.yml'), 'utf8')).toBe(patch)
       expect(readFileSync(resolve(profile, 'aspera-desktop-host.mjs'), 'utf8')).toContain('next/host.js')
       expect(JSON.parse(readFileSync(resolve(profile, 'package.json'), 'utf8'))).toEqual(manifest)
+      expect(readFileSync(resolve(profile, 'package.json'), 'utf8')).toBe(JSON.stringify(manifest))
       expect(existsSync(resolve(profile, 'node_modules/test-plugin'))).toBe(true)
       expect(readFileSync(resolve(profile, 'aspera-desktop.patch.yml'), 'utf8')).not.toContain('plugin-manager')
     } finally { clean(root) }
@@ -82,6 +125,7 @@ describe('desktop profile installation', () => {
       const migrated = readFileSync(resolve(profile, 'cordis.patch.yml'), 'utf8')
       expect(migrated).not.toContain('plugin-manager')
       expect(migrated).toContain('retained')
+      expect(JSON.parse(readFileSync(resolve(profile, 'package.json'), 'utf8'))).toMatchObject({ name: 'aspera-desktop-profile', version: '0.1.1' })
       prepareDesktopProfile(home, resolve(root, 'runtime.asar'), resolve(root, 'host.js'))
       expect(readFileSync(resolve(profile, 'cordis.patch.v1.yml'), 'utf8')).toBe(old)
     } finally { clean(root) }

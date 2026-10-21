@@ -1,5 +1,7 @@
 /** A node owns one experiment allocation and confined process ranges independently of SSH connections. */
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readSync, statSync, readdirSync, readFileSync } from 'node:fs'
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readSync, statSync, readdirSync, readFileSync, unlinkSync } from 'node:fs'
+import { writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
+import { createHash } from 'node:crypto'
 import { resolve } from 'node:path'
 import { createServer, connect } from 'node:net'
 import type { AddressInfo, Server } from 'node:net'
@@ -14,6 +16,8 @@ import { clusterFiles, clusterPath, readClusterChunk } from '@aspera/experiments
 import { clusterFileHash } from './cluster-runtime.ts'
 import { serverRunRoot } from './storage.ts'
 import { experimentSandboxArgv } from './experiment-sandbox.ts'
+import { ownedCommandArgv } from './owned-command.ts'
+import { inspectCompletionFile } from '../scripts/completion-files.mjs'
 import { verifyStorage } from '../scripts/storage.mjs'
 import { NetworkProbes } from './network-probes.ts'
 import { openInferenceGateway } from './inference-gateway.ts'
@@ -22,6 +26,14 @@ import { processLogRequestSchema } from '@aspera/experiments'
 import { controllerBootIdSchema, controllerMaintenanceSchema, gpuIdentities, normalizedSet, normalizedGpuInventory } from '@aspera/experiments'
 import type { ControllerStatus, ControllerRepairId, GpuInventory } from '@aspera/experiments'
 import { probeControllerGpu, controllerPolicyDigest, controllerProcessIdentity } from './controller.ts'
+import { ManagedEnvironments, managedEnvironmentMounts } from './managed-environment.ts'
+import type { ManagedEnvironmentPolicy, ManagedEnvironmentBinding } from './managed-environment.ts'
+import { prepareExperimentEnvironmentSchema, experimentCacheCleanupSchema, environmentOperationIdSchema } from '@aspera/experiments'
+import type { EnvironmentOperationStatus, EnvironmentRuntime } from '@aspera/experiments'
+import { assessExperimentStorageSchema, inspectExperimentMaterialsSchema, prepareExperimentMaterialsSchema, storageOperationIdSchema, experimentStoragePlanSchema } from '@aspera/experiments'
+import { assertStorageSourceAvailable, materialReadonlyPaths } from './storage-governance.ts'
+import { finalizationPolicySchema } from './finalization-policy.ts'
+import type { FinalizationPolicy } from './finalization-policy.ts'
 
 const allocationObject = z.object({ experimentId: experimentIdSchema, deploymentId: deploymentIdSchema,
   node: z.union([clusterNodeSchema, legacyClusterNodeSchema]).transform((node): ClusterNode => node), protocol: z.union([z.literal(2), z.literal(3), z.literal(4)]).optional(), budget: budgetSchema.optional(), deadline: z.number().int().optional(), released: z.boolean(), releasing: z.boolean().default(false), bootId: z.string() }).strict()
@@ -65,6 +77,8 @@ export interface ClusterNodeConfig {
   devicePaths: readonly string[]
   networkProbeLifetimeMs?: number
   observations?: ObservationPolicy
+  managedEnvironments?: ManagedEnvironmentPolicy
+  finalization?: FinalizationPolicy
 }
 
 /**
@@ -79,6 +93,7 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
   const allocations = store.table('allocations')
   const commands = store.table('commands')
   const services = store.table('services')
+  const environments = new ManagedEnvironments(ctx, config.managedEnvironments)
   let maintenance: ControllerRepairId | undefined
   const policy: ControllerStatus['policy'] = { backendPath: config.backendPath, hiddenPaths: normalizedSet(config.hiddenPaths),
     devicePaths: normalizedSet(config.devicePaths), ...(config.gpuSnapshot === undefined ? {} : { gpu: config.gpuSnapshot }) }
@@ -103,6 +118,55 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
   const netServers = new Map<ExperimentId, Server>()
   const network = new NetworkProbes(config.networkProbeLifetimeMs ?? config.cleanupTimeoutMs, config.cleanupTimeoutMs)
   const deadlines = new Map<string, ReturnType<typeof setTimeout>>()
+  const environmentFence = (id: ExperimentId) => resolve(config.root, 'state/environment-fences', id + '.json')
+  const clearEnvironmentFence = (id: ExperimentId, operationId: string) => {
+    const path = environmentFence(id)
+    if (existsSync(path) && z.object({ operationId: z.string() }).parse(JSON.parse(readFileSync(path, 'utf8'))).operationId === operationId) unlinkSync(path)
+  }
+  const environmentBinding = (id: ExperimentId): ManagedEnvironmentBinding => {
+    const saved = allocations.get(id)
+    if (saved === undefined || saved.protocol !== 4) throw new Error('Managed environments require a protocol-4 allocation and capable fixed release')
+    if (saved.node.server.storagePlacement === undefined) throw new Error('Managed environment storage placement is missing')
+    return { experimentId: id, node: saved.node, deploymentId: saved.deploymentId, controlRoot: config.root,
+      hiddenPaths: [...config.hiddenPaths, ...saved.node.hiddenPaths, config.root, saved.node.server.storagePlacement.namespaceRoot] }
+  }
+  const environmentIdle = (id: ExperimentId, originalCommand?: string) => {
+    assertStorageSourceAvailable(config.root, id)
+    if (maintenance !== undefined || closing) throw new Error('Controller is stopping or in maintenance')
+    if ([...commands.entries()].some(([, row]) => row.experimentId === id && row.commandId !== originalCommand && !row.released)
+      || [...services.entries()].some(([, row]) => row.experimentId === id && !row.released)) throw new Error('Environment changes require confirmed exit of every command and inference service')
+  }
+  const environmentRecoveryIdle = (id: ExperimentId, operationId: string, commandId: string) => {
+    environmentIdle(id, commandId)
+    const fence = environmentFence(id)
+    if (existsSync(fence) && z.object({ operationId: environmentOperationIdSchema }).parse(JSON.parse(readFileSync(fence, 'utf8'))).operationId !== operationId) throw new Error('Recover the currently fenced environment operation before another operation')
+  }
+  const environmentStatus = (id: ExperimentId, operationId: string): EnvironmentOperationStatus => {
+    const binding = environmentBinding(id)
+    const request = environments.originalRequest(binding, operationId)
+    const receipt = environments.receipt(binding, request)
+    const runtime = environments.runtime(binding, operationId)
+    const launch = environments.launch(binding, operationId)
+    const reusePlan = environments.reusePlan(binding, operationId)
+    const key = commandKey(id, 'environment-' + operationId)
+    const command = commands.get(key)
+    const admissionReleased = !existsSync(environmentFence(id)) && !handles.has(key) && !settlements.has(key)
+    const notStarted = launch?.state === 'not-started' && command === undefined
+    const exited = (command?.released === true || notStarted) && runtime?.exitConfirmed === true
+    const settled = exited && admissionReleased && receipt.exitConfirmed && runtime.admissionReleased
+    const running = handles.has(key) || settlements.has(key)
+    const state = settled ? receipt.state === 'completed' && command?.exitCode === 0 && runtime.stopReason === undefined ? 'completed' : 'failed'
+      : running ? 'running' : 'unknown'
+    const checkedAt = Date.now()
+    return { experimentId: id, serverId: binding.node.server.id, operationId: request.operationId, state, operation: receipt,
+      ...(runtime === undefined ? {} : { runtime }), ...(launch === undefined ? {} : { launch }), ...(reusePlan === undefined ? {} : { reusePlan }),
+      checkedAt, elapsedMs: Math.max(0, (settled ? runtime.updatedAt : checkedAt) - (runtime?.startedAt ?? receipt.startedAt)),
+      processState: notStarted ? 'not-started' : exited ? 'exited' : handles.has(key) ? 'running' : 'unknown', admissionReleased,
+      ...(state === 'unknown' ? { detail: 'Original process exit, receipt or admission release is unconfirmed; recover this operation before another mutation' }
+        : receipt.exitConfirmed && !settled ? { detail: 'Installer receipt saved; waiting for process-group exit and admission release' }
+        : runtime?.stopReason !== undefined ? { detail: 'Installation stopped: ' + runtime.stopReason + (receipt.detail === undefined ? '' : '; ' + receipt.detail) }
+        : receipt.detail === undefined ? {} : { detail: receipt.detail }) }
+  }
   const serial = <T>(operation: () => Promise<T>): Promise<T> => {
     const pending = chain.then(operation)
     chain = pending.then(() => {}, () => {})
@@ -132,15 +196,16 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
     return async () => { clearInterval(timer); samplingLifetime.abort(); await sampling }
   }, 'Aspera: node resource samples')
   const allocation = (id: ExperimentId) => {
+    if (existsSync(resolve(config.root, 'state/interruption-fences', `${id}.json`))) throw new Error('Experiment interruption is fencing new commands')
     const saved = allocations.get(id)
     if (saved === undefined || saved.released || saved.releasing || saved.bootId !== config.bootId) throw new Error('node allocation is unavailable or interrupted')
     return saved
   }
-  const finish = async (key: string, handle: SubprocessHandle): Promise<void> => {
+  const finish = async (key: string, handle: SubprocessHandle, exitTimeoutMs = config.cleanupTimeoutMs): Promise<void> => {
     let patch: Partial<ClusterCommandResult>
     try {
       const outcome = await handle.done
-      const released = await handle.waitForExit(AbortSignal.timeout(config.cleanupTimeoutMs))
+      const released = await handle.waitForExit(AbortSignal.timeout(exitTimeoutMs))
       patch = { exitCode: outcome.exitCode, released, state: outcome.exitCode === 0 && released ? 'completed' : 'failed' }
     } catch (error) { patch = { state: 'failed', released: false, detail: String(error) } }
     await serial(async () => {
@@ -164,7 +229,7 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
     await network.close()
     await chain
     await Promise.all([...gateways.keys()].map(stopGateway))
-    for (const handle of handles.values()) handle.terminate()
+    for (const [key, handle] of handles) { await recordEnvironmentStop(key, 'controller-stopping'); handle.terminate() }
     for (const timer of deadlines.values()) clearTimeout(timer)
     await Promise.all([...netServers.values()].map(server => new Promise<void>((done) => { server.close(() => { done() }) })))
     await Promise.all(settlements.values())
@@ -196,6 +261,246 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
     })
     const input = z.object({ experimentId: experimentIdSchema }).loose().parse(raw)
     const id = input.experimentId
+    if (operation === 'command-status' || operation === 'stop-command') {
+      const query = z.object({ commandId: clusterCommandSchema.shape.commandId, commandHash: z.string().regex(/^[a-f0-9]{64}$/).optional() }).parse(raw)
+      const key = commandKey(id, query.commandId), row = commands.get(key), allocationRow = allocations.get(id)
+      if (row === undefined || allocationRow === undefined || row.experimentId !== id) throw new Error('Original command is absent from this allocation')
+      if (operation === 'stop-command') {
+        if (query.commandHash === undefined || query.commandHash !== createHash('sha256').update(row.command).digest('hex')) throw new Error('Command contents differ from the owned stop request')
+        if ([...services.entries()].some(([, service]) => service.experimentId === id && service.commandId === query.commandId)) throw new Error('Registered services must use their dedicated stop operation')
+        await serial(async () => { handles.get(key)?.terminate() })
+        await verifyCleanup(key)
+      }
+      return { experimentId: id, serverId: allocationRow.node.server.id, result: commandView(commands.get(key)!), checkedAt: Date.now() }
+    }
+    if (operation === 'stage-source') {
+      const source = z.object({ path: z.string().min(1).max(2048), metadataOnly: z.boolean().optional() }).parse(raw)
+      const owner = allocations.get(id)
+      if (owner === undefined) throw new Error('Stage evidence has no original allocation')
+      return inspectCompletionFile({ runRoot: runRoot(id), experimentId: id, serverId: owner.node.server.id,
+        path: source.path, metadataOnly: source.metadataOnly, maxBytes: finalizationPolicySchema.parse(config.finalization ?? {}).evidenceBytes })
+    }
+    if (operation === 'completion-source') {
+      const source = z.object({ path: z.string().min(1).max(2048) }).parse(raw)
+      return inspectCompletionFile({ runRoot: runRoot(id), experimentId: id, serverId: allocations.get(id)!.node.server.id,
+        path: source.path, maxBytes: config.chunkBytes })
+    }
+    if (operation === 'environment-acceptance') {
+      const required = z.object({ environments: z.array(z.string().min(1).max(2048)).max(512).optional() }).parse(raw).environments ?? []
+      if (existsSync(environmentFence(id))) return { verified: false, detail: 'Environment operation exit or publication remains unconfirmed' }
+      try {
+        const mounts = managedEnvironmentMounts(runRoot(id), workspace(id), config.root)
+          materialReadonlyPaths(runRoot(id), config.root)
+          const planPath = resolve(runRoot(id), 'storage-plan.v1.json')
+          if (existsSync(planPath)) {
+            const plan = experimentStoragePlanSchema.parse(JSON.parse(readFileSync(planPath, 'utf8')))
+            if (plan.state !== 'ready' || plan.experimentId !== id || plan.serverId !== allocation(id).node.server.id
+              || plan.materialIds.some(material => !existsSync(resolve(runRoot(id), 'material-bindings-v1', material + '.json')))) throw new Error('Declared storage/material plan is not verified for this experiment')
+          }
+        return mounts.readonlyPaths.length === 0 ? required.length > 0
+          ? { verified: false, detail: 'Recorded execution environment is not registered; prepare and verify the training environment before completion' }
+          : { verified: true, environments: 0 } : await environments.acceptance(environmentBinding(id), required)
+      }
+      catch (error) { return { verified: false, detail: String(error) } }
+    }
+    if (operation === 'environment-storage') {
+      const binding = environmentBinding(id)
+      return { ...await environments.inspect(binding), operations: environments.operations(binding).map(row => environmentStatus(id, row.operationId)) }
+    }
+    if (operation === 'environment-preview') {
+      const preview = await environments.preview(environmentBinding(id))
+      try { environmentIdle(id); return preview }
+      catch (error) { return { ...preview, eligible: false, detail: String(error) } }
+    }
+    if (operation === 'environment-inspect') {
+      const binding = environmentBinding(id)
+      const operations = environments.operations(binding)
+      const launches = operations.map(receipt => environments.launch(binding, receipt.operationId)).filter(value => value !== undefined)
+      try { return { operations, launches, storage: { ...await environments.inspect(binding), operations: operations.map(row => environmentStatus(id, row.operationId)) } } }
+      catch (error) { return { operations, launches, error: String(error) } }
+    }
+    if (operation === 'environment-status') {
+      const request = z.object({ operationId: environmentOperationIdSchema }).parse(raw)
+      return environmentStatus(id, request.operationId)
+    }
+    if (operation === 'environment-recover') return serial(async () => {
+      const request = z.object({ operationId: environmentOperationIdSchema }).parse(raw)
+      const binding = environmentBinding(id)
+      const original = environments.originalRequest(binding, request.operationId)
+      const commandId = 'environment-' + request.operationId; const key = commandKey(id, commandId)
+      if (handles.has(key)) return { ...environments.receipt(binding, original), detail: 'Original environment process is still managed and running; wait for its command exit' }
+      environmentRecoveryIdle(id, request.operationId, commandId)
+      const command = commands.get(key); const launch = environments.launch(binding, request.operationId)
+      const rejected = launch?.state === 'prepared' || launch?.state === 'not-started'
+      if (command === undefined && !rejected) throw new Error('Original command and verifiable startup evidence are missing; preserve the environment fence and inspect original release, failure logs and process identity')
+      const result = await environments.recover(binding, original, rejected || command?.state === 'failed' && command.released)
+      if (result.exitConfirmed) {
+        if (command !== undefined && !command.released) await commands.put(key, { ...command, released: true, state: 'interrupted', exitCode: null, detail: result.detail })
+        if (launch !== undefined && !rejected) await environments.recordLaunch(binding, request.operationId, 'exited', result.detail)
+        clearEnvironmentFence(id, request.operationId)
+        if (environments.runtime(binding, request.operationId) !== undefined) await environments.recordRuntime(binding, original,
+          { exitConfirmed: true, exitCode: command?.exitCode ?? null, admissionReleased: true })
+      }
+      return result
+    })
+    if (operation === 'storage-inspect') {
+      const request = z.object({ refresh: z.boolean().optional(), cursor: z.string().optional() }).parse(raw)
+      return environments.governance(environmentBinding(id), 'storage-inspect', request)
+    }
+    if (operation === 'storage-assess') return serial(async () => {
+      allocation(id); environmentIdle(id)
+      const { experimentId: _id, ...request } = z.object({ experimentId: experimentIdSchema }).loose().parse(raw)
+      return environments.governance(environmentBinding(id), 'storage-assess', { request: assessExperimentStorageSchema.parse(request) })
+    })
+    if (operation === 'storage-plan') return environments.governance(environmentBinding(id), 'storage-plan')
+    if (operation === 'material-metadata-pending') return environments.governance(environmentBinding(id), 'material-metadata-pending')
+    if (operation === 'material-metadata-error') {
+      const request = z.object({ experimentId: experimentIdSchema, requestId: z.string().regex(/^[a-f0-9]{64}$/), detail: z.string().max(16384) }).strict().parse(raw)
+      return environments.governance(environmentBinding(id), 'material-metadata-error', request)
+    }
+    if (operation === 'material-inspect' || operation === 'material-manifest-import') {
+      const { experimentId: _id, canonical, ...input } = z.object({ experimentId: experimentIdSchema, canonical: z.unknown().optional() }).loose().parse(raw)
+      if (operation === 'material-inspect' && canonical !== undefined) throw new Error('Canonical manifest import is a program-owned operation')
+      return environments.governance(environmentBinding(id), 'material-inspect', { request: inspectExperimentMaterialsSchema.parse(input),
+        ...(canonical === undefined ? {} : { canonical }) })
+    }
+    if (operation === 'material-status') {
+      const request = z.object({ operationId: storageOperationIdSchema }).parse(raw)
+      const status = environments.materialStatus(environmentBinding(id), request.operationId)
+      if (status === undefined) return null
+      const key = commandKey(id, status.commandId ?? 'material-' + request.operationId)
+      const command = commands.get(key)
+      const released = (command?.released === true || status.processState === 'not-started') && !handles.has(key) && !settlements.has(key)
+      return { ...status, ...(status.state === 'completed' && !released ? { stage: 'waiting-exit' } : {}), exitConfirmed: status.exitConfirmed && released, admissionReleased: status.admissionReleased && released }
+    }
+    if (operation === 'material-prepare') return serial(async () => {
+      const { experimentId: _id, ...input } = z.object({ experimentId: experimentIdSchema }).loose().parse(raw)
+      const request = prepareExperimentMaterialsSchema.parse(input)
+      const binding = environmentBinding(id)
+      const previous = environments.materialStatus(binding, request.operationId)
+      if (previous !== undefined) {
+        const original = environments.materialOriginal(binding, request.operationId)
+        if (original.materialId !== request.materialId || original.budgetId !== request.budgetId || request.action !== 'recover' && original.action !== request.action) throw new Error('Material operation identity is bound to different content')
+      }
+      if (request.action === 'recover' && previous === undefined) throw new Error('Original material receipt is missing; inspect startup and exit evidence before resubmitting this operation')
+      const key = commandKey(id, previous?.commandId ?? 'material-' + request.operationId)
+      if (previous?.state === 'completed' || handles.has(key) || settlements.has(key)) return previous ?? null
+      allocation(id)
+      if (request.action === 'recover' && previous !== undefined) {
+        environmentRecoveryIdle(id, request.operationId, previous.commandId ?? 'material-' + request.operationId)
+        await environments.governance(binding, 'material-settle', { operationId: request.operationId, launchFailureConfirmed: previous.processState === 'not-started' })
+        const original = commands.get(key)
+        if (original !== undefined && !original.released) await commands.put(key, { ...original, released: true, state: 'failed', detail: 'Original material process exit confirmed; recover the same acquisition without repeating training' })
+        clearEnvironmentFence(id, request.operationId)
+      }
+      environmentIdle(id)
+      const command = environments.materialCommand(binding, request)
+      await environments.governance(binding, 'material-register', command.registration)
+      if (existsSync(environmentFence(id))) throw new Error('Recover the fenced operation before material acquisition')
+      await writeFileAtomic(environmentFence(id), JSON.stringify({ version: 1, operationId: request.operationId, commandId: command.commandId }), { mode: 0o600 })
+      try {
+        await launchOwned(id, { commandId: command.commandId, command: `[managed materials] ${request.action} ${request.materialId}` }, command.deadline,
+          { argv: command.argv, operationId: request.operationId, material: true })
+      } catch (error) {
+        const row = commands.get(commandKey(id, command.commandId))
+        if (row === undefined || row.released) {
+          await environments.governance(binding, 'material-settle', { operationId: request.operationId, launchFailureConfirmed: true, notStarted: row === undefined })
+          clearEnvironmentFence(id, request.operationId)
+        }
+        throw error
+      }
+      return environments.materialStatus(binding, request.operationId) ?? null
+    })
+    if (operation === 'environment-prepare') return serial(async () => {
+      const { experimentId: _id, ...body } = z.object({ experimentId: experimentIdSchema }).loose().parse(raw)
+      const request = prepareExperimentEnvironmentSchema.parse(body)
+      const binding = environmentBinding(id)
+      const previous = environments.operations(binding).find(row => row.operationId === request.operationId)
+      if (previous !== undefined) {
+        environments.command(binding, request)
+        return previous
+      }
+      allocation(id); environmentIdle(id)
+      if (existsSync(environmentFence(id))) throw new Error('Original environment operation requires recovery before another operation')
+      const command = environments.command(binding, request)
+      const lifetime = await environments.recordRuntime(binding, request)
+      await environments.recordLaunch(binding, request.operationId, 'prepared')
+      await writeFileAtomic(environmentFence(id), JSON.stringify({ version: 1, operationId: request.operationId, commandId: command.commandId }), { mode: 0o600 })
+      try {
+        await launchOwned(id, { commandId: command.commandId, command: `[managed environment] ${request.action} ${request.environmentId}` },
+          lifetime.deadline, { argv: command.argv, operationId: request.operationId })
+      } catch (error) {
+        const evidence = environments.launch(binding, request.operationId)
+        const row = commands.get(commandKey(id, command.commandId))
+        if (evidence?.state === 'prepared' || row?.state === 'failed' && row.released) {
+          await environments.recordLaunch(binding, request.operationId, 'not-started', String(error))
+          const outcome = await environments.recover(binding, request, true)
+          if (outcome.exitConfirmed) {
+            clearEnvironmentFence(id, request.operationId)
+            await environments.recordRuntime(binding, request, { exitConfirmed: true, exitCode: null, admissionReleased: true, detail: String(error) })
+          }
+        }
+        throw error
+      }
+      return environments.receipt(binding, request)
+    })
+    if (operation === 'environment-cleanup-status') return serial(async () => {
+      const request = experimentCacheCleanupSchema.parse(raw); const binding = environmentBinding(id)
+      if (request.nodes.length !== 1 || request.nodes[0]!.serverId !== binding.node.server.id) throw new Error('Cleanup status has an unassigned node')
+      const key = commandKey(id, 'environment-cleanup-' + request.operationId); const original = commands.get(key)
+      if (original === undefined) {
+        const launch = environments.launch(binding, request.operationId)
+        if (launch?.state === 'prepared' || launch?.state === 'not-started') {
+          if (environments.cleanupFingerprint(binding, request.operationId) !== request.nodes[0]!.fingerprint) throw new Error('Cleanup status differs from the original preview')
+          environmentRecoveryIdle(id, request.operationId, 'environment-cleanup-' + request.operationId)
+          const result = await environments.recoverCleanup(binding, request.operationId, request.nodes[0]!.fingerprint, true)
+          clearEnvironmentFence(id, request.operationId); return { state: 'settled', result }
+        }
+        return launch === undefined && !existsSync(environmentFence(id)) ? { state: 'not-started' }
+          : { state: 'unknown', detail: 'Original cleanup startup cannot be confirmed; preserve the fence and inspect its original receipt and process identity' }
+      }
+      if (environments.cleanupFingerprint(binding, request.operationId) !== request.nodes[0]!.fingerprint) throw new Error('Cleanup status differs from the original preview')
+      if (handles.has(key)) return { state: 'running' }
+      environmentRecoveryIdle(id, request.operationId, original.commandId)
+      const result = await environments.recoverCleanup(binding, request.operationId, request.nodes[0]!.fingerprint, original.released)
+      if (!original.released) await commands.put(key, { ...original, released: true, state: 'interrupted', exitCode: null, detail: result.detail })
+      clearEnvironmentFence(id, request.operationId); return { state: 'settled', result }
+    })
+    if (operation === 'environment-cleanup') return serial(async () => {
+      const request = experimentCacheCleanupSchema.parse(raw)
+      if (request.experimentId !== id || request.nodes.length !== 1) throw new Error('Node cleanup requires exactly its original server')
+      const binding = environmentBinding(id); const node = request.nodes[0]!
+      if (node.serverId !== binding.node.server.id) throw new Error('Cleanup node is outside this experiment')
+      const previous = environments.cleanupResult(binding, request.operationId)
+      const command = environments.cleanupCommand(binding, request.operationId, node.fingerprint, node.candidateIds)
+      const original = commands.get(commandKey(id, command.commandId))
+      if (previous !== undefined && (original?.released === true || environments.launch(binding, request.operationId)?.state === 'not-started')) { clearEnvironmentFence(id, request.operationId); return previous }
+      if (original !== undefined && !handles.has(commandKey(id, command.commandId))) {
+        environmentRecoveryIdle(id, request.operationId, command.commandId)
+        const result = await environments.recoverCleanup(binding, request.operationId, node.fingerprint, original.released)
+        if (!original.released) await commands.put(commandKey(id, command.commandId), { ...original, released: true, state: 'interrupted', exitCode: null, detail: result.detail })
+        clearEnvironmentFence(id, request.operationId); return result
+      }
+      if (original !== undefined) return { serverId: node.serverId, state: 'blocked', reclaimedBytes: 0, checkedAt: Date.now(),
+        detail: original.released ? 'Cleanup exited without a committed result; inspect the original receipt and command. ' + (original.detail ?? '') : 'Cleanup remains pending; inspect its original command before retrying' }
+      environmentIdle(id)
+      if (existsSync(environmentFence(id))) throw new Error('Environment outcome requires recovery before cleanup')
+      await environments.recordLaunch(binding, request.operationId, 'prepared', undefined, command.commandId)
+      await writeFileAtomic(environmentFence(id), JSON.stringify({ version: 1, operationId: request.operationId, commandId: command.commandId }), { mode: 0o600 })
+      try {
+        await launchOwned(id, { commandId: command.commandId, command: '[managed environment] cache cleanup' },
+          Date.now() + environments.policy.timeoutMs, { argv: command.argv, operationId: request.operationId, cleanup: true })
+      } catch (error) {
+        const evidence = environments.launch(binding, request.operationId); const row = commands.get(commandKey(id, command.commandId))
+        if (evidence?.state === 'prepared' || row?.state === 'failed' && row.released) {
+          await environments.recordLaunch(binding, request.operationId, 'not-started', String(error), command.commandId)
+          await environments.recoverCleanup(binding, request.operationId, node.fingerprint, true)
+          clearEnvironmentFence(id, request.operationId)
+        }
+        throw error
+      }
+      return { serverId: node.serverId, state: 'blocked', reclaimedBytes: 0, checkedAt: Date.now(), detail: 'Cleanup started; repeat the same operation to read its committed result' }
+    })
     if (operation === 'observation-sources') {
       if (allocations.get(id) === undefined) return []
       return observationSources(runRoot(id)).filter(source => source.experimentId === id)
@@ -213,6 +518,7 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
     if (operation === 'allocate') return serial(async () => {
       if (closing) throw new Error('node is stopping')
       if (maintenance !== undefined) throw new Error('node is in controller maintenance')
+      if (existsSync(resolve(config.root, 'state/interruption-fences', `${id}.json`))) throw new Error('Experiment interruption prevents allocation')
 
       const request = allocationRequestSchema.parse(raw)
       if (request.protocol === 3 || request.protocol === 4) {
@@ -246,6 +552,7 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
           throw new Error(`GPU hardware changed after preparation; copy this experiment. Requested devices: ${JSON.stringify(request.node.devicePaths)}; actual: ${JSON.stringify(actual)}`)
         }
       }
+      if (existsSync(resolve(config.root, 'state/interruption-fences', `${id}.json`))) throw new Error('Experiment interruption prevents allocation')
       await allocations.put(id, { ...request, released: false, releasing: false, bootId: config.bootId })
       return { allocated: true }
     })
@@ -269,9 +576,10 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
         if (owned.some(([, command]) => !command.released)) return { released: false,
           detail: 'node restarted; process cleanup requires operator verification' }
         await allocations.put(id, { ...saved, released: true })
+        if (existsSync(resolve(runRoot(id), 'storage-plan.v1.json'))) await environments.governance(environmentBinding(id), 'storage-release')
         return { released: true }
       })
-      for (const [key] of owned) handles.get(key)?.terminate()
+      for (const [key] of owned) { await recordEnvironmentStop(key, 'cancelled'); handles.get(key)?.terminate() }
       await Promise.all(owned.flatMap(([key]) => {
         const pending = settlements.get(key)
         return pending === undefined ? [] : [pending]
@@ -284,6 +592,7 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
           if (server !== undefined) await new Promise<void>(resolveClose => server.close(() => { resolveClose() }))
           netServers.delete(id)
           await allocations.put(id, { ...saved, released: true })
+          if (existsSync(resolve(runRoot(id), 'storage-plan.v1.json'))) await environments.governance(environmentBinding(id), 'storage-release')
         }
         return { released }
       })
@@ -485,7 +794,11 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
       }
       return service
     })
-    if (operation === 'run') return launch(id, { commandId: input.commandId, command: input.command })
+    if (operation === 'run') {
+      const command = clusterCommandSchema.parse({ commandId: input.commandId, command: input.command })
+      if (/^(?:service|environment|material)-/.test(command.commandId)) throw new Error('Ordinary commands cannot use reserved managed-operation names')
+      return launch(id, command)
+    }
     throw new Error('unknown node operation')
   }
 
@@ -530,8 +843,35 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
     return serial(() => launchOwned(id, raw, serviceDeadline))
   }
 
-  async function launchOwned(id: ExperimentId, raw: unknown, serviceDeadline?: number): Promise<ClusterCommandResult> {
-      const current = allocation(id)
+  async function recordEnvironmentStop(key: string, reason: NonNullable<EnvironmentRuntime['stopReason']>): Promise<void> {
+    const command = commands.get(key)
+    if (command !== undefined && command.commandId.startsWith('material-')) {
+      const identity = /^material-([a-f0-9-]{36})(?:-retry-\d+)?$/.exec(command.commandId)
+      const parsed = storageOperationIdSchema.safeParse(identity?.[1])
+      if (parsed.success) await serial(() => environments.governance(environmentBinding(command.experimentId), 'material-stop', { operationId: parsed.data, reason }))
+      return
+    }
+    if (command === undefined || !command.commandId.startsWith('environment-') || command.commandId.startsWith('environment-cleanup-')) return
+    const parsed = environmentOperationIdSchema.safeParse(command.commandId.slice('environment-'.length))
+    if (!parsed.success) return
+    const operationId = parsed.data
+    await serial(async () => {
+      const binding = environmentBinding(command.experimentId)
+      const runtime = environments.runtime(binding, operationId)
+      if (runtime !== undefined && runtime.stopReason === undefined) await environments.recordRuntime(binding,
+        environments.originalRequest(binding, operationId), { stopReason: reason })
+    })
+  }
+
+  async function launchOwned(id: ExperimentId, raw: unknown, serviceDeadline?: number, managed?: { argv: string[]; operationId: string; cleanup?: boolean; material?: boolean }): Promise<ClusterCommandResult> {
+      assertStorageSourceAvailable(config.root, id)
+      const current = managed?.cleanup === true ? allocations.get(id) : allocation(id)
+      if (current === undefined) throw new Error('Original allocation is missing')
+      if (managed === undefined && existsSync(environmentFence(id))) {
+        const fence = z.object({ operationId: environmentOperationIdSchema }).parse(JSON.parse(readFileSync(environmentFence(id), 'utf8')))
+        const plan = environments.reusePlan(environmentBinding(id), fence.operationId)
+        throw new Error(`Environment operation ${fence.operationId} (${plan?.stage ?? 'exit-unconfirmed'}) prevents execution; wait for prepare_experiment_environment or recover this original operation`)
+      }
       const request = clusterCommandSchema.parse(raw)
       const key = commandKey(id, request.commandId)
       const previous = commands.get(key)
@@ -542,7 +882,10 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
       if (closing) throw new Error('node is stopping')
       if (current.deadline !== undefined && current.deadline <= Date.now() && serviceDeadline === undefined) throw new Error('experiment runtime budget expired')
       if (current.budget !== undefined && [...commands.entries()].filter(([, row]) => row.experimentId === id).length >= current.budget.maxCommands) throw new Error('node command budget exhausted')
-      if (current.node.server.storagePlacement !== undefined) verifyStorage(current.node.server.storagePlacement)
+      if (current.node.server.storagePlacement !== undefined) verifyStorage(current.node.server.storagePlacement, 0, managed !== undefined)
+      if (managed === undefined && existsSync(resolve(runRoot(id), 'storage-plan.v1.json'))) {
+        await environments.governance(environmentBinding(id), 'storage-command-reserve', { commandId: request.commandId })
+      }
       const row = { ...request, experimentId: id, state: 'starting' as const, exitCode: null, released: false }
       await commands.put(key, row)
       let handle: SubprocessHandle
@@ -559,18 +902,27 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
           const owner = z.object({ namespaceRoot: z.string() }).parse(JSON.parse(readFileSync(resolve(storageRoots, name, '.aspera-owner.json'), 'utf8')))
           hidden.push(owner.namespaceRoot)
         }
-        const argv = experimentSandboxArgv({ backendPath: current.node.backendPath, workspaceRoot: workspace(id),
-          devicePaths: current.node.devicePaths, hiddenPaths: hidden }, ['bash', '-c', request.command])
-        handle = ctx.subprocess.spawn({ argv, cwd: workspace(id),
-          env: { HOME: workspace(id), PYTHONUNBUFFERED: '1' }, graceMs: config.cleanupTimeoutMs,
+        const mounts = managed === undefined ? managedEnvironmentMounts(runRoot(id), workspace(id), config.root) : undefined
+        const materialPaths = managed === undefined ? materialReadonlyPaths(runRoot(id), config.root) : []
+        mounts?.readonlyPaths.push(...materialPaths)
+        const argv = managed?.argv ?? experimentSandboxArgv({ backendPath: current.node.backendPath, workspaceRoot: workspace(id),
+          devicePaths: current.node.devicePaths, hiddenPaths: hidden, environment: mounts, offlineMaterials: materialPaths.length > 0 }, ['bash', '-c', request.command])
+        if (managed !== undefined && !managed.material) await environments.recordLaunch(environmentBinding(id), managed.operationId, 'starting', undefined, request.commandId)
+        handle = ctx.subprocess.spawn({ argv: ownedCommandArgv(runRoot(id), { experimentId: id, serverId: current.node.server.id, commandId: request.commandId,
+          controlRoot: config.root, deploymentId: current.deploymentId, ...(managed === undefined ? {} : { environmentOperation: managed.operationId, cacheCleanup: managed.cleanup }) }, argv), cwd: workspace(id),
+          env: { HOME: workspace(id), PYTHONUNBUFFERED: '1' }, graceMs: managed === undefined ? config.cleanupTimeoutMs : environments.policy.stopTimeoutMs,
           stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' } })
       } catch (error) {
         await commands.put(key, { ...row, state: 'failed', released: true, detail: String(error) })
+        if (managed === undefined && existsSync(resolve(runRoot(id), 'storage-plan.v1.json'))) await environments.governance(environmentBinding(id), 'storage-command-settle', { commandId: request.commandId, launchFailureConfirmed: true })
+        if (managed !== undefined) ctx.logger.error('Environment manager failed to launch; the operation remains fenced for recovery')
         throw error
       }
       handles.set(key, handle)
       const deadline = serviceDeadline ?? current.deadline
-      if (deadline !== undefined) deadlines.set(key, setTimeout(() => { handle.terminate() }, Math.min(Math.max(1, deadline - Date.now()), 2_147_483_647)))
+      if (deadline !== undefined) deadlines.set(key, setTimeout(() => {
+        void recordEnvironmentStop(key, 'timeout').catch((error: unknown) => { ctx.logger.error(`Environment stop record failed: ${String(error)}`) }).finally(() => { handle.terminate() })
+      }, Math.min(Math.max(1, deadline - Date.now()), 2_147_483_647)))
       const append = (chunk: Buffer | string, stream?: 'stdout' | 'stderr') => {
         try {
           appendFileSync(logPath(id), chunk, { mode: 0o600 })
@@ -582,10 +934,38 @@ export async function createClusterNode(ctx: Context, config: ClusterNodeConfig)
       append(`\n[${request.commandId}]\n`)
       handle.stdout?.on('data', (chunk: Buffer) => { append(chunk, 'stdout') })
       handle.stderr?.on('data', (chunk: Buffer) => { append(chunk, 'stderr') })
-      const settled = finish(key, handle).catch((error: unknown) => { ctx.logger.error(`experiment node: ${String(error)}`) })
-        .finally(() => { observation.close(commands.get(key)?.released === true); settlements.delete(key) })
+      const settled = finish(key, handle, managed === undefined ? config.cleanupTimeoutMs : environments.policy.stopTimeoutMs).catch((error: unknown) => { ctx.logger.error(`experiment node: ${String(error)}`) })
+        .finally(async () => {
+          observation.close(commands.get(key)?.released === true)
+          if (managed !== undefined && commands.get(key)?.released === true) {
+            const binding = environmentBinding(id)
+            if (managed.material === true) {
+              await serial(async () => {
+                await environments.governance(binding, 'material-settle', { operationId: managed.operationId, exitCode: commands.get(key)?.exitCode ?? null })
+                clearEnvironmentFence(id, managed.operationId)
+              })
+            } else if (managed.cleanup === true) {
+              if (environments.cleanupResult(binding, managed.operationId) !== undefined) clearEnvironmentFence(id, managed.operationId)
+            } else await serial(async () => {
+              const original = environments.originalRequest(binding, managed.operationId)
+              let receipt = environments.receipt(binding, original)
+              if (!receipt.exitConfirmed) receipt = await environments.recover(binding, original, false)
+              if (receipt.exitConfirmed) {
+                await environments.recordLaunch(binding, managed.operationId, 'exited')
+                await environments.recordRuntime(binding, original, { exitConfirmed: true, exitCode: commands.get(key)?.exitCode ?? null, admissionReleased: true })
+                clearEnvironmentFence(id, managed.operationId)
+              }
+            })
+          }
+          if (commands.get(key)?.released === true && existsSync(resolve(config.root, 'state/storage-governance-v1/reservations'))) {
+            await environments.governance(environmentBinding(id), 'storage-command-settle', { commandId: request.commandId })
+          }
+        }).catch((error: unknown) => { ctx.logger.error(`Environment exit verification failed: ${String(error)}`) }).finally(() => { settlements.delete(key) })
       settlements.set(key, settled)
-      try { await commands.put(key, { ...row, state: 'running' }) }
+      try {
+        await commands.put(key, { ...row, state: 'running' })
+        if (managed !== undefined && !managed.material) await environments.recordLaunch(environmentBinding(id), managed.operationId, 'started', undefined, request.commandId)
+      }
       catch (error) { handle.terminate(); throw error }
       return commandView({ ...row, state: 'running' })
   }

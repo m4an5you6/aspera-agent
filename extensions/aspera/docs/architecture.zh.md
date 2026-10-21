@@ -6,6 +6,10 @@
 
 Aspera 在 Harness 源码树之外管理实验业务。已发布的 DSH 提供装配、Agent、Goal、Session、凭据、子进程管理和 Web 插槽；Aspera 提供任务记录、调度、远端执行和管理视图。
 
+[完成验收](completion-review.zh.md) 在执行完成和历史复验之间共用同一程序判断。受限补录 Agent 在独立 Session 中记录已有证据，原失败任务与固定发布保持不变。
+
+[阶段验收与实验收尾](finalization.zh.md)使用已有 DSH 工具注册及生命周期扩展点。Agent 选择批准的阶段要求及已有证据，runtime 和 Host 提供方负责命令等待、数值核验及来源绑定的结束判定。不增加编排 Agent，不修改 Agent 主循环。
+
 ## 目录
 
 - [组件](#components)
@@ -35,13 +39,15 @@ Host 程序依赖已安装包的类型声明。[types/typert-protocol.d.ts](../t
 <a id="architecture-diagrams"></a>
 ## 架构图
 
+管理 Host 负责[本机运行记录](state-and-api.zh.md#local-running-records)，包含独立于页面的同步、持久续读及控制角色停止时的只读 SSH 补拉。页面离线读取已提交副本；远端任务结果及原发布保持原归属。
+
 桌面端与浏览器共用页面和任务服务。持久接管后，远端调度主机管理执行；本机桌面壳不管理 GPU 进程。
 
 执行 Agent 向调度主机上报批准计划的步骤，页面同时读取这些记录和独立的准备／结果验收证据。[步骤进度](state-and-api.zh.md#execution-step-progress)使用独立版本文件，不改变固定的提交、队列或 Session 格式。旧实验保留原远端发布。
 
-准备 Agent 诊断 GPU 授权差异并请求按身份修复控制进程。提供方负责实际探测、空闲接入限制、确认退出和复验；交接不接受 Agent 的完成声明作为验收。[控制进程就绪](state-and-api.zh.md#controller-readiness)说明原发布兼容和中断修复恢复。
+准备 Agent 诊断 GPU 授权、控制进程离线及发布 profile 差异，再请求按身份修复。提供方负责探测、资源释放证据、接入限制和复验；按发布隔离的 profile 保留稳定的任务和 Session 运行目录。交接不接受 Agent 的完成声明作为验收。[控制进程就绪](state-and-api.zh.md#controller-readiness)说明原发布兼容和中断恢复。
 
-准备与正式命令共用[执行沙箱](../packages/runtime/README.zh.md#understand-the-implementation)。权限拒绝的原始诊断返回准备 Session，由 Agent 修复账号环境或说明具体云平台操作；仍由程序复验判定就绪。
+准备与正式命令共用[执行沙箱](../packages/runtime/README.zh.md#understand-the-implementation)。权限拒绝的原始诊断及兼容方案实测结果返回原准备 Session。Agent 可以请求[专用沙箱修复](../packages/dispatch/README.zh.md#sandbox-compatibility-repair)；仍由程序复验判定就绪，账号权限不足时说明具体云平台操作。
 
 ```mermaid
 flowchart TB
@@ -52,6 +58,9 @@ flowchart TB
     Remote --> Fleet[Aspera dispatch: fleet / credentials / Sessions]
     Page --> Trace[Official read-only DSH trajectory]
     Trace --> Remote
+    Remote --> Archive[Local archive v1: complete events / logs / steps / metrics]
+    Fleet --> Archive
+    Archive --> History[Authenticated reads / read-only SSH backfill]
     Remote --> Observations[Versioned observations: events / sources / logs / metrics]
     Fleet --> Management[Peer servers / dated checks / deletion journal]
     Management --> Cleanup[Owned paths only / cleanup receipts / tombstones]
@@ -153,6 +162,12 @@ sequenceDiagram
 <a id="execution-and-ownership"></a>
 ## 执行与归属
 
+[存储治理](storage-governance.zh.md) 在准备、执行及管理流程间共用程序拥有的盘点／预算、环境及固定材料服务。Agent 提交限定范围的要求；Host 解析原服务器身份及正式元数据；节点核验历史借用、逐卷预留、保留引用并发布只读内容。这些服务使用已有 DSH 工具和 Session。
+
+节点[受管环境服务](managed-environments.zh.md)负责解释器创建、安装材料核验、不可变共享包发布和引用限定回收。执行 Agent 通过已记录工具选择依赖，来源构建仍限定在私有暂存区；命令与服务通过只读挂载保护共享内容。本机独立保存带时间的空间观察，不改变实验结果或远端发布身份。
+
+Host 管理用户中断及独立持久回执。可见实验、已删除任务与准备修复共用[远端任务收尾](state-and-api.zh.md#remote-task-settlement)。最小归属记录在本机删除后保留；原认证接口或账号内 SSH 核对全部原节点后才能释放占用。待开始任务和退出未确认的任务继续保留占用。准备的控制进程修复在启动前使用同一服务，交接前仍需独立复验。
+
 管理 Host 使用所选模型和现有 Session 启动标准 DSH 准备 Agent。仅依赖 Shell 的探测先于依赖 Node 的清单读取。限定服务器的 SSH 工具使用登录账号权限配置依赖，Node 和 pnpm 版本来自发布要求。Host 保存程序路径、节点阶段及诊断，并复验每次修复。同一 Agent 选择实际存储候选并说明理由，手动目录优先，创建目录前保存选择。准备、上传及启动时复查挂载身份、归属、写入能力和空间。沙箱隔离、凭据隐藏、CUDA 和双向网络证明共同决定能否交接；内核或设备权限限制明确阻塞，模型声明不能免除检查。
 
 控制状态、队列和凭据位于登录用户固定的私有控制目录。发布文件及每个实验的输入、Agent 状态、日志、缓存、环境、临时文件和产物使用选中磁盘。节点工具只暴露获准设备，隐藏控制目录与已登记的实验存储根目录，仅将当前工作目录挂载为可写。框架缓存和环境变量指向该目录。网络仍共享以便下载和训练，此处不提供网络隔离。
@@ -161,7 +176,7 @@ sequenceDiagram
 
 每个发布版本固定 DSH/扩展版本、包文件和冻结的生产依赖锁文件。新部署使用新目录，profile 身份阻止 worker 状态目录被绑定到另一发布版本。正在运行的控制进程直接复用，不被替换。控制协议不兼容的升级需等待旧任务结束、旧控制进程停止后再启用。
 
-运行时通过公开 Goal 服务延长有限轮数窗口，保留同一执行 Session 和 Goal。全自动拒绝人工等待；半自动持久保存问题，暂停新的 Agent 操作，并将保存的回复交给原工具调用。控制台独立于页面选择刷新共用待处理数量，桌面校验计数后更新 Windows 叠加图标和隐藏窗口时的托盘标识。上下文压缩继续由 DSH base bundle 提供。
+运行时通过公开 Goal 服务延长有限轮数窗口，保留同一执行 Session 和 Goal。全自动拒绝人工等待；半自动持久保存问题，暂停新的 Agent 操作，并将保存的回复交给原工具调用。控制台独立于页面选择刷新共用待处理数量，桌面校验计数后更新 Windows 叠加图标和隐藏窗口时的托盘标识。已发布的 [DSH 上下文服务](../packages/runtime/README.zh.md#use-this-package)在各阶段的私有模型环境中执行压缩；未完成的 token 上限停止写入受阻终态结果。
 
 -----
 

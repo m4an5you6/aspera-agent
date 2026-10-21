@@ -5,7 +5,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { resolve, sep } from 'node:path'
 import { readFileSync, writeFileSync, lstatSync, readdirSync, unlinkSync, rmSync, realpathSync } from 'node:fs'
 
-/** Remove one generated test directory, unlinking junctions before recursive cleanup. */
+/** Remove one generated test directory after process shutdown, allowing bounded Windows handle release. */
 export function removeTestDirectory(directory, parent) {
   const target = resolve(directory); const intended = realpathSync(parent)
   if (!target.startsWith(resolve(parent) + sep) || lstatSync(target).isSymbolicLink()
@@ -18,7 +18,7 @@ export function removeTestDirectory(directory, parent) {
     }
   }
   unlinkLinks(target)
-  rmSync(target, { recursive: true, force: true })
+  rmSync(target, { recursive: true, force: true, maxRetries: process.platform === 'win32' ? 6 : 0, retryDelay: 100 })
 }
 
 /** Run a bounded maintenance command; application starts use launchProfile. */
@@ -30,7 +30,7 @@ export async function command(file, args, cwd, env = {}, timeoutMs = 180000) {
   child.stderr.on('data', bytes => { output += bytes })
   const timer = setTimeout(() => { child.kill('SIGTERM') }, timeoutMs)
   try {
-    const [code] = await once(child, 'exit')
+    const [code] = await once(child, 'close')
     if (code !== 0) throw new Error(`Maintenance command failed (${code}): ${output.slice(-5000)}`)
     return output
   } finally { clearTimeout(timer) }
@@ -50,7 +50,7 @@ export async function launchProfile(release, home, profile, env = {}, startupTim
   const child = spawn(process.execPath, [resolve(release, 'node_modules/@deepseek-ai/dsh/lib/bin.js'), '--profile', profile, '--no-open', '--port', '0'],
     { cwd: release, env: { ...process.env, DSH_HOME: home, ASPERA_EXTENSION_ROOT: release, DSH_TELEMETRY_DISABLED: '1', ...env },
       windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
-  const exited = once(child, 'exit')
+  const exited = once(child, 'close')
   let output = ''
   child.stdout.on('data', bytes => { output += bytes })
   child.stderr.on('data', bytes => { output += bytes })

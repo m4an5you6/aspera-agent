@@ -2,7 +2,7 @@
 import { randomUUID } from 'node:crypto'
 import { posix, resolve } from 'node:path'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
-import { ObservationWriter } from '@aspera/runtime'
+import { ObservationWriter, redactObservation } from '@aspera/runtime'
 import { observationSourceIdSchema } from '@aspera/experiments'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
@@ -10,7 +10,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { executableDirectoriesSchema, serverIdSchema } from '@aspera/experiments'
-import type { ExperimentId, ExperimentServerId, ServerEnvironment } from '@aspera/experiments'
+import type { ExperimentId, ExperimentServerId, ServerEnvironment, ObservationSource } from '@aspera/experiments'
 import { remote, remoteResult, RemoteCommandError, shellQuote } from './transport.ts'
 import type { Target, RemoteCommandResult } from './transport.ts'
 import { inspectEnvironment } from './environment.ts'
@@ -18,10 +18,13 @@ import type { EnvironmentRequirements } from './environment.ts'
 import { SavedReleaseUnavailable, ControllerDiagnostic } from './cluster-deploy.ts'
 import { SandboxVerificationError } from './sandbox-verification.ts'
 import type { ControllerRepairTools } from './controller-repair.ts'
+import type { SandboxRepairTools, SandboxRepairDiagnostic } from './sandbox-repair.ts'
 import { ReleaseInstallationPending } from './deploy.ts'
 import type { EnvironmentProgress, PreparationCommand } from './types.ts'
 import type { InstallationTools } from './installation.ts'
 import { installationSourceProbeIdSchema } from './installation-model.ts'
+import { preparationCommandScript, recoverPreparationCommand, preparationCommandSource, preparationCommandPolicySchema } from './preparation-command.ts'
+import type { PreparationCommandPolicy, RecoveredPreparationCommand } from './preparation-command.ts'
 
 /** Injectable SSH operations are shared by production tools and the profile replay. */
 export interface EnvironmentDriver {
@@ -44,8 +47,10 @@ export interface EnvironmentPreparationInput {
   observation: ServerEnvironment
   pendingCommand?: PreparationCommand
   outputChars: number
+  commandDeadline?: number
   installation?: InstallationTools
   controller?: ControllerRepairTools
+  sandbox?: SandboxRepairTools
   progress: (value: EnvironmentProgress) => Promise<void>
 }
 
@@ -55,17 +60,22 @@ export class UnconfirmedPreparationCommand extends Error {}
 interface ActivePreparation {
   serverId: ExperimentServerId
   inspect: (signal: AbortSignal) => Promise<object>
-  command: (script: string, signal: AbortSignal, callId: string) => Promise<RemoteCommandResult>
+  command: (script: string, signal: AbortSignal, callId: string, ownedRepair?: boolean) => Promise<RemoteCommandResult>
   verify: (pathEntries: string[], signal: AbortSignal, callId: ToolCallId) => Promise<object>
   block: (reason: string) => Promise<void>
   installation?: InstallationTools
   repair: (signal: AbortSignal) => Promise<object>
+  repairSandbox: (signal: AbortSignal, callId: ToolCallId) => Promise<object>
+  prepareTool: (signal: AbortSignal, callId: ToolCallId) => Promise<object>
 }
 
 /** Installs preparation tools on the existing DSH Agent, without another model loop. */
 export class EnvironmentPreparation {
   private active: ActivePreparation | undefined
   private reject: ((error: Error) => void) | undefined
+
+  /** @param commandPolicy - resolved command, read and exit-recovery limits. */
+  constructor(private readonly commandPolicy: PreparationCommandPolicy = preparationCommandPolicySchema.parse({})) {}
 
   /** Register tools after the storage selector has restricted inherited tools.
    * @param ctx - the preparation Agent's scoped context. @param agent - owning Agent.
@@ -78,9 +88,14 @@ export class EnvironmentPreparation {
       parameters: { server_id: { type: 'string', required: true } }, output, presentCall,
       execute: async (args, exec) => JSON.stringify(await this.owner(args.server_id).inspect(exec.signal)) })))
     ctx.effect(() => ctx.tools.register(defineTool({ name: 'run_preparation_command',
-      description: 'Run a foreground POSIX command on the currently assigned server using its existing SSH account permissions. Install and configure required user-space dependencies. Never background work, read credentials, replace sealed releases, stop controllers, change host drivers, or disable isolation checks. Nonzero exits retain stdout and stderr.',
+      description: 'Run a foreground POSIX command on the assigned server within one program-enforced budget. ASPERA_PREPARATION_REMAINING_MS and ASPERA_PREPARATION_DEADLINE_MS expose that budget; downloads and all retries must share it. ASPERA_PREPARATION_CACHE_DIRECTORY retains reusable material across attempts. The tool supervises exit and recovers complete logs after SSH disconnects. A confirmed timeout is repairable in this Session; never repeat an unconfirmed operation. Prefer prepare_preparation_tool for fixed uv. Never background work, read credentials, replace sealed releases, stop controllers, change host drivers, or disable isolation checks.',
       parameters: { server_id: { type: 'string', required: true }, command: { type: 'string', required: true } }, output, presentCall,
       execute: async (args, exec) => JSON.stringify(await this.owner(args.server_id).command(args.command, exec.signal, exec.callId)) })))
+    ctx.effect(() => ctx.tools.register(defineTool({ name: 'prepare_preparation_tool',
+      description: 'Prepare the fixed uv version declared by this release on the assigned server. The program checks its existing executable and validated cached material before downloading, preserves partial downloads and validates SHA-256 and Python/platform tags. Uses the same command deadline and original preparation Session. Python 3 with pip wheel/tag parsing must already be available. Returns executable directories; afterwards call verify_preparation_environment with them. It does not install training dependencies or establish readiness.',
+      parameters: { server_id: { type: 'string', required: true }, tool: { type: 'string', enum: ['uv'], required: true } }, output,
+      presentCall: args => ({ ...presentCall(args), title: 'Aspera preparation tool installation' }),
+      execute: async (args, exec) => { if (args.tool !== 'uv') throw new Error('Unsupported preparation tool'); return JSON.stringify(await this.owner(args.server_id).prepareTool(exec.signal, exec.callId)) } })))
     ctx.effect(() => ctx.tools.register(defineTool({ name: 'verify_preparation_environment',
       description: 'Run the application-owned checks for this preparation step. Supply absolute executable directories when tools were installed outside the original SSH PATH. Completion requires a successful provider result.',
       parameters: { server_id: { type: 'string', required: true }, path_entries: { type: 'array', items: { type: 'string' }, required: true } }, output, presentCall,
@@ -90,10 +105,15 @@ export class EnvironmentPreparation {
       parameters: { server_id: { type: 'string', required: true }, reason: { type: 'string', required: true } }, output, presentCall,
       execute: async args => { await this.owner(args.server_id).block(args.reason); return 'Preparation is blocked.' } })))
     ctx.effect(() => ctx.tools.register(defineTool({ name: 'repair_preparation_controller',
-      description: 'Request an identity-bound repair of the controller assigned to this preparation step. The program checks task, command and inference-service release, fences admission, confirms process exit and restarts the fixed release with verified GPU authorization. Never supply a PID or device grant. Afterwards call verify_preparation_environment; this tool does not establish preparation completion.',
+      description: 'Request an identity-bound repair of the controller assigned to this preparation step. Before startup the program checks original submissions and all task, Agent, command and inference-service exits. It can close a started orphan only after every authorized original node confirms release, preserving any original terminal outcome; missing outcomes become interrupted. It never stops active, queued or awaiting-approval work automatically. Unselected nodes and unconfirmable identities remain blocked with a manual interruption instruction. The program fences admission, retains the stable home and old profiles, creates a profile for the selected fixed release and restarts with verified GPU authorization. Returned interruption receipts are program checks. Never supply a PID, profile path, ledger edit or device grant. Afterwards call verify_preparation_environment; this tool does not establish preparation completion.',
       parameters: { server_id: { type: 'string', required: true } }, output,
       presentCall: args => ({ ...presentCall(args), title: 'Aspera controller repair' }),
       execute: async (args, exec) => JSON.stringify(await this.owner(args.server_id).repair(exec.signal)) })))
+    ctx.effect(() => ctx.tools.register(defineTool({ name: 'repair_preparation_sandbox',
+      description: 'Request the program-owned private-PID/proc compatibility launcher on the assigned server. The program measures feasibility, preserves every inner bubblewrap namespace and device grant, drops all capabilities, installs an immutable content-addressed launcher and records its exit. Uses only existing account privileges; never changes host kernel policy. No PID, path or isolation flags may be supplied. Afterwards call verify_preparation_environment; configuration alone does not complete preparation.',
+      parameters: { server_id: { type: 'string', required: true } }, output,
+      presentCall: args => ({ ...presentCall(args), title: 'Aspera sandbox repair' }),
+      execute: async (args, exec) => JSON.stringify(await this.owner(args.server_id).repairSandbox(exec.signal, exec.callId)) })))
     ctx.effect(() => ctx.tools.register(defineTool({ name: 'inspect_preparation_installation',
       description: 'Read the original supervised installer, real download/compiler progress, remaining budget, exit receipt and log source. Polling does not start another installer or reset limits.',
       parameters: { server_id: { type: 'string', required: true } }, output, presentCall,
@@ -135,7 +155,11 @@ export class EnvironmentPreparation {
     let target = input.target
     let observation = input.observation
     let verification: object | undefined
+    let sandboxDiagnosis: SandboxRepairDiagnostic | undefined
+    let sandboxPaths: string[] = []
+    let sandboxNeedsVerification = false
     let pending = input.pendingCommand
+    let previousCommand: RemoteCommandResult | undefined
     let accepted: { value: T; pathEntries: string[] } | undefined
     let terminal: Error | undefined
     let ended = false
@@ -162,19 +186,33 @@ export class EnvironmentPreparation {
     const reconcile = async (lifetime = signal) => {
       if (pending === undefined) return
       if (pending.directory.includes('/controller-repairs/') && input.controller !== undefined) await input.controller.reconcile(pending.directory, lifetime)
-      const exit = await driver.remote(target, `if [ -f ${shellQuote(pending.directory + '/exited')} ]; then cat ${shellQuote(pending.directory + '/exited')}; else printf unknown; fi`, lifetime, input.password)
+      const root = resolve(resolveDshHome(), 'aspera-observations', input.experimentId)
+      const source = preparationCommandSource(root, pending.directory)
+      const recovered = source === undefined ? undefined : await recoverPreparationCommand(driver, target, pending.directory, root, source,
+        this.commandPolicy, input.password, lifetime)
+      const exit = recovered === undefined ? await driver.remote(target, `if [ -f ${shellQuote(pending.directory + '/exited')} ]; then cat ${shellQuote(pending.directory + '/exited')}; else printf unknown; fi`, lifetime, input.password) : String(recovered.exitCode)
       if (!/^\d+\s*$/.test(exit)) throw new UnconfirmedPreparationCommand(`Remote preparation command has no confirmed exit: ${pending.directory}. Inspect that command before retrying; it will not be started again.`)
+      previousCommand = recovered
       pending = undefined
       await progress('inspecting-environment', `Previous preparation command exited ${exit.trim()}; rechecking the environment.`)
     }
     await reconcile()
     const check = async (pathEntries: string[], operationSignal = signal, callId?: ToolCallId): Promise<object> => {
       const lifetime = AbortSignal.any([signal, operationSignal])
+      pathEntries = [...new Set([...sandboxPaths, ...pathEntries])]
       target = { ...target, pathEntries }
       await progress('verifying-environment')
       let value: T
       try {
         observation = await driver.inspectEnvironment(target, input.password, lifetime)
+        const backend = observation.programs.find(program => program.name === 'bwrap')?.path ?? ''
+        if (input.sandbox !== undefined && /\/tools\/sandbox\/[a-f0-9]{64}\/bin\/bwrap$/.test(backend)) {
+          sandboxDiagnosis = await input.sandbox.inspect(target, observation, lifetime)
+          if (sandboxDiagnosis.state !== 'configured' || sandboxDiagnosis.launcher.path !== backend) {
+            throw new SandboxVerificationError('sandbox-launch', backend, { exitCode: observation.sandboxExitCode,
+              stdout: sandboxDiagnosis.stdout, stderr: sandboxDiagnosis.reason + '\n' + sandboxDiagnosis.stderr })
+          }
+        }
         if (observation.sandboxExitCode !== 0) throw new SandboxVerificationError('sandbox-launch',
           observation.programs.find(program => program.name === 'bwrap')?.path ?? '',
           { exitCode: observation.sandboxExitCode, stdout: '', stderr: observation.diagnostics })
@@ -183,23 +221,36 @@ export class EnvironmentPreparation {
         lifetime.throwIfAborted()
         if (error instanceof SavedReleaseUnavailable || error instanceof ReleaseInstallationPending) throw error
         if (error instanceof RemoteCommandError && !error.result.exitConfirmed) throw error
+        if (error instanceof SandboxVerificationError && error.diagnostic.stage === 'sandbox-launch' && input.sandbox !== undefined) {
+          sandboxDiagnosis = await input.sandbox.inspect(target, observation, lifetime)
+        }
         await progress(error instanceof SandboxVerificationError ? 'repairing-environment' : 'configuring-environment', String(error))
-        verification = { ready: false, error: String(error), ...(error instanceof ControllerDiagnostic || error instanceof SandboxVerificationError ? { diagnostic: error.diagnostic } : {}) }
+        verification = { ready: false, error: String(error), ...(error instanceof ControllerDiagnostic || error instanceof SandboxVerificationError ? {
+          diagnostic: error instanceof SandboxVerificationError && sandboxDiagnosis !== undefined ? { ...error.diagnostic,
+            requiresPlatformAction: sandboxDiagnosis.requiresPlatformAction, requiredAction: sandboxDiagnosis.reason,
+            sandboxRepair: { ...sandboxDiagnosis, ...(['available', 'configured'].includes(sandboxDiagnosis.state) ? { tool: 'repair_preparation_sandbox' } : {}) },
+          } : error.diagnostic } : {}) }
         return verification
       }
       await progress('environment-ready')
       accepted = { value, pathEntries }
-      verification = { ready: true, result: value }
+      verification = { ready: true, result: value, ...(sandboxDiagnosis === undefined ? {} : { sandboxRepair: sandboxDiagnosis }) }
       return verification
     }
     const initial = await check([...(target.pathEntries ?? [])])
     const message = createUserMessage({ source: { kind: 'aspera', experimentId: input.experimentId }, content: [{
       type: 'text', text: JSON.stringify({ operation: 'prepare-experiment-environment', experimentId: input.experimentId, step: input.operation,
         serverId: input.serverId, serverName: input.serverName, requirements: input.requirements,
+        managedEnvironmentTools: input.requirements.uv === undefined ? undefined : `Install fixed uv ${input.requirements.uv}, normally at /usr/local/bin/uv, and Python 3 using this account's existing permissions. Tool paths are verified before handover. Training dependencies belong to execution's managed environment tools, never account .local.`,
         directories: input.directories,
         observation, verification: initial, pathEntries: target.pathEntries ?? [], controllerRepairAvailable: input.controller !== undefined,
-        sandboxInstruction: 'Shell inspection exercises the execution namespaces before installation or storage selection. Deployment verification uses the full launch, device grants, hidden directories and cleared environment. Preserve these requirements during repair. For a proc mount or namespace permission refusal, inspect the exact stderr and request the required cloud-platform permissions if this account cannot restore them; never remove isolation flags, bind the host proc filesystem, or claim completion without provider verification.',
-        controllerInstruction: input.controller === undefined ? undefined : 'Inspect GPU identities and controller authorization with inspect_preparation_environment. For a repairable controller difference call repair_preparation_controller; the program authorizes maintenance and restart. Never stop a controller through shell commands. Afterwards call verify_preparation_environment. Unknown ownership, unsupported legacy maintenance and unconfirmed exits require a concrete blocker, not another stop attempt.',
+        sandboxInstruction: 'Shell inspection exercises the execution namespaces before installation or storage selection. Deployment verification uses the full launch, device grants, hidden directories and cleared environment. When diagnostic.sandboxRepair offers repair_preparation_sandbox, call that dedicated tool and then verify_preparation_environment. Its private PID/proc parent preserves every inner isolation flag with zero capabilities and no_new_privs; it uses privileges this account already holds. Never disable user namespaces, bind host proc into the final sandbox, change host AppArmor/sysctl/drivers, or declare a cloud blocker without checking an available program-owned repair. Configuration alone is not verification.',
+        controllerInstruction: input.controller === undefined ? undefined : 'Inspect GPU identities, controller authorization and offline SSH recovery evidence with inspect_preparation_environment. An unavailable control port or an old profile binding can be repaired by repair_preparation_controller after the program confirms durable resource release. This tool creates a separate fixed-release profile while retaining original tasks and Sessions. Never stop or start a controller or rewrite its profiles through shell commands. Afterwards call verify_preparation_environment. Unknown ownership, active tasks, unsupported legacy maintenance and unconfirmed exits require a concrete diagnostic; control-port refusal alone does not establish a cloud-platform or account-permission blocker.',
+        previousCommand: previousCommand === undefined ? undefined : { ...previousCommand,
+          stdout: redactObservation(previousCommand.stdout.slice(-input.outputChars), input.password ? [input.password] : []),
+          stderr: redactObservation(previousCommand.stderr.slice(-input.outputChars), input.password ? [input.password] : []) },
+        commandBudgetMs: Math.min(target.toolTimeoutMs, Math.max(0, (input.commandDeadline ?? Date.now() + target.toolTimeoutMs) - Date.now())),
+        commandInstruction: 'For missing fixed uv, call prepare_preparation_tool before a custom download. It checks existing executables and verified complete/partial material. All download retries share the supplied command budget; use the retained cache rather than a new temporary installation. A confirmed timeout result permits repair in this Session; an unknown exit does not. Include returned executable directories in verify_preparation_environment. Only provider verification completes preparation.',
         instruction: accepted !== undefined ? 'This check passed. Retain these observations as context for the next preparation step; no repair is requested.'
           : 'Prepare this server using its existing SSH account permissions. Inspect the installation and complete logs before repairing network, disk, permissions, tool versions or compiler requirements. You choose download sources autonomously: probe an HTTPS candidate and switch only when its measured result supports that choice. Keep existing caches, original release material, frozen lockfile and checkpoints. Heartbeats and repeated retry text do not mean progress. Installation restarts, including source changes, share the saved retry and total budget. Never read or forward credentials, change global registry settings, disable TLS/integrity, replace sealed releases, stop controllers, change host drivers or disable isolation. Use foreground repair commands within the remaining budget and verify_preparation_environment after repair. Only program verification establishes success. Report concrete permission/kernel/device blockers. Do not complete the dispatch Goal.' }),
     }] })
@@ -209,6 +260,12 @@ export class EnvironmentPreparation {
     const stop = (error: Error) => { terminal = error; this.reject?.(error) }
     const handlers: ActivePreparation = {
       serverId: input.serverId,
+      prepareTool: async (operationSignal, callId) => {
+        const python = observation.programs.find(program => program.name === 'python3')?.path
+        if (input.requirements.uv === undefined) throw new Error('The selected release does not declare a uv requirement')
+        if (!python?.startsWith('/')) throw new Error('Install Python 3 and its pip wheel/tag parser before preparing uv')
+        return handlers.command(`exec ${shellQuote(python)} -B -I "$ASPERA_PREPARATION_COMMAND_DIRECTORY/command.py" uv "$ASPERA_PREPARATION_COMMAND_DIRECTORY"`, operationSignal, callId)
+      },
       inspect: async operationSignal => { const lifetime = AbortSignal.any([signal, operationSignal]); observation = await driver.inspectEnvironment(target, input.password, lifetime); await progress('inspecting-environment');
         return { ...observation, latestVerification: verification, ...(input.controller === undefined ? {} : { controller: await input.controller.inspect(lifetime) }) } },
       repair: async operationSignal => {
@@ -230,9 +287,34 @@ export class EnvironmentPreparation {
           return { repaired: false, error: String(error), ...(error instanceof ControllerDiagnostic ? { diagnostic: error.diagnostic } : {}) }
         }
       },
+      repairSandbox: async (operationSignal, callId) => {
+        if (input.sandbox === undefined) throw new Error('Sandbox repair is unavailable in this preparation step')
+        if (accepted !== undefined || terminal !== undefined) throw new Error('Preparation step has already finished')
+        const lifetime = AbortSignal.any([signal, operationSignal])
+        await reconcile(lifetime)
+        observation = await driver.inspectEnvironment(target, input.password, lifetime)
+        await progress('repairing-environment', 'Preparation Agent requested the program-owned sandbox compatibility repair.')
+        try {
+          sandboxDiagnosis = await input.sandbox.repair(target, observation, script => handlers.command(script, lifetime, callId, true), lifetime)
+        } catch (error) {
+          if (terminal !== undefined) throw terminal
+          throw error
+        }
+        if (sandboxDiagnosis.state === 'configured') {
+          sandboxPaths = sandboxDiagnosis.pathEntries
+          sandboxNeedsVerification = true
+          target = { ...target, pathEntries: [...new Set([...sandboxPaths, ...(target.pathEntries ?? [])])] }
+        }
+        await progress('repairing-environment', sandboxDiagnosis.reason)
+        return { ...sandboxDiagnosis, verificationRequired: true }
+      },
       verify: async (paths, operationSignal, callId) => {
         if (accepted !== undefined || terminal !== undefined) throw new Error('Preparation step has already finished')
-        try { return await check(paths, operationSignal, callId) }
+        try {
+          const checked = await check(paths, operationSignal, callId)
+          sandboxNeedsVerification = false
+          return checked
+        }
         catch (error) {
           const failure = error instanceof Error ? error : new Error(String(error))
           stop(failure)
@@ -242,9 +324,12 @@ export class EnvironmentPreparation {
       block: async reason => {
         if (accepted !== undefined) throw new Error('Preparation step has already finished')
         if (reason.trim() === '') throw new Error('A preparation blocker requires a reason')
+        if (sandboxNeedsVerification || sandboxDiagnosis?.state === 'available' || (sandboxDiagnosis?.state === 'configured' && sandboxPaths.length === 0)) {
+          throw new Error('A program-measured available sandbox repair has not been verified. Call repair_preparation_sandbox and verify_preparation_environment before reporting an exhausted account-level blocker.')
+        }
         terminal = new Error(reason)
       },
-      command: async (script, operationSignal, callId) => {
+      command: async (script, operationSignal, callId, ownedRepair = false) => {
         const lifetime = AbortSignal.any([signal, operationSignal])
         if (accepted !== undefined || terminal !== undefined) throw new Error('Preparation step has already finished')
         if (script.trim() === '') throw new Error('Preparation command must not be empty')
@@ -255,49 +340,61 @@ export class EnvironmentPreparation {
   file=${shellQuote(control + '/state')}/"$role.pid"
   if [ -f "$file" ] && kill -0 "$(cat "$file")" 2>/dev/null; then printf active; fi
 done`, lifetime, input.password)
-        if (active !== '' && (input.operation === 'bootstrap' || input.operation === 'deployment')) throw new Error('A node controller is running. Reuse its compatible environment; stop it only after its tasks finish and cleanup is confirmed before changing shared dependencies.')
+        if (!ownedRepair && active !== '' && (input.operation === 'bootstrap' || input.operation === 'deployment')) throw new Error('A node controller is running. Reuse its compatible environment; stop it only after its tasks finish and cleanup is confirmed before changing shared dependencies.')
         const commandId = randomUUID()
+        const timeoutMs = Math.min(target.toolTimeoutMs, (input.commandDeadline ?? Date.now() + target.toolTimeoutMs) - Date.now())
+        if (timeoutMs <= 0) throw new Error('Preparation budget exhausted; retry preparation to start a new recovery budget')
         pending = { directory: posix.join(observation.home, '.local/state/aspera/preparation', input.experimentId, input.serverId, commandId) }
         await progress('configuring-environment')
-        const capture = new ObservationWriter(resolve(resolveDshHome(), 'aspera-observations', input.experimentId), {
+        const root = resolve(resolveDshHome(), 'aspera-observations', input.experimentId)
+        const source: ObservationSource = {
           version: 1, id: observationSourceIdSchema.parse(`preparation-${commandId}`), experimentId: input.experimentId, serverId: input.serverId,
           kind: 'preparation', phase: 'preparation', sessionId: agent.session.id, commandId, toolCallId: callId, label: input.operation,
-          createdAt: Date.now(), streams: ['stdout', 'stderr'], complete: false }, input.password === undefined ? [] : [input.password])
+          createdAt: Date.now(), streams: ['stdout', 'stderr'], complete: false }
+        const capture = new ObservationWriter(root, source, input.password === undefined ? [] : [input.password])
         let result: RemoteCommandResult
         let captureComplete = false
         try {
-          result = await driver.remoteResult(target, `umask 077
-mkdir -p ${shellQuote(posix.dirname(pending.directory))}
-mkdir ${shellQuote(pending.directory)} || exit 1
-mkfifo ${shellQuote(pending.directory + '/stdout.pipe')} ${shellQuote(pending.directory + '/stderr.pipe')} || exit 1
-tee ${shellQuote(pending.directory + '/stdout.log')} < ${shellQuote(pending.directory + '/stdout.pipe')} &
-output_reader=$!
-tee ${shellQuote(pending.directory + '/stderr.log')} < ${shellQuote(pending.directory + '/stderr.pipe')} >&2 &
-error_reader=$!
-sh -c ${shellQuote(script)} > ${shellQuote(pending.directory + '/stdout.pipe')} 2> ${shellQuote(pending.directory + '/stderr.pipe')}
-status=$?
-wait "$output_reader"
-wait "$error_reader"
-rm -f ${shellQuote(pending.directory + '/stdout.pipe')} ${shellQuote(pending.directory + '/stderr.pipe')}
-printf '%s\\n' "$status" > ${shellQuote(pending.directory + '/exited')}
-exit "$status"`, lifetime, input.password, (stream, chunk) => { capture.append(stream, chunk) })
-          if (result.exitConfirmed) {
-            const receipt = await driver.remote(target, `if [ -f ${shellQuote(pending.directory + '/exited')} ]; then cat ${shellQuote(pending.directory + '/exited')}; else printf unknown; fi`, lifetime, input.password)
-            result = { ...result, exitConfirmed: /^\d+\s*$/.test(receipt) }
+          const python = observation.programs.find(program => program.name === 'python3')?.path
+          // Base executables remain outside the experiment namespaces hidden by the execution sandbox.
+          const cacheDirectory = posix.join(observation.home, '.cache/aspera/preparation', input.serverId)
+          let transport: RemoteCommandResult | undefined
+          try {
+            transport = await driver.remoteResult({ ...target, toolTimeoutMs: python?.startsWith('/') ? this.commandPolicy.readTimeoutMs
+              : timeoutMs + this.commandPolicy.stopGraceMs + this.commandPolicy.readTimeoutMs },
+              preparationCommandScript({ directory: pending.directory, cacheDirectory, command: script, source, timeoutMs,
+                policy: this.commandPolicy, python: python?.startsWith('/') ? python : undefined, uvVersion: input.requirements.uv,
+                uvPath: observation.programs.find(program => program.name === 'uv')?.path }), lifetime, input.password)
+          } catch (error) {
+            await progress('configuring-environment', `SSH reader stopped; checking the original command: ${String(error)}`)
           }
+          const alreadyCancelled = lifetime.aborted
+          let recovered: RecoveredPreparationCommand
+          try {
+            recovered = await recoverPreparationCommand(driver, target, pending.directory, root, source, this.commandPolicy,
+              input.password, alreadyCancelled ? AbortSignal.timeout(this.commandPolicy.recoveryTimeoutMs) : lifetime, alreadyCancelled)
+          } catch (error) {
+            if (alreadyCancelled || !lifetime.aborted) throw error
+            recovered = await recoverPreparationCommand(driver, target, pending.directory, root, source, this.commandPolicy,
+              input.password, AbortSignal.timeout(this.commandPolicy.recoveryTimeoutMs), true)
+          }
+          result = recovered.supervised ? recovered : { ...(transport ?? recovered), exitConfirmed: recovered.exitConfirmed, exitCode: recovered.exitCode }
+          if (!recovered.supervised) { capture.append('stdout', result.stdout); capture.append('stderr', result.stderr) }
           captureComplete = result.exitConfirmed
         } catch (error) {
           const unresolved = new UnconfirmedPreparationCommand(`Preparation command outcome is unknown at ${pending.directory}: ${String(error)}`)
           await progress('configuring-environment', unresolved.message); stop(unresolved); throw unresolved
         } finally { capture.close(captureComplete) }
-        const publicResult = { ...result, stdout: result.stdout.slice(-input.outputChars), stderr: result.stderr.slice(-input.outputChars) }
+        const publicResult = { ...result, stdout: redactObservation(result.stdout.slice(-input.outputChars), input.password ? [input.password] : []),
+          stderr: redactObservation(result.stderr.slice(-input.outputChars), input.password ? [input.password] : []) }
         if (!result.exitConfirmed) {
           const unresolved = new UnconfirmedPreparationCommand(`Preparation command outcome is unknown at ${pending.directory}; inspect its exit before retrying.`)
           await progress('configuring-environment', unresolved.message); stop(unresolved)
         } else {
           pending = undefined
-          await progress(result.exitCode === 0 ? 'configuring-environment' : 'repairing-environment',
-            result.exitCode === 0 ? undefined : publicResult.stderr || publicResult.stdout)
+          const succeeded = result.exitCode === 0 && !result.timedOut && !result.cancelled
+          await progress(succeeded ? 'configuring-environment' : 'repairing-environment',
+            succeeded ? undefined : publicResult.stderr || publicResult.stdout)
         }
         return publicResult
       },
@@ -308,6 +405,8 @@ exit "$status"`, lifetime, input.password, (stream, chunk) => { capture.append(s
       command: (script, operationSignal, callId) => serial(() => handlers.command(script, operationSignal, callId)),
       verify: (paths, operationSignal, callId) => serial(() => handlers.verify(paths, operationSignal, callId)),
       repair: operationSignal => serial(() => handlers.repair(operationSignal)),
+      repairSandbox: (operationSignal, callId) => serial(() => handlers.repairSandbox(operationSignal, callId)),
+      prepareTool: (operationSignal, callId) => serial(() => handlers.prepareTool(operationSignal, callId)),
       block: reason => serial(() => handlers.block(reason)),
       installation: input.installation === undefined ? undefined : {
         inspect: operationSignal => serial(() => input.installation!.inspect(AbortSignal.any([signal, operationSignal]))),

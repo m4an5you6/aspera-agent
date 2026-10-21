@@ -24,6 +24,10 @@ import { modelSelections } from '../../experiments/tests/fixtures.ts'
 import { readyEnvironment } from './environment-fixture.ts'
 import { inspectEnvironment } from '../src/environment.ts'
 import { controllerFixture, preparedFixture } from './controller-fixture.ts'
+import { runArchivePolicySchema } from '../src/run-archive-reader.ts'
+import type { ExperimentInterruptionStatus, ExperimentServerId } from '@aspera/experiments'
+import type { InterruptionFacts } from '../src/interruption-remote.ts'
+import { offlineControllerSchema } from '../src/controller-recovery.ts'
 vi.mock('../src/environment.ts', async importOriginal => ({
   ...await importOriginal<typeof import('../src/environment.ts')>(),
   environmentRequirements: () => ({ node: '^22.19.0 || >=24.0.0', pnpm: '11.7.0' }),
@@ -72,7 +76,7 @@ beforeEach(() => {
 })
 
 function receipt(submission: ClusterSubmission) {
-  return clusterRecordSchema.parse({ submission, payloadHash: 'b'.repeat(64), sequence: 1, revision: 1, state: 'queued',
+  return clusterRecordSchema.parse({ submission, payloadHash: createHash('sha256').update(JSON.stringify(submission)).digest('hex'), sequence: 1, revision: 1, state: 'queued',
     resourcesReleased: true, updatedAt: 1, handover: '本机派发完成，远端实验已接管' })
 }
 
@@ -80,6 +84,7 @@ async function fixture() {
   const tables = new Map<string, Map<string, unknown>>()
   const records = new Map<string, FleetExperiment>()
   const failingLocalTables = new Set<string>()
+  const failingWrites = new Set<string>()
   tables.set('experiments', records)
   const live = new Map<string, ReturnType<typeof makeAgent>>()
   const saved = new Map<string, ReturnType<typeof makeAgent>>()
@@ -101,7 +106,7 @@ async function fixture() {
   const ctx = fromAny<Context, object>({ storage: { domain: { open: async () => ({ table: (name: string) => {
     let table = tables.get(name); if (table === undefined) { table = new Map(); tables.set(name, table) }
     return { get: (id: string) => table.get(id), entries: () => table.entries(), delete: async (id: string) => { if (failingLocalTables.has(name)) throw new Error('CPU fixture local cleanup unavailable'); table.delete(id) },
-      put: async (id: string, value: unknown) => { table.set(id, structuredClone(value)) } }
+      put: async (id: string, value: unknown) => { if (failingWrites.has(name)) throw new Error('CPU fixture durable write failed'); table.set(id, structuredClone(value)) } }
   }, close: async () => {} }) } },
   agents: { create: async ({ sessionId }: { sessionId: string }) => {
     const agent = makeAgent(sessionId); saved.set(sessionId, agent); live.set(sessionId, agent); return handle(agent)
@@ -112,15 +117,26 @@ async function fixture() {
   settings: { describe: () => [{ ns: 'models', value: { providers: { test: { api: 'openai-completions', baseURL: 'http://127.0.0.1:9/v1', apiKeyEnv: 'TEST_API_KEY', models: [{ id: 'test-model' }] } } } }] },
   llm: { listConfigurableProviders: () => [{ provider: 'test', settingsNs: 'models', settingsPath: ['providers', 'test'] }], listModels: async () => [{ id: 'test-model' }], resolveModelInfo: async () => ({ reasoning: { efforts: [{ id: 'high' }, { id: 'low' }] } }) },
   agentDefaultModel: { currentSelection: () => ({ provider: 'test', model: 'test-model' }) },
-  effect: () => {}, on: () => () => {}, logger: { error: vi.fn(), debug: vi.fn() },
+  effect: () => {}, on: () => () => {}, emit: vi.fn(), logger: { error: vi.fn(), debug: vi.fn() },
   })
   let localRepo = '/original-source'
   const deployment = (server: Parameters<Parameters<typeof ExperimentFleet.open>[1]>[0]) => ({ ...server, localRepo,
     dataRoots: [], preparationOutputChars: 65536, tokenRef: 'TOKEN', agentCredentialRefs: [], controlPollIntervalMs: 1000,
     toolTimeoutMs: 30000, minimumFreeBytes: 1024 })
   const open = async (policy = resolveSshConnectionPolicy({})) => { const fleet = await ExperimentFleet.open(ctx,
-    deployment, 20000, undefined, undefined, undefined, policy); fleets.push(fleet); return fleet }
+    deployment, 20000, undefined, undefined, undefined, policy, undefined, runArchivePolicySchema.parse({ archiveEnabled: false })); fleets.push(fleet); return fleet }
   const fleet = await open()
+  vi.mocked(remote).mockImplementation(async (_target, script) => {
+    const offset = script.lastIndexOf('{"mode":"interrupt-')
+    if (offset < 0) return ''
+    const input = JSON.parse(script.slice(offset))
+    if (['interrupt-inspect', 'interrupt-fence', 'interrupt-settle'].includes(input.mode)) return JSON.stringify({
+      serverId: input.serverId, agentsExited: true, commandsReleased: true, servicesReleased: true,
+      commandsReady: true, servicesReady: true, digest: 'a'.repeat(64), hostBootId: 'cpu-host', blockers: [], agents: [], commands: [],
+      coordinatorExited: true, state: 'running',
+    })
+    return JSON.stringify({ released: true })
+  })
   const a = clusterServerSchema.parse({ id: randomUUID(), name: 'Coordinator', host: 'gpu-a', username: 'trainer',
     sshPort: 22, remotePort: 43019, remoteRoot: '/runs', authMode: 'password' })
   const b = clusterServerSchema.parse({ ...a, id: randomUUID(), name: 'Node B', host: 'gpu-b' })
@@ -130,11 +146,167 @@ async function fixture() {
     const row = records.get((body as { experimentId: string }).experimentId)!
     return { status: 200, value: { record: receipt(row.submission!), waitingFor: [] } }
   })
-  return { fleet, open, ctx, tables, records, saved, live, makeAgent, complete, resume, a, b, failingLocalTables,
+  return { fleet, open, ctx, tables, records, saved, live, makeAgent, complete, resume, a, b, failingLocalTables, failingWrites,
     source: { directory: process.env.DSH_HOME!, archive: resolve(process.env.DSH_HOME!, 'snapshot.tar'),
       digest: 'a'.repeat(64), archiveHash: createHash('sha256').update('CPU fixture immutable material').digest('hex'), dispose: () => {} },
     setRepo: (value: string) => { localRepo = value } }
 }
+
+async function deletedRemoteFixture(state: 'running' | 'completed' = 'running') {
+  const f = await fixture()
+  const row = await f.fleet.create({ models: modelSelections, experimentId: randomUUID(), name: 'Deleted training task',
+    objective: 'Private original training objective', coordinatorId: f.a.id, serverIds: [f.a.id], mode: 'automatic' })
+  await vi.waitFor(() => { expect(f.records.get(row.request.experimentId)?.handoverRecorded).toBe(true) })
+  const original = structuredClone(f.records.get(row.request.experimentId)!)
+  const submission = original.submission!
+  const digest = createHash('sha256').update(JSON.stringify(submission)).digest('hex')
+  f.records.get(row.request.experimentId)!.latest = { ...receipt(submission), payloadHash: digest, state, resourcesReleased: state === 'completed' }
+  await f.fleet.deleteExperiments({ operationId: randomUUID(), experimentIds: [row.request.experimentId], cleanupRemote: false, allowUnconfirmed: true })
+  await vi.waitFor(() => { expect(f.records.has(row.request.experimentId)).toBe(false) })
+  return { ...f, original, submission, digest, id: row.request.experimentId }
+}
+
+function offlineTask(f: Awaited<ReturnType<typeof deletedRemoteFixture>>, options: { active?: boolean; badDigest?: boolean; controllerAlive?: boolean } = {}) {
+  const modes: string[] = []
+  let released = false
+  const record = clusterRecordSchema.parse({ ...receipt(f.submission), payloadHash: options.badDigest ? 'f'.repeat(64) : f.digest,
+    state: 'running', resourcesReleased: false })
+  const finished = clusterRecordSchema.parse({ ...record, payloadHash: f.digest, state: 'interrupted', resourcesReleased: true, revision: 2,
+    detail: 'Original controller exited; all original task work was confirmed stopped' })
+  vi.mocked(request).mockRejectedValue(new Error('CPU fixture controller is offline'))
+  vi.mocked(remote).mockImplementation(async (_target, script) => {
+    const offset = script.indexOf('{"mode":"')
+    if (offset < 0) throw new Error('Unexpected fixture SSH command')
+    const input: { mode: string; serverId: ExperimentServerId; status?: ExperimentInterruptionStatus } = JSON.parse(script.slice(offset))
+    modes.push(input.mode)
+    if (input.mode === 'discover') return JSON.stringify({ records: [record] })
+    const facts: InterruptionFacts = { serverId: input.serverId, agentsExited: !options.active, commandsReleased: released,
+      servicesReleased: true, commandsReady: true, servicesReady: true, digest: 'a'.repeat(64), hostBootId: 'cpu-boot', blockers: [],
+      agents: options.active ? [{ pid: 12345, start: 'owned-start', role: 'agent' }] : [], commands: [], state: 'running', coordinatorExited: !options.controllerAlive }
+    if (input.mode === 'interrupt-inspect' || input.mode === 'interrupt-fence') return JSON.stringify(facts)
+    if (input.mode === 'interrupt-settle') { released = true; return JSON.stringify({ ...facts, commandsReleased: true }) }
+    if (input.mode === 'interrupt-complete') return JSON.stringify({ record: finished, status: { ...input.status, phase: 'released', result: finished } })
+    if (input.mode === 'interrupt-stop') throw new Error('Read-only recovery must not stop a process')
+    return JSON.stringify({ released: true })
+  })
+  return { modes, record, finished, isReleased: () => released }
+}
+
+it('settles a deleted offline task through the original operation and retains its result after Host restart', async () => {
+  const f = await deletedRemoteFixture(); const remoteTask = offlineTask(f)
+  const first = f.fleet.settleRemoteTask(f.id, 'reconcile')
+  expect(first.interruption).toMatchObject({ phase: 'requested', stopRequested: false })
+  await vi.waitFor(() => {
+    const status = f.fleet.remoteTaskStatus(f.id)
+    expect(status?.interruption?.phase, status?.interruption?.detail).not.toBe('blocked')
+    expect(status?.released).toBe(true)
+  })
+  expect(remoteTask.isReleased()).toBe(true)
+  expect(remoteTask.modes).toContain('interrupt-complete'); expect(remoteTask.modes).not.toContain('interrupt-stop')
+  expect(f.fleet.list()).toEqual([]); expect(f.fleet.snapshot().unconfirmedWork).toEqual([])
+  expect(vi.mocked(cleanupServerStorage)).not.toHaveBeenCalled()
+  const before = remoteTask.modes.length
+  expect(f.fleet.settleRemoteTask(f.id, 'reconcile').interruption?.operationId).toBe(first.interruption?.operationId)
+  expect(remoteTask.modes).toHaveLength(before)
+  const restored = await f.open()
+  expect(restored.remoteTaskStatus(f.id)).toMatchObject({ released: true, deleted: true, interruption: { operationId: first.interruption?.operationId } })
+  expect(restored.list()).toEqual([])
+  expect(JSON.stringify(restored.remoteTaskStatus(f.id))).not.toContain('Private original training objective')
+})
+
+it('retains deleted-task occupancy when its Agent is active without issuing stop or release', async () => {
+  const f = await deletedRemoteFixture(); const remoteTask = offlineTask(f, { active: true })
+  const first = f.fleet.settleRemoteTask(f.id, 'reconcile')
+  await vi.waitFor(() => { expect(f.fleet.remoteTaskStatus(f.id)?.interruption?.phase).toBe('blocked') })
+  expect(f.fleet.remoteTaskStatus(f.id)?.released).toBe(false)
+  expect(f.fleet.snapshot().unconfirmedWork).toHaveLength(1)
+  expect(remoteTask.modes).not.toContain('interrupt-fence'); expect(remoteTask.modes).not.toContain('interrupt-stop')
+  offlineTask(f)
+  expect(f.fleet.settleRemoteTask(f.id, 'reconcile').interruption?.operationId).toBe(first.interruption?.operationId)
+  await vi.waitFor(() => {
+    const status = f.fleet.remoteTaskStatus(f.id)
+    expect(status?.interruption?.phase, status?.interruption?.detail).not.toBe('blocked')
+    expect(status?.released).toBe(true)
+  })
+})
+
+it('preserves an already confirmed terminal result when deleting its local record', async () => {
+  const f = await deletedRemoteFixture('completed')
+  expect(f.fleet.remoteTaskStatus(f.id)).toMatchObject({ released: true, deleted: true })
+  expect(f.fleet.snapshot().unconfirmedWork).toEqual([])
+  const calls = vi.mocked(remote).mock.calls.length
+  expect(f.fleet.settleRemoteTask(f.id, 'reconcile').released).toBe(true)
+  expect(vi.mocked(remote).mock.calls).toHaveLength(calls)
+})
+
+it('refuses automatic settlement of an idle-looking task while its original coordinator is alive', async () => {
+  const f = await deletedRemoteFixture(); const remoteTask = offlineTask(f, { controllerAlive: true })
+  f.fleet.settleRemoteTask(f.id, 'reconcile')
+  await vi.waitFor(() => { expect(f.fleet.remoteTaskStatus(f.id)?.interruption?.phase).toBe('blocked') })
+  expect(f.fleet.remoteTaskStatus(f.id)?.interruption?.detail).toContain('coordinator exit')
+  expect(remoteTask.modes).not.toContain('interrupt-fence'); expect(remoteTask.modes).not.toContain('interrupt-stop')
+})
+
+it('retains occupancy when a discovered original record has a different submission digest', async () => {
+  const f = await deletedRemoteFixture(); const remoteTask = offlineTask(f, { badDigest: true })
+  f.fleet.settleRemoteTask(f.id, 'reconcile')
+  await vi.waitFor(() => { expect(f.fleet.remoteTaskStatus(f.id)?.interruption?.phase).toBe('blocked') })
+  expect(f.fleet.remoteTaskStatus(f.id)?.interruption?.detail).toContain('digest')
+  expect(remoteTask.modes).toEqual(['discover'])
+  expect(f.fleet.snapshot().unconfirmedWork).toHaveLength(1)
+})
+
+it('blocks preparation recovery before remote reads when a deleted task includes an unselected original node', async () => {
+  const f = await fixture()
+  const old = await f.fleet.create({ models: modelSelections, experimentId: randomUUID(), name: 'Original two-node task',
+    objective: 'Keep original nodes', coordinatorId: f.a.id, serverIds: [f.a.id, f.b.id], mode: 'automatic' })
+  await vi.waitFor(() => { expect(f.records.get(old.request.experimentId)?.handoverRecorded).toBe(true) })
+  const owner = await f.fleet.create({ models: modelSelections, experimentId: randomUUID(), objective: 'Prepare selected node only',
+    coordinatorId: f.a.id, serverIds: [f.a.id], mode: 'semi', uploads: [{ name: 'pending.txt', size: 1 }] })
+  const original = f.records.get(old.request.experimentId)!
+  original.latest = { ...receipt(original.submission!), state: 'running', resourcesReleased: false }
+  await f.fleet.deleteExperiments({ operationId: randomUUID(), experimentIds: [old.request.experimentId], cleanupRemote: false, allowUnconfirmed: true })
+  await vi.waitFor(() => { expect(f.records.has(old.request.experimentId)).toBe(false) })
+  vi.mocked(request).mockClear(); vi.mocked(remote).mockClear()
+  const recovery = f.fleet['interruptionRecovery'](owner.request.experimentId)
+  const results = await recovery.settleExperiments(offlineControllerSchema.parse({ version: 1, state: 'occupied', role: 'coordinator',
+    root: '/runs', home: '/runs/state/coordinator-home', hostBootId: 'cpu-boot', digest: 'a'.repeat(64), savedPid: null,
+    releaseBinding: null, processes: [], records: [], converged: [],
+    blockers: [{ kind: 'experiment', id: old.request.experimentId, reason: 'Original allocation remains' }] }), AbortSignal.timeout(5000))
+  expect(results).toMatchObject([{ phase: 'blocked', stopRequested: false }])
+  expect(results[0]?.detail).toContain(f.b.id)
+  expect(vi.mocked(request)).not.toHaveBeenCalled(); expect(vi.mocked(remote)).not.toHaveBeenCalled()
+  expect(f.fleet.remoteTaskStatus(old.request.experimentId)?.released).toBe(false)
+  expect(f.fleet.list().map(row => row.request.experimentId)).toEqual([owner.request.experimentId])
+})
+
+it('does not erase the only task identity when saving recovery data fails', async () => {
+  const f = await fixture()
+  const row = await f.fleet.create({ models: modelSelections, experimentId: randomUUID(), objective: 'retain on failed recovery write',
+    coordinatorId: f.a.id, serverIds: [f.a.id], mode: 'automatic' })
+  await vi.waitFor(() => { expect(f.records.get(row.request.experimentId)?.handoverRecorded).toBe(true) })
+  f.tables.get('tasks')!.delete(row.request.experimentId); f.failingWrites.add('tasks')
+  await expect(f.fleet.deleteExperiments({ operationId: randomUUID(), experimentIds: [row.request.experimentId], cleanupRemote: false,
+    allowUnconfirmed: true })).rejects.toThrow('durable write failed')
+  expect(f.fleet.list().map(record => record.request.experimentId)).toContain(row.request.experimentId)
+  expect(f.tables.get('removals')?.has(row.request.experimentId)).not.toBe(true)
+})
+
+it('retains a submitted task identity after local deletion without restoring its visible experiment', async () => {
+  const f = await fixture()
+  const row = await f.fleet.create({ models: modelSelections, experimentId: randomUUID(), name: 'Deleted remote task', objective: 'Preserve original environment and logs',
+    coordinatorId: f.a.id, serverIds: [f.a.id], mode: 'automatic' })
+  await vi.waitFor(() => { expect(f.records.get(row.request.experimentId)?.handoverRecorded).toBe(true) })
+  const original = f.records.get(row.request.experimentId)!
+  original.latest = { ...receipt(original.submission!), state: 'running', resourcesReleased: false }
+  await f.fleet.deleteExperiments({ operationId: randomUUID(), experimentIds: [row.request.experimentId], cleanupRemote: false, allowUnconfirmed: true })
+  await vi.waitFor(() => { expect(f.records.has(row.request.experimentId)).toBe(false) })
+  expect(f.fleet.remoteTaskStatus(row.request.experimentId)).toMatchObject({ experimentId: row.request.experimentId, deleted: true,
+    serverIds: [f.a.id] })
+  expect(f.fleet.list()).toEqual([])
+  expect(JSON.stringify(f.tables.get('tasks')?.get(row.request.experimentId))).not.toContain('Preserve original environment and logs')
+  expect(vi.mocked(cleanupServerStorage)).not.toHaveBeenCalled()
+})
 
 it('removes unused peer registrations without assigning a permanent coordinator', async () => {
   const f = await fixture()
@@ -150,6 +322,25 @@ it('removes unused peer registrations without assigning a permanent coordinator'
   await expect(f.fleet.saveServer(f.a)).rejects.toThrow('was removed')
   await f.fleet.saveServer({ ...f.a, id: randomUUID() })
   expect(f.fleet.servers().coordinatorId).toBeUndefined()
+})
+
+it('reads each pinned environment through its authenticated node port instead of the coordinator port', async () => {
+  const f = await fixture()
+  await f.fleet.saveServer({ ...f.b, remotePort: 43127 })
+  const row = await f.fleet.create({ models: modelSelections, experimentId: randomUUID(), objective: 'inspect managed environments', coordinatorId: f.a.id, serverIds: [f.a.id, f.b.id], mode: 'automatic' })
+  await vi.waitFor(() => { expect(f.records.get(row.request.experimentId)?.handoverRecorded).toBe(true) })
+  const saved = f.records.get(row.request.experimentId)!
+  const ports: number[] = []
+  vi.mocked(request).mockImplementation(async (target, _token, route) => {
+    expect(route).toBe('/aspera/v4/node/environment-storage')
+    const server = saved.submission!.nodes.find(node => node.server.host === target.host)!.server
+    expect(target.remotePort).toBe(server.remotePort); ports.push(target.remotePort)
+    return { status: 200, value: { serverId: server.id, name: server.name, checkedAt: 123, source: 'remote', capacityBytes: 100,
+      availableBytes: 10, workspaceBytes: 3, sharedBytes: 4, reclaimableBytes: 0, environments: [], legacy: [], complete: true } }
+  })
+  const usage = await f.fleet.storageUsage(row.request.experimentId)
+  expect(usage.nodes.every(node => node.source === 'remote')).toBe(true)
+  expect(ports.sort()).toEqual([43019, 43127])
 })
 
 it('registers a selected server host key before a model-free connection check', async () => {
@@ -767,7 +958,9 @@ it('removes an unreachable experiment locally without claiming its resources are
   expect(cleanupServerStorage).not.toHaveBeenCalled()
   const reopened = await f.open()
   expect(reopened.list()).toEqual([])
-  await expect(reopened.create({ ...row.request, experimentId: randomUUID(), coordinatorId: f.a.id })).rejects.toThrow('unconfirmed')
+  const next = await reopened.create({ ...row.request, experimentId: randomUUID(), coordinatorId: f.a.id })
+  expect(next.request.experimentId).not.toBe(id)
+  expect(reopened.remoteTaskStatus(id)?.released).toBe(false)
 })
 
 it('deletes a server configuration with acknowledged linked work and retains the experiment snapshot', async () => {
@@ -852,4 +1045,56 @@ it('removes a staging record and prevents pending input commits from dispatching
   expect((await f.fleet.deleteExperiments(input))[0]?.state).toBe('deleted')
   await expect(f.fleet.commitInputs(row.request.experimentId)).rejects.toThrow('not found')
   await vi.waitFor(() => { expect(f.fleet.snapshot().unconfirmedWork).toEqual([]) })
+})
+
+it('retains ownership and recovery records after blocked interruption, then reuses its operation for explicit retry', async () => {
+  const f = await fixture(); const complete = await finished(f); const id = complete.request.experimentId
+  const running = { ...complete, latest: { ...complete.latest!, state: 'running' as const, resourcesReleased: false } }
+  f.records.set(id, running)
+  const originalRemote = vi.mocked(remote).getMockImplementation()!
+  vi.mocked(remote).mockRejectedValueOnce(new Error('Original process identity is unavailable'))
+  const first = f.fleet.interrupt(id)
+  expect(f.fleet.interrupt(id).operationId).toBe(first.operationId)
+  await vi.waitFor(() => { expect(f.fleet.interruptionStatus(id)?.phase).toBe('blocked') })
+  const remoteReads = vi.mocked(remote).mock.calls.length
+  expect(f.fleet.interruptionStatus(id)?.detail).toContain('identity is unavailable')
+  expect(vi.mocked(remote).mock.calls.length).toBe(remoteReads)
+  expect(f.fleet.previewDeletion([id])[0]?.recordDeletionAvailable).toBe(false)
+  await expect(f.fleet.approve(id, 1)).rejects.toThrow('confirm resource release')
+  await expect(f.fleet.retry(id)).rejects.toThrow('confirm resource release')
+  expect((await f.fleet.deleteExperiments({ experimentIds: [id], cleanupRemote: false, allowUnconfirmed: true, operationId: randomUUID() }))[0]?.state).toBe('failed')
+  expect(f.fleet.list().find(row => row.request.experimentId === id)?.latest?.resourcesReleased).toBe(false)
+  vi.mocked(remote).mockImplementation(originalRemote)
+  vi.mocked(request).mockResolvedValue({ status: 200, value: { ...running.latest, state: 'cancelled', resourcesReleased: true, revision: 3 } })
+  expect(f.fleet.interrupt(id).operationId).toBe(first.operationId)
+  await vi.waitFor(() => { expect(f.fleet.interruptionStatus(id)?.phase).toBe('released') })
+  expect(f.fleet.list().find(row => row.request.experimentId === id)?.latest).toMatchObject({ state: 'cancelled', resourcesReleased: true, revision: 3 })
+  expect(f.fleet.snapshot().interruptions).toHaveLength(1)
+})
+
+it('recovers a completed original remote receipt without repeating cancel or process stopping', async () => {
+  const f = await fixture(); const complete = await finished(f); const id = complete.request.experimentId
+  const running = { ...complete, latest: { ...complete.latest!, state: 'running' as const, resourcesReleased: false } }
+  f.records.set(id, running)
+  vi.mocked(remote).mockRejectedValueOnce(new Error('The original reply was lost'))
+  const first = f.fleet.interrupt(id)
+  await vi.waitFor(() => { expect(f.fleet.interruptionStatus(id)?.phase).toBe('blocked') })
+  const saved = { ...first, phase: 'released', updatedAt: first.updatedAt + 100,
+    nodes: first.nodes.map(node => ({ ...node, phase: 'released', agentsExited: true, commandsReleased: true, servicesReleased: true })),
+    result: { ...running.latest!, state: 'cancelled', resourcesReleased: true, revision: 3 } }
+  const modes: string[] = []
+  vi.mocked(request).mockClear()
+  vi.mocked(remote).mockImplementation(async (_target, script) => {
+    const input = JSON.parse(script.slice(script.lastIndexOf('{"mode":"interrupt-')))
+    modes.push(input.mode)
+    return JSON.stringify(['interrupt-inspect', 'interrupt-fence'].includes(input.mode) ? {
+      serverId: input.serverId, agentsExited: true, commandsReleased: true, servicesReleased: true,
+      commandsReady: true, servicesReady: true, digest: 'a'.repeat(64), hostBootId: 'cpu-host', blockers: [], agents: [], commands: [], receipt: saved,
+    } : { released: true })
+  })
+  expect(f.fleet.interrupt(id).operationId).toBe(first.operationId)
+  await vi.waitFor(() => { expect(f.fleet.interruptionStatus(id)?.phase).toBe('released') })
+  expect(f.fleet.list().find(row => row.request.experimentId === id)?.latest).toMatchObject({ state: 'cancelled', resourcesReleased: true, revision: 3 })
+  expect(vi.mocked(request)).not.toHaveBeenCalled()
+  expect(modes).toContain('interrupt-publish'); expect(modes).not.toContain('interrupt-stop'); expect(modes).not.toContain('interrupt-complete')
 })

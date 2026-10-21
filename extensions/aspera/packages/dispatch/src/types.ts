@@ -4,6 +4,7 @@ import type { ModelSelection } from '@deepseek-ai/dsh-agent'
 import type { Branded } from '@deepseek-ai/dsh-brand'
 import type { ExperimentModels, ExperimentModelSnapshots } from '@aspera/experiments/types'
 import type { ServerEnvironment, ServerProbe } from '@aspera/experiments/types'
+import type { ExperimentInterruptionStatus } from '@aspera/experiments/types'
 
 /** Durable command ownership survives local cancellation and restart. */
 export interface PreparationCommand { directory: string }
@@ -119,7 +120,9 @@ export interface ServerDeletionPreview {
 }
 
 /** Deleted experiments may still own remote resources; these notices contain no credentials. */
-export interface UnconfirmedWorkNotice { experimentId: ExperimentId; name: string; serverIds: ExperimentServerId[] }
+export interface UnconfirmedWorkNotice { experimentId: ExperimentId; name: string; serverIds: ExperimentServerId[];
+  updatedAt?: number; recoveryAvailable?: boolean; interruption?: import('@aspera/experiments').ExperimentInterruptionStatus }
+export type { RemoteTaskStatus } from './remote-task.ts'
 
 /** Minimal durable identity retained after removing management records. */
 export interface DeletedExperiment {
@@ -131,6 +134,12 @@ export interface DeletedExperiment {
 
 /** Concrete input and execution evidence for one independently dispatched experiment. */
 export interface FleetExperiment {
+  /** Presentation-only supplementary assessment; never written into fleet generation 6. */
+  completionReview?: import('@aspera/experiments/types').CompletionReview
+  /** Presentation-only original-result-bound stage and step supplements. */
+  completionAssessment?: import('@aspera/experiments/types').CompletionAssessment
+  /** Presentation-only eligibility; fresh original-node verification is still required. */
+  completionReviewAvailable?: boolean
   request: { experimentId: ExperimentId; objective: string; serverIds: ExperimentServerId[]; coordinatorId?: ExperimentServerId; files: string[]; uploads: { name: string; size: number }[]; mode: 'semi' | 'automatic'; budget?: ExperimentBudget; name?: string; models?: ExperimentModels }
   coordinator: ServerSettings
   servers: ServerSettings[]
@@ -165,6 +174,7 @@ export interface PreparationRetryResult { record: FleetExperiment; installations
 /** Snapshot delivered over the reconnecting Remote stream. */
 export interface FleetSnapshot { registry: FleetRegistry; experiments: FleetExperiment[]; deletedIds: ExperimentId[]; deletions: ExperimentDeletion[];
   installations: import('./installation-model.ts').InstallationProgress[];
+  interruptions: ExperimentInterruptionStatus[];
   removedServerIds: ExperimentServerId[]; unconfirmedWork: UnconfirmedWorkNotice[] }
 
 /** Immutable deployment policy; all credential fields are references. */

@@ -1,11 +1,12 @@
 /** Shared removal checks include coordinator work and unconfirmed remote commands. */
-import type { ExperimentServerId, ServerProbe } from '@aspera/experiments/types'
+import type { ExperimentServerId, ServerProbe, ExperimentInterruptionStatus } from '@aspera/experiments/types'
 import type { FleetExperiment } from './types.ts'
 
 /** Explain why a record cannot be removed or handed to another coordinator.
- * @param record - immutable submission and latest execution evidence. @returns the outstanding obligation, if any.
+ * @param record - immutable submission and latest execution evidence. @param interruption - retained program release checks. @returns the outstanding obligation, if any.
  */
-export function experimentRemovalBlocker(record: FleetExperiment): 'active' | 'cleanup-unconfirmed' | undefined {
+export function experimentRemovalBlocker(record: FleetExperiment, interruption?: ExperimentInterruptionStatus): 'active' | 'cleanup-unconfirmed' | undefined {
+  if (interruption !== undefined && interruption.phase !== 'released') return 'cleanup-unconfirmed'
   if (record.preparation?.environments?.some(value => value.pendingCommand !== undefined)) return 'cleanup-unconfirmed'
   if (record.state === 'staging' || record.state === 'preparing') return 'active'
   const remote = record.latest ?? record.receipt
@@ -20,13 +21,14 @@ export function experimentRemovalBlocker(record: FleetExperiment): 'active' | 'c
  * @param records - local records, including pinned historical coordinators.
  * @param probe - last remote allocation observation.
  * @param deletedIds - locally deleted terminal identities whose stale allocations have already been reconciled.
+ * @param interruptions - program-owned release checks.
  * @returns experiment identities that prevent removing this registration.
  */
-export function serverRemovalBlockers(id: ExperimentServerId, records: readonly FleetExperiment[], probe?: ServerProbe, deletedIds: readonly string[] = []): string[] {
+export function serverRemovalBlockers(id: ExperimentServerId, records: readonly FleetExperiment[], probe?: ServerProbe, deletedIds: readonly string[] = [], interruptions: readonly ExperimentInterruptionStatus[] = []): string[] {
   const blockers = new Set<string>()
   for (const record of records) {
     if (record.coordinator.id !== id && !record.servers.some(server => server.id === id)) continue
-    if (experimentRemovalBlocker(record) !== undefined) {
+    if (experimentRemovalBlocker(record, interruptions.find(value => value.experimentId === record.request.experimentId)) !== undefined) {
       blockers.add(record.request.experimentId)
     }
   }

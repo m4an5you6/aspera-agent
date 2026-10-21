@@ -12,20 +12,29 @@
   en: 2ea0efe7c70c27f8
   zh: 939a4657c20a81cc
 /aspera-dispatch/table-of-contents:
-  en: b563e4ec4727d0de
-  zh: 55c133137e526dcc
+  en: 483a20fc0655e099
+  zh: a5d645062d69c985
 /aspera-dispatch/use-this-package:
-  en: e64d41329874720b
-  zh: 96f0ecc5cf474c39
+  en: 418b77eb70054ddd
+  zh: ef197e731930c4af
 /aspera-dispatch/understand-the-implementation:
-  en: 6962c9f3166eca2b
-  zh: bf857226ed500b4d
+  en: 31af255f249f4f4c
+  zh: 95fb2e629b6061fe
+/aspera-dispatch/understand-the-implementation/sandbox-compatibility-repair:
+  en: 9d9250a35c1e9521
+  zh: 333800ead6a35f5c
 /aspera-dispatch/further-exploration:
   en: 346f75b47eb508b4
   zh: 1de6fcef59bc8d98
 /aspera-dispatch/model-experience:
-  en: 2fdb19b040cf79a8
-  zh: fdee4a288b713159
+  en: 894d161c0e3a611f
+  zh: b550979b8d015878
+/aspera-dispatch/preparation-command-recovery:
+  en: d725fc31a89a605d
+  zh: 66a21b9724a8c425
+/aspera-dispatch/remote-task-settlement:
+  en: ed8ff1e1cb5c1082
+  zh: 570ca1a7697c0852
 /aspera-dispatch/known-limitations-and-deferred-work:
   en: b92aa5978422bafe
   zh: 29a65b9ad3c805c2

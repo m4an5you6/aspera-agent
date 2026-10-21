@@ -12,19 +12,22 @@ import type { ExperimentLocaleKey } from './locales.ts'
 import { experimentProgress, experimentPhases } from './experiment-progress.ts'
 import { experimentTodos } from './attention.ts'
 import css from './ExperimentsPage.module.css'
+import type { ExperimentInterruptionStatus } from '@aspera/experiments/types'
+import { interruptionView } from './interruption-view.ts'
 
 type Props = { controller: ExperimentsController; t: TranslateNS<'experiments'> }
 
 /** @param props - actual experiment status. @returns consistent text, glyph and semantic color. */
-export function ExperimentStatus({ row, t }: { row: FleetExperiment; t: Props['t'] }) {
+export function ExperimentStatus({ row, t, interruption, requesting }: { row: FleetExperiment; t: Props['t']; interruption?: ExperimentInterruptionStatus; requesting?: boolean }) {
   const { status } = experimentProgress(row)
+  const stopping = interruptionView(row, interruption, requesting)
   const danger = status === 'failed' || status === 'interrupted'
-  const warning = ['blocked', 'awaiting-approval', 'waiting-reply'].includes(status)
-  const success = status === 'completed' || status === 'serving'
-  return <Tag tone={danger ? 'danger' : warning ? 'warning' : success ? 'success' : status === 'cancelled' ? 'neutral' : 'info'}
+  const warning = ['blocked', 'awaiting-approval', 'waiting-reply', 'review-blocked'].includes(status)
+  const success = status === 'completed' || status === 'serving' || status === 'revalidated'
+  return <Tag tone={stopping.blocked ? 'warning' : stopping.busy ? 'info' : danger ? 'danger' : warning ? 'warning' : success ? 'success' : status === 'cancelled' ? 'neutral' : 'info'}
     className={`${css.statusTag} ${status === 'queued' ? css.queuedTag : ''}`}>
-    {danger ? <IconCloseCircleFillRegular size={14} /> : warning ? <IconWarningOutlineRegular size={14} />
-      : success ? <IconCheckCircleOutlineRegular size={14} /> : <IconClockOutlineRegular size={14} />}{t(status)}
+    {stopping.busy || status === 'reviewing' ? <StateDot state="ongoing" size={14} /> : stopping.blocked ? <IconWarningOutlineRegular size={14} /> : danger ? <IconCloseCircleFillRegular size={14} /> : warning ? <IconWarningOutlineRegular size={14} />
+      : success ? <IconCheckCircleOutlineRegular size={14} /> : <IconClockOutlineRegular size={14} />}{t(stopping.busy ? 'interruptingExperiment' : stopping.blocked ? 'interruptionBlocked' : stopping.userInterrupted ? 'interruptedByUser' : status)}
   </Tag>
 }
 
@@ -37,8 +40,8 @@ export function ManagementFeedback({ controller, useExperiments, t }: Experiment
     icon={<IconWarningOutlineRegular />} holdMs={8000} onDone={() => { controller.dismissErrorNotice() }}
     actions={[{ label: t('technicalDetails'), onClick: () => { setDetails(error.message); controller.dismissErrorNotice() } }, { label: '×', onClick: () => { controller.dismissErrorNotice() } }]} /></>
   if (details !== undefined) return <Modal open title={t('technicalDetails')} closeLabel={t('close')} onClose={() => { setDetails(undefined) }}><div className={css.deleteContent}><pre className={css.prewrap}>{details}</pre></div></Modal>
-  return toast === null ? null : <Toast key={`${toast.key}-${toast.sequence}`} text={t(toast.key)} {...(toast.failed ? { icon: <IconWarningOutlineRegular /> } : { tone: 'success' as const })}
-    {...(toast.detail === undefined ? {} : { actions: [{ label: t('sourceSwitchReason'), onClick: () => { setDetails(toast.detail); controller.clearToast() } }, { label: '×', onClick: () => { controller.clearToast() } }] })}
+  return toast === null ? null : <Toast key={`${toast.key}-${toast.sequence}`} text={toast.key === 'storageFallbackApplied' ? t(toast.key, { size: t('environmentGiB', { size: ((toast.peakBytes ?? 0) / 1024 ** 3).toLocaleString(undefined, { maximumFractionDigits: 2 }) }) }) : t(toast.key)} {...(toast.failed ? { icon: <IconWarningOutlineRegular /> } : { tone: 'success' as const })}
+    {...(toast.detail === undefined ? {} : { actions: [{ label: t(toast.storage === undefined ? 'sourceSwitchReason' : 'storageDetails'), onClick: () => { if (toast.storage !== undefined) controller.openStorageDetails(toast.storage.experimentId, toast.storage.serverId); else setDetails(toast.detail); controller.clearToast() } }, { label: '×', onClick: () => { controller.clearToast() } }] })}
     onDone={() => { controller.clearToast() }} />
 }
 
@@ -112,10 +115,14 @@ export function DeleteExperimentsDialog({ controller, t, ids, close }: Props & {
 
 function RowMenu({ row, controller, t, clone, remove }: Props & { row: FleetExperiment; clone: () => void; remove: () => void }) {
   const [open, setOpen] = useState(false)
+  const live = useSyncExternalStore(controller.store.subscribe, controller.store.getSnapshot)
+  const id = row.request.experimentId
+  const stopping = interruptionView(row, live.interruptions.find(value => value.experimentId === id), live.interrupting.includes(id))
   return <Menu open={open} portal onClose={() => { setOpen(false) }} items={[
     { id: 'open', label: t('openExperiment') }, { id: 'copy', label: t('clone') },
-    { id: 'delete', label: <span className={css.dangerText}>{t('deleteExperiment')}</span> },
-  ]} onSelect={id => { setOpen(false); if (id === 'open') controller.select(row.request.experimentId); else if (id === 'copy') clone(); else if (id === 'delete') remove() }}
+    ...(stopping.available ? [{ id: 'interrupt', label: t(stopping.action), disabled: stopping.busy }] : []),
+    { id: 'delete', label: <span className={css.dangerText}>{t('deleteExperiment')}</span>, disabled: stopping.busy || stopping.blocked },
+  ]} onSelect={action => { setOpen(false); if (action === 'open') controller.select(id); else if (action === 'copy') clone(); else if (action === 'delete') remove(); else if (action === 'interrupt') void controller.interrupt(id).catch(error => { controller.report(error, { experimentId: id, operation: 'interrupt' }) }) }}
     anchor={<Tooltip label={t('moreActions')} portal><Button variant="ghost" size="sm" aria-label={`${t('moreActions')} ${row.request.name ?? row.request.experimentId}`}
       icon={<IconEllipsisOutlineRegular />} onClick={() => { setOpen(!open) }} /></Tooltip>} />
 }
@@ -132,9 +139,10 @@ export function ExperimentList({ controller, t, rows, onClone, pendingOnly, onPe
   const [deleting, setDeleting] = useState<string[]>()
   useEffect(() => { if (pendingOnly) setFilter('pending') }, [pendingOnly])
   const changeFilter = (value: typeof filter) => { setFilter(value); onPendingChange(value === 'pending'); setSelected([]) }
-  const attention = (row: FleetExperiment) => experimentProgress(row).attention
+  const receipt = (row: FleetExperiment) => management.interruptions.find(value => value.experimentId === row.request.experimentId)
+  const attention = (row: FleetExperiment) => { const stopping = interruptionView(row, receipt(row)); return stopping.blocked || !stopping.busy && experimentProgress(row).attention }
   const pending = (row: FleetExperiment) => experimentTodos([row]).length > 0
-  const ended = (row: FleetExperiment) => experimentRemovalBlocker(row) === undefined
+  const ended = (row: FleetExperiment) => experimentProgress(row).status !== 'reviewing' && experimentRemovalBlocker(row, receipt(row)) === undefined
   const active = (row: FleetExperiment) => !attention(row) && !ended(row)
   const visible = rows.filter(row => (filter === 'all' || (filter === 'pending' ? pending(row) : filter === 'attention' ? attention(row) : filter === 'active' ? active(row) : ended(row)))
     && `${row.request.name ?? ''} ${row.request.objective} ${row.servers.map(node => node.name).join(' ')}`.toLocaleLowerCase().includes(search.toLocaleLowerCase()))
@@ -151,7 +159,7 @@ export function ExperimentList({ controller, t, rows, onClone, pendingOnly, onPe
       onClick={() => { changeFilter(item.id) }}>{t(item.key)}</Button>)}</div>
       <Input aria-label={t('search')} placeholder={t('search')} value={search} onChange={event => { setSearch(event.target.value); setSelected([]) }} /></div>
     {selectedVisible.length > 0 && <div className={css.batchBar}><span>{t('selectedExperiments', { count: selectedVisible.length })}</span><Button variant="ghost" size="sm" className={css.dangerText}
-      icon={<IconTrashOutlineRegular />} onClick={() => { setDeleting(selectedVisible.map(row => row.request.experimentId)) }}>{t('batchDelete')}</Button></div>}
+      icon={<IconTrashOutlineRegular />} disabled={selectedVisible.some(row => { const status = receipt(row); return status !== undefined && status.phase !== 'released' })} onClick={() => { setDeleting(selectedVisible.map(row => row.request.experimentId)) }}>{t('batchDelete')}</Button></div>}
     {visible.length === 0 ? <div className={css.emptyState}><h2>{t(rows.length === 0 ? 'empty' : 'noMatches')}</h2><p>{t('newHint')}</p></div>
       : <div className={css.managementTableWrap}><table className={css.managementTable}><thead><tr>
         <th className={css.checkColumn}><Checkbox label={t('selectVisible')} checked={visible.every(row => selected.includes(row.request.experimentId))}
@@ -161,13 +169,13 @@ export function ExperimentList({ controller, t, rows, onClone, pendingOnly, onPe
         const id = row.request.experimentId
         const name = row.request.name ?? row.request.objective.split('\n')[0]?.slice(0, 120)
         const progress = experimentProgress(row)
-        const phase = row.latest?.progress?.phase ?? t(progress.local && row.preparation !== undefined ? row.preparation.stage : experimentPhases[progress.phase])
+        const phase = row.completionReview !== undefined ? t(experimentPhases[progress.phase]) : row.latest?.progress?.phase ?? t(progress.local && row.preparation !== undefined ? row.preparation.stage : experimentPhases[progress.phase])
         const deletion = management.deletions.find(value => value.experimentId === id && value.started && value.state !== 'deleted')
-        const detail = deletion?.detail ?? row.latest?.detail ?? row.detail
+        const detail = deletion?.detail ?? (progress.status === 'revalidated' ? undefined : row.completionReview?.detail ?? row.latest?.detail ?? row.detail)
         return <tr key={id} data-experiment-id={id} data-selected={selected.includes(id)}>
           <td className={css.checkColumn}><Checkbox label={`${t('selectExperiment')} ${name}`} checked={selected.includes(id)} onChange={value => { setSelected(current => value ? [...current, id] : current.filter(item => item !== id)) }} /></td>
           <td><button className={css.rowLink} onClick={() => { controller.select(id) }}>{name}</button><small>{t(row.request.mode)} · {row.coordinator.name}</small></td>
-          <td><ExperimentStatus row={row} t={t} /></td>
+          <td><ExperimentStatus row={row} t={t} interruption={management.interruptions.find(value => value.experimentId === id)} requesting={management.interrupting.includes(id)} /></td>
           <td><span className={css.stageText}>{deletion === undefined ? phase : t(deletion.state === 'deleting' ? 'deleting' : 'deletionIncomplete')}</span>{detail !== undefined && <Tooltip label={detail} portal><button className={css.issueLink} onClick={() => { if (deletion === undefined) controller.select(id); else setDeleting([id]) }}>{t('viewIssue')}</button></Tooltip>}</td>
           <td><span className={css.stageText}>{row.servers.map(server => server.name).join(' · ')}</span></td>
           <td><time dateTime={new Date(row.latest?.updatedAt ?? row.createdAt).toISOString()}>{new Date(row.latest?.updatedAt ?? row.createdAt).toLocaleString()}</time></td>

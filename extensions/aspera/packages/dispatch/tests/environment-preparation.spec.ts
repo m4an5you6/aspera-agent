@@ -14,6 +14,8 @@ import type { EnvironmentProgress } from '../src/types.ts'
 import type { RemoteCommandResult } from '../src/transport.ts'
 import { readyEnvironment } from './environment-fixture.ts'
 import { SandboxVerificationError } from '../src/sandbox-verification.ts'
+import { SandboxRepair, sandboxRepairPolicySchema } from '../src/sandbox-repair.ts'
+import { preparationCommandPolicySchema } from '../src/preparation-command.ts'
 
 interface RegisteredTool {
   name: string
@@ -21,7 +23,7 @@ interface RegisteredTool {
 }
 
 function fixture() {
-  const preparation = new EnvironmentPreparation()
+  const preparation = new EnvironmentPreparation(preparationCommandPolicySchema.parse({ pollIntervalMs: 1, recoveryTimeoutMs: 5 }))
   const registered = new Map<string, RegisteredTool>()
   const abort = new AbortController()
   const progress: EnvironmentProgress[] = []
@@ -49,12 +51,14 @@ function fixture() {
     observation: readyEnvironment(), operation: 'bootstrap', outputChars: 4096,
     progress: async value => { progress.push(structuredClone(value)) },
   }
+  const invocations: ToolCallId[] = []
   const call = (name: string, args: Record<string, unknown> = {}, signal = abort.signal) => {
     const tool = registered.get(name)
     if (tool === undefined) throw new Error('fixture tool is absent')
-    return tool.execute({ server_id: input.serverId, ...args }, { signal, callId: brandString<ToolCallId>(randomUUID()) })
+    const callId = brandString<ToolCallId>(randomUUID()); invocations.push(callId)
+    return tool.execute({ server_id: input.serverId, ...args }, { signal, callId })
   }
-  return { preparation, agent, input, driver, result, abort, append, inject, followup, progress, call,
+  return { preparation, agent, input, driver, result, abort, append, inject, followup, progress, call, invocations,
     loop: (body: () => Promise<void>) => { run = body },
     ensure: <T>(verify: () => Promise<T>) => preparation.ensure(agent, input, driver, verify, abort.signal) }
 }
@@ -135,6 +139,7 @@ it('lets the existing Agent install missing tools and only completes after provi
 it('keeps nonzero command diagnostics available for another repair attempt', async () => {
   const f = fixture()
   let installed = false
+  vi.mocked(f.driver.remote).mockImplementation(async (_target, command) => command.includes('/exited') ? installed ? '0\n' : '1\n' : '')
   vi.mocked(f.driver.remoteResult)
     .mockResolvedValueOnce({ ...f.result, exitCode: 1, stdout: 'package metadata', stderr: 'download unavailable' })
     .mockImplementationOnce(async () => { installed = true; return f.result })
@@ -147,6 +152,62 @@ it('keeps nonzero command diagnostics available for another repair attempt', asy
   })
   await f.ensure(async () => { if (!installed) throw new Error('tools missing'); return 'verified' })
   expect(f.driver.remoteResult).toHaveBeenCalledTimes(2)
+})
+
+it('reconciles the original timed-out command and returns its persisted download failure to the Agent', async () => {
+  const f = fixture(); let repaired = false
+  vi.mocked(f.driver.remoteResult).mockResolvedValue({ ...f.result, exitCode: null, timedOut: true, exitConfirmed: false })
+  vi.mocked(f.driver.remote).mockImplementation(async (_target, command) => {
+    if (!command.includes('/command.py')) return ''
+    const directory = f.progress.findLast(value => value.pendingCommand !== undefined)!.pendingCommand!.directory
+    return JSON.stringify({ status: { version: 1, experimentId: f.input.experimentId, serverId: f.input.serverId,
+      sessionId: f.agent.session.id, toolCallId: f.invocations.at(-1),
+      commandId: directory.split('/').at(-1), exitCode: 143, exitConfirmed: true, timedOut: true, cancelled: false, signal: 'SIGTERM' },
+    lines: [{ seq: 0, time: 1, stream: 'stderr', text: 'download exceeded the shared deadline; cache retained\n' }], offset: 200, hasMore: false })
+  })
+  f.loop(async () => {
+    const result = JSON.parse(await f.call('run_preparation_command', { command: 'curl --retry 3 --max-time 300 example' }))
+    expect(result).toMatchObject({ exitConfirmed: true, timedOut: true, exitCode: 143 })
+    expect(result.stderr).toContain('cache retained')
+    repaired = true
+    await f.call('verify_preparation_environment', { path_entries: [] })
+  })
+  expect((await f.ensure(async () => { if (!repaired) throw new Error('uv missing'); return 'verified' })).value).toBe('verified')
+  expect(f.driver.remoteResult).toHaveBeenCalledOnce()
+  expect(f.progress.at(-1)?.pendingCommand).toBeUndefined()
+})
+
+it('gives downloads the same command budget and retains output independently of the SSH reader', async () => {
+  const f = fixture(); let installed = false
+  f.input.directories = { workspace: '/hidden-namespace/runs/experiment/workspace', release: '/hidden-namespace/releases/fixed', control: '/hidden-namespace/control' }
+  vi.mocked(f.driver.remoteResult).mockImplementation(async (_target, command) => {
+    expect(command).toContain('request.v1.json')
+    expect(command).toContain('ASPERA_PREPARATION_REMAINING_MS')
+    expect(command).not.toContain('mkfifo')
+    expect(command).not.toContain('/hidden-namespace')
+    expect(command).not.toMatch(/command\.py follow /)
+    installed = true; return f.result
+  })
+  f.loop(async () => { await f.call('run_preparation_command', { command: 'download fixed uv' }); await f.call('verify_preparation_environment', { path_entries: [] }) })
+  await f.ensure(async () => { if (!installed) throw new Error('uv missing'); return 'verified' })
+})
+
+it('scopes fixed uv acquisition to the selected node and still requires independent verification', async () => {
+  const f = fixture(); f.input.requirements.uv = '0.13.0'; let installed = false
+  vi.mocked(f.driver.remoteResult).mockImplementation(async (_target, command) => {
+    expect(command).toContain('ASPERA_PREPARATION_COMMAND_DIRECTORY/command.py')
+    expect(command).toContain('0.13.0')
+    installed = true
+    return { ...f.result, stdout: JSON.stringify({ reused: true, downloadBytes: 0, pathEntries: ['/cache/uv/bin'] }) }
+  })
+  f.loop(async () => {
+    await expect(f.call('prepare_preparation_tool', { server_id: randomUUID(), tool: 'uv' })).rejects.toThrow('outside')
+    const result = JSON.parse(await f.call('prepare_preparation_tool', { tool: 'uv' }))
+    expect(JSON.parse(result.stdout).downloadBytes).toBe(0)
+    expect(f.progress.at(-1)?.phase).not.toBe('environment-ready')
+    await f.call('verify_preparation_environment', { path_entries: ['/cache/uv/bin'] })
+  })
+  expect((await f.ensure(async () => { if (!installed) throw new Error('uv missing'); return 'verified' })).value).toBe('verified')
 })
 
 it('serializes parallel Agent commands and verifies only after both have settled', async () => {
@@ -235,8 +296,102 @@ it('blocks a container permission refusal when an Agent declares completion with
   expect(f.progress.some(value => value.phase === 'environment-ready')).toBe(false)
 })
 
+it('offers a measured private-proc repair to the original Agent and requires the installed launcher for revalidation', async () => {
+  const f = fixture(); let repaired = false
+  const launcher = { version: 1 as const, path: '/control/tools/sandbox/' + 'a'.repeat(64) + '/bin/bwrap', digest: 'a'.repeat(64) }
+  const inspect = vi.fn(async () => ({ version: 1 as const, state: 'available' as const, strategy: 'private-proc' as const,
+    reason: 'Private PID/proc launch passed with all inner isolation flags and zero capabilities',
+    stdout: 'isolated', stderr: '', exitCode: 0, requiresPlatformAction: false }))
+  const repair = vi.fn(async () => { repaired = true; return { version: 1 as const, state: 'configured' as const, strategy: 'private-proc' as const,
+    reason: 'Immutable launcher installed', stdout: '', stderr: '', exitCode: 0, requiresPlatformAction: false,
+    launcher, pathEntries: [launcher.path.slice(0, -6)] } })
+  f.input.sandbox = { inspect, repair }
+  f.loop(async () => {
+    const inspected = JSON.parse(await f.call('inspect_preparation_environment'))
+    expect(inspected.latestVerification.diagnostic).toMatchObject({ requiresPlatformAction: false,
+      sandboxRepair: { state: 'available', tool: 'repair_preparation_sandbox' } })
+    await expect(f.call('report_preparation_blocked', { reason: 'Only the cloud platform can fix proc mounts' })).rejects.toThrow('available sandbox repair')
+    await expect(f.call('repair_preparation_sandbox', { server_id: randomUUID() })).rejects.toThrow('outside')
+    expect(JSON.parse(await f.call('repair_preparation_sandbox'))).toMatchObject({ state: 'configured', verificationRequired: true, launcher })
+    expect(f.progress.at(-1)?.phase).not.toBe('environment-ready')
+    await f.call('verify_preparation_environment', { path_entries: [] })
+  })
+  const verify = vi.fn(async (target: EnvironmentPreparationInput['target']) => {
+    if (!repaired) throw new SandboxVerificationError('sandbox-launch', '/usr/bin/bwrap', {
+      exitCode: 1, stdout: '', stderr: "bwrap: Can't mount proc on /newroot/proc: Operation not permitted" })
+    expect(target.pathEntries?.[0]).toBe(launcher.path.slice(0, -6))
+    return 'full provider acceptance'
+  })
+  expect((await f.preparation.ensure(f.agent, f.input, f.driver, verify, f.abort.signal)).value).toBe('full provider acceptance')
+  expect(repair).toHaveBeenCalledOnce()
+  expect(JSON.stringify(f.followup.mock.calls)).toContain('repair_preparation_sandbox')
+  expect(JSON.stringify(f.followup.mock.calls)).not.toContain(f.input.password)
+})
+
+it('rejects sandbox configuration without a subsequent independent verification', async () => {
+  const f = fixture()
+  f.input.sandbox = { inspect: async () => ({ version: 1, state: 'available', strategy: 'private-proc', reason: 'Probe passed',
+    stdout: '', stderr: '', exitCode: 0, requiresPlatformAction: false }),
+    repair: async () => ({ version: 1, state: 'configured', strategy: 'private-proc', reason: 'Installed', stdout: '', stderr: '', exitCode: 0,
+      requiresPlatformAction: false, launcher: { version: 1, path: '/control/bin/bwrap', digest: 'b'.repeat(64) }, pathEntries: ['/control/bin'] }) }
+  f.loop(async () => {
+    await f.call('repair_preparation_sandbox')
+    await expect(f.call('report_preparation_blocked', { reason: 'Account repair exhausted' })).rejects.toThrow('has not been verified')
+  })
+  await expect(f.ensure(async () => { throw new SandboxVerificationError('sandbox-launch', '/usr/bin/bwrap', {
+    exitCode: 1, stdout: '', stderr: 'proc mount denied' }) })).rejects.toThrow('without passing environment verification')
+  expect(f.progress.some(value => value.phase === 'environment-ready')).toBe(false)
+})
+
+it('records the dedicated immutable install while leaving active controllers and shared dependencies intact', async () => {
+  const f = fixture(); let installed = false
+  const launcher = { version: 1, path: '/control/tools/sandbox/' + 'c'.repeat(64) + '/bin/bwrap', digest: 'c'.repeat(64) }
+  const diagnostic = () => ({ version: 1, strategy: 'private-proc', state: installed ? 'configured' : 'available',
+    reason: 'Measured private-proc fixture', stdout: '', stderr: '', exitCode: 0, requiresPlatformAction: false,
+    ...(installed ? { launcher, pathEntries: [launcher.path.slice(0, -6)] } : {}) })
+  vi.mocked(f.driver.remote).mockImplementation(async (_target, script) => script.includes('/exited') ? '0\n' : 'active')
+  vi.mocked(f.driver.remoteResult).mockImplementation(async (_target, script) => {
+    if (script.replaceAll('\\"', '"').includes('"mode":"repair"')) installed = true
+    return { ...f.result, stdout: JSON.stringify(diagnostic()) }
+  })
+  f.input.sandbox = new SandboxRepair({ experimentId: f.input.experimentId, serverId: f.input.serverId,
+    policy: sandboxRepairPolicySchema.parse({}) }, f.driver)
+  f.loop(async () => {
+    await f.call('repair_preparation_sandbox')
+    expect(f.progress.some(value => value.pendingCommand !== undefined)).toBe(true)
+    await f.call('verify_preparation_environment', { path_entries: [] })
+  })
+  await f.ensure(async () => { if (!installed) throw new SandboxVerificationError('sandbox-launch', '/usr/bin/bwrap', {
+    exitCode: 1, stdout: '', stderr: 'proc mount refused' }); return 'verified without stopping active controllers' })
+  expect(f.progress.at(-1)?.pendingCommand).toBeUndefined()
+  const commands = vi.mocked(f.driver.remoteResult).mock.calls.map(call => call[1])
+  expect(commands.filter(script => script.replaceAll('\\"', '"').includes('"mode":"repair"'))).toHaveLength(1)
+  expect(commands.some(script => script.includes('ASPERA_PREPARATION_COMMAND_DIRECTORY'))).toBe(true)
+  expect(commands.some(script => script.includes('kill -9'))).toBe(false)
+})
+
+it('retains a sandbox install with a lost command channel until the original receipt is reconciled', async () => {
+  const f = fixture()
+  vi.mocked(f.driver.remote).mockImplementation(async (_target, command) => command.includes('/exited') ? 'unknown' : '')
+  const diagnostic = { version: 1, strategy: 'private-proc', state: 'available', reason: 'Compatible private proc',
+    stdout: '', stderr: '', exitCode: 0, requiresPlatformAction: false }
+  vi.mocked(f.driver.remoteResult).mockImplementation(async (_target, script) => script.replaceAll('\\"', '"').includes('"mode":"repair"')
+    ? { ...f.result, stdout: '', exitConfirmed: false, timedOut: true } : { ...f.result, stdout: JSON.stringify(diagnostic) })
+  f.input.sandbox = new SandboxRepair({ experimentId: f.input.experimentId, serverId: f.input.serverId,
+    policy: sandboxRepairPolicySchema.parse({}) }, f.driver)
+  f.loop(async () => { await f.call('repair_preparation_sandbox') })
+  await expect(f.ensure(async () => { throw new SandboxVerificationError('sandbox-launch', '/usr/bin/bwrap', {
+    exitCode: 1, stdout: '', stderr: 'proc mount refused' }) })).rejects.toBeInstanceOf(UnconfirmedPreparationCommand)
+  f.input.pendingCommand = f.progress.at(-1)?.pendingCommand
+  expect(f.input.pendingCommand).toBeDefined()
+  vi.mocked(f.driver.remote).mockResolvedValue('unknown')
+  await expect(f.ensure(async () => 'ready')).rejects.toThrow('no confirmed exit')
+  expect(vi.mocked(f.driver.remoteResult).mock.calls.filter(call => call[1].replaceAll('\\"', '"').includes('"mode":"repair"'))).toHaveLength(1)
+})
+
 it('retains an unconfirmed mutation and refuses to repeat it on retry', async () => {
   const f = fixture()
+  vi.mocked(f.driver.remote).mockImplementation(async (_target, command) => command.includes('/exited') ? 'unknown' : '')
   vi.mocked(f.driver.remoteResult).mockResolvedValue({ ...f.result, exitCode: null, timedOut: true, exitConfirmed: false })
   f.loop(async () => { await f.call('run_preparation_command', { command: 'long installation' }) })
   await expect(f.ensure(async () => { throw new Error('tools missing') })).rejects.toBeInstanceOf(UnconfirmedPreparationCommand)
@@ -308,6 +463,7 @@ it('does not change shared dependencies while a controller is active', async () 
 
 it('passes individual tool cancellation to the SSH operation', async () => {
   const f = fixture()
+  vi.mocked(f.driver.remote).mockImplementation(async (_target, command) => command.includes('/exited') ? 'unknown' : '')
   const commandAbort = new AbortController()
   vi.mocked(f.driver.remoteResult).mockImplementation(async (_target, _script, signal) => {
     commandAbort.abort()
@@ -316,4 +472,23 @@ it('passes individual tool cancellation to the SSH operation', async () => {
   })
   f.loop(async () => { await f.call('run_preparation_command', { command: 'install' }, commandAbort.signal) })
   await expect(f.ensure(async () => { throw new Error('missing') })).rejects.toBeInstanceOf(UnconfirmedPreparationCommand)
+})
+
+it('confirms the original command after cancellation during status polling', async () => {
+  const f = fixture(), commandAbort = new AbortController()
+  vi.mocked(f.driver.remote).mockImplementation(async (_target, command) => {
+    if (!command.includes('/command.py')) return ''
+    if (!command.includes(' stop ')) { commandAbort.abort(); throw new Error('status read cancelled') }
+    const directory = f.progress.findLast(value => value.pendingCommand !== undefined)!.pendingCommand!.directory
+    return JSON.stringify({ status: { version: 1, experimentId: f.input.experimentId, serverId: f.input.serverId,
+      commandId: directory.split('/').at(-1), sessionId: f.agent.session.id, toolCallId: f.invocations.at(-1),
+      exitCode: 0, exitConfirmed: true, timedOut: false, cancelled: true, signal: null }, lines: [], offset: 0, hasMore: false })
+  })
+  f.loop(async () => {
+    expect(JSON.parse(await f.call('run_preparation_command', { command: 'install' }, commandAbort.signal))).toMatchObject({ cancelled: true, exitConfirmed: true, exitCode: 0 })
+    expect(f.progress.at(-1)?.pendingCommand).toBeUndefined()
+    await f.call('report_preparation_blocked', { reason: 'User cancelled the fixture command' })
+  })
+  await expect(f.ensure(async () => { throw new Error('missing') })).rejects.toThrow('User cancelled')
+  expect(f.driver.remoteResult).toHaveBeenCalledOnce()
 })

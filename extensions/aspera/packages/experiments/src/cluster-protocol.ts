@@ -6,6 +6,7 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { remotePathSchema, storagePlacementSchema, storagePreferenceSchema, serverInventorySchema } from './storage-protocol.ts'
 import { experimentModelSnapshotsSchema } from './models.ts'
+import { stageRequirementSchema } from './stage-requirements.ts'
 
 /** Stable configured server identity, independent of list order and address edits. */
 export type ExperimentServerId = string & Branded<'ExperimentServerId'>
@@ -158,6 +159,10 @@ export const planSchema = z.object({
   steps: z.array(z.string().min(1).max(10_000)).min(1).max(100),
   frameworks: z.array(z.object({ name: z.string().min(1), version: z.string().min(1), documentation: z.string().url().startsWith('https://') }).strict()).max(16),
   createdAt: z.number().int(),
+  stages: z.array(stageRequirementSchema).max(100).optional(),
+  conditionalSteps: z.array(z.object({ step: z.number().int().min(1).max(100),
+    trigger: z.literal('command-failure'), commandIds: z.array(z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/)).min(1).max(64),
+  }).strict()).max(100).optional(),
 }).strict()
 /** Durable execution plan and version-specific documentation. */
 export type ExperimentPlan = z.infer<typeof planSchema>

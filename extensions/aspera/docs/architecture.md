@@ -6,6 +6,10 @@ English | [中文](architecture.zh.md)
 
 Aspera owns experimental work outside the Harness source tree. Published DSH supplies composition, Agents, Goals, Sessions, credentials, subprocess management and Web slots; Aspera supplies task records, scheduling, remote execution and management views.
 
+[Completion verification](completion-review.md) shares one program-owned decision across execution completion and retrospective reviews. Restricted review Agents record existing evidence in separate Sessions; original failed tasks and fixed releases remain immutable.
+
+[Stage acceptance and finalization](finalization.md) uses the existing DSH tool registry and lifecycle extensions. Agents select approved stage requirements and existing evidence; runtime and Host providers own command waiting, numerical verification and source-bound finish decisions. No additional orchestrator or Agent-loop changes are involved.
+
 ## Table of Contents
 
 - [Components](#components)
@@ -35,13 +39,15 @@ Host programs compile against installed package declarations. The Typert shim in
 <a id="architecture-diagrams"></a>
 ## Architecture diagrams
 
+The management Host owns [local running records](state-and-api.md#local-running-records), including page-independent synchronization, durable continuation and read-only SSH recovery when control roles are stopped. The console reads committed copies offline; remote task results and original releases retain their ownership.
+
 Desktop and browser share the page and task service. The remote coordinator owns execution after durable handover; the local carrier does not own GPU processes.
 
 The execution Agent reports approved plan steps to the coordinator; the console reads these reports alongside independent preparation and result evidence. [Step progress](state-and-api.md#execution-step-progress) has its own versioned file and does not change the fixed submission, queue or Session formats. Old experiments retain their original remote release.
 
-The preparation Agent diagnoses GPU authorization differences and requests identity-bound controller repair. Providers own actual probing, idle admission fencing, confirmed exit and verification; handover cannot accept an Agent's completion statement. [Controller readiness](state-and-api.md#controller-readiness) describes original-release compatibility and interrupted repair recovery.
+The preparation Agent diagnoses GPU authorization, offline controllers and release-profile differences, then requests identity-bound repair. Providers own probing, resource-release evidence, admission fencing and verification; release-specific profiles retain the stable task and Session home. Handover cannot accept an Agent's completion statement. [Controller readiness](state-and-api.md#controller-readiness) describes original-release compatibility and interrupted recovery.
 
-Preparation and managed commands share the [execution sandbox](../packages/runtime/README.md#understand-the-implementation). Permission refusals return exact diagnostics to the original preparation Session for account repair or a concrete cloud-platform action; program revalidation still owns readiness.
+Preparation and managed commands share the [execution sandbox](../packages/runtime/README.md#understand-the-implementation). Permission refusals return exact diagnostics and measured compatibility to the original preparation Session. The Agent can request the [dedicated sandbox repair](../packages/dispatch/README.md#sandbox-compatibility-repair); program revalidation still owns readiness, and unavailable account permissions require a concrete cloud-platform action.
 
 ```mermaid
 flowchart TB
@@ -52,6 +58,9 @@ flowchart TB
     Remote --> Fleet[Aspera dispatch: fleet / credentials / Sessions]
     Page --> Trace[Official read-only DSH trajectory]
     Trace --> Remote
+    Remote --> Archive[Local archive v1: complete events / logs / steps / metrics]
+    Fleet --> Archive
+    Archive --> History[Authenticated reads / read-only SSH backfill]
     Remote --> Observations[Versioned observations: events / sources / logs / metrics]
     Fleet --> Management[Peer servers / dated checks / deletion journal]
     Management --> Cleanup[Owned paths only / cleanup receipts / tombstones]
@@ -153,6 +162,12 @@ The management profile serializes admission checks. Different coordinators canno
 <a id="execution-and-ownership"></a>
 ## Execution and ownership
 
+[Storage governance](storage-governance.md) shares program-owned inventory/budget, environment and fixed-material services across preparation, execution and management. Agents submit scoped requirements; the Host resolves original server identities and canonical metadata, while nodes verify historical loans, reserve each volume, retain references and publish read-only content. These services use the existing DSH tools and Sessions.
+
+The node's [managed environment service](managed-environments.md) owns interpreter creation, artifact verification, immutable shared package publication and reference-bound collection. The execution Agent selects dependencies through logged tools; source builds remain confined to private staging. Read-only mounts protect shared payloads for commands and services. The Host retains dated storage observations independently of experiment outcomes and remote release identity.
+
+The Host owns user interruption and independent durable receipts. Visible experiments, deleted tasks and preparation repair share [remote task settlement](state-and-api.md#remote-task-settlement). A minimal ownership record survives local deletion; original authenticated APIs or account-scoped SSH verify every original node before releasing occupancy. Pending tasks and unconfirmed exits retain their reservations. Preparation's controller repair uses this service before startup and still requires independent verification before handover.
+
 The management Host starts the standard DSH preparation Agent with the selected model and existing Session. Shell-only inspection precedes Node-dependent inventory. Scoped SSH tools configure dependencies using the login account's permissions; release requirements determine Node and pnpm versions. The Host saves executable paths, node stages and diagnostics, then verifies each repair. The same Agent selects an observed storage candidate and reason; manual paths take precedence. Selection precedes directory creation. Mount identity, ownership, writes and space are rechecked during preparation, transfer and startup. Sandbox confinement, hidden credentials, CUDA and mutual network proofs gate handover. Kernel/device restrictions remain explicit blockers; model declarations cannot waive checks.
 
 Control state, queues and credentials remain under the login user’s fixed private control directory. Releases and per-experiment inputs, Agent homes, logs, caches, environments, temporary files and artifacts use the selected disk. Node tools expose granted devices, hide the control directory and registered experiment storage roots, and bind only the current workspace writable. Framework cache/environment variables point into that workspace. Network access remains shared for downloads and training; it is not network isolation.
@@ -161,7 +176,7 @@ Registered inference processes belong to node controls rather than the execution
 
 Every release has immutable DSH/extension versions, package files and a frozen production lockfile. New deployments use new directories; profile identities reject rebinding a worker home to another release. Active control processes are reused without replacement. An incompatible control-protocol upgrade waits for old tasks to finish and the old controls to stop before activation.
 
-The runtime extends finite Goal windows through the public Goal service, preserving one execution Session and Goal. Automatic mode rejects human waiting; semi mode persists questions, pauses new Agent operations and routes saved replies to the original tool invocation. The console refreshes the shared attention count independently of page selection; the desktop validates that count before updating Windows overlays and hidden-window tray artwork. Context compaction remains supplied by the DSH base bundle.
+The runtime extends finite Goal windows through the public Goal service, preserving one execution Session and Goal. Automatic mode rejects human waiting; semi mode persists questions, pauses new Agent operations and routes saved replies to the original tool invocation. The console refreshes the shared attention count independently of page selection; the desktop validates that count before updating Windows overlays and hidden-window tray artwork. Published [DSH context services](../packages/runtime/README.md#use-this-package) compact each phase beside its private model provider; unfinished token-limit stops produce a terminal blocked outcome.
 
 -----
 

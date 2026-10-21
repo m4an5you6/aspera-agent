@@ -24,11 +24,14 @@ export interface DeploymentConfig extends Target {
   readonly tokenRef: string
   /** Interval for observing remote control process transitions. */
   readonly controlPollIntervalMs: number
+  readonly managedEnvironments?: import('@aspera/runtime').ManagedEnvironmentPolicy
 }
 
 /** Probe result attached to one deployed version. */
 export interface PreparedEnvironment {
   readonly state: 'ready'
+  /** Capabilities required by this verified fixed release; older manifests omit them. */
+  readonly requiredFeatures?: readonly string[]
   readonly deploymentId: string
   readonly preparationId: string
   readonly backend: 'bwrap'
@@ -138,6 +141,15 @@ bwrap_bin=$(command -v bwrap || true)
 test -n "$bwrap_bin" || { echo 'bubblewrap is missing from the verified executable directories' >&2; exit 1; }
 python3 -c ${shellQuote(`import glob,json,pathlib,stat,sys
 root=pathlib.Path(${JSON.stringify(p.root)})
+manifest=json.loads(pathlib.Path(${JSON.stringify(p.release + '/package.json')}).read_text())
+required=['managed-environment-reuse-v1'] if manifest.get('asperaEnvironmentTools',{}).get('reuseVersion')==1 else []
+if manifest.get('asperaEnvironmentTools',{}).get('cleanupVersion')==1: required.append('managed-environment-cleanup-v1')
+if manifest.get('asperaEnvironmentTools',{}).get('installVersion') in (2,3): required.append('managed-environment-install-v2')
+if manifest.get('asperaEnvironmentTools',{}).get('installVersion')==3: required.append('managed-environment-install-v3')
+if manifest.get('asperaEnvironmentTools',{}).get('storageVersion')==1: required.extend(['storage-governance-v1','historical-environment-borrow-v1','managed-materials-v1'])
+if manifest.get('asperaEnvironmentTools',{}).get('storageFormat')=='0.1.0': required.append('purpose-storage-0.1.0')
+if manifest.get('asperaCompletionVersion')==1: required.append('completion-evidence-v1')
+if manifest.get('asperaFinalizationVersion')==2: required.append('experiment-finalization-v2')
 hidden=[str(root/'secrets'),str(root/'state')]
 ssh=pathlib.Path.home()/'.ssh'
 if ssh.is_dir(): hidden.append(str(ssh))
@@ -147,9 +159,9 @@ if owners.is_dir():
  for entry in owners.iterdir(): namespaces.append(json.loads((entry/'.aspera-owner.json').read_text())['namespaceRoot'])
 devices=sorted(set(path for pattern in ['/dev/nvidia[0-9]*','/dev/nvidiactl','/dev/nvidia-uvm','/dev/nvidia-uvm-tools','/dev/nvidia-modeset','/dev/nvidia-caps/nvidia-cap*'] for path in glob.glob(pattern) if stat.S_ISCHR(pathlib.Path(path).stat().st_mode)))
 if not any(path[len('/dev/nvidia'):].isdigit() for path in devices): raise RuntimeError('no allocated NVIDIA character device')
-print(json.dumps({'backendPath':sys.argv[1],'devicePaths':devices,'hiddenPaths':hidden,'namespaceRoots':sorted(set(namespaces))}))`)} "$bwrap_bin"`, signal, password)
+print(json.dumps({'backendPath':sys.argv[1],'devicePaths':devices,'hiddenPaths':hidden,'namespaceRoots':sorted(set(namespaces)),'requiredFeatures':required}))`)} "$bwrap_bin"`, signal, password)
   const absolute = z.string().startsWith('/')
-  const observed = z.object({ backendPath: absolute, devicePaths: z.array(absolute), hiddenPaths: z.array(absolute), namespaceRoots: z.array(absolute) }).parse(JSON.parse(discovery))
+  const observed = z.object({ backendPath: absolute, devicePaths: z.array(absolute), hiddenPaths: z.array(absolute), namespaceRoots: z.array(absolute), requiredFeatures: z.array(z.string()).optional() }).parse(JSON.parse(discovery))
   const spec = { backendPath: observed.backendPath, workspaceRoot: p.workspace, devicePaths: observed.devicePaths,
     hiddenPaths: [...observed.hiddenPaths, p.root, ...observed.namespaceRoots] }
   const launch = (command: readonly string[]) => experimentSandboxArgv(spec, command).map(shellQuote).join(' ')
@@ -191,6 +203,7 @@ printf 'DSH_DEVICES=%s\\nDSH_BWRAP=%s\\nDSH_HIDDEN=%s\\n' ${shellQuote(observed.
   }
   return {
     state: 'ready', deploymentId: digest, preparationId: digest, backend: 'bwrap',
+    ...(observed.requiredFeatures === undefined ? {} : { requiredFeatures: observed.requiredFeatures }),
     backendPath: backend[1], devicePaths: normalizedSet(match[1].split(',')), hiddenPaths: z.array(z.string()).parse(JSON.parse(hidden[1])), workspaceRoot: p.workspace,
     gpu: parseGpuInventory(gpuQuery ?? '', match[1].split(',')),
     sandboxWriteProbe: 'passed', cudaProbe: 'passed',

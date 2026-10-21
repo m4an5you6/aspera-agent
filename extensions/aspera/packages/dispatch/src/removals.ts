@@ -27,11 +27,12 @@ export interface LocalRemoval {
   error?: string
 }
 
-const workSchema = z.object({ coordinatorId: serverIdSchema, protocol: z.number().int().min(1).max(4), submissionHash: z.string().optional(),
+/** Pinned account and directory references retained until every original node confirms release. */
+export const removedWorkSchema = z.object({ coordinatorId: serverIdSchema, protocol: z.number().int().min(1).max(4), submissionHash: z.string().optional(),
   nodes: z.array(z.object({ server: fleetExperimentV5Schema.shape.coordinator, target: pinnedTargetSchema,
     pendingDirectory: z.string().optional() }).strict()), }).strict()
 const removalSchema = z.object({ identity: deletedExperimentSchema, operationId: experimentDeletionSchema.shape.operationId, name: z.string(),
-  localCleanup: z.enum(['pending', 'complete']), credentialRefs: z.array(z.string()), work: workSchema.optional(), error: z.string().optional() }).strict()
+  localCleanup: z.enum(['pending', 'complete']), credentialRefs: z.array(z.string()), work: removedWorkSchema.optional(), error: z.string().optional() }).strict()
 
 /** Independent version 1 storage never rewrites released fleet or remote records. */
 export const removalStoreSpec = defineDomain({ name: 'aspera_removals', version: 1, layout: 'per-record', tables: {

@@ -10,11 +10,13 @@ import { checkModelPickerLayout, checkAsperaDisclosure } from './test-ui-layout.
 import { checkServerManagement, checkExperimentManagement } from './test-management-ui.mjs'
 import { checkStageLayout, checkOverviewPhase } from './test-stage-layout.mjs'
 import { checkExecutionOverview } from './test-overview.mjs'
+import { checkInterruption } from './test-interruption-ui.mjs'
 
 import { fixtureOptions, fixtureProvider } from './fixtures/models.mjs'
 
 const root = resolve(import.meta.dirname, '..')
 const expect = baseExpect.configure({ timeout: 40000 })
+const focusedOverview = process.argv.includes('--case=overview')
 // Fresh published DSH profiles have measured 128 s cold starts on Windows; readiness still requires the profile's own signal.
 const profileStartupMs = 180000
 mkdirSync(resolve(root, '.artifacts'), { recursive: true })
@@ -134,6 +136,13 @@ try {
     assert.equal(response.status(), 200, JSON.stringify(value))
     return value
   }
+  if (focusedOverview) {
+    const overview = await checkExecutionOverview(page, control, create, browser, app.url, resolve(root, '.artifacts'))
+    assert.deepEqual(errors, [])
+    writeFileSync(resolve(root, '.artifacts/overview-regression.json'), JSON.stringify(overview, null, 2) + '\n')
+    verified = true
+    console.log('Production overview: compact steps, stored reading state, storage dialog, keyboard, theme and window checks passed.')
+  } else {
   await control('hold-host-key')
   const checkConnection = coordinator.getByRole('button', { name: /^(检查连接|检查中…|Check connection|Checking…)$/ })
   await checkConnection.click()
@@ -152,6 +161,8 @@ try {
   await control('hold-plan')
   await create('CPU semi experiment', 'CPU A', 'semi', true)
   await expect(page.locator('header').getByRole('status')).toHaveText(/准备计划|Preparing plan/)
+  const planningRecord = (await control()).experiments.find(row => row.request.objective === 'CPU semi experiment')
+  await control('sync-runtime', planningRecord.request.experimentId)
   const planningPipeline = await checkOverviewPhase(page, 1, true)
   await page.screenshot({ path: resolve(root, '.artifacts/web-overview-planning.png'), fullPage: true })
   await control('release-plan')
@@ -174,6 +185,8 @@ try {
   await expect(page.getByLabel(/1 个实验待处理|1 experiments need attention/)).toBeVisible()
   await create('CPU independent experiment', 'CPU B')
   await expect(page.locator('header').getByRole('status')).toHaveText(/服务中|Serving/, { timeout: profileStartupMs })
+  const independentRecord = (await control()).experiments.find(row => row.request.objective === 'CPU independent experiment')
+  await control('sync-runtime', independentRecord.request.experimentId)
   const executionPipeline = await checkOverviewPhase(page, 2, true)
   await page.screenshot({ path: resolve(root, '.artifacts/web-overview-execution.png'), fullPage: true })
   await page.getByRole('button', { name: /^(服务器|Servers)$/ }).click()
@@ -210,7 +223,15 @@ try {
   await context.setOffline(false)
   await expect(log()).toContainText('断线后继续')
   await control('rotate', first.request.experimentId)
-  await expect(page.getByText(/日志已轮转|log was rotated/)).toBeVisible()
+  await page.getByRole('button', { name: /^(概览|Overview)$/ }).click()
+  await control('archive-sync', first.request.experimentId)
+  const archiveDetails = page.getByRole('region', { name: /^(记录保存|Record saving)$/ }).locator('summary').filter({ hasText: /历史缺口|Historical gaps/ })
+  await archiveDetails.click()
+  await expect(page.getByText(/来源已变化，旧副本单独保留|The source changed; its earlier copy is retained separately/).first()).toBeVisible()
+  await archiveDetails.click()
+  await page.getByRole('button', { name: /^(运行监控|Runtime monitor)$/ }).click()
+  const newest = page.getByRole('button', { name: /回到最新|Back to latest/ })
+  if (await newest.isVisible()) await newest.click()
   await expect(log()).toContainText('轮转后日志')
   await page.getByRole('button', { name: /^(Agent 记录|Agent records)$/ }).click()
   await page.getByRole('button', { name: /^(计划|Planning)$/ }).click()
@@ -271,8 +292,8 @@ try {
   await page.getByRole('button', { name: /^(返回实验|Back to experiments)$/ }).click()
   await page.getByRole('button').filter({ has: page.getByText('CPU shared experiment', { exact: true }) }).click()
   await expect(page.locator('header').getByRole('status')).toHaveText(/服务中|Serving/, { timeout: profileStartupMs })
-  await page.getByRole('button', { name: /^(取消实验|Cancel experiment)$/ }).click()
-  await expect(page.locator('header').getByRole('status')).toHaveText(/已取消|Cancelled/)
+  const sharedRunning = (await control()).experiments.find(row => row.request.objective === 'CPU shared experiment')
+  const interruption = await checkInterruption(page, control, sharedRunning.request.experimentId, resolve(root, '.artifacts'), browser, app.url)
   await page.getByRole('button', { name: /^(返回实验|Back to experiments)$/ }).click()
   await page.getByRole('button').filter({ has: page.getByText('CPU independent experiment', { exact: true }) }).click()
   await control('crash', separate.request.experimentId)
@@ -306,8 +327,8 @@ try {
   assert.equal(afterRetry.sessionId, beforeRetry.sessionId)
   assert.deepEqual(afterRetry.preparation.placements, beforeRetry.preparation.placements)
   await expect(page.getByRole('button', { name: /^(重试准备|Retry preparation)$/ })).toHaveCount(0)
-  await page.getByRole('button', { name: /^(取消实验|Cancel experiment)$/ }).click()
-  await expect(page.locator('header').getByRole('status')).toHaveText(/已取消|Cancelled/)
+  await page.locator('header').getByRole('button', { name: /^(中断实验|Interrupt experiment)$/ }).click()
+  await expect(page.locator('header').getByRole('status')).toHaveText(/已中断|Interrupted/)
   await create('CPU completed experiment', 'CPU A')
   await expect(page.locator('header').getByRole('status')).toHaveText(/已完成|Completed/)
   const completedPipeline = await checkOverviewPhase(page, 3, false)
@@ -339,8 +360,8 @@ try {
   assert.equal(answered.latest.sessionId, waiting.latest.sessionId)
   assert.equal(answered.latest.goalId, waiting.latest.goalId)
   assert.equal(answered.latest.questions[0].state, 'answered')
-  await page.getByRole('button', { name: /^(取消实验|Cancel experiment)$/ }).click()
-  await expect(page.locator('header').getByRole('status')).toHaveText(/已取消|Cancelled/)
+  await page.locator('header').getByRole('button', { name: /^(中断实验|Interrupt experiment)$/ }).click()
+  await expect(page.locator('header').getByRole('status')).toHaveText(/已中断|Interrupted/)
   await control('hold-installation')
   await create('CPU installation recovery', 'CPU A', 'automatic', false, false, true)
   const recoveryRegion = page.getByRole('region', { name: /^(运行环境安装|Release installation)$/ })
@@ -389,6 +410,28 @@ try {
     verified: controllerRecovered.preparation.environments.every(environment => environment.phase === 'environment-ready'),
   }
   assert.deepEqual(controllerRecovery, { tools: ['inspect_preparation_environment', 'repair_preparation_controller', 'verify_preparation_environment'], stoppedRoles: ['node'], diagnosticsLogged: true, verified: true })
+  const offlineControllerRecovery = {}
+  for (const scenario of ['controller-offline', 'controller-offline-blocked']) {
+    await control(scenario)
+    let record
+    await expect(async () => {
+      record = (await control()).experiments.find(row => row.request.objective === 'CPU ' + scenario)
+      if (scenario.endsWith('blocked')) assert.equal(record?.state, 'failed')
+      else { if (record?.state === 'failed') throw new Error(record.detail); assert.equal(record?.handoverRecorded, true) }
+    }).toPass({ timeout: 40000 })
+    const state = await control()
+    const events = state.events.filter(item => item.sessionId === record.sessionId)
+    const tools = state.environmentCalls.filter(call => call.experimentId === record.request.experimentId && call.step === 'controller').map(call => call.name)
+    const blocked = scenario.endsWith('blocked')
+    offlineControllerRecovery[scenario] = { tools, verified: !blocked && record.preparation.environments.every(row => row.phase === 'environment-ready'),
+      handoverRecorded: record.handoverRecorded === true,
+      diagnosticsLogged: events.some(item => item.event.type.includes('tool') && JSON.stringify(item.event.data).includes('releaseBinding')),
+      credentialsHidden: !JSON.stringify(events).includes('cpu-only-offline-password') }
+    assert.deepEqual(tools, ['inspect_preparation_environment', 'repair_preparation_controller', 'verify_preparation_environment', ...(blocked ? ['report_preparation_blocked'] : [])])
+    assert.equal(offlineControllerRecovery[scenario].diagnosticsLogged, true)
+    assert.equal(offlineControllerRecovery[scenario].credentialsHidden, true)
+    assert.equal(offlineControllerRecovery[scenario].handoverRecorded, !blocked)
+  }
   await control('ssh-handshake-recovery')
   let handshakeRecovered
   await expect(async () => {
@@ -426,7 +469,7 @@ try {
       ready: experiment.preparation.environments.every(environment => environment.phase === 'environment-ready'),
     }
     assert.deepEqual(tools, scenario === 'claim' ? ['inspect_preparation_environment']
-      : ['inspect_preparation_environment', 'run_preparation_command', 'verify_preparation_environment', ...(scenario === 'blocked' ? ['report_preparation_blocked'] : [])])
+      : ['inspect_preparation_environment', 'repair_preparation_sandbox', 'verify_preparation_environment', ...(scenario === 'blocked' ? ['report_preparation_blocked'] : [])])
     assert.equal(sandboxPreparation[scenario].diagnosticsLogged, true)
     assert.equal(sandboxPreparation[scenario].toolDiagnosticsLogged, true)
     assert.equal(sandboxPreparation[scenario].credentialsHidden, true)
@@ -436,7 +479,9 @@ try {
     if (scenario === 'claim') assert.ok(experiment.detail.includes('without passing environment verification'))
   }
   const snapshot = {
-    managementChecks, managementDeletion, serverRegistration, installationRecovery, controllerRecovery, sshHandshakeRecovery, sandboxPreparation, executionOverview: overview.facts,
+    managementChecks, managementDeletion, serverRegistration, installationRecovery, controllerRecovery, offlineControllerRecovery, sshHandshakeRecovery, sandboxPreparation, executionOverview: overview.facts,
+    experimentInterruption: { confirmedNodes: interruption.confirmedNodes, blockedRetryRetainsIdentity: interruption.blockedRetryRetainsIdentity,
+      hiddenPageContinues: interruption.hiddenPageContinues, originalOutcome: interruption.originalOutcome },
     overviewPhases: { planning: planningPipeline, approval: approvalPipeline, execution: executionPipeline, queued: queuedPipeline, retry: retryPipeline, completed: completedPipeline, question: questionPipeline },
     stageCards: { preparation: preparationFailureStage, remote: remoteFailureStage, retryRetainsSession: afterRetry.sessionId === beforeRetry.sessionId,
       recoveryHandover: final.events.filter(item => item.sessionId === afterRetry.sessionId && item.event.type === 'user/message'
@@ -468,6 +513,7 @@ try {
     console.log('Production overview preview is running; its local entry is saved in .artifacts/overview-preview.json.')
   }
   console.log('Real Web: servers/passwords, attachments, independent Goals, plan confirmation, parallelism/queue, handover Session snapshot, UTF-8/reconnect/rotation, download, service access/survival/stop/unexpected exit, cancellation and errors passed.')
+  }
 } catch (error) {
   if (page !== undefined && !page.isClosed()) {
     await page.screenshot({ path: resolve(root, '.artifacts/web-failure.png'), fullPage: true })

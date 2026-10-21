@@ -1,10 +1,13 @@
 /** Storage preparation shared by SSH dispatch and the installed node controller. */
 import { readFileSync } from 'node:fs'
 import { posix, resolve } from 'node:path'
+import { gzipSync } from 'node:zlib'
 import { serverInventorySchema, storageCandidateSchema, storagePlacementSchema } from '@aspera/experiments'
 import type { ClusterServer, ExperimentId, ServerInventory, ServerSettings, StorageCandidateId, StoragePlacement } from '@aspera/experiments'
 import { remote, shellQuote } from './transport.ts'
 import type { Target } from './transport.ts'
+import { managedEnvironmentProgram, managedEnvironmentPolicySchema } from './managed-environment.ts'
+import { storageGovernancePolicySchema } from './storage-governance.ts'
 
 /** Read-only SSH inventory works before any Aspera installation exists.
  * @param target - pinned SSH account. @param directory - explicit storage directory. @param password - private credential.
@@ -19,7 +22,18 @@ async function storageRequest(target: Target, operation: 'inspectStorage' | 'pre
   const source = readFileSync(new URL('../scripts/storage.mjs', import.meta.url), 'utf8')
   const payload = Buffer.from(JSON.stringify(input)).toString('base64')
   const script = `${source}\nconsole.log(JSON.stringify(${operation}(JSON.parse(Buffer.from('${payload}', 'base64').toString()), ${requiredBytes})))`
-  return JSON.parse(await remote(target, `node --input-type=module -e ${shellQuote(script)}`, signal, password))
+  let command = `node --input-type=module -e ${shellQuote(script)}`
+  if (operation === 'cleanupStorage') {
+    const { placement } = input as { placement: StoragePlacement }
+    const locked = `import base64,fcntl,json,os,pathlib,subprocess\np=pathlib.Path(${JSON.stringify(posix.join(placement.controlRoot, 'state/controller-admission.lock'))})\n`
+      + `marker=json.loads((p.parent.parent/".aspera-owner.json").read_text())\nif marker!={"version":1,"serverId":${JSON.stringify(placement.serverId)},"kind":"control"}: raise RuntimeError("Control ownership differs before deletion")\n`
+      + 'p.parent.mkdir(parents=True,exist_ok=True)\n'
+      + 'for part in (p,*p.parents):\n if part.is_symlink(): raise RuntimeError("Admission lock contains a symbolic link")\n'
+      + 'with open(p,"a") as handle:\n fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)\n subprocess.run(["node","--input-type=module","-e",base64.b64decode("'
+      + Buffer.from(script).toString('base64') + '").decode()],check=True)'
+    command = 'python3 -c ' + shellQuote(locked)
+  }
+  return JSON.parse(await remote(target, command, signal, password))
 }
 
 /** Remove an ended experiment's owned files over its pinned SSH connection.
@@ -30,6 +44,12 @@ async function storageRequest(target: Target, operation: 'inspectStorage' | 'pre
 export async function cleanupServerStorage(target: Target, placement: StoragePlacement, privateNames: string[], password?: string, signal?: AbortSignal): Promise<void> {
   const result = await storageRequest(target, 'cleanupStorage', { placement: storagePlacementSchema.parse(placement), privateNames }, password, signal)
   if (typeof result !== 'object' || result === null || !('cleaned' in result) || result.cleaned !== true) throw new Error('Remote cleanup was not confirmed')
+  const program = managedEnvironmentProgram().split('if __name__ == "__main__":')[0]!
+  const config = Buffer.from(JSON.stringify({ action: 'release-references', placement, policy: managedEnvironmentPolicySchema.parse({}), governancePolicy: storageGovernancePolicySchema.parse({}) })).toString('base64')
+  const releaseProgram = 'import base64,gzip,json;exec(gzip.decompress(base64.b64decode("' + gzipSync(program).toString('base64')
+    + '")));print(json.dumps(main(json.loads(base64.b64decode("' + config + '")))))'
+  const released = JSON.parse(await remote(target, 'python3 -c ' + shellQuote(releaseProgram), signal, password))
+  if (typeof released !== 'object' || released === null || !('released' in released) || released.released !== true) throw new Error('Environment references were not released after remote deletion')
 }
 
 /** Materialize a saved assignment without reselecting a disk.

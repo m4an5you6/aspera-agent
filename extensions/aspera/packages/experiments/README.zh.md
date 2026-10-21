@@ -37,6 +37,10 @@ kind: "package-library"
 <a id="understand-the-implementation"></a>
 ## 了解实现
 
+[interruption.ts](src/interruption.ts) 定义独立版本 1 操作回执，不修改提交、fleet 或 Session 代次。队列终态拒绝会恢复已结束任务的迟到更新；释放核验保留已有终态结果。[受控中断](../../docs/state-and-api.zh.md#experiment-interruption)说明公开字段、节点证据与历史保留。
+
+[archive.ts](src/archive.ts)公开版本 1 本机副本状态及来源可用性，与实验结果独立。[本机运行记录](../../docs/state-and-api.zh.md#local-running-records)说明持久化类型确认及使用方；现有提交、Session 事件和执行步骤文件保持原格式。
+
 [execution-progress.ts](src/execution-progress.ts)导出独立第 1 代步骤上报及读取／结果定义。记录绑定实验、批准的计划版本和执行 Session，调用身份及时间由程序提供。[步骤进度](../../docs/state-and-api.zh.md#execution-step-progress)说明持久化、版本冲突及兼容规则，现有队列记录和计划保留原格式。
 
 第 4 代固定简短实验名称及三个阶段的模型配置摘要，保留第 1～3 代读取定义。[records.ts](src/records.ts) 定义实验／阶段／Session 分页以及节点／进程／输出流游标。首次等待计划确认时保持资源释放，确认后才整组分配。
@@ -62,7 +66,21 @@ kind: "package-library"
 <a id="model-experience"></a>
 ## 模型体验
 
+可选清理及恢复字段提供独立版本 1 `EnvironmentCleanup` 与 `EnvironmentRecovery` 记录；缺少这些字段的原回执及观察继续可读。诊断中的挂载 ID 只说明一次检查，不授权后续操作。
+
+[受管环境类型](src/managed-environment.ts)定义独立版本 1 清单、包身份、引用、复用计划、启动证据和候选绑定清理请求。空间观察可选包含复用计划及带时间的材料描述，清理区分包、材料和临时文件。协议 4、本机存储域 6 和 Session 格式保持固定；[环境归属](../../docs/managed-environments.zh.md#recovery-and-compatibility)说明引用保留与消费者。
+
+`EnvironmentRuntime` 记录操作原期限、停止原因和独立退出/释放观察；`EnvironmentRequirements` 将生效的合并约束绑定到原请求摘要。`EnvironmentOperationStatus` 校验认证轻量读取与最终工具结果，空间观察可选包含这些带时间的状态。两种新增持久记录均使用版本 1，不改写原回执。
+
+可选的 `EnvironmentOperation.failure` 包含版本 1 `EnvironmentFailure` 证据，绑定实验、节点、环境、请求和原冲突 wheel 身份。被拒绝的重试引用原操作，不改写原回执。`EnvironmentReusePlan.installerTemporaryBytes` 可选记录专属工具的临时占用；缺少这两个字段的旧记录继续可读。
+
 间接影响：运行时和派发工具展示本库验证的记录，本库不注册工具或模型消息。
+
+独立的[版本 1 完成记录](src/completion.ts) 描述来源身份、历史环境及回顾验收。[完成验收](../../docs/completion-review.zh.md) 说明持久记录和兼容性变更确认；原执行记录、协议 4 和 Fleet 存储域 6 均不变。
+
+[收尾记录](src/finalization.ts)和[批准阶段](src/stage-requirements.ts)将数值验收、命令等待、结束判定和历史步骤补录绑定原实验、计划及 Session。[记录与兼容](../../docs/finalization.zh.md#records-and-compatibility)确认独立版本 1 文件及可选计划字段的持久类型变更，原步骤文件和 Session 格式不变。
+
+[存储记录](src/storage-governance.ts) 声明带品牌的候选／操作 ID、目录索引、历史借用、逐卷计划、正式材料、绑定与最终退出回执。存储观察的可选字段及所选清理 ID 保留原读取数据。独立版本 1 持久记录及生成消费者变更见[存储治理确认](../../docs/storage-governance.zh.md#records-and-compatibility)；协议 4、fleet 第 6 代和 Session 格式不变。
 
 <a id="known-limitations-and-deferred-work"></a>
 ## 已知限制和后续工作

@@ -1,0 +1,28 @@
+# Bilingual-pair consistency record for completion-review.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write extensions/aspera/docs/completion-review.md
+/completion-evidence-and-retrospective-verification:
+  en: f8f2adeabedfbd50
+  zh: 92ad41f316e520a0
+/completion-evidence-and-retrospective-verification/summary:
+  en: b1cd40c236365986
+  zh: d0d79f199c7e2069
+/completion-evidence-and-retrospective-verification/table-of-contents:
+  en: 46d81dfaf0eea8a2
+  zh: c314c8efd02cf971
+/completion-evidence-and-retrospective-verification/normal-completion:
+  en: 6de89b968ab14f12
+  zh: 8f764136e27dc5b9
+/completion-evidence-and-retrospective-verification/review-an-existing-result:
+  en: 20034442022874aa
+  zh: 73c0c4b9a35b44b5
+/completion-evidence-and-retrospective-verification/verification-and-ownership:
+  en: bfd4d27aab605d3c
+  zh: 5f67b8ca2f181244
+/completion-evidence-and-retrospective-verification/persistence-and-api:
+  en: 7042365e9d53a3d2
+  zh: 36c936f524e70d4c
+/completion-evidence-and-retrospective-verification/validation:
+  en: 220928b92581ff0d
+  zh: 3d96ae925e88c95e

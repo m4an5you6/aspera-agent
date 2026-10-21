@@ -50,6 +50,31 @@
     "diagnosticsLogged": true,
     "verified": true
   },
+  "offlineControllerRecovery": {
+    "controller-offline": {
+      "tools": [
+        "inspect_preparation_environment",
+        "repair_preparation_controller",
+        "verify_preparation_environment"
+      ],
+      "verified": true,
+      "handoverRecorded": true,
+      "diagnosticsLogged": true,
+      "credentialsHidden": true
+    },
+    "controller-offline-blocked": {
+      "tools": [
+        "inspect_preparation_environment",
+        "repair_preparation_controller",
+        "verify_preparation_environment",
+        "report_preparation_blocked"
+      ],
+      "verified": false,
+      "handoverRecorded": false,
+      "diagnosticsLogged": true,
+      "credentialsHidden": true
+    }
+  },
   "sshHandshakeRecovery": {
     "connectionAttempts": 3,
     "commandCount": 1,
@@ -61,7 +86,7 @@
     "repair": {
       "tools": [
         "inspect_preparation_environment",
-        "run_preparation_command",
+        "repair_preparation_sandbox",
         "verify_preparation_environment"
       ],
       "diagnosticsLogged": true,
@@ -73,7 +98,7 @@
     "blocked": {
       "tools": [
         "inspect_preparation_environment",
-        "run_preparation_command",
+        "repair_preparation_sandbox",
         "verify_preparation_environment",
         "report_preparation_blocked"
       ],
@@ -102,13 +127,28 @@
     "reportedTrainingPercentage": 27,
     "invalidTotalHidden": true,
     "readFailureRetainsReports": true,
-    "initialReadFailureDistinct": true,
+    "offlineInitialReadRetainsCopy": true,
     "internalFieldsCollapsed": true,
     "stoppedAnimations": true,
     "oldReleaseUnrecorded": true,
     "localizedLabels": true,
     "responsiveColumns": true,
-    "keyboardDisclosure": true
+    "keyboardDisclosure": true,
+    "managedEnvironmentMeasured": true,
+    "mandatoryReusePlanDisplayed": true,
+    "retainedMaterialsDisplayed": true,
+    "managedCachePreviewAndCleanup": true,
+    "completedStepsCollapsed": true,
+    "fullStepSearch": true,
+    "readingStateRestored": true,
+    "storageModalViewport": true,
+    "systemFallbackAndShortfall": true
+  },
+  "experimentInterruption": {
+    "confirmedNodes": 1,
+    "blockedRetryRetainsIdentity": true,
+    "hiddenPageContinues": true,
+    "originalOutcome": "cancelled"
   },
   "overviewPhases": {
     "planning": [
@@ -186,6 +226,8 @@
     "inspect_preparation_environment",
     "run_preparation_command",
     "run_preparation_command",
+    "inspect_preparation_environment",
+    "prepare_preparation_tool",
     "verify_preparation_environment"
   ],
   "environmentCommands": [
@@ -197,6 +239,11 @@
     {
       "exitCode": 0,
       "stdout": "Required tools installed",
+      "stderr": ""
+    },
+    {
+      "exitCode": 0,
+      "stdout": "{\"ready\":true,\"reused\":true,\"downloadBytes\":0,\"pathEntries\":[\"/usr/local/bin\"]}",
       "stderr": ""
     }
   ],

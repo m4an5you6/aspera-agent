@@ -6,26 +6,35 @@
   en: d570a7463bdddb6f
   zh: d4dbcf97a9a9212c
 /state-and-apis/summary:
-  en: 2df75c75f4d3a33d
-  zh: f93d6e425a9b5104
+  en: 88ac7fcb7af5b330
+  zh: 0c44690db15042e8
 /state-and-apis/table-of-contents:
-  en: 9f405f89338b20af
-  zh: 1360a4a29c824ed3
+  en: 567eb520c9423bca
+  zh: e8f98b0463c0e6e9
 /state-and-apis/persistent-ownership:
-  en: f5a37bcd00507ae0
-  zh: 9b15c1583565cc87
+  en: 76376c01faec7915
+  zh: 40b025f87268e059
 /state-and-apis/receipts-and-goals:
-  en: d601d8518499c543
-  zh: 3be02e8401b15c8d
+  en: 0080bf077ceb2286
+  zh: 204ce24366d3ec3c
 /state-and-apis/controller-readiness-and-recovery:
-  en: d8600923311c2639
-  zh: 90b49296769c94a5
+  en: 55a6d3921bf8dc00
+  zh: c363175bca68a258
 /state-and-apis/api-consumers:
-  en: fe77395122ea544e
-  zh: 350b1665e7da9231
+  en: 47a4c9dbefaaf574
+  zh: ad7e9050efe5b179
 /state-and-apis/execution-step-progress:
-  en: e21c7ceb52cae005
-  zh: b18ebe2d7fa5da73
+  en: 6dbf46f2f20064ff
+  zh: 0789478e3961bb59
+/state-and-apis/controlled-interruption:
+  en: 3356933c9eec2a66
+  zh: cdfb9380b1328c27
+/state-and-apis/remote-task-settlement:
+  en: a48e4993387ce08f
+  zh: bbe84c9d15375784
+/state-and-apis/local-running-records:
+  en: f6fc2b2861f5e4e3
+  zh: 50572130138d38a0
 /state-and-apis/logs-outputs-and-services:
-  en: 7ca66f4977767c6d
-  zh: b218cd8f6a617f92
+  en: b74c168a5b472d1f
+  zh: 0047a97214fbc49c

@@ -6,6 +6,7 @@ import { expect, it, vi } from 'vitest'
 import type { FleetExperiment, FleetRegistry, ServerConnectionCheck, PreparationRetryResult, InstallationProgress } from '@aspera/dispatch/types'
 import { ExperimentsController } from '../src/client/controller.ts'
 import { experimentProgress } from '../src/client/experiment-progress.ts'
+import { interruptionView, blockedPreparationTasks } from '../src/client/interruption-view.ts'
 const ok = <T>(value: T) => ({ ok: true as const, value })
 function record(id: string): FleetExperiment {
   const experimentId = id as FleetExperiment['request']['experimentId']
@@ -32,13 +33,21 @@ function fixture() {
     readExperiment: vi.fn(async (_id: string, _kind: string, offset: number) => ok({ data: '', offset, nextOffset: offset,
       generation: 'one', eof: true, reset: false })),
     createExperiment: vi.fn(async () => ok(record('third'))), cancelExperiment: vi.fn(async () => ok(rows[0]!)),
+    interruptExperiment: vi.fn(async (id: string) => ok(fromAny<import('@aspera/experiments/types').ExperimentInterruptionStatus, object>({ version: 1, experimentId: id,
+      operationId: 'operation', submissionHash: 'a'.repeat(64), reason: 'user', stopRequested: true, phase: 'requested', startedAt: 1, updatedAt: 1, nodes: [] }))),
     retryPreparation: vi.fn(async (_id: string) => ok<PreparationRetryResult>({ record: rows[0]!, installations: [] })),
     saveServer: vi.fn(async () => ok<FleetRegistry>({ servers: [] })), setPassword: vi.fn(async () => ok(undefined)),
     removeServer: vi.fn(async () => ok<FleetRegistry>({ servers: [] })),
+    reviewExperimentCompletion: vi.fn(async (id: string) => ok(fromAny<import('@aspera/experiments/types').CompletionReview, object>({ experimentId: id,
+      operationId: 'review-operation', originalRevision: 1, phase: 'collecting', revision: 1 }))),
+    reconcileRemovedWork: vi.fn(async (_id: string) => ok([])),
+    settleRemoteTask: vi.fn(async (input: { taskId: string; mode: 'reconcile' | 'interrupt' }) => ok(fromAny<import('@aspera/dispatch/types').RemoteTaskStatus, object>({
+      experimentId: input.taskId, name: 'Deleted task', serverIds: [], deleted: true, released: false, recoveryAvailable: true, updatedAt: 2 }))),
     claimErrorNotice: vi.fn(async (_scope: { identity: string }) => ok(true)),
+    experimentStorageUsage: vi.fn(async (_id: string) => ok<import('@aspera/experiments/types').ExperimentStorageUsage>({ version: 1, experimentId: rows[0]!.request.experimentId, nodes: [], updatedAt: 1 })),
     probeServer: vi.fn(async () => ok<ServerConnectionCheck>({ status: 'passed', configuration: 'test', result: { gpuInfo: 'GPU fixture', allocations: [] } })),
   }
-  const completeRemote = { ...remote, experimentSnapshot: async () => { const registry = await remote.servers(); const experiments = await remote.experiments(); return ok({ registry: registry.value, experiments: experiments.value, deletedIds: [], deletions: [], removedServerIds: [], unconfirmedWork: [], installations: [] }) } }
+  const completeRemote = { ...remote, experimentSnapshot: async () => { const registry = await remote.servers(); const experiments = await remote.experiments(); return ok({ registry: registry.value, experiments: experiments.value, deletedIds: [], deletions: [], removedServerIds: [], unconfirmedWork: [], interruptions: [], installations: [] }) } }
   const controller = new ExperimentsController(fromAny<ConstructorParameters<typeof ExperimentsController>[0], typeof completeRemote>(completeRemote),
     { pollIntervalMs: 3000, retainedTextChars: 1000, defaultControlPort: 43019 })
   return { controller, remote, rows }
@@ -54,6 +63,53 @@ function executionFixture() {
   f.remote.experimentExecutionProgress.mockResolvedValue(ok(value))
   return { ...f, value }
 }
+
+it('claims applied storage fallback events durably and opens their owning node without repeating notifications', async () => {
+  const claimed = new Set<string>()
+  const usage = fromAny<import('@aspera/experiments/types').ExperimentStorageUsage, object>({ version: 1, experimentId: 'first', updatedAt: 1,
+    nodes: [{ serverId: 'node', arrangement: { eventId: 'a'.repeat(64), estimatedPeakBytes: 100, reason: 'Data storage insufficient' } }] })
+  const exercise = async (first: boolean) => {
+    const f = fixture()
+    f.remote.experimentStorageUsage.mockResolvedValue(ok(usage))
+    f.remote.claimErrorNotice.mockImplementation(async scope => { const key = JSON.stringify(scope); const fresh = !claimed.has(key); claimed.add(key); return ok(fresh) })
+    try {
+      await f.controller.storageUsage('first')
+      await vi.waitFor(() => { expect(f.remote.claimErrorNotice).toHaveBeenCalledTimes(1) })
+      if (first) await vi.waitFor(() => { expect(f.controller.store.getSnapshot().toast?.key).toBe('storageFallbackApplied') })
+      else expect(f.controller.store.getSnapshot().toast).toBeNull()
+      f.controller.clearToast()
+      await f.controller.storageUsage('first')
+      expect(f.remote.claimErrorNotice).toHaveBeenCalledTimes(1)
+      expect(f.controller.store.getSnapshot().toast).toBeNull()
+      f.controller.openStorageDetails('first', 'node')
+      expect(f.controller.store.getSnapshot()).toMatchObject({ selectedId: 'first', storageFocus: { experimentId: 'first', serverId: 'node' } })
+    } finally { f.controller.dispose() }
+  }
+  await exercise(true)
+  await exercise(false)
+})
+
+it('coalesces deleted-task verification and ignores its late reply after the pending notice disappears', async () => {
+  const f = fixture(); const id = f.rows[0]!.request.experimentId
+  const task: import('@aspera/dispatch/types').RemoteTaskStatus = { experimentId: id, name: 'Deleted task', serverIds: [],
+    deleted: true, released: false, recoveryAvailable: true, updatedAt: 1 }
+  const snapshot = { registry: { servers: [] }, experiments: [], deletedIds: [id], deletions: [], removedServerIds: [],
+    unconfirmedWork: [task], interruptions: [], installations: [] }
+  f.controller.receive(snapshot)
+  const gate = Promise.withResolvers<Awaited<ReturnType<typeof f.remote.settleRemoteTask>>>()
+  f.remote.settleRemoteTask.mockReturnValueOnce(gate.promise)
+  try {
+    const first = f.controller.settleRemoteTask(id, 'reconcile')
+    expect(f.controller.settleRemoteTask(id, 'reconcile')).toBe(first)
+    await vi.waitFor(() => { expect(f.remote.settleRemoteTask).toHaveBeenCalledOnce() })
+    expect(f.controller.store.getSnapshot().settlingTasks).toEqual([id])
+    f.controller.receive({ ...snapshot, unconfirmedWork: [] })
+    gate.resolve(ok({ ...task, updatedAt: 2 })); await first
+    expect(f.controller.store.getSnapshot().unconfirmedWork).toEqual([])
+    expect(f.controller.store.getSnapshot().experiments).toEqual([])
+    expect(f.controller.store.getSnapshot().settlingTasks).toEqual([])
+  } finally { gate.resolve(ok(task)); f.controller.dispose() }
+})
 
 it('keeps the last step report after a failed refresh and rejects a mismatched plan response', async () => {
   const f = executionFixture()
@@ -79,7 +135,7 @@ it('ignores step replies after switching away and back, deletion or disposal', a
       await vi.waitFor(() => { expect(f.remote.experimentExecutionProgress).toHaveBeenCalledOnce() })
       const running = f.controller.refresh()
       if (change === 'selection') { f.controller.select('second'); f.controller.select('first') }
-      else if (change === 'deletion') f.controller.receive({ registry: { servers: [] }, experiments: f.rows, deletedIds: [f.rows[0]!.request.experimentId], deletions: [], removedServerIds: [], unconfirmedWork: [], installations: [] })
+      else if (change === 'deletion') f.controller.receive({ registry: { servers: [] }, experiments: f.rows, deletedIds: [f.rows[0]!.request.experimentId], deletions: [], removedServerIds: [], unconfirmedWork: [], interruptions: [], installations: [] })
       else f.controller.dispose()
       read.resolve(ok(f.value)); await running
       expect(f.controller.store.getSnapshot().executionReads.first).toBeUndefined()
@@ -97,7 +153,7 @@ it('announces an applied source change once across snapshots, close and applicat
       changes: [{ id: 'unique-source-change', applied: true, changedAt: 100, reason: 'Measured mirror succeeds',
         previous: { npm: 'https://registry.npmjs.org/' }, next: { npm: 'https://mirror.example.test/' },
         probe: { kind: 'npm', detail: '65536 bytes downloaded over HTTPS' } }] } })
-  const snapshot = { registry: { servers: [] }, experiments: first.rows, deletedIds: [], deletions: [], removedServerIds: [], unconfirmedWork: [], installations: [installation] }
+  const snapshot = { registry: { servers: [] }, experiments: first.rows, deletedIds: [], deletions: [], removedServerIds: [], unconfirmedWork: [], interruptions: [], installations: [installation] }
   for (const f of [first, restarted]) f.remote.claimErrorNotice.mockImplementation(async ({ identity }) => {
     const seen = claims.has(identity); claims.add(identity); return ok(!seen)
   })
@@ -143,7 +199,7 @@ it('coalesces a connection check and retains its busy state until the request se
 it('discards a connection result for a removed registration and retains rows after failed removal', async () => {
   const { controller, remote, rows } = fixture()
   const server = rows[0]!.servers[0]!
-  controller.receive({ deletedIds: [], deletions: [], removedServerIds: [], unconfirmedWork: [], installations: [], registry: { servers: [server], coordinatorId: server.id }, experiments: [] })
+  controller.receive({ deletedIds: [], deletions: [], removedServerIds: [], unconfirmedWork: [], interruptions: [], installations: [], registry: { servers: [server], coordinatorId: server.id }, experiments: [] })
   const result = Promise.withResolvers<ReturnType<typeof ok<ServerConnectionCheck>>>()
   remote.probeServer.mockReturnValue(result.promise)
   try {
@@ -333,14 +389,14 @@ it('suppresses late operation failures after the experiment or server was remove
     remote.refreshExperiment.mockImplementationOnce(() => response.promise)
     const loading = controller.refresh()
     await vi.waitFor(() => { expect(remote.refreshExperiment.mock.calls.length).toBeGreaterThan(2) })
-    controller.receive({ registry: { servers: [] }, experiments: [], deletedIds: [rows[0]!.request.experimentId], deletions: [], removedServerIds: [rows[0]!.servers[0]!.id], unconfirmedWork: [], installations: [] })
+    controller.receive({ registry: { servers: [] }, experiments: [], deletedIds: [rows[0]!.request.experimentId], deletions: [], removedServerIds: [rows[0]!.servers[0]!.id], unconfirmedWork: [], interruptions: [], installations: [] })
     response.reject(new Error('The operation was aborted due to timeout'))
     await loading
     controller.report(new Error('ECONNREFUSED'), { serverId: 'node', operation: 'probe' })
     await Promise.resolve()
     expect(controller.store.getSnapshot().errorNotice).toBeNull()
     expect(controller.store.getSnapshot().sourceErrors).toEqual({})
-    controller.receive({ registry: { servers: rows[0]!.servers }, experiments: rows, deletedIds: [], deletions: [], removedServerIds: [], unconfirmedWork: [], installations: [] })
+    controller.receive({ registry: { servers: rows[0]!.servers }, experiments: rows, deletedIds: [], deletions: [], removedServerIds: [], unconfirmedWork: [], interruptions: [], installations: [] })
     expect(controller.store.getSnapshot().registry.servers).toEqual([])
   } finally { controller.dispose() }
 })
@@ -353,11 +409,104 @@ it('does not restore deleted experiments from a late refresh, stream reply or st
     remote.refreshExperiment.mockImplementationOnce(() => response.promise)
     const loading = controller.refresh()
     await vi.waitFor(() => { expect(remote.refreshExperiment.mock.calls.length).toBeGreaterThan(2) })
-    controller.receive({ registry: { servers: [] }, experiments: [], deletedIds: [rows[0]!.request.experimentId], deletions: [], removedServerIds: [], unconfirmedWork: [], installations: [] })
+    controller.receive({ registry: { servers: [] }, experiments: [], deletedIds: [rows[0]!.request.experimentId], deletions: [], removedServerIds: [], unconfirmedWork: [], interruptions: [], installations: [] })
     response.resolve(ok(rows[0]!)); await loading
-    controller.receive({ registry: { servers: [] }, experiments: rows, deletedIds: [], deletions: [], removedServerIds: [], unconfirmedWork: [], installations: [] })
+    controller.receive({ registry: { servers: [] }, experiments: rows, deletedIds: [], deletions: [], removedServerIds: [], unconfirmedWork: [], interruptions: [], installations: [] })
     expect(controller.store.getSnapshot().experiments.map(row => row.request.experimentId)).toEqual(['second'])
     expect(controller.store.getSnapshot().selectedId).toBeNull()
     expect(Object.keys(controller.store.getSnapshot().streams).some(key => key.startsWith('first/'))).toBe(false)
+  } finally { controller.dispose() }
+})
+
+it('shares one interruption request and retains Host progress after selection changes', async () => {
+  const { controller, remote } = fixture()
+  try {
+    await controller.refresh()
+    const reply = Promise.withResolvers<Awaited<ReturnType<typeof remote.interruptExperiment>>>()
+    remote.interruptExperiment.mockImplementationOnce(() => reply.promise)
+    const first = controller.interrupt('first'); const duplicate = controller.interrupt('first')
+    expect(first).toBe(duplicate)
+    await vi.waitFor(() => { expect(remote.interruptExperiment).toHaveBeenCalledTimes(1) })
+    controller.select('second')
+    expect(controller.store.getSnapshot().interrupting).toEqual(['first'])
+    const status = (await remote.interruptExperiment.getMockImplementation()!('first')).value
+    reply.resolve(ok(status)); await first
+    expect(controller.store.getSnapshot().selectedId).toBe('second')
+    expect(controller.store.getSnapshot().interruptions[0]?.experimentId).toBe('first')
+    expect(controller.store.getSnapshot().interrupting).toEqual([])
+  } finally { controller.dispose() }
+})
+
+it('retains confirmed interruption against stale snapshots and drops late acknowledgements after deletion', async () => {
+  const { controller, remote, rows } = fixture()
+  try {
+    await controller.refresh()
+    const original = (await remote.interruptExperiment('first')).value
+    const released = { ...original, phase: 'released' as const, updatedAt: 3 }
+    const ended = { ...rows[0]!, latest: { ...rows[0]!.latest!, state: 'cancelled' as const, resourcesReleased: true, revision: 2 } }
+    const snapshot = { registry: { servers: [] }, experiments: [ended], deletedIds: [], deletions: [], removedServerIds: [], unconfirmedWork: [], interruptions: [released], installations: [] }
+    controller.receive(snapshot)
+    controller.receive({ ...snapshot, experiments: rows, interruptions: [{ ...original, updatedAt: 4 }] })
+    expect(controller.store.getSnapshot().interruptions[0]?.phase).toBe('released')
+    expect(controller.store.getSnapshot().experiments.find(row => row.request.experimentId === 'first')?.latest?.state).toBe('cancelled')
+    const reply = Promise.withResolvers<Awaited<ReturnType<typeof remote.interruptExperiment>>>()
+    remote.interruptExperiment.mockImplementationOnce(() => reply.promise)
+    const stopping = controller.interrupt('second')
+    await vi.waitFor(() => { expect(remote.interruptExperiment).toHaveBeenCalledWith('second') })
+    controller.receive({ ...snapshot, experiments: [ended], deletedIds: [rows[1]!.request.experimentId] })
+    reply.resolve(ok({ ...original, experimentId: rows[1]!.request.experimentId })); await stopping
+    expect(controller.store.getSnapshot().interruptions.some(value => value.experimentId === 'second')).toBe(false)
+  } finally { controller.dispose() }
+})
+
+it('offers interruption for started work, cancellation for pending work and retry for unconfirmed exit', () => {
+  const row = record('first')
+  expect(interruptionView(row)).toMatchObject({ available: true, action: 'interruptExperiment', busy: false })
+  expect(interruptionView({ ...row, latest: { ...row.latest!, state: 'awaiting-approval' } }).action).toBe('cancel')
+  const journal = fromAny<import('@aspera/experiments/types').ExperimentInterruptionStatus, object>({ phase: 'blocked', stopRequested: true, operationId: 'operation' })
+  expect(interruptionView(row, journal)).toMatchObject({ available: true, action: 'retryInterruption', busy: false, blocked: true })
+  expect(interruptionView(row, { ...journal, phase: 'verifying' }).busy).toBe(true)
+  const cancelled = { ...row, latest: { ...row.latest!, state: 'cancelled' as const, resourcesReleased: true } }
+  expect(interruptionView(cancelled, { ...journal, phase: 'released' })).toMatchObject({ available: false, busy: false, userInterrupted: true })
+})
+
+it('links program-observed old task blockers to their original experiment without changing its plan', () => {
+  const old = record('first'); const second = record('second'); const { submission: _submission, ...local } = second
+  const preparation = { ...local, state: 'failed' as const }
+  const journal = fromAny<import('@aspera/experiments/types').ExperimentInterruptionStatus, object>({ experimentId: old.request.experimentId,
+    reason: 'controller-recovery', phase: 'blocked' })
+  expect(blockedPreparationTasks(preparation, [old, second], [journal])).toEqual([{ experimentId: old.request.experimentId, name: 'first' }])
+  expect(blockedPreparationTasks(preparation, [second], [journal])).toEqual([])
+  expect(blockedPreparationTasks(preparation, [old, second], [{ ...journal, phase: 'released' }])).toEqual([])
+  expect(blockedPreparationTasks(second, [old, second], [journal])).toEqual([])
+})
+
+it('projects revalidation only from a committed assessment of the current original result', () => {
+  const row = record('first'), failed = { ...row, latest: { ...row.latest!, state: 'failed' as const, resourcesReleased: true } }
+  const review = fromAny<import('@aspera/experiments/types').CompletionReview, object>({ originalRevision: failed.latest.revision,
+    phase: 'passed', remoteCommitted: true, check: { ready: true } })
+  expect(experimentProgress({ ...failed, completionReview: review })).toMatchObject({ status: 'revalidated', phase: 3, issue: false, busy: false })
+  expect(failed.latest.state).toBe('failed')
+  for (const invalid of [{ ...review, remoteCommitted: false }, { ...review, check: { ...review.check!, ready: false } }, { ...review, originalRevision: review.originalRevision + 1 }]) {
+    expect(experimentProgress({ ...failed, completionReview: invalid }).status).toBe('failed')
+  }
+  expect(experimentProgress({ ...failed, completionReview: { ...review, phase: 'collecting' } })).toMatchObject({ busy: true, status: 'reviewing' })
+  expect(experimentProgress({ ...failed, completionReview: { ...review, phase: 'blocked' } })).toMatchObject({ busy: false, attention: true, status: 'review-blocked' })
+})
+
+it('shares supplementary requests across navigation and ignores acknowledgements after deletion', async () => {
+  const { controller, remote, rows } = fixture()
+  try {
+    await controller.refresh()
+    const reply = Promise.withResolvers<Awaited<ReturnType<typeof remote.reviewExperimentCompletion>>>()
+    remote.reviewExperimentCompletion.mockImplementationOnce(() => reply.promise)
+    const first = controller.reviewCompletion('first'), duplicate = controller.reviewCompletion('first')
+    expect(first).toBe(duplicate); controller.select('second')
+    const review = (await remote.reviewExperimentCompletion.getMockImplementation()!('first')).value
+    controller.receive({ registry: { servers: [] }, experiments: [rows[1]!], deletedIds: [rows[0]!.request.experimentId], deletions: [], removedServerIds: [],
+      unconfirmedWork: [], interruptions: [], installations: [] })
+    reply.resolve(ok(review)); await first
+    expect(controller.store.getSnapshot().selectedId).toBe('second')
+    expect(controller.store.getSnapshot().experiments.some(row => row.request.experimentId === 'first')).toBe(false)
   } finally { controller.dispose() }
 })

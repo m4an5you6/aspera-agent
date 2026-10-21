@@ -5,6 +5,9 @@ import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import { applyClusterRole } from './cluster.ts'
 import type { ClusterRoleConfig } from './cluster.ts'
+import { PhaseContextPolicyConfig } from './phase-context.ts'
+import { ManagedEnvironmentPolicyConfig } from './managed-environment.ts'
+import { FinalizationPolicyConfig } from './finalization-policy.ts'
 
 export * from '@aspera/experiments'
 export { inspectServerStorage, prepareServerStorage, verifyServerStorage, cleanupServerStorage, resolveStoragePlacement, serverRunRoot, serverReleaseRoot } from './storage.ts'
@@ -17,6 +20,10 @@ export { controllerPolicyDigest } from './controller.ts'
 export { gpuIdentityQueryScript } from './gpu-query.ts'
 export { experimentIsolationArgs, experimentSandboxArgv } from './experiment-sandbox.ts'
 export type { ExperimentSandboxSpec } from './experiment-sandbox.ts'
+export { ManagedEnvironmentPolicyConfig, managedEnvironmentPolicySchema, managedEnvironmentPolicyForRelease, managedEnvironmentConfig, managedEnvironmentMounts, managedEnvironmentProgram, ManagedEnvironments } from './managed-environment.ts'
+export type { ManagedEnvironmentPolicy, ManagedEnvironmentBinding } from './managed-environment.ts'
+export { storageGovernancePolicySchema, StorageGovernancePolicyConfig } from './storage-governance.ts'
+export type { StorageGovernancePolicy } from './storage-governance.ts'
 
 /** Validated role configuration supplied by the profile. */
 export interface Config extends ClusterRoleConfig {}
@@ -36,6 +43,9 @@ export const Config: z<Config> = z.object({
   documentationHosts: z.array(z.string()).default(['github.com', 'raw.githubusercontent.com', 'docs.nvidia.com', 'unsloth.ai', 'docs.unsloth.ai', 'swift.readthedocs.io', 'huggingface.co']),
   documentationBytes: z.number().step(1).min(1024).default(1048576),
   goalContinuationWindow: z.number().step(1).min(2).max(10000).default(128),
+  agentContext: PhaseContextPolicyConfig.default({}),
+  managedEnvironments: ManagedEnvironmentPolicyConfig.default({}),
+  finalization: FinalizationPolicyConfig.default({}),
   networkProbeLifetimeMs: z.number().step(1).min(1000).default(300000),
   observations: z.object({ intervalMs: z.number().step(1).min(500).default(2000), historyMs: z.number().step(1).min(60000).default(900000),
     readBytes: z.number().step(1).min(1024).max(262144).default(65536), metricSamples: z.number().step(1).min(30).max(10000).default(1000) }),
@@ -50,3 +60,16 @@ export type { AsperaMessageSource } from './messages.ts'
 
 export { setupWorkerProfile } from './profiles.ts'
 export { openPhaseModelContext, privateModelConfigurationSchema } from './phase-model.ts'
+export { deepSeekConfigurationOptions, readDeepSeekConfigurationOptions } from './model-configuration.ts'
+export { PhaseContextPolicyConfig } from './phase-context.ts'
+export type { PhaseContextPolicy } from './phase-context.ts'
+export { checkExperimentCompletion } from './completion-check.ts'
+export type { CompletionFacts } from './completion-check.ts'
+export { completionEvidenceProgram } from './completion-evidence.ts'
+export { verifyTrainingStage } from './stage-acceptance.ts'
+export { inspectRegisteredStage, stageSources } from './stage-runtime.ts'
+export type { StageReader } from './stage-runtime.ts'
+export type { StageDocument } from './stage-acceptance.ts'
+export { finalizationPolicySchema, FinalizationPolicyConfig } from './finalization-policy.ts'
+export type { FinalizationPolicy } from './finalization-policy.ts'
+export { legacyTrainingStages } from './legacy-stages.ts'

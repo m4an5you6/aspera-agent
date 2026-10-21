@@ -7,6 +7,8 @@ export interface ExperimentSandboxSpec {
   readonly workspaceRoot: string
   readonly devicePaths: readonly string[]
   readonly hiddenPaths: readonly string[]
+  readonly offlineMaterials?: boolean
+  readonly environment?: { readonlyPaths: readonly string[]; writablePaths: readonly string[]; hiddenPaths?: readonly string[]; python?: string }
 }
 
 /**
@@ -15,7 +17,7 @@ export interface ExperimentSandboxSpec {
  */
 export function experimentIsolationArgs(): string[] {
   return ['--ro-bind', '/', '/', '--unshare-user', '--unshare-pid', '--unshare-ipc', '--unshare-uts',
-    '--die-with-parent', '--new-session', '--dev', '/dev', '--proc', '/proc', '--tmpfs', '/tmp']
+    '--die-with-parent', '--new-session', '--cap-drop', 'ALL', '--dev', '/dev', '--proc', '/proc', '--tmpfs', '/tmp']
 }
 
 /**
@@ -35,6 +37,18 @@ export function experimentSandboxArgv(spec: ExperimentSandboxSpec, command: read
     PIP_CACHE_DIR: posix.join(workspace, 'cache', 'pip'), UV_CACHE_DIR: posix.join(workspace, 'cache', 'uv'),
     TORCH_HOME: posix.join(workspace, 'cache', 'torch'), UV_PROJECT_ENVIRONMENT: posix.join(workspace, 'env'),
     CONDA_PKGS_DIRS: posix.join(workspace, 'cache', 'conda'), CONDA_ENVS_PATH: posix.join(workspace, 'envs'), TMPDIR: posix.join(workspace, 'tmp') })) argv.push('--setenv', name, value)
-  argv.push('--bind', workspace, workspace, '--chdir', workspace, '--', ...command)
+  argv.push('--bind', workspace, workspace)
+  if (spec.offlineMaterials) for (const name of ['HF_HUB_OFFLINE', 'TRANSFORMERS_OFFLINE', 'HF_DATASETS_OFFLINE']) argv.push('--setenv', name, '1')
+  if (spec.environment !== undefined) {
+    for (const path of spec.environment.hiddenPaths ?? []) argv.push('--tmpfs', path, '--remount-ro', path)
+    for (const path of spec.environment.readonlyPaths) argv.push('--ro-bind', path, path)
+    for (const path of spec.environment.writablePaths) argv.push('--bind', path, path)
+    argv.push('--setenv', 'PYTHONNOUSERSITE', '1', '--setenv', 'PIP_REQUIRE_VIRTUALENV', '1', '--setenv', 'PYTHONDONTWRITEBYTECODE', '1')
+    if (spec.environment.python !== undefined) {
+      const directory = posix.dirname(posix.dirname(spec.environment.python))
+      argv.push('--setenv', 'VIRTUAL_ENV', directory, '--setenv', 'PATH', posix.join(directory, 'bin') + ':/usr/local/bin:/usr/bin:/bin')
+    }
+  }
+  argv.push('--chdir', workspace, '--', ...command)
   return argv
 }

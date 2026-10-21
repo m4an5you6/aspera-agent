@@ -10,6 +10,9 @@ import * as DeepSeek from '@deepseek-ai/dsh-llm-deepseek-api-key'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { PhaseModelSnapshot } from '@aspera/experiments'
 import { PhaseAgents } from './phase-agents.ts'
+import { readDeepSeekConfigurationOptions } from './model-configuration.ts'
+import { PhaseContextPolicyConfig } from './phase-context.ts'
+import type { PhaseContextPolicy } from './phase-context.ts'
 
 /** Private JSON has no browser projection; provider headers may contain credentials. */
 export const privateModelConfigurationSchema = z.object({ version: z.literal(1),
@@ -19,9 +22,11 @@ export const privateModelConfigurationSchema = z.object({ version: z.literal(1),
 
 /** Bind the standard Agent driver and its provider to the same phase without changing global settings.
  * @param ctx - profile owner with credentials, agents and agentLoop dependencies. @param snapshot - admitted immutable model.
+ * @param policy - profile-owned DSH compaction and tool-output settings.
  * @returns scope used to create the Agent and a disposer after the Agent has stopped.
  */
-export async function openPhaseModelContext(ctx: Context, snapshot: PhaseModelSnapshot): Promise<{ context: Context; dispose: () => Promise<void> }> {
+export async function openPhaseModelContext(ctx: Context, snapshot: PhaseModelSnapshot,
+  policy: PhaseContextPolicy = PhaseContextPolicyConfig({ compaction: {}, pruning: {} })): Promise<{ context: Context; dispose: () => Promise<void> }> {
   const saved = await ctx.credentials.resolve(credentialRef(snapshot.configurationRef))
   if (saved === undefined) throw new Error('Experiment model configuration snapshot is missing')
   if (createHash('sha256').update(saved.value).digest('hex') !== snapshot.configurationHash) throw new Error('Experiment model configuration snapshot changed')
@@ -33,9 +38,9 @@ export async function openPhaseModelContext(ctx: Context, snapshot: PhaseModelSn
   const phase = {}
   const scope = createScope(ctx.isolate('llm').isolate('agents').isolate('agentLoop').isolate('typert'), phase)
   try {
-    await scope.ctx.plugin(PhaseAgents, { registry: ctx.agents })
+    await scope.ctx.plugin(PhaseAgents, { registry: ctx.agents, policy, provider: snapshot.provider, model: snapshot.model })
     const provider = await scope.ctx.plugin(LlmRuntime)
-    if (stored.adapter === 'deepseek-api-key') await provider.ctx.plugin(DeepSeek, stored.options)
+    if (stored.adapter === 'deepseek-api-key') await provider.ctx.plugin(DeepSeek, readDeepSeekConfigurationOptions(stored.options))
     else await provider.ctx.plugin(PiAi, { providers: { [snapshot.provider]: stored.options } })
     await provider.ctx.llm.resolveModelInfo(snapshot.provider, snapshot.model)
     const loop = await scope.ctx.plugin(AgentLoop, { agents: [], maxParallelToolCalls: ctx.agentLoop.config.maxParallelToolCalls.get() })

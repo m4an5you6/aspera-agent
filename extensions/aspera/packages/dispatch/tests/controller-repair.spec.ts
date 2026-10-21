@@ -1,17 +1,17 @@
 /** Real preparation providers use explicit simulated SSH replies and isolated repair receipts. */
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, mkdtempSync, rmSync, readFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { afterEach, expect, it, vi } from 'vitest'
 import { fromAny } from '@total-typescript/shoehorn'
-import { controllerBootIdSchema, experimentIdSchema, serverIdSchema, parseGpuInventory, normalizedSet } from '@aspera/experiments'
+import { controllerBootIdSchema, experimentIdSchema, serverIdSchema, parseGpuInventory, normalizedSet, clusterRecordSchema, clusterSubmissionSchema } from '@aspera/experiments'
 import { controllerPolicyDigest } from '@aspera/runtime'
 import type { FleetDriver } from '../src/fleet.ts'
 import type { DeploymentConfig } from '../src/deploy.ts'
 import { ControllerDiagnostic, verifyController, ensureClusterRole, inspectController, SavedReleaseUnavailable } from '../src/cluster-deploy.ts'
 import { ControllerRepair } from '../src/controller-repair.ts'
 import { controllerFixture, preparedFixture, fixtureGpu } from './controller-fixture.ts'
-import { placement } from '../../experiments/tests/fixtures.ts'
+import { placement, inventory, modelSnapshots } from '../../experiments/tests/fixtures.ts'
 import { request, remote } from '../src/transport.ts'
 vi.mock('../src/transport.ts', async importOriginal => ({ ...await importOriginal<typeof import('../src/transport.ts')>(), request: vi.fn(), remote: vi.fn() }))
 const roots: string[] = []; const originalHome = process.env.DSH_HOME
@@ -27,6 +27,15 @@ function fixture(maxAttempts = 2) {
   const inspectController = vi.fn(async () => structuredClone(status))
   const ensure = vi.fn(async () => { status = { ...controllerFixture(target), bootId: controllerBootIdSchema.parse('cpu-replacement') } })
   const run = vi.fn(async (_target, script: string) => {
+    if (script.includes('"mode":"')) {
+      const operation = JSON.parse(script.slice(script.lastIndexOf(" '{") + 2, -1))
+      if (operation.mode === 'inspect') return JSON.stringify({ version: 1, state: 'offline', root: target.remoteRoot, role: 'node',
+        home: target.remoteRoot + '/state/node-home', hostBootId: 'cpu-host', digest: 'f'.repeat(64), savedPid: null,
+        releaseBinding: '/old-release', processes: [], blockers: [], records: [], converged: [] })
+      if (operation.mode === 'begin') return JSON.stringify({ version: 1, operationId: operation.operationId, phase: 'fenced',
+        directory: operation.directory, role: 'node', release: operation.release })
+      return JSON.stringify({ completed: true, operationId: operation.operationId })
+    }
     if (script.includes('pidfd_send_signal')) { stopped = true; return '' }
     if (script.includes('stopped.json')) return stopped ? JSON.stringify({ operationId: status.maintenance, exited: true }) : '{}'
     return '0'
@@ -65,6 +74,26 @@ it('accepts reordered authorization but distinguishes UUID, device mapping and a
   status.actualGpu = undefined; status.gpuError = 'CUDA device permission denied'
   expect(() => verifyController(status, target, prepared, 'node')).toThrow('unavailable')
 })
+it('requires fixed-release environment capabilities before reusing a healthy controller', async () => {
+  const status = controllerFixture(target)
+  const prepared = { ...preparedFixture(), requiredFeatures: ['managed-environment-reuse-v1', 'managed-environment-cleanup-v1', 'managed-environment-install-v2', 'managed-environment-install-v3'] }
+  vi.mocked(request).mockResolvedValue({ status: 200, value: { protocol: 4, role: 'node', deploymentId: status.deploymentId,
+    features: ['public-inference-v1', 'controller-readiness-v1', 'controller-maintenance-v1'], controller: status } })
+  await expect(ensureClusterRole(target, prepared, 'node', 'private-token', undefined, AbortSignal.timeout(1000))).rejects.toMatchObject({ diagnostic: { code: 'configuration-outdated' } })
+  expect(remote).not.toHaveBeenCalled()
+  vi.mocked(request).mockResolvedValue({ status: 200, value: { protocol: 4, role: 'node', deploymentId: status.deploymentId,
+    features: ['managed-environment-reuse-v1', 'public-inference-v1'], controller: status } })
+  await expect(ensureClusterRole(target, prepared, 'node', 'private-token', undefined, AbortSignal.timeout(1000))).rejects.toMatchObject({ diagnostic: { code: 'configuration-outdated' } })
+  vi.mocked(request).mockResolvedValue({ status: 200, value: { protocol: 4, role: 'node', deploymentId: status.deploymentId,
+    features: ['managed-environment-reuse-v1', 'managed-environment-cleanup-v1', 'public-inference-v1'], controller: status } })
+  await expect(ensureClusterRole(target, prepared, 'node', 'private-token', undefined, AbortSignal.timeout(1000))).rejects.toMatchObject({ diagnostic: { code: 'configuration-outdated' } })
+  vi.mocked(request).mockResolvedValue({ status: 200, value: { protocol: 4, role: 'node', deploymentId: status.deploymentId,
+    features: ['managed-environment-reuse-v1', 'managed-environment-cleanup-v1', 'managed-environment-install-v2', 'public-inference-v1'], controller: status } })
+  await expect(ensureClusterRole(target, prepared, 'node', 'private-token', undefined, AbortSignal.timeout(1000))).rejects.toMatchObject({ diagnostic: { code: 'configuration-outdated' } })
+  vi.mocked(request).mockResolvedValue({ status: 200, value: { protocol: 4, role: 'node', deploymentId: status.deploymentId,
+    features: ['managed-environment-reuse-v1', 'managed-environment-cleanup-v1', 'managed-environment-install-v2', 'managed-environment-install-v3', 'public-inference-v1'], controller: status } })
+  await expect(ensureClusterRole(target, prepared, 'node', 'private-token', undefined, AbortSignal.timeout(1000))).resolves.toBeUndefined()
+})
 it('maps NVIDIA UUIDs to accessible minor numbers and refuses missing identities', () => {
   expect(parseGpuInventory(`${fixtureGpu.gpus[0]!.uuid}, NVIDIA RTX 4090, 5`, ['/dev/nvidia5', '/dev/nvidiactl']).gpus[0]?.devicePath).toBe('/dev/nvidia5')
   expect(() => parseGpuInventory('unknown, RTX 4090, 5', ['/dev/nvidia5'])).toThrow()
@@ -72,6 +101,11 @@ it('maps NVIDIA UUIDs to accessible minor numbers and refuses missing identities
   expect(normalizedSet(['/dev/nvidia2', '/dev/nvidia2'])).toEqual(['/dev/nvidia2'])
   expect(() => parseGpuInventory(`${fixtureGpu.gpus[0]!.uuid}, First, 5\nGPU-22222222-2222-2222-2222-222222222222, Second, 5`, ['/dev/nvidia5'])).toThrow('does not match')
   expect(() => parseGpuInventory(`${fixtureGpu.gpus[0]!.uuid}, First, 5`, ['/dev/nvidia5', '/dev/nvidia-caps/../../token'])).toThrow()
+})
+it('keeps an original older release off an installer-v3 controller', () => {
+  const status = controllerFixture(target); status.features = ['managed-environment-install-v2', 'managed-environment-install-v3']
+  const prepared = { ...preparedFixture(), requiredFeatures: ['managed-environment-install-v2'] }
+  expect(() => verifyController(status, target, prepared, 'node')).toThrow('original release installer')
 })
 it('distinguishes unchanged UUIDs with a different device path and missing auxiliary devices', () => {
   const status = controllerFixture(target); const prepared = preparedFixture()
@@ -111,7 +145,7 @@ it('saves accepted process identity without counting a restart', async () => {
   const f = fixture(); f.status = controllerFixture(target)
   const accepted = await f.repair.verify(AbortSignal.timeout(1000))
   expect(accepted.controller?.bootId).toBe(f.status.bootId)
-  const journal = JSON.parse(readFileSync(resolve(process.env.DSH_HOME!, 'aspera-controller-repairs', f.input.experimentId, `${f.input.serverId}-node.v1.json`), 'utf8'))
+  const journal = JSON.parse(readFileSync(resolve(process.env.DSH_HOME!, 'aspera-controller-repairs', f.input.experimentId, `${f.input.serverId}-node.v2.json`), 'utf8'))
   expect(journal.attempts).toEqual([]); expect(journal.acceptance.controller.policyDigest).toBe(f.status.policyDigest)
   expect(JSON.stringify(journal)).not.toContain(f.input.password)
 })
@@ -150,11 +184,76 @@ it('recovers a confirmed stop without repeating the stop or resetting the attemp
   const f = fixture(); f.ensure.mockRejectedValueOnce(new Error('SSH lost during startup'))
   await expect(f.runRepair()).rejects.toThrow('SSH lost')
   f.inspectController.mockRejectedValueOnce(new Error('control port is closed'))
-  f.run.mockImplementation(async (_target, script: string) => script.includes('/exited') ? 'unknown' : JSON.stringify({ operationId: f.status.maintenance, exited: true }))
+  const previousRun = f.run.getMockImplementation()!
+  f.run.mockImplementation(async (_target, script: string) => script.includes('"mode":"') ? previousRun(_target, script)
+    : script.includes('/exited') ? 'unknown' : JSON.stringify({ operationId: f.status.maintenance, exited: true }))
   const resumed = new ControllerRepair(f.input, f.driver)
   await resumed.reconcile(f.pending[0]!, AbortSignal.timeout(1000))
   expect(f.ensure).toHaveBeenCalledTimes(2)
-  expect(f.run.mock.calls.filter(([, script]) => script.includes('pidfd_send_signal'))).toHaveLength(1)
+  expect(f.run.mock.calls.filter(([, script]) => script.includes('pidfd_send_signal') && !script.includes('"mode":"'))).toHaveLength(1)
+})
+it('recovers an offline endpoint under a durable fence without sending maintenance to the dead role', async () => {
+  const f = fixture(); f.inspectController.mockRejectedValueOnce(new Error('(SSH) Channel open failure: Connection refused'))
+  await expect(f.runRepair()).resolves.toMatchObject({ repaired: true, mode: 'offline-recovery', verificationRequired: true })
+  expect(f.request).not.toHaveBeenCalled()
+  expect(f.ensure).toHaveBeenCalledOnce()
+  expect(f.ensure).toHaveBeenCalledWith(f.input.target, f.input.prepared, 'node', f.input.token, f.input.password, expect.any(AbortSignal), expect.any(String))
+  expect(f.run.mock.calls.filter(([, script]) => script.includes('pidfd_send_signal') && !script.includes('"mode":"'))).toHaveLength(0)
+  const journal = JSON.parse(readFileSync(resolve(process.env.DSH_HOME!, 'aspera-controller-repairs', f.input.experimentId, `${f.input.serverId}-node.v2.json`), 'utf8'))
+  expect(journal).toMatchObject({ version: 2, attempts: [{ phase: 'completed', offline: { state: 'offline' } }] })
+})
+it('returns SSH-derived offline evidence when the control health channel is refused', async () => {
+  const f = fixture(); f.inspectController.mockRejectedValueOnce(new Error('Connection refused'))
+  await expect(f.repair.inspect(AbortSignal.timeout(1000))).resolves.toMatchObject({ ready: false, repairable: true, recovery: { state: 'offline' } })
+  expect(f.ensure).not.toHaveBeenCalled()
+})
+it('does not start an offline controller while SSH evidence contains an unreleased command', async () => {
+  const f = fixture(); f.inspectController.mockRejectedValueOnce(new Error('Connection refused'))
+  const previousRun = f.run.getMockImplementation()!
+  f.run.mockImplementation(async (_target, script: string) => {
+    const value = await previousRun(_target, script)
+    if (!script.includes('"mode":"inspect"')) return value
+    return JSON.stringify({ ...JSON.parse(value), state: 'occupied', blockers: [{ kind: 'command', id: 'original-command', reason: 'Exit unconfirmed' }] })
+  })
+  await expect(f.runRepair()).rejects.toMatchObject({ diagnostic: { code: 'occupied' } })
+  expect(f.pending).toEqual([]); expect(f.ensure).not.toHaveBeenCalled(); expect(f.request).not.toHaveBeenCalled()
+})
+it('retains the admission fence until recovered process ownership can be confirmed without launching again', async () => {
+  const f = fixture(); f.inspectController.mockRejectedValueOnce(new Error('Connection refused'))
+  const previousRun = f.run.getMockImplementation()!
+  f.run.mockImplementation(async (_target, script: string) => {
+    if (script.includes('Recovered process belongs to another operation')) throw new Error('Recovered process belongs to another operation')
+    return previousRun(_target, script)
+  })
+  await expect(f.runRepair()).rejects.toThrow('another operation')
+  expect(f.run.mock.calls.some(([, script]) => script.includes('"mode":"complete"'))).toBe(false)
+  f.run.mockImplementation(previousRun)
+  const resumed = new ControllerRepair(f.input, f.driver)
+  await resumed.reconcile(f.pending[0]!, AbortSignal.timeout(1000))
+  expect(f.ensure).toHaveBeenCalledOnce()
+  expect(f.run.mock.calls.filter(([, script]) => script.includes('"mode":"begin"'))).toHaveLength(1)
+  expect(f.run.mock.calls.filter(([, script]) => script.includes('"mode":"complete"'))).toHaveLength(1)
+})
+it('rejects a saved attempt when either process or offline evidence belongs to another server', async () => {
+  const f = fixture(); await f.runRepair()
+  const path = resolve(process.env.DSH_HOME!, 'aspera-controller-repairs', f.input.experimentId, `${f.input.serverId}-node.v2.json`)
+  const journal = JSON.parse(readFileSync(path, 'utf8'))
+  journal.attempts[0].offline.root = '/another-server'
+  writeFileSync(path, JSON.stringify(journal))
+  expect(() => new ControllerRepair(f.input, f.driver)).toThrow('outside its saved server')
+  expect(f.ensure).toHaveBeenCalledOnce()
+})
+it('preserves version-1 receipts and their limits when starting a version-2 successor', async () => {
+  const f = fixture(); const directory = resolve(process.env.DSH_HOME!, 'aspera-controller-repairs', f.input.experimentId)
+  mkdirSync(directory, { recursive: true })
+  const path = resolve(directory, `${f.input.serverId}-node.v1.json`)
+  const original = JSON.stringify({ version: 1, experimentId: f.input.experimentId, serverId: f.input.serverId,
+    role: 'node', deploymentId: f.input.prepared.deploymentId, maxAttempts: 0, attempts: [] }) + '\n'
+  writeFileSync(path, original)
+  const resumed = new ControllerRepair({ ...f.input, maxAttempts: 10 }, f.driver)
+  await expect(resumed.repair(AbortSignal.timeout(1000), async () => {})).rejects.toThrow('attempt limit')
+  expect(readFileSync(path, 'utf8')).toBe(original)
+  expect(existsSync(path.replace('.v1.json', '.v2.json'))).toBe(false)
 })
 it('only reads whitelisted startup settings from a legacy controller and refuses unknown GPU identity', async () => {
   vi.mocked(request).mockResolvedValue({ status: 200, value: { protocol: 4, role: 'node', features: ['public-inference-v1'] } })
@@ -168,4 +267,35 @@ it('only reads whitelisted startup settings from a legacy controller and refuses
   expect(vi.mocked(remote).mock.calls[0]?.[1]).not.toContain('kill(')
   vi.mocked(remote).mockResolvedValue('{}')
   await expect(inspectController(target, 'node', 'private-token', undefined, AbortSignal.timeout(1000))).rejects.toMatchObject({ diagnostic: { code: 'unknown' } })
+})
+
+it('adopts program-confirmed old task receipts before starting the independent fixed profile and still requires verification', async () => {
+  const f = fixture(); const oldId = experimentIdSchema.parse(randomUUID())
+  const server = { id: f.input.serverId, name: 'Original CPU node', host: target.host, sshPort: 22, username: 'trainer', remotePort: target.remotePort,
+    remoteRoot: target.remoteRoot, authMode: 'password', storagePlacement: placement(f.input.serverId, oldId, target.remoteRoot) }
+  const submission = clusterSubmissionSchema.parse({ protocol: 4, name: 'Original CPU task', models: modelSnapshots(), experimentId: oldId, deploymentId: 'a'.repeat(64),
+    inventories: [{ serverId: f.input.serverId, inventory: inventory(target.remoteRoot) }], coordinator: server,
+    nodes: [{ server, devicePaths: ['/dev/nvidia0'], backendPath: '/usr/bin/bwrap', hiddenPaths: [], gpuInfo: 'Original CPU fixture' }],
+    objective: 'Original task', inputs: [], createdAt: 1, strategy: { mode: 'automatic', coordinator: 'single-agent' },
+    versions: { dsh: '0.2.0-rc.2', extension: '0.1.1', harness: 'a'.repeat(64), data: [] } })
+  const result = clusterRecordSchema.parse({ submission, payloadHash: 'b'.repeat(64), sequence: 1, revision: 3,
+    state: 'interrupted', resourcesReleased: true, executions: [], services: [], updatedAt: 1, handover: '本机派发完成，远端实验已接管' })
+  const recordInterruptions = vi.fn(async () => {})
+  f.inspectController.mockRejectedValueOnce(new Error('Original controller is offline'))
+  const run = f.run.getMockImplementation()!
+  f.run.mockImplementation(async (...args) => {
+    const reply = await run(...args)
+    if (args[1].includes('"mode":"begin"')) {
+      const operation = JSON.parse(args[1].slice(args[1].lastIndexOf(" '{") + 2, -1))
+      return JSON.stringify({ ...JSON.parse(reply), interruptions: [{ version: 1, experimentId: oldId, operationId: operation.operationId,
+        submissionHash: 'b'.repeat(64), reason: 'controller-recovery', stopRequested: false, phase: 'released', startedAt: 1, updatedAt: 1,
+        nodes: [{ serverId: f.input.serverId, name: server.name, phase: 'released', agentsExited: true, commandsReleased: true, servicesReleased: true, updatedAt: 1 }], result }] })
+    }
+    return reply
+  })
+  const repair = new ControllerRepair({ ...f.input, allowedExperimentIds: [oldId], allowedSubmissions: [{ submission, payloadHash: result.payloadHash }], recordInterruptions }, f.driver)
+  const response = await repair.repair(AbortSignal.timeout(1000), async () => {})
+  expect(response).toMatchObject({ repaired: true, verificationRequired: true, interruptions: [{ experimentId: oldId, phase: 'released' }] })
+  expect(recordInterruptions).toHaveBeenCalledOnce()
+  expect(recordInterruptions.mock.invocationCallOrder[0]).toBeLessThan(f.ensure.mock.invocationCallOrder[0]!)
 })

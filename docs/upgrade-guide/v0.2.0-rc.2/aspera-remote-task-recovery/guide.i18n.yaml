@@ -1,0 +1,16 @@
+# Bilingual-pair consistency record for guide.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write docs/upgrade-guide/v0.2.0-rc.2/aspera-remote-task-recovery/guide.md
+/:
+  en: e46a8a8454be1894
+  zh: 44aaa75648aa4b00
+/recover-remote-tasks-after-deleting-local-experiments:
+  en: 17688fd97597a341
+  zh: d4ee2566c268cf29
+/recover-remote-tasks-after-deleting-local-experiments/change:
+  en: 0e3ff1f593a0fb11
+  zh: 3831aa52190e8c60
+/recover-remote-tasks-after-deleting-local-experiments/migration:
+  en: a5f50f3bd5ac119a
+  zh: 21039fd5342360b5

@@ -103,13 +103,13 @@ export function inspectStorage(input = {}) {
 }
 
 /** Check a frozen mount and current capacity before writes, without choosing another disk. */
-export function verifyStorage(placement, requiredBytes = 0) {
+export function verifyStorage(placement, requiredBytes = 0, maintenance = false) {
   const mounts = parseMounts(readFileSync('/proc/self/mountinfo', 'utf8'))
   const observed = candidate(placement.candidate.directory, mounts)
   if (observed.id !== placement.candidate.id) throw new Error('Storage mount changed or disappeared; this experiment retains its original directory')
   if (!observed.writable || observed.persistence === 'ephemeral') throw new Error('Selected storage is not a writable disk')
   if (!Number.isSafeInteger(requiredBytes) || requiredBytes < 0) throw new Error('Invalid required storage size')
-  if (observed.availableBytes < placement.minimumFreeBytes + requiredBytes) throw new Error(`Insufficient storage at ${observed.directory}: ${observed.availableBytes} bytes available`)
+  if (!maintenance && observed.availableBytes < placement.minimumFreeBytes + requiredBytes) throw new Error(`Insufficient storage at ${observed.directory}: ${observed.availableBytes} bytes available`)
   for (const path of [placement.controlRoot, placement.namespaceRoot, placement.releaseRoot, placement.runRoot, placement.workspaceRoot]) rejectLinks(path)
   const namespace = placement.layout === 'legacy' ? placement.candidate.directory : posix.join(placement.candidate.directory, '.aspera', placement.serverId)
   if (placement.namespaceRoot !== namespace || namespace === '/'
@@ -192,6 +192,22 @@ export function removeOwnedTree(directory, owner) {
 export function cleanupStorage({ placement, privateNames }) {
   verifyStorage({ ...placement, minimumFreeBytes: 0 })
   const { serverId, experimentId, runRoot, namespaceRoot, controlRoot } = placement
+  const leases = posix.join(controlRoot, 'state/storage-governance-v1/environment-leases')
+  rejectLinks(leases)
+  if (existsSync(leases)) for (const name of readdirSync(leases).filter(name => name.endsWith('.json'))) {
+    const path = posix.join(leases, name); rejectLinks(path)
+    const value = JSON.parse(readFileSync(path, 'utf8'))
+    if (value.version !== 1 || value.serverId !== serverId || typeof value.sourceExperimentId !== 'string') throw new Error('Historical environment lease identity is unconfirmed')
+    if (value.sourceExperimentId === experimentId) throw new Error('Original environment is still borrowed by experiment ' + value.experimentId)
+  }
+  const materialLeases = posix.join(controlRoot, 'state/storage-governance-v1/material-source-leases')
+  rejectLinks(materialLeases)
+  if (existsSync(materialLeases)) for (const name of readdirSync(materialLeases).filter(name => name.endsWith('.json'))) {
+    const path = posix.join(materialLeases, name); rejectLinks(path)
+    const value = JSON.parse(readFileSync(path, 'utf8'))
+    if (value.version !== 1 || value.serverId !== serverId || typeof value.sourceExperimentId !== 'string') throw new Error('Historical material lease identity is unconfirmed')
+    if (value.sourceExperimentId === experimentId) throw new Error('Original model/data files are retained by immutable material ' + value.materialId)
+  }
   const allowed = new RegExp('^' + experimentId + '(?:-model)?\\.json$|^' + experimentId + '-[0-9a-f-]{36}\\.(?:known_hosts|identity)$')
   if (!Array.isArray(privateNames) || privateNames.some(name => !allowed.test(name))) throw new Error('Private file does not belong to the experiment')
   const controlMarker = posix.join(controlRoot, '.aspera-owner.json')
@@ -200,6 +216,21 @@ export function cleanupStorage({ placement, privateNames }) {
   const owner = { version: 1, serverId, experimentId }
   const quarantine = posix.join(namespaceRoot, '.cleanup-' + experimentId)
   rejectLinks(quarantine)
+  const arrangementPath = posix.join(existsSync(runRoot) ? runRoot : quarantine, 'storage-arrangement.v1.json')
+  rejectLinks(arrangementPath)
+  if (existsSync(arrangementPath)) {
+    const value = JSON.parse(readFileSync(arrangementPath, 'utf8'))
+    const trainingRoot = posix.join(controlRoot, 'training-storage-v1/runs', experimentId)
+    if (value.version !== 1 || value.formatVersion !== '0.1.0' || value.experimentId !== experimentId || value.serverId !== serverId
+      || value.controlRoot !== controlRoot || value.dataWorkspace !== placement.workspaceRoot
+      || value.environmentNamespace !== posix.join(controlRoot, 'training-storage-v1') || value.environmentWorkspace !== posix.join(trainingRoot, 'workspace')) throw new Error('Training cleanup directory differs from its registered experiment')
+    rejectLinks(trainingRoot)
+    const probe = existsSync(trainingRoot) ? trainingRoot : controlRoot
+    const mounted = inspectStorage({ directory: probe }).candidates.find(row => row.directory === probe)
+    if (mounted?.mount.source !== value.volume.source || mounted.mount.filesystem !== value.volume.filesystem || mounted.mount.mountPoint !== value.volume.directory
+      || String(statSync(existsSync(trainingRoot) ? trainingRoot : controlRoot).dev) !== value.volume.device) throw new Error('Training cleanup filesystem changed')
+    removeOwnedTree(trainingRoot, owner)
+  }
   if (existsSync(runRoot)) {
     const marker = posix.join(runRoot, '.aspera-owner.json')
     rejectLinks(marker)

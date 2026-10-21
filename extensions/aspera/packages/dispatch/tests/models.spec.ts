@@ -4,6 +4,7 @@ import { fromAny } from '@total-typescript/shoehorn'
 import type { Context } from '@deepseek-ai/cordis'
 import { expect, it } from 'vitest'
 import { experimentIdSchema } from '@aspera/experiments'
+import { resolveAdapterOptions, type Options } from '@deepseek-ai/dsh-llm-deepseek-api-key'
 import { getBuiltinModels } from '@earendil-works/pi-ai/providers/all'
 import { captureExperimentModels, experimentModelDirectory, validateExperimentModels } from '../src/models.ts'
 import { modelSelections } from '../../experiments/tests/fixtures.ts'
@@ -22,6 +23,31 @@ function fixture() {
   })
   return { ctx, options, secrets }
 }
+
+it.each([
+  {},
+  { thinking: 'enabled', reasoningEffort: 'low', fileExpiresAfterSeconds: 7200, fileRefreshMarginSeconds: 120,
+    fileQuotaCleanupBatch: 7, retryPolicy: { mode: 'normal', maxRetries: 2, retryableCodes: ['TRANSPORT'],
+      backoff: { initialDelayMs: 750, maxDelayMs: 3000, jitterRatio: 0.2 } } },
+  { thinking: 'disabled', retryPolicy: { mode: 'always', backoff: { initialDelayMs: 900, maxDelayMs: 4000, jitterRatio: 0 } } },
+] satisfies Options[])('captures reusable DeepSeek plugin inputs with their resolved defaults: %j', async overrides => {
+  const f = fixture()
+  const options = { apiKeyEnv: 'CUSTOM_KEY', baseURL: 'https://deepseek.example.test/anthropic', ...overrides }
+  Object.assign(f.ctx, { get: () => undefined })
+  Object.assign(f.ctx.llm, { listConfigurableProviders: () => [{ provider: 'deepseek-official', settingsNs: 'api', settingsPath: [] }] })
+  Object.assign(f.ctx.settings, { describe: () => [{ ns: 'api', value: options }] })
+  const selection = { provider: 'deepseek-official', model: 'test-model' }
+  const snapshots = await captureExperimentModels(f.ctx, experimentIdSchema.parse(randomUUID()),
+    { preparation: selection, planning: selection, execution: selection })
+  for (const phase of Object.values(snapshots)) {
+    const stored = JSON.parse(f.secrets.get(phase.configurationRef)!)
+    expect(resolveAdapterOptions(stored.options)).toEqual({ ...resolveAdapterOptions(options), apiKeyEnv: stored.keyRef })
+    expect(stored.options).not.toHaveProperty('defaults')
+    expect(stored.options).not.toHaveProperty('filePolicy')
+    expect(stored.options.retryPolicy).not.toHaveProperty('initialDelayMs')
+    expect(f.secrets.get(stored.keyRef)).toBe('private-original-key')
+  }
+})
 
 it('copies independent phase keys and keeps secrets out of the model directory and receipts', async () => {
   const f = fixture()

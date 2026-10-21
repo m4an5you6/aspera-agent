@@ -92,6 +92,22 @@ it('uses the saved application engines without consulting the local or installed
   expect(remote).toHaveBeenCalledTimes(2)
 })
 
+it.each([2, 3])('reads installer version %s without changing a saved release requirement', async installVersion => {
+  vi.mocked(remote).mockResolvedValueOnce(JSON.stringify({ version: 1, deploymentId: digest, dsh: '0.2.0-rc.2', extension: '0.1.1' }))
+    .mockResolvedValueOnce(JSON.stringify({ packageManager: 'pnpm@11.7.0', engines: { node: '>=22.19.0' },
+      dependencies: { '@deepseek-ai/dsh': '0.2.0-rc.2' }, asperaEnvironmentTools: { uvVersion: '0.13.0', installVersion,
+        ...(installVersion === 3 ? { pipVersion: '26.2.1' } : {}) } }))
+  expect(await installedEnvironmentRequirements(target, '/original/release', digest)).toEqual({ node: '>=22.19.0', pnpm: '11.7.0', uv: '0.13.0',
+    ...(installVersion === 3 ? { pip: '26.2.1' } : {}) })
+})
+
+it('rejects an installer-v3 release without a fixed pip version', async () => {
+  vi.mocked(remote).mockResolvedValueOnce(JSON.stringify({ version: 1, deploymentId: digest, dsh: '0.2.0-rc.2', extension: '0.1.1' }))
+    .mockResolvedValueOnce(JSON.stringify({ packageManager: 'pnpm@11.7.0', engines: { node: '>=22.19.0' },
+      dependencies: { '@deepseek-ai/dsh': '0.2.0-rc.2' }, asperaEnvironmentTools: { uvVersion: '0.13.0', installVersion: 3 } }))
+  await expect(installedEnvironmentRequirements(target, '/original/release', digest)).rejects.toBeInstanceOf(SavedReleaseUnavailable)
+})
+
 it.each(['unknown release', 'changed installed version', 'changed dependency', 'invalid engines'])('rejects %s instead of guessing a requirement', async failure => {
   const dsh = failure === 'unknown release' ? '0.9.0' : '0.2.0-rc.2'
   vi.mocked(remote).mockResolvedValueOnce(JSON.stringify({ version: 1, deploymentId: digest, dsh, extension: '0.1.1' }))

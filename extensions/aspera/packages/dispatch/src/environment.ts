@@ -11,7 +11,11 @@ import { SavedReleaseUnavailable, verifySavedRelease } from './cluster-deploy.ts
 import { experimentIsolationArgs } from '@aspera/runtime'
 
 /** Runtime requirements owned by the source release manifest. */
-export interface EnvironmentRequirements { node: string; pnpm: string }
+export interface EnvironmentRequirements { node: string; pnpm: string; uv?: string; pip?: string }
+
+const environmentTools = z.object({ uvVersion: z.string().regex(/^\d+\.\d+\.\d+$/), pipVersion: z.string().regex(/^\d+\.\d+(?:\.\d+)?$/).optional(),
+  reuseVersion: z.literal(1).optional(), cleanupVersion: z.literal(1).optional(), installVersion: z.union([z.literal(2), z.literal(3)]).optional(), storageVersion: z.literal(1).optional(), storageFormat: z.literal('0.1.0').optional() })
+  .strict().refine(value => value.installVersion !== 3 || value.pipVersion !== undefined, 'Installer v3 requires an exact pip version').optional()
 
 const enginesSchema = z.object({ node: z.string().min(1).refine(value => validRange(value) !== null, 'Invalid Node engine range') })
 // Historical release requirements stay fixed when the local application changes its Node support.
@@ -23,14 +27,15 @@ const legacyNodeEngines: Readonly<Record<string, string | undefined>> = {
  * Read dependency versions from the independent application's release manifest.
  * @param root - source or installed application directory.
  * @param identity - verified historical release identity, when its manifest predates engines.
- * @returns Node engine range and exact pnpm version.
+ * @returns Node engine range and fixed pnpm, uv and installer pip versions when declared.
  */
 export function environmentRequirements(root: string, identity?: { extension: string; dsh: string }): EnvironmentRequirements {
   const manifest = z.object({ engines: enginesSchema.optional(),
-    packageManager: z.string().regex(/^pnpm@\d+\.\d+\.\d+$/) }).parse(JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')))
+    packageManager: z.string().regex(/^pnpm@\d+\.\d+\.\d+$/), asperaEnvironmentTools: environmentTools }).parse(JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')))
   const node = manifest.engines?.node ?? (identity === undefined ? undefined : legacyNodeEngines[`${identity.extension}/${identity.dsh}/${manifest.packageManager}`])
   if (node === undefined) throw new Error('Original release has no recorded Node requirement')
-  return { node, pnpm: manifest.packageManager.slice(5) }
+  return { node, pnpm: manifest.packageManager.slice(5), ...(manifest.asperaEnvironmentTools === undefined ? {} : { uv: manifest.asperaEnvironmentTools.uvVersion,
+    ...(manifest.asperaEnvironmentTools.pipVersion === undefined ? {} : { pip: manifest.asperaEnvironmentTools.pipVersion }) }) }
 }
 
 /**
@@ -46,7 +51,7 @@ export async function installedEnvironmentRequirements(target: Target, release: 
   const identity = await verifySavedRelease(target, release, digest, password, signal)
   try {
     const manifest = z.object({ packageManager: z.string().regex(/^pnpm@\d+\.\d+\.\d+$/), engines: enginesSchema.optional(),
-      dependencies: z.object({ '@deepseek-ai/dsh': z.literal(identity.dsh) }) })
+      dependencies: z.object({ '@deepseek-ai/dsh': z.literal(identity.dsh) }), asperaEnvironmentTools: environmentTools })
       .parse(JSON.parse(await remote(target, `cat ${shellQuote(release + '/package.json')}`, signal, password)))
     let node = manifest.engines?.node
     if (node === undefined) {
@@ -55,7 +60,8 @@ export async function installedEnvironmentRequirements(target: Target, release: 
       node = dsh.engines?.node ?? legacyNodeEngines[`${identity.extension}/${identity.dsh}/${manifest.packageManager}`]
     }
     if (node === undefined) throw new Error(`No recorded Node requirement for Aspera ${identity.extension}, DSH ${identity.dsh}, ${manifest.packageManager}`)
-    return { node, pnpm: manifest.packageManager.slice(5) }
+    return { node, pnpm: manifest.packageManager.slice(5), ...(manifest.asperaEnvironmentTools === undefined ? {} : { uv: manifest.asperaEnvironmentTools.uvVersion,
+      ...(manifest.asperaEnvironmentTools.pipVersion === undefined ? {} : { pip: manifest.asperaEnvironmentTools.pipVersion }) }) }
   } catch (error) {
     signal?.throwIfAborted()
     if (error instanceof RemoteCommandError && !error.result.exitConfirmed) throw error
@@ -76,7 +82,7 @@ printf 'ASPERA_SYSTEM=%s\\n' "$(uname -s)"
 printf 'ASPERA_ARCH=%s\\n' "$(uname -m)"
 printf 'ASPERA_ID=%s\\n' "$(id)"
 test ! -f /etc/os-release || cat /etc/os-release
-for program in node pnpm python3 bwrap; do
+for program in node pnpm python3 bwrap uv; do
   binary=$(command -v "$program" || true)
   printf 'ASPERA_PATH_%s=%s\\n' "$program" "$binary"
   if [ -n "$binary" ]; then
@@ -98,7 +104,7 @@ printf 'ASPERA_SANDBOX=%s\\n' "$sandbox_status"
   return serverEnvironmentSchema.parse({
     home: fields.get('ASPERA_HOME'), system: fields.get('ASPERA_SYSTEM'),
     architecture: fields.get('ASPERA_ARCH'), identity: fields.get('ASPERA_ID'),
-    programs: (['node', 'pnpm', 'python3', 'bwrap'] as const).map(name => ({
+    programs: (['node', 'pnpm', 'python3', 'bwrap', 'uv'] as const).map(name => ({
       name, path: fields.get(`ASPERA_PATH_${name}`) ?? '', version: fields.get(`ASPERA_VERSION_${name}`) ?? '',
     })), sandboxExitCode: Number(fields.get('ASPERA_SANDBOX')),
     diagnostics: [result.stderr, result.stdout].filter(Boolean).join('\n'),
@@ -124,12 +130,15 @@ export function checkEnvironment(observation: ServerEnvironment, requirements: E
   if (!node || !valid(node.version) || !satisfies(node.version, requirements.node)) failures.push(`Node must satisfy ${requirements.node}; observed ${node?.version || 'missing'}`)
   if (pnpm?.version !== requirements.pnpm) failures.push(`pnpm must be ${requirements.pnpm}; observed ${pnpm?.version || 'missing'}`)
   if (!python?.version.startsWith('Python 3.')) failures.push('Python 3 is required for the CUDA probe')
+  const uv = program('uv')
+  if (requirements.uv !== undefined && (!uv?.path.startsWith('/') || uv.version.split(/\s+/)[1] !== requirements.uv)) failures.push(`uv must be ${requirements.uv}; observed ${uv?.version || 'missing'}`)
   if (observation.sandboxExitCode !== 0) failures.push(`bubblewrap probe exited ${observation.sandboxExitCode}: ${observation.diagnostics}`)
   if (failures.length > 0) return { ready: false, failures }
   const toolchain = preparedToolchainSchema.parse({
     node: node?.path, pnpm: pnpm?.path, python3: python?.path, bwrap: bwrap?.path,
     nodeVersion: node?.version, pnpmVersion: pnpm?.version,
-    pathEntries: [...new Set([...pathEntries, ...observation.programs.map(value => posix.dirname(value.path))])],
+    ...(requirements.uv === undefined ? {} : { uv: uv?.path, uvVersion: requirements.uv }),
+    pathEntries: [...new Set([...pathEntries, ...observation.programs.filter(value => value.path.startsWith('/')).map(value => posix.dirname(value.path))])],
   })
   return { ready: true, toolchain }
 }

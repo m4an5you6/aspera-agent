@@ -6,6 +6,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { setupWorkerProfile } from './profiles.ts'
 import type { Context } from '@deepseek-ai/cordis'
 import { serverRunRoot, serverReleaseRoot } from './storage.ts'
+import { ownedAgentArgv } from './owned-command.ts'
 import { networkProofSchema } from './network-probes.ts'
 import { z } from 'zod'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
@@ -17,6 +18,9 @@ import { request } from './transport.ts'
 import { readClusterChunk } from '@aspera/experiments'
 import { observationSourceIdSchema } from '@aspera/experiments'
 import { ObservationWriter } from './observations.ts'
+import type { PhaseContextPolicy } from './phase-context.ts'
+import { managedEnvironmentPolicyForRelease, managedEnvironmentPolicySchema } from './managed-environment.ts'
+import type { FinalizationPolicy } from './finalization-policy.ts'
 
 /** Complete model selection captured before dispatch, including provider-owned reasoning effort. */
 export const clusterAgentModelSchema = z.object({ provider: z.string(), model: z.string(),
@@ -34,6 +38,11 @@ export const clusterPrivateSchema = z.object({
 }).strict()
 /** Host-only settings kept outside Agent workspaces. */
 export type ClusterPrivate = z.infer<typeof clusterPrivateSchema>
+/** A received authenticated HTTP rejection differs from a lost or unreadable launch response. */
+export class ClusterNodeOperationError extends Error {
+  /** @param status - actual HTTP response. @param detail - node-owned diagnostic. */
+  constructor(readonly status: number, detail: string) { super(detail); this.name = 'ClusterNodeOperationError' }
+}
 
 /** Bounds shared by coordinator and execution processes. */
 export interface ClusterRuntimeConfig {
@@ -45,7 +54,10 @@ export interface ClusterRuntimeConfig {
   documentationHosts: string[]
   documentationBytes: number
   goalContinuationWindow: number
+  agentContext?: PhaseContextPolicy
   observations?: import('@aspera/experiments').ObservationPolicy
+  managedEnvironments?: import('./managed-environment.ts').ManagedEnvironmentPolicy
+  finalization?: FinalizationPolicy
 }
 
 /**
@@ -90,7 +102,7 @@ export async function clusterNodeRequest(runtime: ClusterPrivate, serverId: Expe
     toolTimeoutMs: runtime.toolTimeoutMs }, connection.token, path, 'POST', payload, signal, connection.password)
   if (result.status !== 200) {
     const error = z.object({ error: z.string() }).safeParse(result.value)
-    throw new Error(error.success ? error.data.error : `node ${node.server.name} returned HTTP ${result.status}`)
+    throw new ClusterNodeOperationError(result.status, error.success ? error.data.error : `node ${node.server.name} returned HTTP ${result.status}`)
   }
   return result.value
 }
@@ -189,13 +201,15 @@ async function prepareNodes(config: ClusterRuntimeConfig, runtime: ClusterPrivat
 /**
  * Read settled command facts from every assigned node.
  * @param runtime - node credentials.
+ * @param signal - optional caller cancellation.
  * @returns all command exit and cleanup facts.
  */
 export async function clusterCommandStatuses(
   runtime: ClusterPrivate,
+  signal?: AbortSignal,
 ): Promise<{ serverId: ExperimentServerId; commands: ClusterCommandResult[] }[]> {
   return Promise.all(runtime.submission.nodes.map(async node => ({ serverId: node.server.id,
-    commands: z.array(clusterCommandResultSchema).parse(await clusterNodeRequest(runtime, node.server.id, 'status')) })))
+    commands: z.array(clusterCommandResultSchema).parse(await clusterNodeRequest(runtime, node.server.id, 'status', {}, signal)) })))
 }
 
 /**
@@ -291,12 +305,17 @@ export class RemoteClusterExecutor implements ClusterExecutor {
     const submission = record.submission
     const runtime = await validateClusterAdmission(this.config, submission)
     const runRoot = serverRunRoot(submission.coordinator, submission.experimentId)
+    if (existsSync(resolve(this.config.root, 'state/interruption-fences', `${submission.experimentId}.json`))) throw new Error('Experiment interruption prevents another Agent launch')
     const workspace = resolve(runRoot, 'agent-workspace')
     mkdirSync(workspace, { recursive: true, mode: 0o700 })
     const home = resolve(runRoot, 'agent-homes', planning ? 'plan' : 'execution')
     const release = serverReleaseRoot(submission.coordinator, submission.deploymentId)
     // Profiles are installed before launching; no mutable checkout or CLI argv escape is used.
     await setupWorkerProfile(home, release)
+    const manifest = z.object({ asperaEnvironmentTools: z.object({ installVersion: z.union([z.literal(2), z.literal(3)]).optional(), storageVersion: z.literal(1).optional(), storageFormat: z.literal('0.1.0').optional() }).optional() })
+      .parse(JSON.parse(readFileSync(resolve(release, 'package.json'), 'utf8')))
+    const environmentPolicy = managedEnvironmentPolicyForRelease(managedEnvironmentPolicySchema.parse(this.config.managedEnvironments ?? {}),
+      manifest.asperaEnvironmentTools?.installVersion === 3, manifest.asperaEnvironmentTools?.storageVersion === 1, manifest.asperaEnvironmentTools?.storageFormat === '0.1.0')
     if (!planning) writeClusterReceipt(this.config.root, submission.experimentId, { cleanupConfirmed: false }, 'execution.json')
     const credentials = z.object({ refs: z.record(z.string(), z.string()) }).parse(JSON.parse(readFileSync(runtime.modelCredentialFile, 'utf8')))
     const logObservation = new ObservationWriter(runRoot, { version: 1, experimentId: submission.experimentId, serverId: submission.coordinator.id,
@@ -304,7 +323,9 @@ export class RemoteClusterExecutor implements ClusterExecutor {
       sessionId: `aspera-${planning ? 'plan' : 'execution'}-${submission.experimentId}`, label: planning ? 'planning' : 'execution',
       createdAt: Date.now(), streams: ['stdout', 'stderr'], complete: false }, [...Object.values(credentials.refs),
         ...runtime.connections.flatMap(connection => [connection.token, ...(connection.password === undefined ? [] : [connection.password])])])
-    const child = this.ctx.subprocess.spawn({ argv: [process.execPath, resolve(release, 'node_modules/@deepseek-ai/dsh/lib/bin.js'), '--profile', 'aspera-worker'],
+    const child = this.ctx.subprocess.spawn({ argv: ownedAgentArgv(runRoot, { experimentId: submission.experimentId, serverId: submission.coordinator.id,
+      controlRoot: this.config.root, deploymentId: submission.deploymentId, role: planning ? 'planner' : 'agent' },
+      [process.execPath, resolve(release, 'node_modules/@deepseek-ai/dsh/lib/bin.js'), '--profile', 'aspera-worker']),
       cwd: workspace, graceMs: this.config.cleanupTimeoutMs, signal,
       env: { DSH_HOME: home, DSH_EXPERIMENT_ROLE: planning ? 'planner' : 'agent', DSH_CLUSTER_ROOT: this.config.root,
         DSH_CLUSTER_EXPERIMENT: submission.experimentId, DSH_CLUSTER_GENERATION: readFileSync(resolve(this.config.root, 'state', 'coordinator.generation'), 'utf8'),
@@ -312,6 +333,9 @@ export class RemoteClusterExecutor implements ClusterExecutor {
         DSH_CLUSTER_CLEANUP_MS: String(this.config.cleanupTimeoutMs), DSH_CLUSTER_POLL_MS: String(this.config.pollIntervalMs),
         DSH_CLUSTER_DOCUMENTATION_HOSTS: JSON.stringify(this.config.documentationHosts), DSH_CLUSTER_DOCUMENTATION_BYTES: String(this.config.documentationBytes),
         DSH_CLUSTER_GOAL_WINDOW: String(this.config.goalContinuationWindow),
+        DSH_CLUSTER_CONTEXT_POLICY_JSON: JSON.stringify(this.config.agentContext ?? {}),
+        DSH_CLUSTER_FINALIZATION_POLICY_JSON: JSON.stringify(this.config.finalization ?? {}),
+        DSH_CLUSTER_ENVIRONMENT_POLICY_JSON: JSON.stringify(environmentPolicy),
         DSH_EXPERIMENT_TOKEN_FILE: resolve(this.config.root, 'secrets/coordinator.token'),
         DSH_EXPERIMENT_MODEL_CREDENTIAL_FILE: runtime.modelCredentialFile, DSH_EXPERIMENT_DEPLOYMENT_ID: submission.deploymentId,
         DSH_EXPERIMENT_PORT: '0', DSH_EXPERIMENT_DEVICES: '', DSH_TELEMETRY_DISABLED: '1' },

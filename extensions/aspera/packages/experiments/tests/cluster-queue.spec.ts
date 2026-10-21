@@ -190,7 +190,23 @@ it('retains occupancy after failed cleanup, and resumes queued work after confir
   await vi.waitFor(() => { expect(f.queue.get(first.experimentId)?.state).toBe('failed') })
   expect(f.queue.get(second.experimentId)?.state).toBe('queued')
   await f.queue.cancel(first.experimentId)
+  expect(f.queue.get(first.experimentId)).toMatchObject({ state: 'failed', detail: 'node unreachable', resourcesReleased: true })
   await vi.waitFor(() => { expect(f.started.has(second.experimentId)).toBe(true) })
+})
+
+it('ignores late Agent activity after an independently recorded interrupted outcome', async () => {
+  const f = fixture(); const input = submission([serverIdSchema.parse(randomUUID())])
+  const outcome = Promise.withResolvers<ClusterOutcome>()
+  let activity: Parameters<ClusterExecutor['run']>[3] | undefined
+  f.executor.run = async (_record, _signal, started, update) => { activity = update; await started('original-session', 'original-goal'); return outcome.promise }
+  await f.queue.submit(input)
+  await vi.waitFor(() => { expect(activity).toBeDefined() })
+  const interrupted = { ...f.queue.get(input.experimentId)!, state: 'interrupted' as const, resourcesReleased: true, revision: 20, detail: 'Controller exited' }
+  f.records.set(input.experimentId, interrupted)
+  await activity!({ state: 'running', progress: { phase: 'late training', metrics: {}, updatedAt: 99 } })
+  outcome.resolve({ state: 'completed', resourcesReleased: true })
+  await f.queue.close()
+  expect(f.queue.get(input.experimentId)).toEqual(interrupted)
 })
 
 it('recovers durable queue order without replaying interrupted training', async () => {

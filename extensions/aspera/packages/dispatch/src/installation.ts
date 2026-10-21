@@ -92,6 +92,8 @@ export class InstallationRecovery {
   }
   /** @param id - experiment. @returns whether a pre-existing policy and material journal can be resumed. */
   has(id: ExperimentId): boolean { return this.store.table('installations').get(id) !== undefined }
+  /** @param id - experiment. @param serverId - selected node. @returns the original round deadline without resetting it. */
+  deadline(id: ExperimentId, serverId: ExperimentServerId): number { return this.round(id, serverId).deadline }
   /** @param id - experiment. @returns retained original material metadata, if available. */
   material(id: ExperimentId): PreparationRecord['material'] { return this.store.table('installations').get(id)?.material }
   /** @param ids - currently visible experiments. @returns public progress without private archive paths. */

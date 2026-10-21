@@ -25,10 +25,14 @@ export function installStorageReplay(ctx, observedCalls, environmentCalls = []) 
   ctx.on('llm/stream', async function* (options, next) {
     let input
     let sourceProbeId
+    let timeoutRecovered = false
+    let taskReleaseObserved = false
     for (const message of options.messages) for (const block of message.content ?? []) {
       if (block.type !== 'text' || !block.text.startsWith('{')) continue
       try {
         const value = JSON.parse(block.text)
+        if (value.timedOut === true && value.exitConfirmed === true && value.stderr.includes('cache was retained')) timeoutRecovered = true
+        if (value.repaired === true && value.interruptions?.some(task => task.phase === 'released')) taskReleaseObserved = true
         if (value.available === true && value.kind === 'npm' && typeof value.id === 'string') sourceProbeId = value.id
         if (value.operation === 'prepare-experiment-environment' && value.verification?.ready !== true) input = value
         if (value.operation === 'prepare-experiment-storage' && value.servers.some(server => server.selected === undefined)) input = value
@@ -37,25 +41,32 @@ export function installStorageReplay(ctx, observedCalls, environmentCalls = []) 
     }
     if (input === undefined) { yield* next(); return }
     const names = (options.tools ?? []).map(tool => tool.name).sort()
-    const expectedTools = ['inspect_server_storage', 'select_experiment_storage', 'inspect_preparation_environment', 'run_preparation_command', 'verify_preparation_environment', 'report_preparation_blocked',
-      'inspect_preparation_installation', 'probe_preparation_source', 'switch_preparation_source', 'repair_preparation_controller'].sort()
+    const expectedTools = ['inspect_server_storage', 'select_experiment_storage', 'inspect_preparation_environment', 'run_preparation_command', 'prepare_preparation_tool', 'verify_preparation_environment', 'report_preparation_blocked',
+      'inspect_preparation_installation', 'probe_preparation_source', 'switch_preparation_source', 'repair_preparation_controller', 'repair_preparation_sandbox',
+      'assess_experiment_storage', 'inspect_experiment_materials', 'preview_experiment_cache_cleanup', 'cleanup_experiment_cache'].sort()
     if (JSON.stringify(names) !== JSON.stringify(expectedTools)) throw new Error('Preparation tool scope changed: ' + names.join(','))
     if (input.operation === 'prepare-experiment-environment') {
       const key = input.experimentId + '/' + input.serverId + '/' + input.step
       const step = turns.get(key) ?? 0
+      if (input.serverName === 'CPU preparation timeout' && step >= 2 && !timeoutRecovered) throw new Error('The preparation Agent did not receive the original confirmed timeout')
+      if (input.serverName === 'CPU controller-offline-deleted' && input.step === 'controller' && step >= 2 && !taskReleaseObserved) {
+        throw new Error('The preparation Agent did not receive the program-confirmed deleted-task release receipt')
+      }
       turns.set(key, step + 1)
-      const sandboxRefused = input.verification?.diagnostic?.stage === 'sandbox-launch' && input.verification?.diagnostic?.requiresPlatformAction
+      const sandboxRefused = input.verification?.diagnostic?.stage === 'sandbox-launch'
+        && input.verification?.diagnostic?.exitCode !== 127
       const operations = sandboxRefused ? input.serverName.includes('claim') ? [
         ['inspect_preparation_environment', {}],
       ] : [
         ['inspect_preparation_environment', {}],
-        ['run_preparation_command', { command: 'fixture repair sandbox configuration' }],
+        ['repair_preparation_sandbox', {}],
         ['verify_preparation_environment', { path_entries: [] }],
         ...(input.serverName.includes('blocked') ? [['report_preparation_blocked', { reason: 'The container still denies mounting /proc with the required user namespace. The cloud platform must provide these permissions before revalidation.' }]] : []),
       ] : input.step === 'controller' && input.controllerRepairAvailable ? [
         ['inspect_preparation_environment', {}],
         ['repair_preparation_controller', {}],
         ['verify_preparation_environment', { path_entries: [] }],
+        ...(input.serverName.includes('offline-blocked') ? [['report_preparation_blocked', { reason: 'Original command exit is not confirmed; controller recovery remains blocked until resource release is verified.' }]] : []),
       ] : input.step === 'deployment' ? [
         ['inspect_preparation_installation', {}],
         ['probe_preparation_source', { kind: 'npm', url: 'https://cpu-mirror.example.test/npm/' }],
@@ -65,6 +76,8 @@ export function installStorageReplay(ctx, observedCalls, environmentCalls = []) 
         ['inspect_preparation_environment', {}],
         ['run_preparation_command', { command: 'fixture install dependencies' }],
         ['run_preparation_command', { command: 'fixture retry installation' }],
+        ['inspect_preparation_environment', {}],
+        ['prepare_preparation_tool', { tool: 'uv' }],
         ['verify_preparation_environment', { path_entries: [] }],
       ]
       const operation = operations[step]
@@ -75,7 +88,9 @@ export function installStorageReplay(ctx, observedCalls, environmentCalls = []) 
         return
       }
       const [name, args] = operation
-      environmentCalls.push({ experimentId: input.experimentId, serverId: input.serverId, step: input.step, name })
+      environmentCalls.push({ experimentId: input.experimentId, serverId: input.serverId, step: input.step, name,
+        ...(input.serverName === 'CPU preparation timeout' ? { timeoutRecovered } : {}),
+        ...(input.serverName === 'CPU controller-offline-deleted' ? { taskReleaseObserved } : {}) })
       yield { type: 'block-start', index: 0, blockType: 'tool-call' }
       yield { type: 'block-end', index: 0, block: { type: 'tool-call', id: ToolCallId(randomUUID()), name, arguments: JSON.stringify({ server_id: input.serverId, ...args }) } }
       yield { type: 'usage', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }

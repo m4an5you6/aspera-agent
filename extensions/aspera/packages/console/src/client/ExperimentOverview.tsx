@@ -9,6 +9,13 @@ import { InstallationProgress as InstallationRecords } from './InstallationProgr
 import type { ExecutionProgressView } from './controller.ts'
 import { experimentPhases, experimentProgress } from './experiment-progress.ts'
 import css from './ExperimentsPage.module.css'
+import type { ExperimentInterruptionStatus } from '@aspera/experiments/types'
+import { interruptionView } from './interruption-view.ts'
+import type { PreparationBlockedTask } from './interruption-view.ts'
+import { EnvironmentStorage } from './EnvironmentStorage.tsx'
+import { CompletionReview } from './CompletionReview.tsx'
+import { FinalizationStatus } from './FinalizationStatus.tsx'
+import type { ExperimentsController } from './controller.ts'
 
 type Props = { row: FleetExperiment; t: TranslateNS<'experiments'> }
 
@@ -17,7 +24,12 @@ type Props = { row: FleetExperiment; t: TranslateNS<'experiments'> }
  * @param props - saved experiment, pending operation and real detail-page destinations.
  * @returns an overview with four phases and responsive work/information columns.
  */
-export function ExperimentOverview({ row, t, retrying, onRetry, onView, children, installations, execution }: Props & {
+export function ExperimentOverview({ row, t, retrying, onRetry, onView, children, installations, execution, activityConfirmed, interruption, interrupting, onInterrupt, blockingTasks, onOpenTask, controller, archive }: Props & {
+  controller: ExperimentsController
+  archive?: ReactNode
+  blockingTasks?: PreparationBlockedTask[]; onOpenTask?: (id: PreparationBlockedTask['experimentId']) => void
+  interruption?: ExperimentInterruptionStatus; interrupting?: boolean; onInterrupt?: () => void
+  activityConfirmed?: boolean
   installations: InstallationProgress[]
   execution: ExecutionProgressView | undefined
   retrying: boolean; onRetry: () => void; onView: (tab: 'agentRecords' | 'monitoring' | 'files' | 'services') => void; children: ReactNode
@@ -25,6 +37,7 @@ export function ExperimentOverview({ row, t, retrying, onRetry, onView, children
   const plan = useRef<HTMLDivElement>(null)
   const diagnostics = useRef<HTMLDivElement>(null)
   const { phase, status, local, busy, attention } = experimentProgress(row)
+  const stopping = interruptionView(row, interruption, interrupting)
   const showPlan = () => {
     const disclosure = plan.current?.querySelector<HTMLDetailsElement>('details[data-execution-plan]')
     if (disclosure !== null && disclosure !== undefined) disclosure.open = true
@@ -41,26 +54,30 @@ export function ExperimentOverview({ row, t, retrying, onRetry, onView, children
     <section className={css.pipelineSection} aria-label={t('experimentProgress')}>
       <h3 className={css.pipelineLabel}>{t('experimentProgress')}</h3>
       <ol className={css.pipeline}>{experimentPhases.map((label, index) => {
-        const complete = index < phase || status === 'completed'
+        const complete = index < phase || status === 'completed' || status === 'revalidated'
         const current = index === phase
-        const active = current && (busy || retrying)
-        const needsAttention = current && attention && !retrying
+        const active = current && (status === 'reviewing' || stopping.busy || !stopping.blocked && interruption?.phase !== 'released' && ((busy && (local || activityConfirmed !== false)) || retrying))
+        const needsAttention = current && (stopping.blocked || attention && !retrying)
         const state = complete ? 'complete' : current ? needsAttention ? 'attention' : active ? 'active' : 'waiting' : 'pending'
         return <li key={label} aria-current={current ? 'step' : undefined} data-state={state}>
           <span className={css.stepCircle} aria-hidden="true">{complete ? <IconCheckOutlineRegular size={18} /> : active ? <StateDot state="ongoing" size={19} /> : needsAttention ? <IconWarningOutlineRegular size={18} /> : current ? <IconClockOutlineRegular size={18} /> : index + 1}</span>
-          <span className={css.stepCopy}><span>{t(label)}</span><small>{t(complete ? 'completed' : current ? retrying ? 'retrying' : status : 'notStarted')}</small></span>
+          <span className={css.stepCopy}><span>{t(label)}</span><small>{t(complete ? 'completed' : current ? stopping.busy ? 'interruptingExperiment' : stopping.blocked ? 'interruptionBlocked' : stopping.userInterrupted ? 'interruptedByUser' : retrying ? 'retrying' : status : 'notStarted')}</small></span>
         </li>
       })}</ol>
     </section>
     <div className={css.overviewColumns}>
       <div className={css.workColumn}>
-        <ExperimentStage row={row} t={t} retrying={retrying} installations={installations} onRetry={onRetry} onRecords={() => { onView('agentRecords') }} onMonitor={() => { onView('monitoring') }}
+        <ExperimentStage row={row} t={t} retrying={retrying} activityConfirmed={activityConfirmed} interruption={interruption} interrupting={interrupting} onInterrupt={onInterrupt} blockingTasks={blockingTasks} onOpenTask={onOpenTask} installations={installations} onRetry={onRetry} onRecords={() => { onView('agentRecords') }} onMonitor={() => { onView('monitoring') }}
           onFiles={() => { onView('files') }} onServices={() => { onView('services') }} onPlan={showPlan} onDiagnostics={showDiagnostics} />
+        <CompletionReview row={row} controller={controller} t={t} onRecords={() => { onView('agentRecords') }} />
         <div className={css.planArea} ref={plan} tabIndex={-1}>{children}</div>
         <div ref={diagnostics} className={css.diagnosticsArea} tabIndex={-1}><ExperimentDiagnostics row={row} t={t} readError={execution?.error} /></div>
       </div>
       <aside className={css.infoColumn} aria-label={t('experimentInformation')}><PreparationNodes row={row} t={t} />
+        {archive}
         {!local && installations.length > 0 && <details className={css.infoSection}><summary>{t('installationRecovery')}</summary><InstallationRecords row={row} installations={installations} t={t} onLogs={() => { onView('monitoring') }} /></details>}
+        {row.submission?.protocol === 4 && <FinalizationStatus key={`finalization-${row.request.experimentId}`} id={row.request.experimentId} controller={controller} t={t} active={busy && !stopping.blocked && !stopping.userInterrupted && activityConfirmed !== false} />}
+        {row.submission?.protocol === 4 && <EnvironmentStorage key={row.request.experimentId} id={row.request.experimentId} placements={row.preparation?.placements} controller={controller} t={t} active={busy && !stopping.blocked && !stopping.userInterrupted && activityConfirmed !== false} />}
         <ExperimentInformation row={row} t={t} /></aside>
     </div>
     <p className={css.overviewFooter}>{row.receipt !== undefined ? row.receipt.handover : local && busy ? t('keepOpenForPreparation') : t('recordsRetained')}</p>
@@ -109,6 +126,7 @@ function PreparationNodes({ row, t }: Props) {
 
 function ExperimentInformation({ row, t }: Props) {
   const { local, remote } = experimentProgress(row)
+  const storageInDialog = row.submission?.protocol === 4
   const modelGroups = new Map<string, { model: NonNullable<FleetExperiment['models']>['preparation']; phases: ('preparation' | 'planning' | 'execution')[] }>()
   for (const phase of ['preparation', 'planning', 'execution'] as const) {
     const model = row.models?.[phase]
@@ -134,14 +152,15 @@ function ExperimentInformation({ row, t }: Props) {
     {modelGroups.size > 0 && <section className={css.infoSection}><h3>{t('agentModels')}</h3>{[...modelGroups.entries()].map(([key, group]) => <div className={css.infoModel} key={key}>
       <div className={css.sectionHeading}><span className={css.hint}>{group.phases.map(phase => t(`${phase}Model`)).join(' · ')}</span><Tag>{group.model.provider}</Tag></div><p>{group.model.model}</p>
     </div>)}</section>}
-    {(row.preparation?.placements.length ?? 0) > 0 && <section className={css.infoSection} aria-label={t('resolvedStorage')}><h3>{t('resolvedStorage')}</h3>{row.preparation?.placements.map(placement => {
+    {(row.preparation?.placements.length ?? 0) > 0 && <section className={css.infoSection} aria-label={t(storageInDialog ? 'resolvedNetwork' : 'resolvedStorage')}><h3>{t(storageInDialog ? 'resolvedNetwork' : 'resolvedStorage')}</h3>{row.preparation?.placements.map(placement => {
       const server = [row.coordinator, ...row.servers].find(value => value.id === placement.serverId)
-      return <div className={css.infoStorage} key={placement.serverId}><span className={css.hint}>{server?.name}</span><code className={css.storagePath}>{placement.candidate.directory}</code>
-        <p className={css.hint}>{t('availableGiB', { size: (placement.candidate.availableBytes / 1024 ** 3).toLocaleString(undefined, { maximumFractionDigits: 1 }) })} · {t(placement.candidate.persistence)}</p>
+      return <div className={css.infoStorage} key={placement.serverId}><span className={css.hint}>{server?.name}</span>
+        {storageInDialog ? <dl className={css.infoFacts}><div><dt>{t('trainingAddress')}</dt><dd>{server?.trainingAddress ?? (row.servers.length === 1 ? t('networkUnused') : t('noNetworkAddress'))}</dd></div></dl> : <>
+        <code className={css.storagePath}>{placement.candidate.directory}</code>
         <details className={css.infoDisclosure}><summary>{t('storageDetails')}</summary><dl className={css.infoFacts}>
           <div><dt>{t('workspaceDirectory')}</dt><dd><code>{placement.workspaceRoot}</code></dd></div><div><dt>{t('selectionReason')}</dt><dd>{placement.reason}</dd></div>
           <div><dt>{t('trainingAddress')}</dt><dd>{server?.trainingAddress ?? (row.servers.length === 1 ? t('networkUnused') : t('noNetworkAddress'))}</dd></div>
-        </dl></details>
+        </dl></details></>}
       </div>
     })}</section>}
     <details className={css.infoSection}><summary>{t('fullGoal')}</summary><div className={css.prewrap}>{row.request.objective}</div></details>

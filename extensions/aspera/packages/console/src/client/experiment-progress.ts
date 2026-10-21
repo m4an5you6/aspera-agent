@@ -11,11 +11,14 @@ export const experimentPhases = ['prepareEnvironment', 'makePlan', 'executePlan'
  */
 export function experimentProgress(row: FleetExperiment) {
   const remote = row.latest ?? row.receipt
-  const status = remote?.state ?? row.state
+  const review = row.completionReview
+  const status: NonNullable<FleetExperiment['latest']>['state'] | FleetExperiment['state'] | 'revalidated' | 'reviewing' | 'review-blocked' = review?.phase === 'passed' && review.remoteCommitted && review.check?.ready === true && review.originalRevision === remote?.revision ? 'revalidated'
+    : review?.phase === 'collecting' || review?.phase === 'verifying' ? 'reviewing'
+      : review?.phase === 'blocked' ? 'review-blocked' : remote?.state ?? row.state
   const local = row.receipt === undefined && remote === undefined
   let phase: 0 | 1 | 2 | 3 = 0
   if (!local && remote !== undefined) {
-    if (status === 'completed') phase = 3
+    if (['completed', 'revalidated', 'reviewing', 'review-blocked'].includes(status)) phase = 3
     else if (['queued', 'starting', 'running', 'serving'].includes(status)) phase = 2
     else if (['preparing', 'planning', 'awaiting-approval'].includes(status)) phase = 1
     else {
@@ -27,8 +30,8 @@ export function experimentProgress(row: FleetExperiment) {
       else phase = 1
     }
   }
-  const issue = ['failed', 'blocked', 'interrupted'].includes(status)
+  const issue = ['failed', 'blocked', 'interrupted', 'review-blocked'].includes(status)
   const attention = issue || status === 'awaiting-approval' || status === 'waiting-reply'
-  const busy = ['staging', 'preparing', 'submitted', 'planning', 'starting', 'running', 'serving', 'cancelling'].includes(status)
+  const busy = ['staging', 'preparing', 'submitted', 'planning', 'starting', 'running', 'serving', 'cancelling', 'reviewing'].includes(status)
   return { phase, status, local, issue, attention, busy, remote }
 }

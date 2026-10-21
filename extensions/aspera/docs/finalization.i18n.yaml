@@ -1,0 +1,28 @@
+# Bilingual-pair consistency record for finalization.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write extensions/aspera/docs/finalization.md
+/stage-acceptance-and-finalization:
+  en: bbdba895a555b576
+  zh: d4731fcf4e70cea2
+/stage-acceptance-and-finalization/summary:
+  en: 0805e8fb3a8a9722
+  zh: 29c24dcb058f1264
+/stage-acceptance-and-finalization/table-of-contents:
+  en: 74f389d5f198d32b
+  zh: 24f981e5d5ca8207
+/stage-acceptance-and-finalization/approved-stages:
+  en: 359edc5780c1b16c
+  zh: 2fd5236939b107a2
+/stage-acceptance-and-finalization/command-waiting:
+  en: cae4d3720660f6ed
+  zh: b076331e896d0403
+/stage-acceptance-and-finalization/finish-decisions:
+  en: cbb6849e5651c464
+  zh: 5b031c3b7b5087ed
+/stage-acceptance-and-finalization/historical-review:
+  en: e7cd4419857463ae
+  zh: a758d4657f4500b3
+/stage-acceptance-and-finalization/records-and-compatibility:
+  en: f7822c23fca35754
+  zh: 489750f68dc1c01a

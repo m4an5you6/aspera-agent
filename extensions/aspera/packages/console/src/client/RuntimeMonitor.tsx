@@ -18,13 +18,14 @@ function bounded(lines: LogLine[], maximum: number, older = false): LogLine[] {
 }
 
 /** @param props - selected experiment and optional tool source. @returns resource curves and a resizable read-only log ledger. */
-export function RuntimeMonitor({ row, controller, t, destination }: { row: FleetExperiment; controller: ExperimentsController;
-  t: TranslateNS<'experiments'>; destination?: { serverId: string; commandId: string } }) {
+export function RuntimeMonitor({ row, controller, t, destination, offline = false }: { row: FleetExperiment; controller: ExperimentsController;
+  t: TranslateNS<'experiments'>; destination?: { serverId: string; commandId: string }; offline?: boolean }) {
   const [node, setNode] = useState(destination?.serverId ?? row.servers[0]?.id ?? '')
   const [sourceId, setSourceId] = useState(destination === undefined ? '' : `process-${destination.commandId}`)
   const [sources, setSources] = useState<ObservationSource[]>([])
   const [stream, setStream] = useState<'all' | 'stdout' | 'stderr'>('all')
   const [samples, setSamples] = useState<MetricSample[]>([])
+  const [metricBefore, setMetricBefore] = useState<number>()
   const [lines, setLines] = useState<LogLine[]>([])
   const [search, setSearch] = useState('')
   const [health, setHealth] = useState({ directory: true, metrics: true, logs: true })
@@ -54,7 +55,7 @@ export function RuntimeMonitor({ row, controller, t, destination }: { row: Fleet
       if (!alive || pending) return
       pending = true
       const results = await Promise.allSettled([controller.logSources(id, node), controller.metrics({ experimentId: id, serverId: node,
-        ...(lastSample === undefined ? {} : { after: lastSample - config.pollIntervalMs * 2 }) })])
+        ...(metricBefore === undefined ? lastSample === undefined ? {} : { after: lastSample - config.pollIntervalMs * 2 } : { before: metricBefore }) })])
       if (!alive) return
       const [directory, metrics] = results
       if (directory.status === 'fulfilled') {
@@ -75,14 +76,17 @@ export function RuntimeMonitor({ row, controller, t, destination }: { row: Fleet
         if (gpu !== undefined) setLastGpu(gpu)
         if (training !== undefined) setLastTraining(training)
         controller.sourceRecovered({ ...scope, operation: 'metrics' })
-        setSamples(previous => [...new Map([...previous, ...metrics.value].map(sample => [`${sample.time}/${sample.training === undefined ? 'resource' : 'training'}`, sample])).values()]
-          .filter(sample => sample.time > Date.now() - config.metricWindowMs).sort((a, b) => a.time - b.time).slice(-config.metricSampleLimit))
+        setSamples(previous => {
+          const merged = [...new Map([...previous, ...metrics.value].map(sample => [JSON.stringify(sample), sample])).values()]
+          const end = metricBefore ?? (offline ? Math.max(0, ...merged.map(sample => sample.time)) : Date.now())
+          return merged.filter(sample => sample.time > end - config.metricWindowMs && sample.time <= end).sort((a, b) => a.time - b.time).slice(-config.metricSampleLimit)
+        })
       } else controller.report(metrics.reason, { ...scope, operation: 'metrics' })
       setHealth(value => ({ ...value, directory: directory.status === 'fulfilled', metrics: metrics.status === 'fulfilled' })); setLoading(false); pending = false
     }
     void load(); const timer = setInterval(() => { void load() }, config.pollIntervalMs)
     return () => { alive = false; clearInterval(timer) }
-  }, [controller, id, node, config, destination])
+  }, [controller, id, node, config, destination, offline, metricBefore])
   useEffect(() => {
     let alive = true; let pending = false; let initial = true
     let catchup: ReturnType<typeof setTimeout> | undefined
@@ -152,8 +156,10 @@ export function RuntimeMonitor({ row, controller, t, destination }: { row: Fleet
         ? <Choice label={t('gpuMetric')} value={gpu?.id ?? ''} options={lastGpu!.gpus.map(gpu => ({ value: gpu.id, label: gpu.name }))} onChange={setGpuId} />
         : <span>{gpu?.name ?? t('metricMissing')}</span>}<span className={css.metricTime}>{latest === undefined ? t('noMetrics') : t('sampledAt', { time: new Date(latest.time).toLocaleTimeString() })}
         {lastGpu !== undefined && latest?.gpus.length === 0 && ` · ${t('gpuMetric')} ${t('lastSample', { time: new Date(lastGpu.time).toLocaleTimeString() })}`}</span>
-      <span data-disconnected={disconnected}>{loading ? <StateDot state="ongoing" /> : t(disconnected ? 'disconnected' : 'liveMonitoring')}</span></div>
+      <span data-disconnected={disconnected}>{loading ? <StateDot state="ongoing" /> : t(disconnected ? 'disconnected' : offline || metricBefore !== undefined ? 'archiveMetricHistory' : 'liveMonitoring')}</span></div>
     <div className={css.metricRegion}>
+      <div className={css.actions}><Button variant="ghost" size="sm" disabled={loading || samples.length === 0} onClick={() => { setMetricBefore(samples[0]?.time) }}>{t('archiveOlderMetrics')}</Button>
+        {metricBefore !== undefined && <Button variant="ghost" size="sm" onClick={() => { setMetricBefore(undefined) }}>{t('archiveLatestMetrics')}</Button>}</div>
       <div className={css.metricTiles}>{[
         [t('gpuMetric'), percent(gpu?.utilization)], [t('gpuMemoryMetric'), gib(gpu?.memoryUsedBytes)], [t('cpuMetric'), percent(latest?.cpuPercent)],
         [t('memoryMetric'), gib(latest?.memoryUsedBytes)], [t('stepMetric'), String(value('step') ?? '—')], [t('lossMetric'), String(value('loss') ?? '—')], [t('throughputMetric'), String(value('tokens_per_second') ?? value('throughput') ?? '—')],

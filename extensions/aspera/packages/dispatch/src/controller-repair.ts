@@ -4,12 +4,14 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSy
 import { resolve } from 'node:path'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { z } from 'zod'
-import { controllerStatusSchema, controllerRepairIdSchema, experimentIdSchema, serverIdSchema } from '@aspera/experiments'
-import type { ControllerStatus, ExperimentId, ExperimentServerId } from '@aspera/experiments'
+import { controllerStatusSchema, controllerRepairIdSchema, experimentIdSchema, serverIdSchema, experimentInterruptionSchema } from '@aspera/experiments'
+import type { ControllerStatus, ExperimentId, ExperimentServerId, ExperimentInterruptionStatus, ClusterSubmission } from '@aspera/experiments'
 import { ControllerDiagnostic, verifyController } from './cluster-deploy.ts'
 import type { FleetDriver } from './fleet.ts'
 import type { DeploymentConfig, PreparedEnvironment } from './deploy.ts'
 import { shellQuote } from './transport.ts'
+import { ControllerRecovery, offlineControllerSchema } from './controller-recovery.ts'
+import type { OfflineController } from './controller-recovery.ts'
 
 /** Only the active preparation step can inspect or restart its assigned role. */
 export interface ControllerRepairTools {
@@ -23,9 +25,12 @@ export interface ControllerRepairTools {
 const attemptSchema = z.object({ id: controllerRepairIdSchema, expected: controllerStatusSchema,
   phase: z.enum(['beginning', 'stopping', 'starting', 'completed', 'failed', 'unconfirmed']),
   directory: z.string().startsWith('/'), startedAt: z.number().int(), detail: z.string().optional() }).strict()
-const receiptSchema = z.object({ version: z.literal(1), experimentId: experimentIdSchema, serverId: serverIdSchema,
+const legacyReceiptSchema = z.object({ version: z.literal(1), experimentId: experimentIdSchema, serverId: serverIdSchema,
   role: z.enum(['node', 'coordinator']), deploymentId: z.string(), maxAttempts: z.number().int().nonnegative(), attempts: z.array(attemptSchema),
   acceptance: z.object({ checkedAt: z.number().int().nonnegative(), controller: controllerStatusSchema }).strict().optional() }).strict()
+const recoveryAttemptSchema = attemptSchema.extend({ expected: controllerStatusSchema.optional(), offline: offlineControllerSchema.optional() })
+  .refine(value => value.expected !== undefined || value.offline !== undefined, 'A repair requires original process or offline ownership evidence')
+const receiptSchema = legacyReceiptSchema.extend({ version: z.literal(2), attempts: z.array(recoveryAttemptSchema) })
 type Receipt = z.infer<typeof receiptSchema>
 /** Profile-owned retry limit is pinned by the independent repair journal. */
 export const controllerRepairPolicySchema = z.object({ maxAttempts: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(2) }).strict()
@@ -37,21 +42,56 @@ export class ControllerRepair implements ControllerRepairTools {
   private receipt: Receipt
   prepared: PreparedEnvironment
   acceptance: ControllerStatus | undefined
+  private recoveredInterruptions: ExperimentInterruptionStatus[] = []
 
   /** @param input - program-selected server, role, immutable release and operation limit. @param driver - existing authenticated providers. */
   constructor(private readonly input: { experimentId: ExperimentId; serverId: ExperimentServerId; role: 'node' | 'coordinator';
-    target: DeploymentConfig; prepared: PreparedEnvironment; token: string; password?: string; maxAttempts: number }, private readonly driver: FleetDriver) {
+    target: DeploymentConfig; prepared: PreparedEnvironment; token: string; password?: string; maxAttempts: number;
+    allowedExperimentIds?: ExperimentId[]; allowedServerIds?: ExperimentServerId[];
+    allowedSubmissions?: { submission: ClusterSubmission; payloadHash: string }[];
+    recoveryScope?: () => { allowedExperimentIds: ExperimentId[]; allowedServerIds: ExperimentServerId[];
+      allowedSubmissions: { submission: ClusterSubmission; payloadHash: string }[] };
+    recordInterruptions?: (statuses: ExperimentInterruptionStatus[]) => Promise<void>;
+    settleExperiments?: (offline: OfflineController, signal: AbortSignal) => Promise<ExperimentInterruptionStatus[]> }, private readonly driver: FleetDriver) {
     this.prepared = input.prepared
     const runRoot = input.target.storagePlacement?.runRoot ?? `${input.target.remoteRoot}/runs/${input.experimentId}`
     this.remoteDirectory = `${runRoot}/controller-repairs/${input.role}`
-    this.path = resolve(resolveDshHome(), 'aspera-controller-repairs', input.experimentId, `${input.serverId}-${input.role}.v1.json`)
+    this.path = resolve(resolveDshHome(), 'aspera-controller-repairs', input.experimentId, `${input.serverId}-${input.role}.v2.json`)
+    const legacyPath = this.path.replace(/\.v2\.json$/, '.v1.json')
     if (existsSync(this.path) && lstatSync(this.path).isSymbolicLink()) throw new Error('Controller repair receipt cannot be a symbolic link')
+    if (existsSync(legacyPath) && lstatSync(legacyPath).isSymbolicLink()) throw new Error('Original controller repair receipt cannot be a symbolic link')
     this.receipt = existsSync(this.path) ? receiptSchema.parse(JSON.parse(readFileSync(this.path, 'utf8')))
-      : { version: 1, experimentId: input.experimentId, serverId: input.serverId, role: input.role, deploymentId: input.prepared.deploymentId, maxAttempts: input.maxAttempts, attempts: [] }
+      : existsSync(legacyPath) ? { ...legacyReceiptSchema.parse(JSON.parse(readFileSync(legacyPath, 'utf8'))), version: 2 }
+        : { version: 2, experimentId: input.experimentId, serverId: input.serverId, role: input.role, deploymentId: input.prepared.deploymentId, maxAttempts: input.maxAttempts, attempts: [] }
     if (this.receipt.experimentId !== input.experimentId || this.receipt.serverId !== input.serverId
       || this.receipt.role !== input.role || this.receipt.deploymentId !== input.prepared.deploymentId) throw new Error('Controller repair receipt has another owner or release')
-    for (const attempt of this.receipt.attempts) if (attempt.expected.root !== input.target.remoteRoot || attempt.expected.role !== input.role
-      || attempt.directory !== `${this.remoteDirectory}/${attempt.id}`) throw new Error('Controller repair attempt is outside its saved server or experiment')
+    for (const attempt of this.receipt.attempts) {
+      if (attempt.directory !== `${this.remoteDirectory}/${attempt.id}`
+        || [attempt.expected, attempt.offline].some(value => value !== undefined && (value.root !== input.target.remoteRoot || value.role !== input.role))) {
+        throw new Error('Controller repair attempt is outside its saved server or experiment')
+      }
+    }
+  }
+  private recovery(): ControllerRecovery {
+    const scope = this.input.recoveryScope?.() ?? this.input
+    return new ControllerRecovery({ target: this.input.target, serverId: this.input.serverId, role: this.input.role,
+      release: this.input.target.storagePlacement?.releaseRoot ?? `${this.input.target.remoteRoot}/releases/${this.prepared.deploymentId}`,
+      password: this.input.password, allowedExperimentIds: scope.allowedExperimentIds, allowedServerIds: scope.allowedServerIds,
+      allowedSubmissions: scope.allowedSubmissions }, this.driver)
+  }
+  private recoveryOperation(attempt: Receipt['attempts'][number]) {
+    return { id: attempt.id, directory: attempt.directory,
+      runRoot: this.input.target.storagePlacement?.runRoot ?? `${this.input.target.remoteRoot}/runs/${this.input.experimentId}` }
+  }
+  private async beginRecovery(attempt: Receipt['attempts'][number], signal: AbortSignal): Promise<void> {
+    if (attempt.offline === undefined) throw new Error('Controller recovery has no saved ownership evidence')
+    const result = await this.recovery().begin({ ...this.recoveryOperation(attempt), digest: attempt.offline.digest }, signal)
+    const interrupted = z.object({ interruptions: z.array(experimentInterruptionSchema).optional() }).parse(result).interruptions ?? []
+    await this.input.recordInterruptions?.(interrupted)
+    this.recoveredInterruptions.push(...interrupted)
+  }
+  private interruptionSummary() {
+    return this.recoveredInterruptions.map(({ experimentId, operationId, phase, updatedAt, nodes, detail }) => ({ experimentId, operationId, phase, updatedAt, nodes, detail }))
   }
   private save(): void {
     const parent = resolve(this.path, '..')
@@ -70,7 +110,14 @@ export class ControllerRepair implements ControllerRepairTools {
       const status = await this.status(signal)
       try { verifyController(status, this.input.target, this.prepared, this.input.role); return { ready: true, controller: status, attempts: this.receipt.attempts } }
       catch (error) { if (error instanceof ControllerDiagnostic) return { ready: false, diagnostic: error.diagnostic, attempts: this.receipt.attempts }; throw error }
-    } catch (error) { if (error instanceof ControllerDiagnostic) return { ready: false, diagnostic: error.diagnostic, attempts: this.receipt.attempts }; throw error }
+    } catch (error) {
+      signal.throwIfAborted()
+      const recovery = await this.recovery().inspect(signal)
+      return { ready: false, diagnostic: { code: recovery.state === 'offline' ? 'unavailable' : recovery.state === 'occupied' ? 'occupied' : 'unknown',
+        role: this.input.role, detail: String(error) }, recovery, repairable: recovery.state === 'offline'
+          || recovery.state === 'occupied' && this.input.settleExperiments !== undefined, attempts: this.receipt.attempts,
+        interruptions: this.interruptionSummary() }
+    }
   }
   /** @param signal - verification lifetime. @param pathEntries - verified executable directories. @returns current accepted deployment after program-owned controller verification. */
   async verify(signal: AbortSignal, pathEntries?: string[]): Promise<PreparedEnvironment> {
@@ -91,7 +138,20 @@ export class ControllerRepair implements ControllerRepairTools {
   }
   private async finish(attempt: Receipt['attempts'][number], signal: AbortSignal): Promise<void> {
     this.acceptance = verifyController(await this.status(signal), this.input.target, this.prepared, this.input.role)
-    if (this.acceptance.bootId === attempt.expected.bootId) throw new Error('Original controller was not replaced by this repair')
+    if (this.acceptance.bootId === attempt.expected?.bootId) throw new Error('Original controller was not replaced by this repair')
+    if (this.acceptance.deploymentId !== this.prepared.deploymentId) throw new Error('Recovered controller uses another fixed release')
+    if (attempt.offline !== undefined) {
+      const current = this.acceptance
+      if (current.processStart === undefined || current.hostBootId === undefined) throw new Error('Recovered controller has no verifiable Linux process identity')
+      await this.driver.remote(this.input.target, `python3 -c ${shellQuote(`import pathlib
+base=pathlib.Path('/proc')/str(${current.pid})
+if pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()!=${JSON.stringify(current.hostBootId)}: raise RuntimeError('Recovered host identity changed')
+if (base/'stat').read_text().rsplit(')',1)[1].split()[19]!=${JSON.stringify(current.processStart)}: raise RuntimeError('Recovered process identity changed')
+env=dict(item.split(b'=',1) for item in (base/'environ').read_bytes().split(b'\\0') if b'=' in item)
+expected={'DSH_CLUSTER_ROOT':${JSON.stringify(this.input.target.remoteRoot)},'DSH_EXPERIMENT_ROLE':${JSON.stringify(this.input.role)},'DSH_EXPERIMENT_DEPLOYMENT_ID':${JSON.stringify(this.prepared.deploymentId)},'ASPERA_CONTROLLER_RECOVERY_ID':${JSON.stringify(attempt.id)}}
+if not all(env.get(key.encode(),b'').decode()==value for key,value in expected.items()): raise RuntimeError('Recovered process belongs to another operation')`)}`, signal, this.input.password)
+      await this.recovery().complete(this.recoveryOperation(attempt), signal)
+    }
     await this.driver.remote(this.input.target, `printf '0\\n' > ${shellQuote(attempt.directory + '/exited')}`, signal, this.input.password)
     attempt.phase = 'completed'; delete attempt.detail; this.save()
   }
@@ -105,12 +165,14 @@ export class ControllerRepair implements ControllerRepairTools {
     this.prepared = await this.driver.prepareClusterServer(this.input.target, { digest: this.prepared.deploymentId, reuse: true }, this.input.password, signal)
     let current: ControllerStatus | undefined
     try { current = await this.status(signal) } catch (error) { signal.throwIfAborted(); if (error instanceof ControllerDiagnostic) throw error }
-    if (current !== undefined && current.bootId !== attempt.expected.bootId) { await this.finish(attempt, signal); return }
+    if (current !== undefined && current.bootId !== attempt.expected?.bootId) { await this.finish(attempt, signal); return }
     const exited = await this.driver.remote(this.input.target, `if [ -f ${shellQuote(directory + '/stopped.json')} ]; then cat ${shellQuote(directory + '/stopped.json')}; else printf '{}'; fi`, signal, this.input.password)
     const stop = z.object({ operationId: z.literal(attempt.id), exited: z.literal(true) }).safeParse(JSON.parse(exited))
-    if (!stop.success || current !== undefined) throw new Error(`Controller repair outcome remains unconfirmed at ${directory}; its command will not be rerun`)
+    if (current !== undefined || (!stop.success && attempt.offline === undefined)) throw new Error(`Controller repair outcome remains unconfirmed at ${directory}; its command will not be rerun`)
+    if (attempt.offline === undefined) attempt.offline = await this.recovery().inspect(signal)
+    await this.beginRecovery(attempt, signal)
     attempt.phase = 'starting'; this.save()
-    await this.driver.ensureClusterRole(this.input.target, this.prepared, this.input.role, this.input.token, this.input.password, signal)
+    await this.driver.ensureClusterRole(this.input.target, this.prepared, this.input.role, this.input.token, this.input.password, signal, attempt.id)
     await this.finish(attempt, signal)
   }
   /** @param signal - repair lifetime. @param pending - durable ownership saved before any remote maintenance operation. @returns verified restart facts, requiring subsequent Agent-requested environment verification. */
@@ -118,7 +180,20 @@ export class ControllerRepair implements ControllerRepairTools {
     const last = this.receipt.attempts.at(-1)
     if (last !== undefined && !['completed', 'failed'].includes(last.phase)) { await this.reconcile(last.directory, signal); return { repaired: true, operationId: last.id, verificationRequired: true } }
     this.prepared = await this.driver.prepareClusterServer(this.input.target, { digest: this.prepared.deploymentId, reuse: true }, this.input.password, signal)
-    const expected = await this.status(signal)
+    let expected: ControllerStatus
+    try { expected = await this.status(signal) }
+    catch (error) {
+      signal.throwIfAborted()
+      let offline = await this.recovery().inspect(signal)
+      if ((offline.state === 'occupied' || offline.converged.length > 0) && this.input.settleExperiments !== undefined) {
+        this.recoveredInterruptions.push(...await this.input.settleExperiments(offline, signal))
+        offline = await this.recovery().inspect(signal)
+      }
+      if (offline.converged.length > 0) throw new Error('Original task records require unified task settlement before controller recovery')
+      if (offline.state !== 'offline') throw new ControllerDiagnostic({ code: offline.state === 'occupied' ? 'occupied' : 'unknown',
+        role: this.input.role, detail: `Offline recovery requires confirmed process and resource release: ${JSON.stringify(offline)}. ${String(error)}` })
+      return this.repairOffline(offline, signal, pending)
+    }
     try { verifyController(expected, this.input.target, this.prepared, this.input.role); return { repaired: false, ready: true, verificationRequired: true } }
     catch (error) { if (!(error instanceof ControllerDiagnostic)) throw error }
     if (expected.legacy) throw new ControllerDiagnostic({ code: 'unknown', role: this.input.role, detail: 'The original controller has no safe maintenance operation; confirm task release and stop it before retrying. Its original release is preserved.' })
@@ -148,7 +223,7 @@ fd=os.pidfd_open(pid)
 base=pathlib.Path('/proc')/str(pid)
 if (base/'stat').read_text().rsplit(')',1)[1].split()[19]!=expected_start: raise RuntimeError('Controller process identity changed')
 command=(base/'cmdline').read_bytes().split(b'\\0')
-if b'--profile' not in command or command[command.index(b'--profile')+1]!=b'aspera-worker': raise RuntimeError('Controller is not the owned worker profile')
+if b'--profile' not in command or command[command.index(b'--profile')+1] not in [b'aspera-worker',('aspera-worker-'+${JSON.stringify(expected.deploymentId)}).encode()]: raise RuntimeError('Controller is not the owned worker profile')
 entries=dict(item.split(b'=',1) for item in (base/'environ').read_bytes().split(b'\\0') if b'=' in item)
 for key,value in {'DSH_CLUSTER_ROOT':${JSON.stringify(expected.root)},'DSH_EXPERIMENT_ROLE':${JSON.stringify(expected.role)},'DSH_EXPERIMENT_DEPLOYMENT_ID':${JSON.stringify(expected.deploymentId)}}.items():
  if entries.get(key.encode(),b'').decode()!=value: raise RuntimeError('Controller configuration identity changed')
@@ -165,12 +240,30 @@ if pid_file.exists():
 (directory/'stopped.json').write_text(json.dumps({'operationId':${JSON.stringify(id)},'exited':True}))
 `
       await this.driver.remote(this.input.target, `python3 -c ${shellQuote(stopScript)}`, signal, this.input.password)
+      attempt.offline = await this.recovery().inspect(signal)
+      await this.beginRecovery(attempt, signal)
       attempt.phase = 'starting'; this.save()
-      await this.driver.ensureClusterRole(this.input.target, this.prepared, this.input.role, this.input.token, this.input.password, signal)
+      await this.driver.ensureClusterRole(this.input.target, this.prepared, this.input.role, this.input.token, this.input.password, signal, attempt.id)
       await this.finish(attempt, signal)
       return { repaired: true, operationId: id, controller: this.acceptance, verificationRequired: true }
     } catch (error) {
       if (attempt.phase !== 'failed') { attempt.phase = 'unconfirmed'; attempt.detail = String(error); this.save() }
+      throw error
+    }
+  }
+  private async repairOffline(offline: OfflineController, signal: AbortSignal, pending: (directory: string) => Promise<void>): Promise<object> {
+    if (this.receipt.attempts.length >= this.receipt.maxAttempts) throw new Error('Controller repair attempt limit reached; inspect the saved receipts')
+    const id = controllerRepairIdSchema.parse(randomUUID())
+    const attempt: Receipt['attempts'][number] = { id, offline, directory: `${this.remoteDirectory}/${id}`, phase: 'beginning', startedAt: Date.now() }
+    this.receipt.attempts.push(attempt); this.save(); await pending(attempt.directory)
+    try {
+      await this.beginRecovery(attempt, signal)
+      attempt.phase = 'starting'; this.save()
+      await this.driver.ensureClusterRole(this.input.target, this.prepared, this.input.role, this.input.token, this.input.password, signal, id)
+      await this.finish(attempt, signal)
+      return { repaired: true, mode: 'offline-recovery', operationId: id, controller: this.acceptance, interruptions: this.interruptionSummary(), verificationRequired: true }
+    } catch (error) {
+      attempt.phase = 'unconfirmed'; attempt.detail = String(error); this.save()
       throw error
     }
   }

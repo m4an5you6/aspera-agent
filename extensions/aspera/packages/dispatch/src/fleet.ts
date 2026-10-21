@@ -21,7 +21,7 @@ import {
   clusterSubmissionV2Schema, clusterSubmissionV4Schema, experimentIdSchema, serverIdSchema, answerExperimentQuestionSchema,
   serverSettingsSchema, inspectServerStorage, prepareServerStorage, verifyServerStorage, cleanupServerStorage, serviceAccessInfoSchema,
 } from '@aspera/runtime'
-import type { ClusterChunk, ClusterFile, ClusterNode, ClusterPrivate, ClusterRecord, ClusterServer, ExperimentId, ExperimentServerId, ServerSettings, ServerProbe } from '@aspera/runtime'
+import type { ClusterChunk, ClusterFile, ClusterNode, ClusterPrivate, ClusterRecord, ClusterServer, ClusterSubmission, ExperimentId, ExperimentServerId, ServerSettings, ServerProbe } from '@aspera/runtime'
 import { copy, remote, remoteResult, request, shellQuote, prepareSshHostKey, resolveSshConnectionPolicy } from './transport.ts'
 import type { SshConnectionPolicy, Target } from './transport.ts'
 import { installPrivateFile } from './deploy.ts'
@@ -42,8 +42,12 @@ import { delegateClusterLogin, describeClusterNode, ensureClusterRole, prepareCl
 import type { DeploymentRelease } from './cluster-deploy.ts'
 import { EnvironmentPreparation, UnconfirmedPreparationCommand } from './environment-preparation.ts'
 import { ControllerRepair, controllerRepairPolicySchema } from './controller-repair.ts'
+import { SandboxRepair, sandboxRepairPolicySchema } from './sandbox-repair.ts'
+import type { SandboxRepairPolicy } from './sandbox-repair.ts'
 import { gpuInventoryText, normalizedSet } from '@aspera/experiments'
 import type { EnvironmentPreparationInput } from './environment-preparation.ts'
+import { preparationCommandPolicySchema } from './preparation-command.ts'
+import type { PreparationCommandPolicy } from './preparation-command.ts'
 import type { EnvironmentProgress } from './types.ts'
 import { environmentRequirements, installedEnvironmentRequirements, inspectEnvironment, checkEnvironment } from './environment.ts'
 import type { FleetCreateRequest, FleetExperiment, FleetRegistry, FleetServerInput, PinnedDeployment } from './types.ts'
@@ -51,15 +55,42 @@ import type { AnswerExperimentQuestion, ExperimentModels } from '@aspera/experim
 import { experimentRemovalBlocker, serverRemovalBlockers } from './server-usage.ts'
 import { executionProgressReadSchema } from '@aspera/experiments'
 import { StorageSelection } from './storage-selection.ts'
+import { preparationStorage } from './preparation-storage.ts'
 import { resolveTrainingNetwork } from './network-selection.ts'
 import { captureExperimentModels } from './models.ts'
 import { experimentPhases } from '@aspera/experiments'
 import { openPhaseModelContext, privateModelConfigurationSchema } from '@aspera/runtime'
+import { PhaseContextPolicyConfig } from '@aspera/runtime'
+import type { PhaseContextPolicy } from '@aspera/runtime'
 import { agentRecordRequestSchema, agentRecordPageSchema, projectAgentRecord, experimentProcessSchema, processLogRequestSchema, processLogPageSchema, traceEventChunkSchema } from '@aspera/experiments'
 import type { AgentRecordRequest, AgentRecordPage, ExperimentProcess, ProcessLogRequest, ProcessLogPage } from '@aspera/experiments'
 import { observationReadSchema, observationSourceSchema, observationSourceIdSchema, observationPageSchema, metricReadSchema, metricSampleSchema } from '@aspera/experiments'
 import type { ObservationSource, ObservationRead, ObservationPage, MetricRead, MetricSample } from '@aspera/experiments'
 import { observationSources, readObservation, redactObservation, readTraceAttachment } from '@aspera/runtime'
+import { RunArchives } from './run-archive.ts'
+import { RunArchiveReader, runArchivePolicySchema } from './run-archive-reader.ts'
+import type { RunArchivePolicy } from './run-archive-reader.ts'
+import type { ExperimentArchiveStatus } from '@aspera/experiments'
+import type { ExperimentInterruptionStatus } from '@aspera/experiments'
+import { ExperimentInterruptions } from './interruption.ts'
+import type { InterruptionTask } from './interruption.ts'
+import { remoteTaskStoreSpec, remoteTaskFromExperiment, remoteTaskAsInterruption, remoteTaskRecordSchema } from './remote-task.ts'
+import type { RemoteTaskStatus } from './remote-task.ts'
+import { RemoteInterruption } from './interruption-remote.ts'
+import type { InterruptionFacts, InterruptionMode } from './interruption-remote.ts'
+import { CompletionReviews } from './completion-review.ts'
+import { CompletionReader } from './completion-reader.ts'
+import { FinalizationRecords } from './finalization-records.ts'
+import { finalizationPolicySchema } from '@aspera/runtime'
+import type { FinalizationPolicy } from '@aspera/runtime'
+import { runCompletionReviewAgent } from './completion-agent.ts'
+import { redactCompletionData, redactCompletionText } from './completion-data.ts'
+import { readCompletionTrace } from './completion-trace.ts'
+import { setTimeout as delay } from 'node:timers/promises'
+import { ExperimentEnvironments } from './managed-environments.ts'
+import { managedEnvironmentProgram, managedEnvironmentPolicySchema } from '@aspera/runtime'
+import type { ManagedEnvironmentPolicy } from '@aspera/runtime'
+import type { ExperimentStorageUsage, ExperimentCachePreview, ExperimentCacheCleanup, ExperimentCacheResult } from '@aspera/experiments'
 
 const requestSchema = fleetRequestV5Schema.safeExtend({ coordinatorId: serverIdSchema })
   .refine(value => value.serverIds.includes(value.coordinatorId), 'Coordinator must be a selected execution node')
@@ -125,12 +156,130 @@ export class ExperimentFleet {
   private readonly requests = new Map<ExperimentId, Set<AbortController>>()
   private closing = false
   private readonly uploadRoot = resolve(resolveDshHome(), 'aspera-inputs')
+  private readonly archives: RunArchives
+  private readonly archiveReader: RunArchiveReader
+  private readonly completionReviews: CompletionReviews
+  private readonly finalizationRecords: FinalizationRecords
+  private readonly interruptions: ExperimentInterruptions
+  private readonly environments: ExperimentEnvironments
+  private readonly remoteInterruption: RemoteInterruption
+  private readonly preparationSettlements = new Set<ExperimentId>()
 
   private constructor(private readonly ctx: Context, private readonly store: Store, private readonly removals: Domain<typeof removalStoreSpec>,
+    private readonly remoteTasks: Domain<typeof remoteTaskStoreSpec>,
     private readonly deployment: (server: ServerSettings) => PinnedDeployment,
     private readonly connectionCheckTimeoutMs: number, private readonly driver: FleetDriver,
     private readonly installations: InstallationRecovery, private readonly controllerRepairMaxAttempts: number,
-    private readonly sshConnectionPolicy: SshConnectionPolicy) {}
+    private readonly sshConnectionPolicy: SshConnectionPolicy, private readonly sandboxRepairPolicy: SandboxRepairPolicy,
+    private readonly archivePolicy: RunArchivePolicy, private readonly agentContext: PhaseContextPolicy,
+    private readonly environmentPolicy: ManagedEnvironmentPolicy, private readonly commandPolicy: PreparationCommandPolicy,
+    private readonly finalizationPolicy: FinalizationPolicy) {
+    this.environments = new ExperimentEnvironments(resolve(resolveDshHome(), 'aspera-environments'), {
+      get: id => this.get(id), alive: id => !this.closing && !this.isRemoved(id), secrets: record => this.archiveSecrets(record), list: () => this.list(),
+      program: managedEnvironmentProgram,
+      ssh: async (record, serverId, command, signal) => {
+        const connection = await this.interruptionConnection(record, serverId)
+        return this.driver.remote(connection.target, command, signal, connection.password)
+      },
+      node: async (record, serverId, operation, body, signal) => {
+        const server = record.submission?.nodes.find(node => node.server.id === serverId)?.server
+        if (server === undefined || record.submission?.protocol !== 4) throw new Error('Environment management requires a capable original protocol-4 release')
+        const connection = await this.interruptionConnection(record, serverId)
+        const target = { ...connection.target, remotePort: server.remotePort, toolTimeoutMs: Math.min(connection.target.toolTimeoutMs, this.environmentPolicy.readTimeoutMs) }
+        const value = await this.driver.request(target, await this.token(server, 'node'), '/aspera/v4/node/' + operation, 'POST', body, signal, connection.password)
+        if (value.status !== 200) throw new Error(`Environment node request failed (${value.status}): ${JSON.stringify(value.value)}`)
+        return value.value
+      },
+    }, environmentPolicy)
+    this.remoteInterruption = new RemoteInterruption(driver, sandboxRepairPolicy.cleanupTimeoutMs)
+    this.interruptions = new ExperimentInterruptions(resolve(resolveDshHome(), 'aspera-interruptions'), {
+      get: id => this.interruptionTask(id), alive: id => this.remoteTasks.table('tasks').get(id) !== undefined
+        || !this.isRemoved(id) && this.store.table('experiments').get(id) !== undefined,
+      settle: (record, status, signal, update) => {
+        const settle = () => this.settleInterruption(record, status, signal, update)
+        if (this.preparationSettlements.has(record.request.experimentId) || record.submission === undefined && record.submissionHash === undefined) return settle()
+        const nodes = [...record.servers.map(server => server.id)].sort()
+        const lock = (index: number): Promise<ClusterRecord | undefined> => index === nodes.length ? settle()
+          : this.onServer(nodes[index]!, signal, () => lock(index + 1), record.request.experimentId)
+        return lock(0)
+      },
+      accept: (id, result) => this.serial(async () => {
+        if (result === undefined) return
+        const identity = this.interruptionTask(id)
+        const expected = identity.submissionHash ?? createHash('sha256').update(JSON.stringify(identity.submission)).digest('hex')
+        if (createHash('sha256').update(JSON.stringify(result.submission)).digest('hex') !== expected) throw new Error('Interruption result belongs to another submission')
+        if (!['completed', 'failed', 'blocked', 'cancelled', 'interrupted'].includes(result.state) || !result.resourcesReleased || result.services.some(service => !service.released)) {
+          throw new Error('Interruption has no confirmed terminal resource release')
+        }
+        if (this.isRemoved(id)) return
+        const current = this.get(id)
+        if ((current.latest?.revision ?? 0) <= result.revision) await this.store.table('experiments').put(id, { ...current, latest: result, waitingFor: [] })
+        this.archives.changed(id)
+      }),
+      changed: () => this.ctx.emit('experiment-fleet/changed', { kind: 'experiments' }),
+      report: error => this.ctx.logger.error(String(error)),
+    }, record => this.resolvedTarget(record.coordinatorTarget).toolTimeoutMs)
+    this.archives = new RunArchives(resolve(resolveDshHome(), 'aspera-run-records'), {
+      list: () => this.list(), get: id => this.get(id), alive: id => !this.closing && !this.isRemoved(id),
+      secrets: record => this.archiveSecrets(record),
+      observe: (id, observed) => this.serial(async () => {
+        if (this.closing || this.isRemoved(id)) return
+        const current = this.get(id)
+        if (JSON.stringify(observed.submission) !== JSON.stringify(current.submission)) throw new Error('Archived status belongs to another submission')
+        if ((current.latest?.revision ?? 0) < observed.revision) await this.store.table('experiments').put(id, { ...current, latest: observed })
+      }),
+    }, this.archiveReader = new RunArchiveReader({ remoteResult: driver.remoteResult,
+      connection: async (record, serverId) => {
+        const server = record.servers.find(server => server.id === serverId)
+        const target = serverId === record.coordinator.id ? record.coordinatorTarget : record.targets[record.servers.findIndex(server => server.id === serverId)]
+        if (server === undefined || target === undefined) throw new Error('Archive node belongs to another experiment')
+        const registered = this.servers().servers.find(value => value.id === serverId)
+        const login = registered ?? server
+        return { target: this.connectionTarget({ ...this.resolvedTarget(target), host: login.host, sshPort: login.sshPort,
+          username: login.username, authMode: login.authMode, identityFile: login.identityFile,
+          knownHostsFile: login.knownHostsFile, passwordRef: sshPasswordRef(login) }),
+          password: await this.password(login) }
+      },
+      rpc: (record, operation, input, signal) => this.call(record, operation, input, signal),
+      trace: (_record, input, signal) => this.recordsRemote(input, true, signal),
+      observation: (_record, input, signal) => this.logReadRemote(input, signal),
+      pipe: (_record, input, signal) => this.processLogRemote(input, signal),
+    }, archivePolicy), archivePolicy)
+    const reader = new CompletionReader(driver, (record, serverId) => this.interruptionConnection(record, serverId), this.archiveReader,
+      { ...archivePolicy, archiveRequestTimeoutMs: finalizationPolicy.readTimeoutMs })
+    this.finalizationRecords = new FinalizationRecords(resolve(resolveDshHome(), 'aspera-run-records'), {
+      get: id => this.get(id), alive: id => !this.closing && !this.isRemoved(id),
+      read: async (record, signal) => {
+        if (record.submission === undefined) return { version: 1, experimentId: record.request.experimentId, supported: false, observedAt: Date.now(), offline: false, truncated: false, waits: [], stages: [] }
+        const lifetime = AbortSignal.any([signal, AbortSignal.timeout(this.finalizationPolicy.readTimeoutMs)])
+        try { return await this.call(record, 'finalization-status', {}, lifetime) }
+        catch (error) { lifetime.throwIfAborted(); void error; return reader.finalization(record, lifetime) }
+      },
+    })
+    const secrets = new Map<ExperimentId, string[]>()
+    this.completionReviews = new CompletionReviews(resolve(resolveDshHome(), 'aspera-completion-reviews'), {
+      get: id => this.get(id), alive: id => !this.closing && !this.isRemoved(id),
+      snapshot: async (record, signal) => { secrets.set(record.request.experimentId, await this.archiveSecrets(record)); return reader.snapshot(record, signal) },
+      source: async (record, input, signal) => {
+        const source = await reader.source(record, input, signal)
+        return { ...source, text: redactCompletionText(source.text, secrets.get(record.request.experimentId) ?? []), tail: redactCompletionText(source.tail, secrets.get(record.request.experimentId) ?? []) }
+      },
+      environment: (record, entry, signal) => reader.environment(record, entry, signal),
+      commit: (record, review, signal, assessment) => reader.commit(record, review, signal, assessment),
+      run: async (record, review, tools, signal) => runCompletionReviewAgent(ctx, record, review, tools, {
+        snapshot: (value, lifetime) => reader.snapshot(value, lifetime),
+        source: async (value, input, lifetime) => {
+          const result = await reader.source(value, input, lifetime)
+          return { ...result, text: redactCompletionText(result.text, secrets.get(value.request.experimentId) ?? []), tail: redactCompletionText(result.tail, secrets.get(value.request.experimentId) ?? []) }
+        },
+      }, agentContext, beforeSeq => this.records({ experimentId: record.request.experimentId, phase: 'execution', beforeSeq, limit: 50 }, true), signal),
+      changed: () => ctx.emit('experiment-fleet/changed', { kind: 'experiments' }),
+      redact: (record, data) => redactCompletionData(data, secrets.get(record.request.experimentId) ?? []),
+      trace: async (review, input) => readCompletionTrace(ctx.sessionPersistence, review, input, await this.archiveSecrets(this.get(review.experimentId))),
+      finished: id => { secrets.delete(id) },
+      report: error => { ctx.logger.error('Completion review: ' + String(error)) },
+    }, this.finalizationPolicy)
+  }
 
   /**
    * Open durable records and reconcile interrupted local preparation.
@@ -141,18 +290,41 @@ export class ExperimentFleet {
    * @param installationPolicy - supervised installer budgets.
    * @param controllerRepairPolicy - per-server and per-role restart limit.
    * @param sshConnectionPolicy - local handshake and reconnection limits; saved releases and submissions remain fixed.
+   * @param sandboxRepairPolicy - private-proc probe, cleanup and immutable launcher installation limits.
+   * @param archivePolicy - local copy intervals, read limits, retry delays and disk reserve.
+   * @param agentContext - DSH compaction and tool-output settings for preparation Agents.
+   * @param environmentPolicy - fixed installer, storage observations and package bounds.
+   * @param commandPolicy - preparation command polling and exit-recovery limits.
+   * @param finalizationPolicy - historical stage tolerances and finalization observation limits.
    * @returns effect-owned fleet service.
    */
   static async open(ctx: Context, deployment: (server: ServerSettings) => PinnedDeployment,
     connectionCheckTimeoutMs: number, driver: FleetDriver = productionDriver,
     installationPolicy: InstallationPolicy = installationPolicySchema.parse({}),
     controllerRepairPolicy = controllerRepairPolicySchema.parse({}),
-    sshConnectionPolicy = resolveSshConnectionPolicy({})): Promise<ExperimentFleet> {
+    sshConnectionPolicy = resolveSshConnectionPolicy({}),
+    sandboxRepairPolicy: SandboxRepairPolicy = sandboxRepairPolicySchema.parse({}),
+    archivePolicy: RunArchivePolicy = runArchivePolicySchema.parse({}),
+    agentContext: PhaseContextPolicy = PhaseContextPolicyConfig({ compaction: {}, pruning: {} }),
+    environmentPolicy: ManagedEnvironmentPolicy = managedEnvironmentPolicySchema.parse({}),
+    commandPolicy: PreparationCommandPolicy = preparationCommandPolicySchema.parse({}),
+    finalizationPolicy: FinalizationPolicy = finalizationPolicySchema.parse({})): Promise<ExperimentFleet> {
     const store = await ctx.storage.domain.open(storeSpec)
     const removals = await ctx.storage.domain.open(removalStoreSpec)
+    const remoteTasks = await ctx.storage.domain.open(remoteTaskStoreSpec)
+    for (const [, record] of store.table('experiments').entries()) {
+      const identity = remoteTaskFromExperiment(record)
+      if (identity !== undefined && remoteTasks.table('tasks').get(identity.experimentId) === undefined) await remoteTasks.table('tasks').put(identity.experimentId, identity)
+    }
+    for (const [id, removal] of removals.table('removals').entries()) {
+      if (removal.work?.protocol === 4 && /^[a-f0-9]{64}$/.test(removal.work.submissionHash ?? '') && remoteTasks.table('tasks').get(id) === undefined) {
+        await remoteTasks.table('tasks').put(id, remoteTaskRecordSchema.parse({ version: 1, experimentId: id, name: removal.name,
+          work: removal.work, createdAt: removal.identity.deletedAt, updatedAt: removal.identity.deletedAt }))
+      }
+    }
     const installations = await InstallationRecovery.open(ctx, installationPolicy, driver)
-    const fleet = new ExperimentFleet(ctx, store, removals, deployment, connectionCheckTimeoutMs, driver, installations,
-      controllerRepairPolicySchema.parse(controllerRepairPolicy).maxAttempts, resolveSshConnectionPolicy(sshConnectionPolicy))
+    const fleet = new ExperimentFleet(ctx, store, removals, remoteTasks, deployment, connectionCheckTimeoutMs, driver, installations,
+      controllerRepairPolicySchema.parse(controllerRepairPolicy).maxAttempts, resolveSshConnectionPolicy(sshConnectionPolicy), sandboxRepairPolicySchema.parse(sandboxRepairPolicy), runArchivePolicySchema.parse(archivePolicy), agentContext, managedEnvironmentPolicySchema.parse(environmentPolicy), preparationCommandPolicySchema.parse(commandPolicy), finalizationPolicySchema.parse(finalizationPolicy))
     ctx.effect(() => () => fleet.close(), 'experiment fleet: local preparations')
     if (store.table('registry').get('servers') === undefined) {
       await store.table('registry').put('servers', { servers: [] })
@@ -173,11 +345,16 @@ export class ExperimentFleet {
         record.submission === undefined ? 'Local preparation was interrupted before remote handover.' : 'Submission outcome is unknown; refresh to reconcile the saved experiment id.' })
     }
     ctx.on('domain/changed', (change) => {
-      if (change.domain === 'aspera_fleet' || change.domain === 'aspera_removals' || change.domain === 'aspera_preparation') ctx.emit('experiment-fleet/changed',
+      if (change.domain === 'aspera_fleet' || change.domain === 'aspera_removals' || change.domain === 'aspera_preparation' || change.domain === 'aspera_remote_tasks') ctx.emit('experiment-fleet/changed',
         { kind: change.table === 'registry' ? 'servers' : 'experiments' })
     })
     for (const [id, removal] of removals.table('removals').entries()) if (removal.localCleanup === 'pending') fleet.beginLocalCleanup(id)
     for (const record of fleet.list()) if (record.state === 'preparing' && installations.has(record.request.experimentId) && record.submission === undefined) fleet.beginPreparation(record.request.experimentId)
+    fleet.archives.start()
+    fleet.environments.start()
+    fleet.interruptions.resume()
+    fleet.completionReviews.resume()
+    for (const record of fleet.list()) void fleet.environments.resume(record.request.experimentId).catch(error => { ctx.logger.error(`Environment cleanup recovery: ${String(error)}`) })
     return fleet
   }
 
@@ -209,7 +386,8 @@ export class ExperimentFleet {
           const password = await this.password(server)
           const prepared = await this.driver.prepareClusterServer(configured, { digest, reuse: true }, password, signal)
           const repair = new ControllerRepair({ experimentId: ownerId, serverId: id, role, target: configured, prepared,
-            token: await this.token(server, role), password, maxAttempts: this.controllerRepairMaxAttempts }, this.driver)
+            token: await this.token(server, role), password, maxAttempts: this.controllerRepairMaxAttempts,
+            ...this.interruptionRecovery(ownerId) }, this.driver)
           await repair.reconcile(directory, signal)
           exit = await this.driver.remote(target, `cat ${shellQuote(directory + '/exited')}`, signal, password)
         }
@@ -276,7 +454,7 @@ export class ExperimentFleet {
   removeServer(id: ExperimentServerId, allowLinked: boolean = false): Promise<FleetRegistry> {
     return this.serial(async () => {
       const current = this.servers()
-      if (!allowLinked && (serverRemovalBlockers(id, this.list(), current.checks?.[id]?.result ?? current.checks?.[id]?.lastSuccess?.result ?? current.probes?.[id], this.deletedIds()).length > 0 || this.list().some(row => this.installations.pending(row.request.experimentId).includes(id)))) {
+      if (!allowLinked && (serverRemovalBlockers(id, this.list(), current.checks?.[id]?.result ?? current.checks?.[id]?.lastSuccess?.result ?? current.probes?.[id], this.deletedIds(), this.interruptions.list()).length > 0 || this.list().some(row => this.installations.pending(row.request.experimentId).includes(id)))) {
         throw new Error('Server has pending work or unconfirmed cleanup; stop or reconcile that work before removing its registration')
       }
       const servers = current.servers.filter(server => server.id !== id)
@@ -297,8 +475,8 @@ export class ExperimentFleet {
    */
   previewServerRemoval(id: ExperimentServerId): ServerDeletionPreview {
     return { serverId: id, linkedExperiments: this.list().filter(row => row.servers.some(server => server.id === id) || row.coordinator.id === id)
-      .map(row => ({ experimentId: row.request.experimentId, name: row.request.name ?? row.request.objective.split('\n')[0]!.slice(0, 120), unfinished: experimentRemovalBlocker(row) !== undefined || this.installations.pending(row.request.experimentId).includes(id) })),
-    unconfirmedExperimentIds: [...this.removals.table('removals').entries()].filter(([, value]) => value.work?.nodes.some(node => node.server.id === id)).map(([key]) => key) }
+      .map(row => ({ experimentId: row.request.experimentId, name: row.request.name ?? row.request.objective.split('\n')[0]!.slice(0, 120), unfinished: experimentRemovalBlocker(row, this.interruptions.status(row.request.experimentId)) !== undefined || this.installations.pending(row.request.experimentId).includes(id) })),
+    unconfirmedExperimentIds: this.unconfirmedRemoteWork().filter(value => value.serverIds.includes(id)).map(value => value.experimentId) }
   }
 
   private async password(server: ServerSettings): Promise<string | undefined> {
@@ -341,8 +519,11 @@ export class ExperimentFleet {
         || `ASPERA_KEY_${record.request.experimentId.replaceAll('-', '_')}_${phase}`.toUpperCase() === ref)) return
     }
     for (const [id, removal] of this.removals.table('removals').entries()) {
-      if (removal.work?.nodes.some(node => sshPasswordRef(node.server) === ref)) return
+      if (!this.isRemoteTaskReleased(id) && removal.work?.nodes.some(node => sshPasswordRef(node.server) === ref)) return
       if (id !== deletingId && removal.localCleanup === 'pending' && removal.credentialRefs.includes(ref)) return
+    }
+    for (const [id, task] of this.remoteTasks.table('tasks').entries()) {
+      if (!this.isRemoteTaskReleased(id) && task.work.nodes.some(node => sshPasswordRef(node.server) === ref)) return
     }
     const key = credentialRef(ref)
     if ((await this.ctx.credentials.describe(key)).writable) await this.ctx.credentials.unset(key)
@@ -350,13 +531,56 @@ export class ExperimentFleet {
 
   /** Complete snapshots include deletion identities so stale replies cannot restore rows. @returns public management state. */
   snapshot(): FleetSnapshot {
-    return { registry: this.servers(), experiments: this.list(), deletedIds: this.deletedIds(),
+    return { registry: this.servers(), experiments: this.list().map(record => this.view(record)), deletedIds: this.deletedIds(),
       installations: this.installations.progress(this.list().map(row => row.request.experimentId)),
       removedServerIds: [...this.removals.table('removed_servers').entries()].map(([id]) => id),
-      unconfirmedWork: [...this.removals.table('removals').entries()].flatMap(([experimentId, value]) => value.work === undefined ? [] :
-        [{ experimentId, name: value.name, serverIds: [...new Set(value.work.nodes.flatMap(node => [node.server.id,
-          ...this.servers().servers.filter(server => sameServerEndpoint(node.server, server)).map(server => server.id)]))] }]),
-      deletions: [...this.store.table('deletions').entries()].map(([id, job]) => this.isRemoved(id) ? { ...job, state: 'deleted' as const } : job) }
+      unconfirmedWork: this.unconfirmedRemoteWork(),
+      deletions: [...this.store.table('deletions').entries()].map(([id, job]) => this.isRemoved(id) ? { ...job, state: 'deleted' as const } : job),
+      interruptions: this.interruptions.list().filter(status => !this.isRemoved(status.experimentId)) }
+  }
+
+  /** @param record - original stored record. @returns presentation-only review state without changing the fleet schema or remote outcome. */
+  view(record: FleetExperiment): FleetExperiment {
+    const review = this.completionReviews.status(record.request.experimentId), original = record.latest ?? record.receipt
+    const matching = review !== undefined && review.submissionHash === createHash('sha256').update(JSON.stringify(record.submission)).digest('hex')
+      && review.originalRevision === original?.revision && review.executionSessionId === original.sessionId
+    return { ...record, completionReviewAvailable: this.completionReviews.eligible(record),
+      ...(matching ? { completionAssessment: this.completionReviews.assessment(record.request.experimentId) } : {}),
+      ...(review === undefined ? {} : { completionReview: matching ? review : { ...review, phase: 'blocked' as const, detail: 'Original result identity changed; the previous review is not applicable.' } }) }
+  }
+  /** @param id - released completion-evidence failure. @returns the durable acknowledgement of read-only supplementation. */
+  reviewCompletion(id: ExperimentId): import('@aspera/experiments').CompletionReview { return this.completionReviews.request(id) }
+  /** @param id - original experiment. @returns saved assessment without network access. */
+  completionReviewStatus(id: ExperimentId): import('@aspera/experiments').CompletionReview | undefined { this.get(id); return this.completionReviews.status(id) }
+  /** @param id - original experiment. @returns saved stage and step supplements, without modifying the original result. */
+  completionAssessment(id: ExperimentId): import('@aspera/experiments').CompletionAssessment | undefined { this.get(id); return this.completionReviews.assessment(id) }
+  /** @param id - original task. @returns lightweight program observations or a dated offline copy. */
+  finalizationStatus(id: ExperimentId): Promise<import('@aspera/experiments').ExperimentFinalizationStatus> { this.get(id); return this.finalizationRecords.read(id) }
+  /** @param id - selected review. @returns after its Agent and pending reads stop, retaining original results. */
+  async cancelCompletionReview(id: ExperimentId): Promise<import('@aspera/experiments').CompletionReview | undefined> {
+    this.get(id); await this.completionReviews.stop(id); return this.completionReviews.status(id)
+  }
+  /** @param id - original experiment. @param operationId - supplementary owner. @param input - bounded source cursor. @returns independently saved review Session events. */
+  completionReviewTrace(id: ExperimentId, operationId: string, input: Omit<AgentRecordRequest, 'experimentId' | 'phase'>): Promise<AgentRecordPage> {
+    this.get(id)
+    if (this.completionReviews.status(id)?.operationId !== z.uuid().parse(operationId)) throw new Error('Supplementary trace belongs to another operation')
+    return this.completionReviews.trace({ ...input, experimentId: id, phase: 'execution' })
+  }
+
+  private unconfirmedRemoteWork(): import('./types.ts').UnconfirmedWorkNotice[] {
+    const notices = new Map<ExperimentId, import('./types.ts').UnconfirmedWorkNotice>()
+    for (const [id, removal] of this.removals.table('removals').entries()) {
+      if (removal.work === undefined || this.isRemoteTaskReleased(id)) continue
+      notices.set(id, { experimentId: id, name: removal.name, serverIds: [...new Set(removal.work.nodes.flatMap(node => [node.server.id,
+        ...this.servers().servers.filter(server => sameServerEndpoint(node.server, server)).map(server => server.id)]))] })
+    }
+    for (const [id, task] of this.remoteTasks.table('tasks').entries()) {
+      if (!this.isRemoved(id) || this.isRemoteTaskReleased(id)) continue
+      const status = this.remoteTaskStatus(id)!
+      notices.set(id, { ...status, serverIds: [...new Set(task.work.nodes.flatMap(node => [node.server.id,
+        ...this.servers().servers.filter(server => sameServerEndpoint(node.server, server)).map(server => server.id)]))] })
+    }
+    return [...notices.values()]
   }
 
   /** Compute removal eligibility without changing tasks or remote files.
@@ -366,14 +590,16 @@ export class ExperimentFleet {
     const ids = z.array(experimentIdSchema).max(100).parse(rawIds)
     return ids.map(id => {
       const record = this.get(id)
-      const reason = this.preparing.has(id) ? 'active' : this.installations.pending(id).length ? 'cleanup-unconfirmed' : experimentRemovalBlocker(record)
+      const interruption = this.interruptions.status(id)
+      const interruptionPending = interruption !== undefined && interruption.phase !== 'released'
+      const reason = interruptionPending ? 'cleanup-unconfirmed' : this.preparing.has(id) ? 'active' : this.installations.pending(id).length ? 'cleanup-unconfirmed' : experimentRemovalBlocker(record)
       const servers = [...new Map([record.coordinator, ...record.servers].map(server => [server.id, server])).values()]
       const nodes = servers.flatMap(server => {
         const placement = server.storagePlacement ?? record.preparation?.placements.find(value => value.serverId === server.id)
         return placement === undefined ? [] : [{ serverId: server.id, name: server.name, path: placement.runRoot }]
       })
       return { experimentId: id, name: record.request.name ?? record.request.objective.split('\n')[0]!.slice(0, 120),
-        eligible: reason === undefined, recordDeletionAvailable: true, ...(reason === undefined ? {} : { reason }), cleanupAvailable: reason === undefined && nodes.length === servers.length, nodes }
+        eligible: reason === undefined, recordDeletionAvailable: !interruptionPending, ...(reason === undefined ? {} : { reason }), cleanupAvailable: reason === undefined && nodes.length === servers.length, nodes }
     })
   }
 
@@ -382,6 +608,7 @@ export class ExperimentFleet {
    */
   async deleteExperiments(raw: DeleteExperimentsRequest): Promise<ExperimentDeletion[]> {
     const input = deleteRequestSchema.parse(raw)
+    await Promise.all(input.experimentIds.map(id => this.interruptions.wait(id)))
     if (!input.cleanupRemote) return Promise.all(input.experimentIds.map(id => this.deleteLocally(id, input)))
     return Promise.all(input.experimentIds.map(id => {
       const existing = this.deletionWork.get(id)
@@ -415,6 +642,7 @@ export class ExperimentFleet {
     if (job.state !== 'deleting') return job
     const record = this.get(id)
     try {
+      if (job.cleanupRemote && !await this.environments.readyToDelete(id)) throw new Error('Original cache cleanup process exit is unconfirmed; remote experiment deletion is blocked')
       if (job.cleanupRemote) for (const node of job.nodes) {
         signal.throwIfAborted()
         if (node.state === 'cleaned') continue
@@ -452,6 +680,7 @@ export class ExperimentFleet {
   }
 
   private async deleteLocally(id: ExperimentId, input: z.infer<typeof deleteRequestSchema>): Promise<ExperimentDeletion> {
+    await this.interruptions.wait(id)
     const result = await this.serial(async () => {
       const prior = this.store.table('deletions').get(id)
       if (this.isRemoved(id)) {
@@ -462,6 +691,12 @@ export class ExperimentFleet {
       if (this.closing) throw new Error('Experiment management is stopping')
       if (prior?.operationId === input.operationId && prior.cleanupRemote !== input.cleanupRemote) throw new Error('Deletion identity has a different cleanup policy')
       const record = this.get(id)
+      const interruption = this.interruptions.status(id)
+      if (interruption !== undefined && interruption.phase !== 'released') {
+        const failed: ExperimentDeletion = { experimentId: id, operationId: input.operationId, cleanupRemote: input.cleanupRemote,
+          state: 'failed', started: false, nodes: [], updatedAt: Date.now(), detail: 'Interruption exit verification is incomplete; retry interruption before deleting its recovery records' }
+        await this.store.table('deletions').put(id, failed); return failed
+      }
       const blocked = this.preparing.has(id) || this.installations.pending(id).length > 0 || experimentRemovalBlocker(record) !== undefined
       if (blocked && (!input.allowUnconfirmed || input.cleanupRemote)) {
         const failed: ExperimentDeletion = { experimentId: id, operationId: input.operationId, cleanupRemote: input.cleanupRemote,
@@ -479,6 +714,7 @@ export class ExperimentFleet {
         name: record.request.name ?? record.request.objective.split('\n')[0]!.slice(0, 120),
         ...(blocked ? { work: removedWork(record, record.submission === undefined ? undefined : createHash('sha256').update(JSON.stringify(record.submission)).digest('hex')) } : {}) }
       // This write hides the record even if compatibility writes or local cleanup are interrupted.
+      await this.rememberRemoteTask(record)
       await this.removals.table('removals').put(id, removal)
       this.preparing.get(id)?.abort.abort(new Error('Local experiment record removed'))
       this.cleanupControllers.get(id)?.abort(new Error('Local experiment record removed'))
@@ -502,6 +738,11 @@ export class ExperimentFleet {
   }
 
   private async finishLocalRemoval(id: ExperimentId): Promise<void> {
+    await this.completionReviews.forget(id)
+    await this.finalizationRecords.forget(id)
+    await this.environments.remove(id)
+    await this.archives.stop(id)
+    await this.interruptions.stop(id)
     await Promise.allSettled([this.preparing.get(id)?.done, this.acceptance.get(id)])
     await this.serial(async () => {
       const removal = this.removals.table('removals').get(id)
@@ -510,6 +751,8 @@ export class ExperimentFleet {
       await this.store.table('experiments').delete(id)
       cleanupLocalInputs(this.uploadRoot, id)
       cleanupLocalInputs(resolve(resolveDshHome(), 'aspera-observations'), id)
+      cleanupLocalInputs(resolve(resolveDshHome(), 'aspera-run-records'), id)
+      if (this.remoteTasks.table('tasks').get(id) === undefined) await this.interruptions.forget(id)
       const next = { ...removal, localCleanup: 'complete' as const }
       if (next.work?.submissionHash === undefined && next.work?.nodes.every(node => node.pendingDirectory === undefined) && this.installations.pending(id).length === 0) delete next.work
       delete next.error
@@ -530,11 +773,15 @@ export class ExperimentFleet {
     const lifetime = signal ?? AbortSignal.timeout(this.connectionCheckTimeoutMs)
     const server = this.servers().servers.find(value => value.id === id)
     if (server === undefined) throw new Error('Server is no longer configured')
+    for (const [taskId, task] of this.remoteTasks.table('tasks').entries()) {
+      if (!this.isRemoved(taskId) || this.isRemoteTaskReleased(taskId) || !task.work.nodes.some(node => sameServerEndpoint(node.server, server))) continue
+      await this.interruptions.recover(taskId, lifetime)
+    }
     for (const [experimentId, removal] of this.removals.table('removals').entries()) {
       const work = removal.work
       if (work === undefined || removal.localCleanup !== 'complete' || !work.nodes.some(node => sameServerEndpoint(node.server, server))) continue
       try {
-        if (work.submissionHash !== undefined) {
+        if (work.submissionHash !== undefined && !this.isRemoteTaskReleased(experimentId)) {
           const coordinator = work.nodes.find(node => node.server.id === work.coordinatorId)!
           const result = z.object({ record: clusterRecordSchema }).parse(await this.controlRequest(coordinator.server, coordinator.target, work.protocol,
             'status', { experimentId }, lifetime))
@@ -565,7 +812,7 @@ export class ExperimentFleet {
         void error
       }
     }
-    return [...this.removals.table('removals').entries()].filter(([, value]) => value.work?.nodes.some(node => sameServerEndpoint(node.server, server))).map(([key]) => key)
+    return this.unconfirmedRemoteWork().filter(value => value.serverIds.includes(id)).map(value => value.experimentId)
   }
 
   private async token(server: ServerSettings, role: 'coordinator' | 'node'): Promise<string> {
@@ -645,7 +892,6 @@ export class ExperimentFleet {
       const result: ServerProbe = { gpuInfo, allocations: health?.success ? health.data.node.allocations : [],
         ...(inventory === undefined ? {} : { inventory }), environment, environmentReady: readiness.ready,
         ...(!readiness.ready ? { detail: readiness.failures.join('\n') } : observations[0].status === 'rejected' ? { detail: String(observations[0].reason) } : {}) }
-      await this.reconcileRemovedWork(id, signal)
       const checkedAt = Date.now()
       check = { status: 'passed', configuration, startedAt, checkedAt, result, lastSuccess: { checkedAt, result },
         gpu: observations[1].status === 'fulfilled' && gpuInfo.trim() !== '' ? 'passed' : 'unavailable', control: health?.success ? 'passed' : 'unavailable' }
@@ -732,11 +978,13 @@ export class ExperimentFleet {
         return previous
       }
       const registry = this.servers()
-      const unresolved = [...this.removals.table('removals').entries()].find(([, removal]) => removal.work?.nodes.some(node =>
-        registry.servers.some(server => input.serverIds.includes(server.id) && sameServerEndpoint(node.server, server))))
+      const unresolved = [...this.removals.table('removals').entries()].find(([id, removal]) => !this.isRemoteTaskReleased(id)
+        && (this.remoteTasks.table('tasks').get(id) === undefined || this.remoteTasks.table('tasks').get(id)!.work.nodes.some(node => !input.serverIds.includes(node.server.id)) || this.installations.pending(id).length > 0
+          || removal.work?.nodes.some(node => node.pendingDirectory !== undefined)) && removal.work?.nodes.some(node =>
+          registry.servers.some(server => input.serverIds.includes(server.id) && sameServerEndpoint(node.server, server))))
       if (unresolved !== undefined) throw new Error('Selected nodes have unconfirmed remote work from a deleted experiment; recheck the server before submitting')
       const coordinator = registry.servers.find(server => server.id === input.coordinatorId)
-      const conflict = this.list().find(row => row.coordinator.id !== input.coordinatorId && (experimentRemovalBlocker(row) !== undefined || this.preparing.has(row.request.experimentId) || this.deletionWork.has(row.request.experimentId))
+      const conflict = this.list().find(row => row.coordinator.id !== input.coordinatorId && (experimentRemovalBlocker(row, this.interruptions.status(row.request.experimentId)) !== undefined || this.preparing.has(row.request.experimentId) || this.deletionWork.has(row.request.experimentId))
         && [row.coordinator.id, ...row.servers.map(server => server.id)].some(id => input.serverIds.includes(id)))
       if (conflict !== undefined) throw new Error(`Selected nodes are assigned to experiment ${conflict.request.name ?? conflict.request.experimentId} under another coordinator; finish that experiment or use its coordinator`)
       if (coordinator === undefined) throw new Error('configure the coordinator server before submitting an experiment')
@@ -805,6 +1053,7 @@ export class ExperimentFleet {
    * @param id - existing experiment. @returns its current preparation or reconciled receipt.
    */
   async retry(id: ExperimentId): Promise<FleetExperiment> {
+    this.assertInterruptionSettled(id)
     if (this.get(id).submission !== undefined) return this.refresh(id)
     return this.serial(async () => {
       const current = this.get(id)
@@ -854,6 +1103,7 @@ export class ExperimentFleet {
 
   /** Confirm a saved plan remotely. @param id - experiment. @param revision - displayed plan. @returns updated record. */
   async approve(id: ExperimentId, revision: number): Promise<FleetExperiment> {
+    this.assertInterruptionSettled(id)
     await this.call(this.get(id), 'approve', { experimentId: id, revision })
     return this.refresh(id)
   }
@@ -884,9 +1134,23 @@ export class ExperimentFleet {
       if (record.preparation?.protocol !== 4 || record.models === undefined) throw new Error('Legacy preparation retains its original model settings; copy it to a new experiment')
       const pendingTarget = record.coordinatorTarget
       const selection = record.agentModel
-      modelScope = await openPhaseModelContext(this.ctx, record.models.preparation)
-      const storage = new StorageSelection()
-      const environment = new EnvironmentPreparation()
+      modelScope = await openPhaseModelContext(this.ctx, record.models.preparation, this.agentContext)
+      const storage = new StorageSelection(async (observation, experimentId, deploymentId, operation, input, operationSignal) =>
+        preparationStorage({ ...observation, id: experimentId, deploymentId, operation, input, policy: this.environmentPolicy, signal: operationSignal,
+          transport: {
+            run: async (server, command, activeSignal) => {
+              const target = server.id === record.coordinator.id ? record.coordinatorTarget : record.targets[record.servers.findIndex(item => item.id === server.id)]
+              if (target === undefined) throw new Error('Preparation storage server is outside this experiment')
+              return this.driver.remote(target, command, activeSignal, await this.password(server))
+            },
+            inspect: async (server, activeSignal) => {
+              const target = server.id === record.coordinator.id ? record.coordinatorTarget : record.targets[record.servers.findIndex(item => item.id === server.id)]
+              if (target === undefined) throw new Error('Preparation storage server is outside this experiment')
+              return this.driver.inspectServerStorage(target, server.storagePreference?.mode === 'manual' ? server.storagePreference.directory : undefined,
+                await this.password(server), activeSignal)
+            },
+          } }))
+      const environment = new EnvironmentPreparation(this.commandPolicy)
       const options = { agentOptions: { ...selection },
         setup: async (ctx: Context, agent: Agent) => { installModelSelection(ctx, { current: selection, assembled: undefined }); storage.install(ctx, agent); environment.install(ctx, agent) } }
       const storedSession = await this.ctx.sessionPersistence.stat(SessionId(record.sessionId), { signal })
@@ -953,8 +1217,10 @@ export class ExperimentFleet {
         },
         observation: await this.driver.inspectEnvironment(this.connectionTarget(target), await this.password(server), operation === 'controller' ? signal : this.installations.signal(id, server.id, signal)),
         pendingCommand: this.get(id).preparation?.environments?.find(value => value.serverId === server.id)?.pendingCommand,
-        outputChars: target.preparationOutputChars,
+        outputChars: target.preparationOutputChars, commandDeadline: operation === 'controller' ? undefined : this.installations.deadline(id, server.id),
         installation: operation === 'deployment' ? this.installations.tools(id, server.id, this.resolvedTarget(target), await this.password(server), handle.agent.session.id) : undefined,
+        sandbox: new SandboxRepair({ experimentId: id, serverId: server.id, controlRoot: target.remoteRoot,
+          password: await this.password(server), policy: this.sandboxRepairPolicy }, this.driver),
         progress: value => this.environmentProgress(id, value),
       })
       for (const server of unique) {
@@ -1014,7 +1280,7 @@ export class ExperimentFleet {
       const controllerAcceptances = new Map<string, ControllerRepair>()
       const startRole = async (server: ServerSettings, pending: PinnedDeployment, prepared: PreparedEnvironment, role: 'coordinator' | 'node', token: string, password: string | undefined) => {
         const repair = new ControllerRepair({ experimentId: id, serverId: server.id, role, target: this.resolvedTarget(pending), prepared,
-          token, password, maxAttempts: this.controllerRepairMaxAttempts }, this.driver)
+          token, password, maxAttempts: this.controllerRepairMaxAttempts, ...this.interruptionRecovery(id) }, this.driver)
         const result = await environment.ensure(handle.agent, { ...await environmentInput(server, pending, 'controller'), controller: repair }, this.driver,
           async (candidate, observed, operationSignal) => {
             const checked = checkEnvironment(observed, requirements, candidate.pathEntries)
@@ -1162,6 +1428,7 @@ export class ExperimentFleet {
       for (const acceptance of controllerAcceptances.values()) await acceptance.verifyAcceptance(signal)
       record = await this.serial(async () => {
         const next = { ...this.get(id), submission }
+        await this.rememberRemoteTask(next)
         await this.store.table('experiments').put(id, next)
         return next
       })
@@ -1189,7 +1456,7 @@ export class ExperimentFleet {
 
   private resolvedTarget(target: PinnedDeployment): DeploymentConfig {
     if (target.remoteRoot === undefined) throw new Error('Server directories have not been resolved')
-    return this.connectionTarget({ ...target, remoteRoot: target.remoteRoot })
+    return this.connectionTarget({ ...target, remoteRoot: target.remoteRoot, managedEnvironments: this.environmentPolicy })
   }
 
   private connectionTarget<T extends Target>(target: T): T & SshConnectionPolicy {
@@ -1358,6 +1625,7 @@ export class ExperimentFleet {
       if ((current.latest?.revision ?? 0) > result.record.revision) return current
       const next = { ...current, latest: result.record, waitingFor: result.waitingFor }
       if (JSON.stringify(next) !== JSON.stringify(current)) await this.store.table('experiments').put(id, next)
+      this.archives.changed(id)
       return next
     })
   }
@@ -1366,6 +1634,7 @@ export class ExperimentFleet {
    * @param id - owning experiment. @param reply - exact question binding and answer. @returns current receipt.
    */
   async answer(id: ExperimentId, reply: AnswerExperimentQuestion): Promise<FleetExperiment> {
+    this.assertInterruptionSettled(id)
     const input = answerExperimentQuestionSchema.parse(reply)
     const latest = clusterRecordSchema.parse(await this.call(this.get(id), 'answer-question', { experimentId: id, ...input }))
     return this.serial(async () => {
@@ -1383,6 +1652,87 @@ export class ExperimentFleet {
    * @returns saved local or remote cancellation state.
    */
   async cancel(id: ExperimentId): Promise<FleetExperiment> {
+    this.interruptions.request(id)
+    await this.interruptions.wait(id)
+    const status = this.interruptions.status(id)
+    if (status?.phase !== 'released') throw new Error(status?.detail ?? 'Experiment exit remains unconfirmed')
+    return this.get(id)
+  }
+
+  /** @param id - user-selected experiment. @returns the durable interruption acknowledgement. */
+  interrupt(id: ExperimentId): ExperimentInterruptionStatus { return this.interruptions.request(id) }
+
+  private async rememberRemoteTask(record: FleetExperiment): Promise<void> {
+    const identity = remoteTaskFromExperiment(record)
+    if (identity === undefined) return
+    const prior = this.remoteTasks.table('tasks').get(identity.experimentId)
+    if (prior !== undefined && prior.work.submissionHash !== identity.work.submissionHash) throw new Error('Remote task submission identity changed')
+    if (prior === undefined || prior.release === undefined && identity.release !== undefined) await this.remoteTasks.table('tasks').put(identity.experimentId,
+      prior === undefined ? identity : { ...prior, release: identity.release, updatedAt: identity.updatedAt })
+  }
+
+  private interruptionTask(id: ExperimentId): InterruptionTask {
+    if (!this.isRemoved(id)) return this.get(id)
+    const task = this.remoteTasks.table('tasks').get(id)
+    if (task === undefined) throw new Error('Remote task identity is unavailable; verify its original submission before settlement')
+    return remoteTaskAsInterruption(task)
+  }
+
+  private isRemoteTaskReleased(id: ExperimentId): boolean {
+    const status = this.interruptions.status(id)
+    return status === undefined ? this.remoteTasks.table('tasks').get(id)?.release !== undefined : status.phase === 'released'
+  }
+
+  /** @param id - program-known remote task. @returns committed progress without contacting a server or restoring a deleted experiment. */
+  remoteTaskStatus(id: ExperimentId): RemoteTaskStatus | undefined {
+    const task = this.remoteTasks.table('tasks').get(id)
+    if (task === undefined) return undefined
+    const interruption = this.interruptions.status(id)
+    const publicStatus = interruption === undefined ? undefined : (({ result: _result, ...status }) => status)(interruption)
+    return { experimentId: id, name: task.name, serverIds: task.work.nodes.map(node => node.server.id), deleted: this.isRemoved(id),
+      updatedAt: interruption?.updatedAt ?? task.release?.observedAt ?? task.updatedAt,
+      released: interruption === undefined ? task.release !== undefined : interruption.phase === 'released', recoveryAvailable: true,
+      ...(publicStatus === undefined ? {} : { interruption: publicStatus }) }
+  }
+
+  /** @param id - selected task identity. @param mode - exit verification or explicit interruption. @returns the persisted background operation. */
+  settleRemoteTask(id: ExperimentId, mode: 'reconcile' | 'interrupt'): RemoteTaskStatus {
+    if (this.closing) throw new Error('Experiment management is stopping')
+    if (this.remoteTasks.table('tasks').get(id) === undefined) throw new Error('Remote task identity is unavailable')
+    if (this.remoteTaskStatus(id)?.released) return this.remoteTaskStatus(id)!
+    if (mode === 'interrupt') this.interruptions.request(id)
+    else this.interruptions.reconcile(id)
+    return this.remoteTaskStatus(id)!
+  }
+
+  private async originalTaskRecord(task: InterruptionTask, signal: AbortSignal): Promise<ClusterRecord> {
+    let record: ClusterRecord | undefined
+    try {
+      record = z.object({ record: clusterRecordSchema }).parse(await this.controlRequest(task.coordinator, task.coordinatorTarget, 4,
+        'status', { experimentId: task.request.experimentId }, signal)).record
+    } catch (error) { signal.throwIfAborted(); this.ctx.logger.debug(`Original task status unavailable: ${redactObservation(String(error))}`) }
+    if (record === undefined) {
+      const connection = await this.interruptionConnection(task, task.coordinator.id)
+      record = (await this.remoteInterruption.discover({ ...connection, serverId: task.coordinator.id,
+        experimentIds: [task.request.experimentId] }, signal)).find(value => value.submission.experimentId === task.request.experimentId)
+    }
+    if (record === undefined || record.submission.protocol !== 4 || record.submission.experimentId !== task.request.experimentId
+      || record.payloadHash !== task.submissionHash || createHash('sha256').update(JSON.stringify(record.submission)).digest('hex') !== task.submissionHash
+      || record.submission.coordinator.id !== task.coordinator.id || record.submission.coordinator.remoteRoot !== task.coordinator.remoteRoot
+      || record.submission.nodes.length !== task.servers.length || record.submission.nodes.some(node => !task.servers.some(server =>
+        server.id === node.server.id && server.remoteRoot === node.server.remoteRoot))) throw new Error('Original remote task submission, nodes or digest cannot be confirmed')
+    return record
+  }
+
+  /** @param id - experiment. @returns retained progress without contacting or changing remote processes. */
+  interruptionStatus(id: ExperimentId): ExperimentInterruptionStatus | undefined { this.get(id); return this.interruptions.status(id) }
+
+  private assertInterruptionSettled(id: ExperimentId): void {
+    const status = this.interruptions.status(id)
+    if (status !== undefined) throw new Error(status.phase === 'released' ? 'Experiment was interrupted; copy it to start another run' : 'Experiment interruption must confirm resource release before another operation')
+  }
+
+  private async cancelPreparation(id: ExperimentId): Promise<FleetExperiment> {
     const pending = await this.serial(async () => {
       const current = this.get(id)
       const preparing = this.preparing.get(id)
@@ -1401,14 +1751,247 @@ export class ExperimentFleet {
       if (outcomes.some(result => result.status === 'rejected' || !result.value)) await this.installations.failed(id, 'Cancellation requested; remote installer exit remains unconfirmed')
     }
     if (current.submission === undefined) return current
-    const latest = clusterRecordSchema.parse(await this.call(current, 'cancel', { experimentId: id, submission: current.submission }))
-    return this.serial(async () => {
-      const current = this.get(id)
-      if ((current.latest?.revision ?? 0) > latest.revision) return current
-      const next = { ...current, latest }
-      await this.store.table('experiments').put(id, next)
-      return next
-    })
+    throw new Error('Remote experiment cancellation must use the interruption operation')
+  }
+
+  private async interruptionConnection(record: InterruptionTask, serverId: ExperimentServerId): Promise<{ target: DeploymentConfig; password?: string }> {
+    const server = record.servers.find(value => value.id === serverId)
+    const target = serverId === record.coordinator.id ? record.coordinatorTarget : record.targets[record.servers.findIndex(value => value.id === serverId)]
+    if (server === undefined || target === undefined) throw new Error('Interruption has an unassigned server')
+    const login = this.servers().servers.find(value => value.id === serverId) ?? server
+    return { target: this.connectionTarget({ ...this.resolvedTarget(target), host: login.host, sshPort: login.sshPort,
+      username: login.username, authMode: login.authMode, identityFile: login.identityFile, knownHostsFile: login.knownHostsFile,
+      passwordRef: sshPasswordRef(login) }), password: await this.password(login) }
+  }
+
+  private interruptionRecovery(ownerId: ExperimentId) {
+    const selected = this.get(ownerId).servers.map(server => server.id)
+    const submissions = new Map<ExperimentId, { submission: ClusterSubmission; payloadHash: string }>()
+    for (const record of this.list()) if (record.request.experimentId !== ownerId && record.submission?.protocol === 4
+      && record.servers.some(server => selected.includes(server.id))) {
+      submissions.set(record.request.experimentId, { submission: record.submission,
+        payloadHash: createHash('sha256').update(JSON.stringify(record.submission)).digest('hex') })
+    }
+    const scope = () => ({ allowedServerIds: selected, allowedExperimentIds: [...submissions.entries()]
+      .filter(([, value]) => value.submission.nodes.every(node => selected.includes(node.server.id))).map(([id]) => id),
+      allowedSubmissions: [...submissions.values()] })
+    return { ...scope(), recoveryScope: scope,
+      recordInterruptions: async (statuses: ExperimentInterruptionStatus[]) => {
+        for (const status of statuses) {
+          if (!scope().allowedExperimentIds.includes(status.experimentId)) throw new Error('Controller recovery attempted an unauthorized experiment')
+          await this.interruptions.adopt(status)
+        }
+      },
+      settleExperiments: async (offline: import('./controller-recovery.ts').OfflineController, signal: AbortSignal) => {
+        const results: ExperimentInterruptionStatus[] = []
+        const seen = new Set<ExperimentId>()
+        const blockers = [...offline.blockers, ...offline.converged.map(value => ({ kind: 'experiment',
+          id: value.experimentId ?? value.id, reason: 'Original task records require unified settlement' }))]
+        for (const blocker of blockers) {
+          if (!['experiment', 'interruption'].includes(blocker.kind) || blocker.id === undefined || blocker.id === null) continue
+          const parsed = experimentIdSchema.safeParse(blocker.id)
+          if (!parsed.success || parsed.data === ownerId || seen.has(parsed.data)) continue
+          const id = parsed.data; seen.add(id)
+          if (!submissions.has(id)) {
+            if (!this.isRemoved(id) && this.remoteTasks.table('tasks').get(id) === undefined) continue
+            if (this.remoteTasks.table('tasks').get(id) === undefined) await this.discoverRemovedTask(ownerId, id, signal)
+            const task = this.interruptionTask(id)
+            const unselected = task.servers.filter(server => !selected.includes(server.id))
+            if (unselected.length > 0) {
+              results.push(this.interruptions.observeBlocked(id, 'Original task includes nodes outside preparation authorization: '
+                + unselected.map(server => `${server.name} (${server.id})`).join(', ')
+                + '; use the server task recovery entry to interrupt and verify all original nodes'))
+              continue
+            }
+            const submission = (await this.originalTaskRecord(task, signal)).submission
+            submissions.set(id, { submission, payloadHash: createHash('sha256').update(JSON.stringify(submission)).digest('hex') })
+          }
+          if (!scope().allowedExperimentIds.includes(id)) {
+            results.push(this.interruptions.observeBlocked(id, blocker.reason + '; use the server task recovery entry to interrupt and verify all original nodes'))
+            continue
+          }
+          this.preparationSettlements.add(id)
+          try { results.push(await this.interruptions.recover(id, signal)) }
+          finally { this.preparationSettlements.delete(id) }
+        }
+        return results
+      },
+    }
+  }
+
+  private async discoverRemovedTask(ownerId: ExperimentId, id: ExperimentId, signal: AbortSignal): Promise<void> {
+    if (!this.isRemoved(id)) throw new Error('Historical task has no local deletion identity')
+    const owner = this.get(ownerId)
+    for (const server of owner.servers) {
+      const connection = await this.interruptionConnection(owner, server.id)
+      const records = await this.remoteInterruption.discover({ ...connection, serverId: server.id, experimentIds: [id] }, signal)
+      const original = records.find(record => record.submission.experimentId === id)
+      if (original === undefined) continue
+      const submission = original.submission
+      const digest = createHash('sha256').update(JSON.stringify(submission)).digest('hex')
+      if (digest !== original.payloadHash) throw new Error('Historical task submission digest differs from its original coordinator record')
+      const nodes = submission.nodes.map(node => {
+        const registered = this.servers().servers.find(value => value.id === node.server.id)
+        if (registered === undefined || registered.username !== node.server.username) throw new Error('Historical task has an unconfirmed original account or node: ' + node.server.id)
+        const login: ServerSettings = { ...registered, ...node.server }
+        return { server: login, target: this.deployment(login) }
+      })
+      const removal = this.removals.table('removals').get(id)
+      const identity = this.store.table('deleted').get(id) ?? removal?.identity
+      if (identity === undefined) throw new Error('Historical deletion identity disappeared during discovery')
+      const task = remoteTaskRecordSchema.parse({ version: 1, experimentId: id, name: removal?.name ?? id,
+        work: { coordinatorId: submission.coordinator.id, protocol: 4, submissionHash: digest, nodes },
+        createdAt: identity.deletedAt, updatedAt: Date.now() })
+      await this.serial(async () => {
+        const current = this.remoteTasks.table('tasks').get(id)
+        if (current !== undefined && current.work.submissionHash !== digest) throw new Error('Another recovery registered a different original submission')
+        if (current === undefined) await this.remoteTasks.table('tasks').put(id, task)
+      })
+      return
+    }
+    throw new Error('Deleted task original submission could not be found in the authorized coordinator directories: ' + id)
+  }
+
+  private async settleInterruption(record: InterruptionTask, original: ExperimentInterruptionStatus, signal: AbortSignal,
+    update: (status: ExperimentInterruptionStatus) => void): Promise<ClusterRecord | undefined> {
+    const id = record.request.experimentId
+    let originalRecord: ClusterRecord | undefined
+    if (record.submission === undefined && record.submissionHash !== undefined) {
+      originalRecord = await this.originalTaskRecord(record, signal)
+      record = { ...record, submission: originalRecord.submission }
+    }
+    if (record.submission === undefined) {
+      await this.cancelPreparation(id)
+      if (this.installations.pending(id).length > 0 || this.get(id).preparation?.environments?.some(value => value.pendingCommand !== undefined)) {
+        throw new Error('Preparation command exit remains unconfirmed')
+      }
+      return undefined
+    }
+    let status = structuredClone(original)
+    const connections = new Map<ExperimentServerId, Awaited<ReturnType<ExperimentFleet['interruptionConnection']>>>()
+    for (const server of record.servers) connections.set(server.id, await this.interruptionConnection(record, server.id))
+    const execute = async (serverId: ExperimentServerId, mode: InterruptionMode, facts?: InterruptionFacts) => {
+      const connection = connections.get(serverId)
+      if (connection === undefined) throw new Error('Interruption has no original node connection')
+      signal.throwIfAborted()
+      return this.remoteInterruption.execute({ record, serverId, ...connection, status }, mode, signal, facts)
+    }
+    const inspect = async (serverId: ExperimentServerId) => {
+      const result = await execute(serverId, 'inspect')
+      if (result.facts === undefined) throw new Error('Interruption inspection returned no node facts')
+      return result.facts
+    }
+    const progress = (phase: ExperimentInterruptionStatus['phase'], serverId?: ExperimentServerId, facts?: InterruptionFacts,
+      nodePhase?: ExperimentInterruptionStatus['nodes'][number]['phase']) => {
+      const now = Date.now()
+      status = { ...status, phase, updatedAt: now, nodes: status.nodes.map(node => node.serverId !== serverId ? node : {
+        ...node, phase: nodePhase ?? (phase === 'stopping' ? 'stopping' : 'verifying'), updatedAt: now,
+        ...(facts === undefined ? {} : { agentsExited: facts.agentsExited, commandsReleased: facts.commandsReleased, servicesReleased: facts.servicesReleased,
+          detail: facts.blockers.length === 0 ? undefined : facts.blockers.join('\n') }),
+      }) }
+      update(status)
+    }
+    const priorReceipts: InterruptionFacts[] = []
+    for (const server of record.servers) {
+      const facts = await inspect(server.id)
+      priorReceipts.push(facts)
+      progress('verifying', server.id, facts)
+      if (!status.stopRequested) {
+        if (facts.state !== undefined && !['starting', 'running', 'serving', 'cancelling', 'planning', 'waiting-reply', 'completed', 'blocked', 'failed', 'cancelled', 'interrupted'].includes(facts.state)) {
+          throw new Error(`Pending experiment ${record.request.name ?? id} requires an explicit user interruption`)
+        }
+        if (!facts.agentsExited || !facts.commandsReady || !facts.servicesReady || facts.blockers.length > 0) {
+          throw new Error(`Original work on ${server.name} has not confirmed exit: ${facts.blockers.join('; ')}`)
+        }
+      }
+    }
+    const coordinatorFacts = priorReceipts.find(facts => facts.serverId === record.coordinator.id)
+    if (!status.stopRequested && coordinatorFacts?.state === undefined) throw new Error('Original task state is unavailable; retain its allocation until the original coordinator record is verified')
+    if (!status.stopRequested && coordinatorFacts?.coordinatorExited !== true
+      && !['completed', 'failed', 'blocked', 'cancelled', 'interrupted'].includes(coordinatorFacts?.state ?? '')) {
+      throw new Error('Original coordinator exit or terminal task outcome remains unconfirmed; active work is retained')
+    }
+    const completedReceipt = priorReceipts.find(facts => facts.receipt?.phase === 'released' && facts.receipt.result !== undefined)?.receipt
+    if (completedReceipt !== undefined && priorReceipts.every(facts => facts.agentsExited && facts.commandsReleased && facts.servicesReleased && facts.blockers.length === 0)
+      && completedReceipt.operationId === status.operationId && completedReceipt.submissionHash === status.submissionHash) {
+      const saved = completedReceipt.result!
+      if (JSON.stringify(saved.submission) !== JSON.stringify(record.submission) || !saved.resourcesReleased || saved.services.some(service => !service.released)) throw new Error('Saved interruption has no original complete release evidence')
+      status = { ...completedReceipt, nodes: status.nodes.map(node => ({ ...node, phase: 'released', agentsExited: true, commandsReleased: true, servicesReleased: true })) }
+      for (const server of record.servers) {
+        await execute(server.id, 'fence')
+        await execute(server.id, 'publish', await inspect(server.id))
+        await execute(server.id, 'unfence', await inspect(server.id))
+      }
+      return saved
+    }
+    for (const server of record.servers) await execute(server.id, 'fence')
+    let result: ClusterRecord | undefined = originalRecord !== undefined && originalRecord.resourcesReleased
+      && originalRecord.services.every(service => service.released) && ['completed', 'failed', 'blocked', 'cancelled', 'interrupted'].includes(originalRecord.state)
+      && priorReceipts.every(facts => facts.agentsExited && facts.commandsReleased && facts.servicesReleased && facts.blockers.length === 0)
+      ? originalRecord : undefined
+    if (status.stopRequested) {
+      progress('stopping')
+      try {
+        while (true) {
+          signal.throwIfAborted()
+          const connection = connections.get(record.coordinator.id)!
+          const response = await this.driver.request({ ...connection.target, remotePort: connection.target.remotePort + 1 },
+            await this.token(record.coordinator, 'coordinator'), `/aspera/v${record.submission.protocol}/cancel`, 'POST',
+            { experimentId: id, submission: record.submission }, signal, connection.password)
+          if (response.status !== 200) throw new CoordinatorRequestError(response.status, JSON.stringify(response.value))
+          const latest = clusterRecordSchema.parse(response.value)
+          if (JSON.stringify(latest.submission) !== JSON.stringify(record.submission)) throw new Error('Cancellation returned another submission')
+          await this.serial(async () => {
+            if (this.isRemoved(id)) return
+            const current = this.get(id)
+            if ((current.latest?.revision ?? 0) <= latest.revision) await this.store.table('experiments').put(id, { ...current, latest })
+          })
+          if (latest.resourcesReleased && latest.services.every(service => service.released)
+            && ['completed', 'failed', 'blocked', 'cancelled', 'interrupted'].includes(latest.state)) { result = latest; break }
+          await delay(this.resolvedTarget(record.coordinatorTarget).controlPollIntervalMs, undefined, { signal })
+        }
+      } catch (error) { signal.throwIfAborted(); this.ctx.logger.debug(`Original coordinator cancellation unavailable: ${redactObservation(String(error))}`) }
+    }
+    for (const server of record.servers) {
+      progress(result === undefined && status.stopRequested ? 'stopping' : 'verifying', server.id)
+      if (result === undefined) {
+        const connection = connections.get(server.id)!
+        const facts = await inspect(server.id)
+        if (status.stopRequested || facts.agentsExited && facts.commandsReady && facts.servicesReady && facts.blockers.length === 0) {
+          try {
+            const token = await this.token(server, 'node')
+            const released = await this.driver.request(connection.target, token, `/aspera/v${record.submission.protocol}/node/release`, 'POST', { experimentId: id }, signal, connection.password)
+            if (released.status === 200) z.object({ released: z.boolean() }).parse(released.value)
+          } catch (error) { signal.throwIfAborted(); this.ctx.logger.debug(`Original node release unavailable: ${redactObservation(String(error))}`) }
+        }
+        let fresh = await inspect(server.id)
+        if (status.stopRequested && (!fresh.agentsExited || !fresh.commandsReady)) {
+          await execute(server.id, 'stop', fresh)
+          fresh = await inspect(server.id)
+        }
+        if (!fresh.agentsExited || !fresh.commandsReady || !fresh.servicesReady || fresh.blockers.length > 0) {
+          throw new Error(`Release of ${server.name} remains unconfirmed: ${fresh.blockers.join('; ')}`)
+        }
+        await execute(server.id, 'settle', fresh)
+      }
+      const confirmed = await inspect(server.id)
+      if (!confirmed.agentsExited || !confirmed.commandsReleased || !confirmed.servicesReleased || confirmed.blockers.length > 0) {
+        throw new Error(`Original processes on ${server.name} have not confirmed release`)
+      }
+      progress('verifying', server.id, confirmed, 'released')
+    }
+    if (result === undefined) {
+      const facts = await inspect(record.coordinator.id)
+      const finished = await execute(record.coordinator.id, 'complete', facts)
+      if (finished.record === undefined) throw new Error('Offline interruption returned no terminal record')
+      result = finished.record
+    }
+    status = { ...status, phase: 'released', result, updatedAt: Date.now() }
+    for (const server of record.servers) {
+      await execute(server.id, 'publish', await inspect(server.id))
+      await execute(server.id, 'unfence', await inspect(server.id))
+    }
+    return result
   }
 
   /**
@@ -1427,11 +2010,22 @@ export class ExperimentFleet {
    */
   async records(raw: AgentRecordRequest, complete = false): Promise<AgentRecordPage> {
     const input = agentRecordRequestSchema.parse(raw)
+    if (input.phase !== 'preparation') {
+      const copy = this.archives.store(input.experimentId)
+      const saved = copy?.records(input)
+      if (saved !== undefined && (copy?.traceCaughtUp(input.phase) || !this.archives.status(input.experimentId).runtimeAvailable)) return saved
+      this.archives.request(input.experimentId)
+    }
+    return this.recordsRemote(input, complete)
+  }
+
+  private async recordsRemote(raw: AgentRecordRequest, complete = false, signal?: AbortSignal): Promise<AgentRecordPage> {
+    const input = agentRecordRequestSchema.parse(raw)
     const record = this.get(input.experimentId)
     if (input.phase !== 'preparation') {
       if (record.submission === undefined || record.submission.protocol !== 4) return { records: [], hasMore: false, missing: true, reset: false }
       try {
-        const page = agentRecordPageSchema.parse(await this.call(record, complete ? 'trace-records' : 'records', input))
+        const page = agentRecordPageSchema.parse(await this.call(record, complete ? 'trace-records' : 'records', input, signal))
         if (page.records.some(event => event.experimentId !== input.experimentId || event.phase !== input.phase
           || (page.cursor !== undefined && event.sessionId !== page.cursor.sessionId))
           || (page.cursor !== undefined && (page.cursor.experimentId !== input.experimentId || page.cursor.phase !== input.phase))) throw new Error('Trajectory page belongs to another experiment or phase')
@@ -1440,7 +2034,7 @@ export class ExperimentFleet {
           let data = ''; let digest: string | undefined
           for (;;) {
             const chunk = traceEventChunkSchema.parse(await this.call(record, 'trace-event', { experimentId: event.experimentId, phase: event.phase,
-              sessionId: event.sessionId, seq: event.seq, offset: data.length, ...(page.cursor?.generation === undefined ? {} : { generation: page.cursor.generation }), ...(digest === undefined ? {} : { digest }) }))
+              sessionId: event.sessionId, seq: event.seq, offset: data.length, ...(page.cursor?.generation === undefined ? {} : { generation: page.cursor.generation }), ...(digest === undefined ? {} : { digest }) }, signal))
             if (chunk.nextOffset !== data.length + chunk.data.length || (digest !== undefined && chunk.digest !== digest)) throw new Error('Event fragments are inconsistent')
             data += chunk.data; digest = chunk.digest
             if (data.length === chunk.length) break
@@ -1453,7 +2047,7 @@ export class ExperimentFleet {
       }
       catch (error) {
         if (!complete || !(error instanceof CoordinatorRequestError) || error.status !== 404) throw error
-        return agentRecordPageSchema.parse(await this.call(record, 'records', input))
+        return agentRecordPageSchema.parse(await this.call(record, 'records', input, signal))
       }
     }
     const cursor = input.cursor
@@ -1504,16 +2098,26 @@ export class ExperimentFleet {
   async processes(id: ExperimentId, serverId: ExperimentServerId): Promise<ExperimentProcess[]> {
     const record = this.get(id)
     if (!record.servers.some(server => server.id === serverId)) throw new Error('Node belongs to another experiment')
+    const saved = this.archives.store(id)
+    if (saved?.hasFacts(serverId)) return saved.processes(serverId)
+    if (!record.servers.some(server => server.id === serverId)) throw new Error('Node belongs to another experiment')
     if (record.submission?.protocol !== 4) return []
     return z.array(experimentProcessSchema).parse(await this.call(record, 'processes', { experimentId: id, serverId }))
   }
 
   /** @param raw - immutable process source and cursor. @returns bounded stdout or stderr bytes. */
   async processLog(raw: ProcessLogRequest): Promise<ProcessLogPage> {
+    const input = processLogRequestSchema.parse(raw)
+    if (!this.get(input.experimentId).servers.some(server => server.id === input.serverId)) throw new Error('Node belongs to another experiment')
+    const saved = this.archives.store(input.experimentId)?.processLog(input, this.archivePolicy.archiveReadBytes)
+    return saved ?? this.processLogRemote(input)
+  }
+
+  private async processLogRemote(raw: ProcessLogRequest, signal?: AbortSignal): Promise<ProcessLogPage> {
     const request = processLogRequestSchema.parse(raw)
     const record = this.get(request.experimentId)
     if (!record.servers.some(server => server.id === request.serverId)) throw new Error('Node belongs to another experiment')
-    return processLogPageSchema.parse(await this.call(record, 'process-log', request))
+    return processLogPageSchema.parse(await this.call(record, 'process-log', request, signal))
   }
 
   /** @param id - experiment. @param serverId - pinned node. @returns registered sources and explicit legacy availability. */
@@ -1521,6 +2125,8 @@ export class ExperimentFleet {
     const record = this.get(id)
     if (!record.servers.some(server => server.id === serverId)) throw new Error('Node belongs to another experiment')
     const local = observationSources(resolve(resolveDshHome(), 'aspera-observations', id)).filter(source => source.serverId === serverId && source.experimentId === id)
+    const saved = this.archives.store(id)
+    if (saved?.hasFacts(serverId)) return { sources: [...local, ...saved.logSources(serverId)], legacy: false }
     if (record.receipt === undefined) return { sources: local, legacy: false }
     try {
       const remote = z.array(observationSourceSchema).parse(await this.call(record, 'observation-sources', { experimentId: id, serverId }))
@@ -1536,25 +2142,16 @@ export class ExperimentFleet {
 
   /** @param raw - registered log source and bound cursor. @param signal - download cancellation. @returns bounded complete log records. */
   async logRead(raw: ObservationRead, signal?: AbortSignal): Promise<ObservationPage> {
+    const input = observationReadSchema.parse(raw)
+    if (!this.get(input.experimentId).servers.some(server => server.id === input.serverId)) throw new Error('Node belongs to another experiment')
+    const saved = this.archives.store(input.experimentId)?.log(input)
+    return saved ?? this.logReadRemote(input, signal)
+  }
+
+  private async logReadRemote(raw: ObservationRead, signal?: AbortSignal): Promise<ObservationPage> {
     const input = observationReadSchema.parse(raw); const record = this.get(input.experimentId)
     if (!record.servers.some(server => server.id === input.serverId)) throw new Error('Node belongs to another experiment')
-    const refs = new Set<string>(record.servers.flatMap(server => [sshPasswordRef(server),
-      `ASPERA_CLUSTER_NODE_${server.id.replaceAll('-', '_')}`, `ASPERA_CLUSTER_COORDINATOR_${server.id.replaceAll('-', '_')}`]))
-    const secrets: string[] = []
-    for (const model of Object.values(record.models ?? {})) {
-      const configuration = await this.ctx.credentials.resolve(credentialRef(model.configurationRef))
-      if (configuration === undefined) continue
-      const saved = privateModelConfigurationSchema.parse(JSON.parse(configuration.value)); refs.add(saved.keyRef)
-      const scan = (value: unknown): void => {
-        if (value === null || typeof value !== 'object') return
-        for (const [key, entry] of Object.entries(value)) {
-          if (/^(?:extra)?headers$/i.test(key) && entry !== null && typeof entry === 'object') secrets.push(...Object.values(entry).filter((item): item is string => typeof item === 'string'))
-          else scan(entry)
-        }
-      }
-      scan(saved.options)
-    }
-    for (const ref of refs) { const value = await this.ctx.credentials.resolve(credentialRef(ref)); if (value !== undefined) secrets.push(value.value) }
+    const secrets = await this.archiveSecrets(record)
     const publish = (page: ObservationPage): ObservationPage => ({ ...page, lines: page.lines.map(line => ({ ...line, text: redactObservation(line.text, secrets) })) })
     const cursor = input.cursor ?? input.before
     if (cursor !== undefined && (cursor.experimentId !== input.experimentId || cursor.serverId !== input.serverId || cursor.sourceId !== input.sourceId || cursor.stream !== input.stream)) throw new Error('Log cursor belongs to another source')
@@ -1609,10 +2206,52 @@ export class ExperimentFleet {
     return publish(page)
   }
 
+  private async archiveSecrets(record: FleetExperiment): Promise<string[]> {
+    const refs = new Set<string>(record.servers.flatMap(server => [sshPasswordRef(server),
+      `ASPERA_CLUSTER_NODE_${server.id.replaceAll('-', '_')}`, `ASPERA_CLUSTER_COORDINATOR_${server.id.replaceAll('-', '_')}`]))
+    for (const saved of record.servers) {
+      const current = this.servers().servers.find(server => server.id === saved.id)
+      if (current !== undefined) refs.add(sshPasswordRef(current))
+    }
+    const secrets: string[] = []
+    for (const model of Object.values(record.models ?? {})) {
+      const configuration = await this.ctx.credentials.resolve(credentialRef(model.configurationRef))
+      if (configuration === undefined) continue
+      const saved = privateModelConfigurationSchema.parse(JSON.parse(configuration.value)); refs.add(saved.keyRef)
+      const scan = (value: unknown): void => {
+        if (value === null || typeof value !== 'object') return
+        for (const [key, entry] of Object.entries(value)) {
+          if (/^(?:extra)?headers$/i.test(key) && entry !== null && typeof entry === 'object') secrets.push(...Object.values(entry).filter((item): item is string => typeof item === 'string'))
+          else scan(entry)
+        }
+      }
+      scan(saved.options)
+    }
+    for (const ref of refs) { const value = await this.ctx.credentials.resolve(credentialRef(ref)); if (value !== undefined) secrets.push(value.value) }
+    return secrets
+  }
+
+  /** @param id - retained experiment. @returns local-copy health, independent of remote task success. */
+  archiveStatus(id: ExperimentId): ExperimentArchiveStatus { this.get(id); return this.archives.status(id) }
+  /** @param id - retained experiment. @returns remote observations or its explicitly offline copy. */
+  storageUsage(id: ExperimentId): Promise<ExperimentStorageUsage> { return this.environments.usage(id) }
+  /** @param id - retained experiment. @returns actual node capacity plans or an empty list before assessment. */
+  storagePlan(id: ExperimentId) { return this.environments.plans(id) }
+  /** @param id - retained experiment. @param serverId - assigned server. @param cursor - bounded scan continuation. @returns refreshed account-side storage measurements. */
+  refreshStorage(id: ExperimentId, serverId: ExperimentServerId, cursor?: string) { return this.environments.refresh(id, serverId, cursor) }
+  /** @param id - retained experiment. @returns reference-checked cleanup candidates. */
+  previewCacheCleanup(id: ExperimentId): Promise<ExperimentCachePreview> { return this.environments.preview(id) }
+  /** @param request - candidate-bound operation. @returns durable per-node results without changing training outcomes. */
+  cleanupCache(request: ExperimentCacheCleanup): Promise<ExperimentCacheResult> { return this.environments.cleanup(request) }
+  /** @param id - retained experiment. @returns current copy status after requesting a read-only synchronization. */
+  syncArchive(id: ExperimentId): ExperimentArchiveStatus { this.get(id); return this.archives.request(id) }
+
   /** @param raw - experiment, node and sampled-time range. @returns only recorded measurements. */
   async metrics(raw: MetricRead): Promise<MetricSample[]> {
     const input = metricReadSchema.parse(raw); const record = this.get(input.experimentId)
     if (!record.servers.some(server => server.id === input.serverId)) throw new Error('Node belongs to another experiment')
+    const saved = this.archives.store(input.experimentId)
+    if (saved?.hasFacts(input.serverId)) return saved.metrics(input)
     if (record.receipt === undefined) return []
     try {
       const samples = z.array(metricSampleSchema).parse(await this.call(record, 'observation-metrics', input))
@@ -1625,6 +2264,10 @@ export class ExperimentFleet {
   /** @param id - saved experiment. @returns progress bound to its pinned plan and Session; unsupported releases remain unchanged. */
   async executionProgress(id: ExperimentId): Promise<import('@aspera/experiments').ExecutionProgressRead> {
     const record = this.get(id)
+    const saved = this.archives.store(id)?.progress()
+    const remote = record.latest ?? record.receipt
+    if (saved !== undefined && (saved.progress === undefined || (saved.progress.planRevision === remote?.plan?.revision
+      && saved.progress.sessionId === (remote?.sessionId ?? `aspera-execution-${id}`)))) return saved
     if (record.receipt === undefined) return { supported: false }
     try {
       const result = executionProgressReadSchema.parse(await this.call(record, 'execution-progress', { experimentId: id }))
@@ -1658,13 +2301,19 @@ export class ExperimentFleet {
   /** Abort local preparations and flush all owned records. Remote accepted work remains independent. */
   async close(): Promise<void> {
     this.closing = true
-    await this.chain
+    await this.completionReviews.close()
+    await this.finalizationRecords.close()
     for (const pending of this.preparing.values()) pending.abort.abort(new Error('local dispatcher stopped'))
+    await this.environments.close()
+    await this.interruptions.close()
+    await this.archives.close()
+    await this.chain
     await Promise.all([...this.preparing.values()].map(pending => pending.done))
     await Promise.allSettled([...this.checks.values(), ...this.deletionWork.values()])
     await Promise.allSettled(this.acceptance.values())
     await Promise.allSettled(this.localCleanupWork.values())
     await this.removals.close()
+    await this.remoteTasks.close()
     await this.installations.close()
     await this.store.close()
   }

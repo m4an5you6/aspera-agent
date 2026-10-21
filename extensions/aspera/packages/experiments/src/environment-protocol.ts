@@ -8,7 +8,7 @@ export const executableDirectoriesSchema = z.array(z.string().startsWith('/').re
 /** Shell observations remain available before Node or Aspera is installed. */
 export const serverEnvironmentSchema = z.object({
   home: z.string().startsWith('/'), system: z.string(), architecture: z.string(), identity: z.string(),
-  programs: z.array(z.object({ name: z.enum(['node', 'pnpm', 'python3', 'bwrap']), path: z.string(), version: z.string() })),
+  programs: z.array(z.object({ name: z.enum(['node', 'pnpm', 'python3', 'bwrap', 'uv']), path: z.string(), version: z.string() })),
   sandboxExitCode: z.number().int(), diagnostics: z.string(),
 })
 /** Observed tools and sandbox result, without credentials. */
@@ -20,6 +20,7 @@ export const preparedToolchainSchema = z.object({
   node: z.string().startsWith('/'), pnpm: z.string().startsWith('/'),
   python3: z.string().startsWith('/'), bwrap: z.string().startsWith('/'),
   nodeVersion: z.string(), pnpmVersion: z.string(),
+  uv: z.string().startsWith('/').optional(), uvVersion: z.string().optional(),
 })
 /** Saved executable paths used consistently by probes and remote profile launches. */
 export type PreparedToolchain = z.infer<typeof preparedToolchainSchema>

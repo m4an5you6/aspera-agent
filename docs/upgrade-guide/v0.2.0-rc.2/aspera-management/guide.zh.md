@@ -31,3 +31,4 @@ Aspera `0.1.1` 要求 DSH `0.2.0-rc.2`。创建及派发要求从选中节点指
 6. 安装匹配的 UI 补丁，在截断前采集完整输出。保留运行版本，控制升级要求任务完成及清理确认。保留桌面 EXE。
 7. 在 `aspera-dispatch` 配置安装限制，自定义 fleet 调用者在第五个参数传入。读取快照 `installations` 及重试 `{ record, installations }`。保留记录、归档、缓存及远端记录。显式重试建立新预算并保留历史，退出未确认的安装进程在取消／删除后仍保留归属。更新现有运行资源。
 8. 读取 `experimentExecutionProgress` 并保留独立的 `execution-progress.v1.json` 文件。新执行 worker 完成前必须上报批准步骤，仍须独立验收。旧固定发布展示未记录的步骤，不升级已有任务；确认资源释放后复制实验，并处理 Goal 与实际硬件不一致的问题。
+9. 更新桌面资源并重启 Aspera，修复 profile 中缺失的包身份，同时保留用户设置及第 2 代归属标记。见[桌面升级](../../../../extensions/aspera/docs/desktop-upgrade.zh.md#profile-changes)。

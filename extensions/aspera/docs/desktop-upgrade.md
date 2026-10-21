@@ -20,9 +20,17 @@ The profile ownership marker advances from version 1 to 2. Upgrade validates the
 
 External packages are installed in the writable profile; the fixed runtime lives in `runtime.asar`. Restart after installing or changing a plugin. Runtime file watching remains disabled. Do not run both versions against the same Harness home or reopen the legacy executable after profile upgrade.
 
+Before starting the Host, desktop fills a missing `name` in the profile's `package.json` with `aspera-desktop-profile` and a missing `version` with the desktop application's package version. Existing names, versions, dependencies, bundles and user patches are retained. Explicit empty or non-string identity fields stop startup for correction. The ownership marker stays at version 2. This allows the DeepSeek plugin inventory to identify the desktop lifecycle module; no request extension is disabled. Fully quit and reopen the updated application to apply the repair; existing conversations can be retried without copying experiments.
+
+The runtime update also repairs DeepSeek phase snapshots. Preserve private configuration records and hashes, restart Aspera, and retry preparation when no release has been captured. Already fixed remote releases retain their original readers; see [model snapshot recovery](../../../docs/upgrade-guide/v0.2.0-rc.2/aspera-model-snapshots/guide.md).
+
 -----
 
 <a id="controller-readiness"></a>
 ## Controller readiness
+
+The [storage-governance update](storage-governance.md#records-and-compatibility) also requires matching Host, runtime and Web resources. Prepare resources first, fully quit Aspera before applying them, and retain the original executable. Old remote experiments keep their sealed release; a copied experiment receives storage, historical borrowing and managed-material capabilities after confirmed release.
+
+The [completion-review resource update](completion-review.md) reuses the existing executable. Fully quit Aspera before applying resources; preserve original fixed releases, failed outcomes and evidence files. Historical review needs no retraining and does not upgrade remote tasks.
 
 The matching resource update adds GPU identity checks and preparation-owned idle controller repair while retaining the current executable. Keep original remote releases and submitted experiments. Controllers with unknown startup authorization or without safe maintenance support require the reported release/stop action; their sealed releases are not overwritten. Interrupted repairs retain independent receipts and their attempt limit. See the [controller readiness upgrade](../../../docs/upgrade-guide/v0.2.0-rc.2/aspera-controller-readiness/guide.md).

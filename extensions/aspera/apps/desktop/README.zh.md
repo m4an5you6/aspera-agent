@@ -37,6 +37,7 @@ Windows 任务栏叠加图标显示需要计划确认或回复的实验数量：
 pnpm install --frozen-lockfile
 pnpm run build:desktop
 pnpm run test:desktop:api
+pnpm run test:desktop:deepseek
 pnpm run test:desktop
 pnpm run start:desktop
 ```
@@ -44,6 +45,8 @@ pnpm run start:desktop
 输出为 `.artifacts/desktop-0.1.1/<build-id>/win-unpacked/Aspera.exe` 和 `aspera-desktop-build.json`，不生成 ZIP，`latest.json` 指向最近成功构建。记录包含可执行文件及运行时的 SHA-256、构建标识、固定的 DSH／Aspera／Electron 版本、第 4 代控制协议、第 6 代本机管理存储、第 4 代远端存储和远端发布摘要。程序内含 `resources/build-info.json`。暂存目录使用 `.artifacts/desktop-build-*`，首次下载依赖需要网络。
 
 桌面验证默认使用最近的构建，也可通过 `ASPERA_DESKTOP_BUILD_ID` 指定构建目录。
+
+DeepSeek 回归使用原执行文件，在本机 Messages 测试接口上回放标准 Agent，以及使用新建和旧模型快照的全部三个阶段。它核对新建及已有 profile 的插件身份、已记录的 Session 交付和快照内容保持不变，不使用真实模型密钥。
 
 构建中断后，设置 `ASPERA_DESKTOP_STAGE=.artifacts/desktop-build-<id>` 可复用该暂存目录，前提是其冻结发布摘要仍与当前构建相同。构建会重新检查生产锁文件并封装运行时，已完成的输出目录各自独立。
 

@@ -1,0 +1,39 @@
+{
+  "role": "preparation",
+  "calls": [
+    "inspect_preparation_environment",
+    "run_preparation_command",
+    "run_preparation_command",
+    "inspect_preparation_environment",
+    "prepare_preparation_tool",
+    "verify_preparation_environment"
+  ],
+  "timeoutRecovered": true,
+  "originalCommandSubmissions": 1,
+  "independentVerification": true,
+  "deletedTaskRecovery": {
+    "calls": [
+      "inspect_preparation_environment",
+      "repair_preparation_controller",
+      "verify_preparation_environment"
+    ],
+    "programReceiptObserved": true,
+    "independentVerification": true,
+    "originalOperationCount": 1,
+    "deletedExperimentRestored": false,
+    "processStopIssued": false,
+    "originalSessionPreserved": true,
+    "ui": [
+      "light",
+      "dark",
+      "narrow",
+      "english"
+    ],
+    "manualBlockedRetry": {
+      "keyboard": true,
+      "operationPreserved": true,
+      "explicitInterrupt": true,
+      "result": "cancelled"
+    }
+  }
+}

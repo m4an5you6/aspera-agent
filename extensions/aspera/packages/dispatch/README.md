@@ -17,12 +17,16 @@ Submit multiple independent Goals, stage inputs and transfer complete experiment
 - [Understand the implementation](#understand-the-implementation)
 - [Further Exploration](#further-exploration)
 - [Model Experience](#model-experience)
+- [Preparation command recovery](#preparation-command-recovery)
+- [Remote task settlement](#remote-task-settlement)
 - [Known Limitations and Deferred Work](#known-limitations-and-deferred-work)
 
 -----
 
 <a id="use-this-package"></a>
 ## Use this package
+
+The management Host synchronizes accepted experiments without a visible page and serves committed copies through the existing trajectory, command, log, step and metric Remotes. `experimentArchiveStatus` and `syncExperimentArchive` expose read-only copy health and immediate backfill. [Local running records](../../docs/state-and-api.md#local-running-records) owns the version-1 index, SSH fallback, configurable limits and deletion lifecycle; exiting the profile stops and awaits its readers while remote execution continues independently.
 
 The generated `experimentExecutionProgress` Remote reads approved-plan Agent reports from each experiment's original coordinator. Unsupported pinned releases return explicit availability; failures preserve diagnostics rather than substituting a new runtime. [Step progress](../../docs/state-and-api.md#execution-step-progress) defines ownership and compatible persistence.
 
@@ -57,11 +61,28 @@ Retries read requirements from the original release. If both its application and
 <a id="understand-the-implementation"></a>
 ## Understand the implementation
 
-[Environment verification](src/deploy.ts) runs workspace writes, directory isolation, credential hiding and CUDA access through the complete execution sandbox. Shell inspection exercises its required namespaces before Node installation. A confirmed refusal returns its check, exit code and unchanged stdout/stderr through [preparation tools](src/environment-preparation.ts); the original Agent may repair account configuration and request revalidation. Container or host permission blockers require a concrete cloud-platform action. Removing isolation flags, mounting the host `/proc` or an Agent's completion statement cannot establish readiness.
+[interruption.ts](src/interruption.ts) owns Host background operations and durable version-1 receipts; [interruption-remote.ts](src/interruption-remote.ts) resolves the original submission, credentials and fixed SSH operations. Task settlement and controller recovery use the same server-side admission lock. Host preparation queues retain their own lifetimes, so stopping old work remains available during Agent diagnosis. Controller repair reconciles authorized, exited old tasks before startup and returns receipts to the preparation Agent; full verification still follows. [Controlled interruption](../../docs/state-and-api.md#experiment-interruption) defines original-result preservation, missing legacy identities, multi-node confirmation, blocked retry and API compatibility.
+
+[Environment verification](src/deploy.ts) runs workspace writes, directory isolation, credential hiding and CUDA access through the complete execution sandbox. Shell inspection exercises its required namespaces before Node installation. A confirmed refusal returns its check, exit code and unchanged stdout/stderr through [preparation tools](src/environment-preparation.ts); the original Agent requests repair and program revalidation. See [sandbox compatibility repair](#sandbox-compatibility-repair) for proc-mount failures. Removing isolation flags, binding the host `/proc` into the final sandbox or an Agent's completion statement cannot establish readiness.
+
+[Controller recovery](../../docs/state-and-api.md#controller-readiness) covers online maintenance and SSH recovery of an exited controller. `repair_preparation_controller` retains the original home, verifies resource release and publishes a separate fixed-release profile. An unavailable control port does not establish an account or cloud-policy blocker.
+
+<a id="sandbox-compatibility-repair"></a>
+### Sandbox compatibility repair
+
+`repair_preparation_sandbox` accepts only the active server id. The program discovers native bubblewrap, util-linux `unshare`/`setpriv` and `sha256sum`, then measures a private PID/proc parent using privileges the account already holds. The inner user/PID/mount/IPC/UTS isolation, private `/proc`, exact device grants and credential/directory masks remain required; `no_new_privs` and an empty capability set prevent privilege gain. A successful local probe supplies the dedicated tool in the logged diagnosis instead of inferring a host-policy blocker from `EPERM` alone. Missing utilities, insufficient existing privilege and failed probes retain distinct evidence. Connection checks never perform this repair probe or call a model.
+
+The tool installs an owner-only, content-addressed launcher and version-1 descriptor below the selected control root's `tools/sandbox`. It verifies existing material rather than overwriting it; native executable or launcher digest changes refuse reuse. Its resolved executable directory takes precedence during verification and is saved through the existing executable-path fields for deployment, controller startup and actual commands. Already running controls keep their configuration; changing their backend still requires the separately checked idle maintenance flow. Configuration alone cannot establish readiness: the Agent must call `verify_preparation_environment`, and every node's full checks must pass before handover. An available repair cannot be skipped by reporting account-level exhaustion.
+
+`sandboxRepairProbeTimeoutMs` defaults to 15000, `sandboxRepairCleanupTimeoutMs` to 1000, `sandboxRepairPollIntervalMs` to 20 and `sandboxRepairMaxAttempts` to two installations per experiment/server. Custom fleet callers pass the resolved policy after the SSH policy. Reusing installed matching material does not consume another attempt. Foreground repair commands use the existing preparation pending-command ownership; independent version-1 receipts bind experiment, server, Session, tool call and exit. Probe cleanup escalates TERM to KILL and checks process identities and private PID namespaces before writing an exit receipt. Cancelled, disconnected or unresolved work must be reconciled before another mutation; no host sysctl, AppArmor policy or driver is changed. A confirmed lack of compatible account permissions requires specific cloud-platform action.
 
 Read-only observations validate experiment, node and Session ownership before returning complete events, registered logs, attachments or measured samples. Preparation captures full command output before limiting tool results. Notice fingerprints persist per management profile; dismissing a Toast leaves failure and cleanup state intact. [Observation APIs](../../docs/state-and-api.md#logs-outputs-and-services) define cursors and legacy availability. Installation and release transfer verify the fixed published DSH rendering adapters through `@aspera/dispatch/compatibility`.
 
-Model admission resolves the three explicit choices through the DSH provider directory. [models.ts](src/models.ts) stores private API settings and independent credential references; retries load those snapshots. DeepSeek and supported pi-ai key routes use pinned adapters. Legacy `agentCredentialRefs` remains a configuration-read field; generation 4 transfers only credentials referenced by the admitted phase snapshots.
+`RunArchives` owns page-independent copies, coalesces manual requests and delays each next round from the previous completion. Ordinary, backlog, waiting and retry intervals are configurable; terminal resource release triggers a final copy, and confirmed drained records stop polling. Historical gaps remain distinct from pending tails. [Local running records](../../docs/state-and-api.md#local-running-records) defines settings, saved timestamps and finalization requirements.
+
+Model admission resolves the three explicit choices through the DSH provider directory. [models.ts](src/models.ts) stores private API settings and independent credential references; retries load those snapshots. DeepSeek captures complete resolved settings as reusable plugin inputs through the runtime's [snapshot conversion](../runtime/src/model-configuration.ts). DeepSeek and supported pi-ai key routes use pinned adapters. Legacy `agentCredentialRefs` remains a configuration-read field; generation 4 transfers only credentials referenced by the admitted phase snapshots.
+
+`agentContext.compaction` and `agentContext.pruning` configure preparation's private phase Agent through the [shared DSH context services](../runtime/README.md#use-this-package). Remote planner and execution profiles resolve the same settings in `aspera-runtime`; the coordinator forwards them to its worker children. No context settings are added to submitted experiment or Session records.
 
 <details>
 <summary>Implementation internals</summary>
@@ -82,9 +103,31 @@ Model admission resolves the three explicit choices through the DSH provider dir
 <a id="model-experience"></a>
 ## Model Experience
 
+Fixed release requirements include exact uv when declared. The preparation Agent installs basic tools; execution owns dependency requests through the node environment service. The Host's storage and cleanup Remotes use saved node ownership, preserve offline check times and wait for I/O before local deletion. `ExperimentFleet.open` accepts optional `ManagedEnvironmentPolicy` after `agentContext`; [managed environments](../../docs/managed-environments.md) owns configuration and recovery details.
+
 GPU and controller checks use actual identities and startup authorization. The preparation Agent can request the scoped controller repair tool; program verification and final handover checks establish readiness. Idle maintenance fences new tasks before an identity-bound restart. `controllerRepairMaxAttempts` defaults to two and is retained in independent recovery receipts. [Controller readiness](../../docs/state-and-api.md#controller-readiness) defines occupancy, unknown exits and original-release compatibility. Custom `FleetDriver` providers implement `inspectController`.
 
 Dispatch tools list non-secret servers, submit an explicit server group and read experiment status. The selected preparation model repairs failed checks through logged tools in the same Session; SSH credentials stay outside model input. Nonzero commands return diagnostics, while unconfirmed exits block repeated mutations. Agent text cannot replace workspace-write, isolation, credential-hiding, GPU and network verification. Passed checks enter the Agent inbox without waking the model; the loop admits their context after its initial system message. Requirements and receipts use existing Session events. **本机派发完成，远端实验已接管** appears only after receipt persistence; ID/revision comparison prevents completing an edited Goal.
+
+<a id="preparation-command-recovery"></a>
+## Preparation command recovery
+
+`run_preparation_command` supervises Python-equipped nodes independently of SSH. Each command shares `toolTimeoutMs` with its downloads and retries, capped by the installation round's remaining deadline. Logs and version-1 request, process, status and event records remain in the original preparation directory. Reconnection reads that command instead of launching another; only confirmed exit clears its pending marker. Unknown legacy exits remain blocked. Shell-only Python bootstrap retains direct log files and uses the system `timeout` utility.
+
+The preparation Agent calls `prepare_preparation_tool` for the release's exact uv. The program reuses an existing matching executable, validated wheel or partial material in the server cache before acquisition. It checks Python/platform tags and SHA-256, resumes supported ranges and returns executable directories for `verify_preparation_environment`. Training dependencies remain separate. Current SSH paths are used for the controller; cached uv paths join the verified toolchain.
+
+Host settings `preparationCommandReadTimeoutMs`, `preparationCommandRecoveryTimeoutMs` and `preparationCommandStopGraceMs` default to 30000, 60000 and 5000 milliseconds. Polling uses `pollIntervalMs`, capped at 10000 milliseconds. Process-group termination verifies boot and start identity; missing evidence preserves the pending marker. Diagnostics and recovered results use existing Session tool events. [Persistent records](../../docs/state-and-api.md) defines compatibility.
+
+<a id="remote-task-settlement"></a>
+## Remote task settlement
+
+The Host retains minimal [remote task identities](src/remote-task.ts) independently of visible experiments. Deletion saves the original submission digest and pinned node connections before the tombstone. It preserves unresolved interruption receipts and required SSH credential references. Original submissions are read through authenticated control or account-owned SSH, checked against the digest and node assignment, and never replaced by a new Goal.
+
+`remoteTaskStatus(id)` reads committed progress. `settleRemoteTask({taskId, mode})` starts Host-owned `reconcile` or explicit `interrupt` work. Existing interruption and controller repair use the same exit verification, fencing and release implementation. Automatic settlement requires an exited original coordinator or a trusted terminal outcome and confirmation of all original Agents, commands and services. Unknown nodes and active work retain occupancy. Server cards expose deleted-task progress and retry; connection checks perform no settlement. [Persistence and recovery](../../docs/state-and-api.md#remote-task-settlement) defines compatibility and retained files.
+
+[Completion reviews](../../docs/completion-review.md) run a restricted standard DSH Agent in an independent Session with the original execution model. The Host owns background reads, source verification, separate receipts, cancellation and deletion; original failed outcomes remain unchanged. JSON evidence retains its structure during credential removal, recording returns all field mismatches together, and local trajectory pages use the original persisted review Session.
+
+[Storage governance](../../docs/storage-governance.md) uses the same preparation Session and selected SSH accounts before controller startup. The Host supplies canonical metadata when remote access fails, manages cancellable reads and exposes saved capacity plans plus explicit bounded inventory refresh. Storage observations preserve original times and connection failures; cleanup selections bind program-issued candidates.
 
 <a id="known-limitations-and-deferred-work"></a>
 ## Known Limitations and Deferred Work

@@ -29,6 +29,7 @@
     }
   },
   "dependencies": {
+    "@deepseek-ai/dsh-brand": "0.2.0-rc.2",
     "@aspera/dispatch": "workspace:*",
     "@aspera/experiments": "workspace:*",
     "@deepseek-ai/schemastery": "3.18.4",

@@ -5,6 +5,12 @@
   disabled: true
 - id: tool-plugin-manager
   disabled: true
+- id: compaction-basic
+  disabled: true
+- id: command-compact
+  disabled: true
+- id: tool-result-pruner
+  disabled: true
 - id: credentials
   config:
     path: !!js process.env.DSH_EXPERIMENT_MODEL_CREDENTIAL_FILE
@@ -55,3 +61,6 @@
         documentationHosts: !!js JSON.parse(process.env.DSH_CLUSTER_DOCUMENTATION_HOSTS || '["docs.nvidia.com","github.com","raw.githubusercontent.com","swift.readthedocs.io","unsloth.ai","docs.unsloth.ai","huggingface.co"]')
         documentationBytes: !!js Number(process.env.DSH_CLUSTER_DOCUMENTATION_BYTES || 262144)
         goalContinuationWindow: !!js Number(process.env.DSH_CLUSTER_GOAL_WINDOW || 128)
+        agentContext: !!js JSON.parse(process.env.DSH_CLUSTER_CONTEXT_POLICY_JSON || '{}')
+        managedEnvironments: !!js JSON.parse(process.env.DSH_CLUSTER_ENVIRONMENT_POLICY_JSON || '{}')
+        finalization: !!js JSON.parse(process.env.DSH_CLUSTER_FINALIZATION_POLICY_JSON || '{}')

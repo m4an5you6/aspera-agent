@@ -7,6 +7,7 @@ import { serverRemovalBlockers } from '@aspera/dispatch/server-usage'
 import type { TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import type { ExperimentsController } from './controller.ts'
 import css from './ExperimentsPage.module.css'
+import { InterruptionProgress } from './InterruptionProgress.tsx'
 
 type Props = { controller: ExperimentsController; t: TranslateNS<'experiments'> }
 
@@ -64,7 +65,7 @@ export function ServerCards({ controller, t, state, edit }: Props & { state: Ret
       reason => { if (live) { setRemovalError(t('deleteServerFailedRetained')); controller.report(reason, { serverId: removal.id, operation: 'server-delete-preview' }) } })
     return () => { live = false }
   }, [controller, removal, previewAttempt, t])
-  const blockers = (server: ServerSettings) => serverRemovalBlockers(server.id, state.experiments, state.registry.checks?.[server.id]?.result ?? state.registry.probes?.[server.id], state.deletedIds)
+  const blockers = (server: ServerSettings) => serverRemovalBlockers(server.id, state.experiments, state.registry.checks?.[server.id]?.result ?? state.registry.probes?.[server.id], state.deletedIds, state.interruptions)
   const remove = async () => {
     if (removal === undefined) return
     try { await controller.removeServer(removal.id); setRemoval(undefined) }
@@ -88,8 +89,21 @@ export function ServerCards({ controller, t, state, edit }: Props & { state: Ret
           {error !== undefined && <details><summary>{t('technicalDetails')}</summary><pre>{error}</pre></details>}</div>}
         <div className={css.serverFacts}><span>{t('linkedExperiments', { count: blocked.length })}</span>
           {check?.checkedAt !== undefined && <time>{t('observedAt', { time: new Date(check.checkedAt).toLocaleString() })}</time>}</div>
-        {state.unconfirmedWork.some(work => work.serverIds.includes(server.id)) && <div className={css.deleteWarning}><div><strong>{t('removedWorkUnconfirmed')}</strong><p>{t('removedWorkHint')}</p>
-          <Button variant="ghost" size="sm" disabled={probing} onClick={() => { void controller.reconcileRemovedWork(server.id).catch(reason => { controller.report(reason, { serverId: server.id, operation: 'release-check' }) }) }}>{t('recheckRemoteWork')}</Button></div></div>}
+        {state.unconfirmedWork.filter(work => work.serverIds.includes(server.id)).map(work => {
+          const status = work.interruption
+          const busy = state.settlingTasks.includes(work.experimentId) || status !== undefined && !['blocked', 'released'].includes(status.phase)
+          const settle = (mode: 'reconcile' | 'interrupt') => {
+            const request = work.recoveryAvailable ? controller.settleRemoteTask(work.experimentId, mode) : controller.reconcileRemovedWork(server.id)
+            void request.catch(reason => { controller.report(reason, { serverId: server.id, operation: 'remote-task-' + mode }) })
+          }
+          return <div key={work.experimentId} className={css.deleteWarning} data-remote-task-id={work.experimentId} aria-busy={busy}><div>
+            <strong>{t('deletedTaskPendingRelease')}</strong><p>{work.name}</p><p className={css.hint}>{t('remoteTaskRetainsFiles')}</p>
+            {status !== undefined && <InterruptionProgress status={status} t={t} />}
+            <div className={css.actions}><Button variant="outline" size="sm" disabled={busy} aria-busy={busy}
+              icon={busy ? <StateDot state="ongoing" /> : <IconRefreshOutlineRegular />} onClick={() => { settle('reconcile') }}>{t(busy ? 'remoteTaskChecking' : 'verifyRemoteTaskRelease')}</Button>
+              {work.recoveryAvailable && <Button variant="ghost" size="sm" disabled={busy} onClick={() => { settle('interrupt') }}>{t('interruptRemoteTask')}</Button>}</div>
+          </div></div>
+        })}
         {current !== undefined ? <><div className={css.actions}><Tag tone="success">{t('sshPassed')}</Tag><Tag tone={check?.gpu === 'passed' ? 'success' : 'warning'}>{t(check?.gpu === 'passed' ? 'gpuPassed' : 'gpuUnavailable')}</Tag>
           <Tag tone={check?.control === 'passed' ? 'success' : 'neutral'}>{t(check?.control === 'passed' ? 'controlPassed' : 'controlUnavailable')}</Tag></div><Hardware probe={current} t={t} /></>
           : old !== undefined && <details className={css.historicalCheck}><summary>{previous === undefined ? t('currentConnectionUnconfirmed') : t('lastSuccessfulCheck', { time: new Date(previous.checkedAt).toLocaleString() })}</summary><Hardware probe={old} t={t} /></details>}

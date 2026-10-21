@@ -1,5 +1,5 @@
 /** Official DSH trajectories consume independently owned, complete phase event feeds. */
-import { useEffect, useState, useSyncExternalStore } from 'react'
+import { useEffect, useMemo, useState, useSyncExternalStore } from 'react'
 import type { ReactNode } from 'react'
 import { Button, Tooltip, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
@@ -43,7 +43,7 @@ class TraceFeed {
   private pending = false
   private disposed = false
   private readingHistory = false
-  constructor(private readonly controller: ExperimentsController, private readonly experimentId: string, private readonly phase: ExperimentPhase) {}
+  constructor(private readonly controller: ExperimentsController, private readonly experimentId: string, private readonly phase: ExperimentPhase, private readonly reviewOperation?: string) {}
   dispose(): void { this.disposed = true }
   activate(): void { this.disposed = false }
   reading(history: boolean): void { this.readingHistory = history; if (!history) void this.load() }
@@ -53,8 +53,9 @@ class TraceFeed {
     if (older) this.paging.update(value => { value.loadingOlder = true })
     const scope = { experimentId: this.experimentId, phase: this.phase, operation: 'trajectory' }
     try {
-      const page = await this.controller.records({ experimentId: this.experimentId, phase: this.phase,
-        ...(older ? { beforeSeq: this.records[0]?.seq ?? 0 } : this.cursor === undefined ? {} : { cursor: this.cursor }) })
+      const request = older ? { beforeSeq: this.records[0]?.seq ?? 0 } : this.cursor === undefined ? {} : { cursor: this.cursor }
+      const page = await (this.reviewOperation === undefined ? this.controller.records({ experimentId: this.experimentId, phase: this.phase, ...request })
+        : this.controller.reviewRecords(this.experimentId, this.reviewOperation, request))
       if (this.disposed) return false
       if (!older) this.cursor = page.cursor
       const previous = this.records
@@ -91,27 +92,36 @@ const phases = ['preparation', 'planning', 'execution'] as const
 const phaseLabels = { preparation: 'phasePreparation', planning: 'phasePlanning', execution: 'phaseExecution' } as const
 
 /** @param props - experiment, official renderer and API. @returns read-only official trajectories without a composer. */
-export function AgentRecords({ controller, row, t, onLog, renderFactorySlot }: { controller: ExperimentsController; row: FleetExperiment;
-  t: TranslateNS<'experiments'>; onLog: (serverId: string, commandId: string) => void } & PropsRenderFactories) {
-  const [phase, setPhase] = useState<ExperimentPhase>('preparation')
+export function AgentRecords({ controller, row, t, onLog, renderFactorySlot, offline = false }: { controller: ExperimentsController; row: FleetExperiment;
+  t: TranslateNS<'experiments'>; onLog: (serverId: string, commandId: string) => void; offline?: boolean } & PropsRenderFactories) {
+  const [phase, setPhase] = useState<ExperimentPhase | 'review'>(() => {
+    if (row.completionReview !== undefined) return 'review'
+    const current = experimentProgress(row).phase
+    return current >= 2 ? 'execution' : current === 1 ? 'planning' : 'preparation'
+  })
   const [feeds] = useState(() => ({ preparation: new TraceFeed(controller, row.request.experimentId, 'preparation'),
     planning: new TraceFeed(controller, row.request.experimentId, 'planning'), execution: new TraceFeed(controller, row.request.experimentId, 'execution') }))
   const progress = experimentProgress(row)
+  const operationId = row.completionReview?.operationId
+  const reviewFeed = useMemo(() => operationId === undefined ? undefined : new TraceFeed(controller, row.request.experimentId, 'execution', operationId), [controller, row.request.experimentId, operationId])
+  useEffect(() => { reviewFeed?.activate(); return () => { reviewFeed?.dispose() } }, [reviewFeed])
   useEffect(() => { for (const feed of Object.values(feeds)) feed.activate(); return () => { for (const feed of Object.values(feeds)) feed.dispose() } }, [feeds])
   const toolbar = <div className={css.tracePhases}>{phases.map((value, index) => {
     const state = index < progress.phase ? 'completed' : index > progress.phase ? 'idle' : progress.issue ? 'failed' : progress.busy ? 'running' : 'idle'
     return <button key={value} type="button" aria-pressed={phase === value} data-state={state} onClick={() => { setPhase(value) }}>
       <span aria-hidden>{state === 'completed' ? '✓' : state === 'failed' ? '×' : state === 'running' ? '●' : '○'}</span>{t(phaseLabels[value])}</button>
-  })}</div>
+  })}{reviewFeed !== undefined && <button type="button" aria-pressed={phase === 'review'} onClick={() => { setPhase('review') }}>{t('reviewTrace')}</button>}</div>
   return <section className={css.officialRecords} aria-label={t('agentRecords')}>
     {phases.map(value => <PhaseTrace key={value} active={phase === value} phase={value} feed={feeds[value]} row={row} t={t}
-      toolbar={toolbar} renderFactorySlot={renderFactorySlot} controller={controller} onLog={onLog} />)}
+      toolbar={toolbar} renderFactorySlot={renderFactorySlot} controller={controller} onLog={onLog} offline={offline && value !== 'preparation'} />)}
+    {reviewFeed !== undefined && <PhaseTrace key={operationId} active={phase === 'review'} phase="execution" feed={reviewFeed} row={row} t={t}
+      toolbar={toolbar} renderFactorySlot={renderFactorySlot} controller={controller} onLog={onLog} offline />}
   </section>
 }
 
-function PhaseTrace({ active, phase, feed, row, t, toolbar, renderFactorySlot, controller, onLog }: { active: boolean; phase: ExperimentPhase;
+function PhaseTrace({ active, phase, feed, row, t, toolbar, renderFactorySlot, controller, onLog, offline }: { active: boolean; phase: ExperimentPhase;
   feed: TraceFeed; row: FleetExperiment; t: TranslateNS<'experiments'>; toolbar: ReactNode; controller: ExperimentsController;
-  onLog: (serverId: string, commandId: string) => void } & PropsRenderFactories) {
+  onLog: (serverId: string, commandId: string) => void; offline: boolean } & PropsRenderFactories) {
   const status = useSyncExternalStore(feed.status.subscribe, feed.status.getSnapshot)
   const paging = useSyncExternalStore(feed.paging.subscribe, feed.paging.getSnapshot)
   const [selected, setSelected] = useState<Cell | null>(null)
@@ -121,6 +131,7 @@ function PhaseTrace({ active, phase, feed, row, t, toolbar, renderFactorySlot, c
   const loadImage = (attachment: { attachmentId: string }) => {
     const cached = images.get(attachment.attachmentId)
     if (cached !== undefined) return cached
+    if (offline) return Promise.reject(new Error(t('archiveAttachmentUnavailable')))
     const event = feed.records.find(record => !record.truncated && record.data.includes(JSON.stringify(attachment.attachmentId)))
     if (event === undefined) return Promise.reject(new Error(t('eventsMissing')))
     const loading = controller.traceImage(row.request.experimentId, phase, event.seq, attachment.attachmentId)
@@ -141,7 +152,8 @@ function PhaseTrace({ active, phase, feed, row, t, toolbar, renderFactorySlot, c
     <footer className={css.readerFooter}><span>{paging.openState === 'loading' ? <StateDot state="ongoing" /> : t(status.disconnected ? 'disconnected' : status.missing ? 'eventsMissing' : status.truncated ? 'recordTruncated' : 'traceReadOnly')}
       {' · '}{status.count}</span>
       {record?.log !== undefined && <Button size="sm" variant="ghost" onClick={() => { onLog(record.log!.serverId, record.log!.commandId) }}>{t('viewLogs')}</Button>}
-      {fileAttachments(record).map(file => <Tooltip key={file.attachmentId} label={file.name} portal><Button size="sm" variant="ghost" disabled={downloading !== undefined}
+      {offline && fileAttachments(record).length > 0 && <span>{t('archiveAttachmentUnavailable')}</span>}
+      {fileAttachments(record).map(file => <Tooltip key={file.attachmentId} label={offline ? t('archiveAttachmentUnavailable') : file.name} portal><Button size="sm" variant="ghost" disabled={offline || downloading !== undefined}
         onClick={() => {
           setDownloading(file.attachmentId)
           void controller.traceImage(row.request.experimentId, phase, record!.seq, file.attachmentId).then(url => {

@@ -1,0 +1,17 @@
+{
+  "conversation": {
+    "provider": "deepseek-official",
+    "model": "deepseek-flash",
+    "turnResult": "completed",
+    "response": "DESKTOP_EXTENSION_OK",
+    "sessionLogAccepted": true
+  },
+  "phases": [
+    { "phase": "preparation", "layout": "config", "provider": "deepseek-official", "model": "deepseek-flash", "turnResult": "completed", "response": "DESKTOP_EXTENSION_OK", "sessionLogAccepted": true, "snapshotPreserved": true },
+    { "phase": "preparation", "layout": "resolved", "provider": "deepseek-official", "model": "deepseek-flash", "turnResult": "completed", "response": "DESKTOP_EXTENSION_OK", "sessionLogAccepted": true, "snapshotPreserved": true },
+    { "phase": "planning", "layout": "config", "provider": "deepseek-official", "model": "deepseek-flash", "turnResult": "completed", "response": "DESKTOP_EXTENSION_OK", "sessionLogAccepted": true, "snapshotPreserved": true },
+    { "phase": "planning", "layout": "resolved", "provider": "deepseek-official", "model": "deepseek-flash", "turnResult": "completed", "response": "DESKTOP_EXTENSION_OK", "sessionLogAccepted": true, "snapshotPreserved": true },
+    { "phase": "execution", "layout": "config", "provider": "deepseek-official", "model": "deepseek-flash", "turnResult": "completed", "response": "DESKTOP_EXTENSION_OK", "sessionLogAccepted": true, "snapshotPreserved": true },
+    { "phase": "execution", "layout": "resolved", "provider": "deepseek-official", "model": "deepseek-flash", "turnResult": "completed", "response": "DESKTOP_EXTENSION_OK", "sessionLogAccepted": true, "snapshotPreserved": true }
+  ]
+}

@@ -4,8 +4,8 @@ import type { ServerInventory, StorageCandidate, StorageMountIdentity, StoragePl
 export function parseMounts(text: string): (StorageMountIdentity & { readOnly: boolean })[]
 /** Read mount and interface facts. @param input - optional explicit directory. @returns non-secret inventory. */
 export function inspectStorage(input?: { directory?: string }): ServerInventory
-/** Recheck recorded placement. @param placement - saved assignment. @param requiredBytes - additional bytes. @returns current space facts. */
-export function verifyStorage(placement: StoragePlacement, requiredBytes?: number): StorageCandidate
+/** Recheck recorded placement. @param placement - saved assignment. @param requiredBytes - additional bytes. @param maintenance - owned diagnostics or cleanup enforce identity without the execution reserve. @returns current space facts. */
+export function verifyStorage(placement: StoragePlacement, requiredBytes?: number, maintenance?: boolean): StorageCandidate
 /** Create private owned paths. @param placement - saved assignment. @param requiredBytes - additional bytes. @returns verified space facts. */
 export function prepareStorage(placement: StoragePlacement, requiredBytes?: number): StorageCandidate
 /** Remove a tree with the exact owner marker, without following links. @param directory - owned tree. @param owner - expected marker. */

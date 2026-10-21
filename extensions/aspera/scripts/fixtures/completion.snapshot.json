@@ -1,0 +1,23 @@
+{
+  "originalOutcomeRetained": true,
+  "originalSubmissionRetained": true,
+  "omittedEvidenceCorrected": true,
+  "crossNodeRejected": true,
+  "historicalEnvironmentReadOnly": true,
+  "restrictedStandardAgent": true,
+  "retrainingToolsAbsent": true,
+  "passed": true,
+  "missingArtifactBlocked": true,
+  "cancelled": true,
+  "traceRecorded": true,
+  "structuredJsonRedaction": true,
+  "aggregateDiagnostics": true,
+  "originalSessionTraceRecovery": true,
+  "localized": true,
+  "responsive": true,
+  "blockedContinuationSupplemented": true,
+  "cumulativeAndAdditionalStepsSeparated": true,
+  "stageToolsCalledByRestrictedAgent": true,
+  "originalStepReportsRetained": true,
+  "gpuAcceptance": "not run"
+}

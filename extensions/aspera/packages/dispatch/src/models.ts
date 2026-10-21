@@ -7,6 +7,7 @@ import type {} from '@deepseek-ai/dsh-agent-default-model'
 import { credentialKey, credentialRef } from '@deepseek-ai/dsh-credentials'
 import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment'
 import { resolveAdapterOptions } from '@deepseek-ai/dsh-llm-deepseek-api-key'
+import { deepSeekConfigurationOptions } from '@aspera/runtime'
 import { builtinProviders, getBuiltinModels, getBuiltinProviders } from '@earendil-works/pi-ai/providers/all'
 import { experimentPhases, experimentModelsSchema, experimentModelSnapshotsSchema } from '@aspera/experiments'
 import type { ExperimentId, ExperimentModels, ExperimentModelDirectory, ExperimentModelSnapshots, ExperimentModelOption, PhaseModelSelection } from '@aspera/experiments'
@@ -23,7 +24,8 @@ function profile(ctx: Context, provider: string): { adapter: 'deepseek-api-key' 
   const adapter = provider === 'deepseek-official' && route.settingsPath.length === 0 ? 'deepseek-api-key'
     : route.settingsPath.length === 2 && route.settingsPath[0] === 'providers' && route.settingsPath[1] === provider ? 'pi-ai' : undefined
   if (adapter === undefined) throw new Error('This provider cannot be transferred; select a DeepSeek API key or llm-pi-ai key API')
-  if (adapter === 'deepseek-api-key') options = z.record(z.string(), z.json()).parse(JSON.parse(JSON.stringify(resolveAdapterOptions(options, launchEnvironmentOf(ctx)))))
+  if (adapter === 'deepseek-api-key') options = z.record(z.string(), z.json()).parse(JSON.parse(JSON.stringify(
+    deepSeekConfigurationOptions(resolveAdapterOptions(options, launchEnvironmentOf(ctx))))))
   const ref = z.string().min(1).optional().parse(options.apiKeyEnv)
   const api = adapter === 'deepseek-api-key' ? 'deepseek-messages' : typeof options.api === 'string' ? options.api : `pi-ai:${provider}`
   const baseURL = typeof options.baseURL === 'string' ? options.baseURL : undefined

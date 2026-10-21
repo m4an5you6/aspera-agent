@@ -1,0 +1,16 @@
+# Bilingual-pair consistency record for guide.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write docs/upgrade-guide/v0.2.0-rc.2/aspera-model-snapshots/guide.md
+/:
+  en: d79eb83e3099cc8f
+  zh: 1f26933d613d2901
+/aspera-deepseek-model-snapshots:
+  en: 395fdb45f9203a21
+  zh: 3bb97c70dc42396c
+/aspera-deepseek-model-snapshots/change:
+  en: 7999a6ff4c617724
+  zh: d542074c19408a51
+/aspera-deepseek-model-snapshots/migration:
+  en: e34699493c88a3eb
+  zh: 19ee0ada664b5c0c

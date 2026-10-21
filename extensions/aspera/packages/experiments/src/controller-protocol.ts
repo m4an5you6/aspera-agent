@@ -70,6 +70,7 @@ export const controllerStatusSchema = z.object({
   occupied: z.object({ experiments: z.array(z.string()), allocations: z.array(z.string()), commands: z.array(z.string()), services: z.array(z.string()) }).strict(),
   actualGpu: gpuInventorySchema.optional(), gpuError: z.string().optional(),
   legacy: z.boolean().optional(),
+  features: z.array(z.string()).optional(),
 }).strict()
 /** Current process identity, authorization and independently observed occupancy. */
 export type ControllerStatus = z.infer<typeof controllerStatusSchema>

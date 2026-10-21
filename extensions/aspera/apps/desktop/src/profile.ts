@@ -6,7 +6,11 @@ import { load, dump } from 'js-yaml'
 import z from 'zod'
 
 const markerSchema = z.object({ version: z.union([z.literal(1), z.literal(2)]), runtime: z.string() }).strict()
-const manifestSchema = z.object({ dependencies: z.record(z.string(), z.string()).optional(),
+const desktopVersion = z.object({ version: z.string().min(1) }).parse(
+  JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')),
+).version
+const manifestSchema = z.object({ name: z.string().min(1).optional(), version: z.string().min(1).optional(),
+  dependencies: z.record(z.string(), z.string()).optional(),
   dsh: z.object({ profile: z.object({ bundles: z.array(z.string()) }).passthrough() }).passthrough(),
 }).passthrough()
 const patchSchema = z.array(z.object({ id: z.string().optional(), disabled: z.boolean().optional(),
@@ -15,7 +19,9 @@ const patchSchema = z.array(z.object({ id: z.string().optional(), disabled: z.bo
 const bundles = ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', '@aspera/dispatch']
 
 /**
- * Prepare the managed external-plugin profile; migrate only a verified legacy runtime link.
+ * Prepare the managed external-plugin profile and fill missing package identity before Host startup.
+ * Explicit identity and user settings are retained; malformed identity stops startup.
+ * Only a verified legacy runtime link is migrated.
  * @param home - Independent Harness home.
  * @param runtime - Frozen application package location, including an Electron archive.
  * @param hostPlugin - Private lifecycle plugin file.
@@ -54,9 +60,13 @@ export function prepareDesktopProfile(home: string, runtime: string, hostPlugin:
       '@deepseek-ai/dsh-host-directory-picker-browse', '@deepseek-ai/dsh-client-ui-directory-picker-browse']) delete manifest.dependencies?.[name]
     writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n')
   }
-  if (!existsSync(manifestPath)) writeFileSync(manifestPath, JSON.stringify({ name: 'aspera-desktop-profile',
-    private: true, type: 'module', dependencies: {}, dsh: { profile: { bundles } } }, null, 2) + '\n')
-  else manifestSchema.parse(JSON.parse(readFileSync(manifestPath, 'utf8')))
+  const manifest = manifestSchema.parse(existsSync(manifestPath) ? JSON.parse(readFileSync(manifestPath, 'utf8'))
+    : { private: true, type: 'module', dependencies: {}, dsh: { profile: { bundles } } })
+  if (manifest.name === undefined || manifest.version === undefined) {
+    manifest.name ??= 'aspera-desktop-profile'
+    manifest.version ??= desktopVersion
+    writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n')
+  }
   if (!existsSync(patchPath)) writeFileSync(patchPath, '[]\n')
   if (!existsSync(resolve(profile, 'pnpm-workspace.yaml'))) writeFileSync(resolve(profile, 'pnpm-workspace.yaml'),
     'packages:\n  - .\nnodeLinker: hoisted\nstrictDepBuilds: true\n')

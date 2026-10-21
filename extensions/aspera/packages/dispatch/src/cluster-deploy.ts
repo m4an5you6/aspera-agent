@@ -6,14 +6,16 @@ import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { z } from 'zod'
 import { controllerStatusSchema, gpuInventorySchema, parseGpuInventory, gpuInventoryText, normalizedSet, normalizedGpuInventory } from '@aspera/experiments'
-import { controllerPolicyDigest, gpuIdentityQueryScript } from '@aspera/runtime'
-import type { ControllerStatus } from '@aspera/experiments'
+import { controllerPolicyDigest, gpuIdentityQueryScript, managedEnvironmentPolicyForRelease } from '@aspera/runtime'
+import type { ControllerStatus, ControllerRepairId } from '@aspera/experiments'
 import type { ClusterNode, ClusterServer } from '@aspera/runtime'
 import { installPrivateFile, installSource, validateEnvironment } from './deploy.ts'
 import type { DeploymentConfig, PreparedEnvironment } from './deploy.ts'
 import type { SourceSnapshot } from './snapshot.ts'
 import { copy, remote, RemoteCommandError, request, shellQuote } from './transport.ts'
 import type { Target } from './transport.ts'
+
+const controllerProfileProgram = readFileSync(new URL('../scripts/controller-profile.mjs', import.meta.url), 'utf8')
 
 /** Retries reuse an installed immutable release even after the local application is upgraded. */
 export type DeploymentRelease = SourceSnapshot | { readonly digest: string; readonly reuse: true }
@@ -37,6 +39,17 @@ export function verifyController(controller: ControllerStatus, target: Deploymen
   const expected = { backendPath: prepared.backendPath, devicePaths: normalizedSet(prepared.devicePaths), hiddenPaths: normalizedSet(prepared.hiddenPaths), gpu: prepared.gpu }
   const fail = (code: ControllerDiagnostic['diagnostic']['code'], detail: string): never => { throw new ControllerDiagnostic({ code, role, detail, controller, expected }) }
   if (controller.role !== role || controller.root !== target.remoteRoot) fail('unknown', 'Control process role or directory differs from this server')
+  const missing = prepared.requiredFeatures?.filter(feature => !controller.features?.includes(feature)) ?? []
+  if (missing.length > 0) fail('configuration-outdated', 'Control process lacks selected-release capabilities: ' + missing.join(', ') + '; request controlled repair before reuse')
+  if (controller.features?.includes('managed-environment-install-v3') && !prepared.requiredFeatures?.includes('managed-environment-install-v3')) {
+    fail('configuration-outdated', 'Control process installer v3 cannot substitute for the original release installer; retain the old release and use controlled idle repair')
+  }
+  if (controller.features?.includes('storage-governance-v1') && !prepared.requiredFeatures?.includes('storage-governance-v1')) {
+    fail('configuration-outdated', 'Storage-governance controller cannot replace the original fixed-release implementation; settle its tasks before controlled repair')
+  }
+  if (controller.features?.includes('purpose-storage-0.1.0') && !prepared.requiredFeatures?.includes('purpose-storage-0.1.0')) {
+    fail('configuration-outdated', 'Purpose-storage controller cannot replace an older fixed storage implementation')
+  }
   if (controller.legacy && controller.deploymentId !== prepared.deploymentId) fail('unknown', 'A legacy controller can only serve its verified original release; release its tasks before starting the selected release')
   if (controller.maintenance !== undefined) fail('occupied', `Control process is held by maintenance ${controller.maintenance}`)
   if (controller.policy.backendPath !== expected.backendPath || JSON.stringify(normalizedSet(controller.policy.devicePaths)) !== JSON.stringify(expected.devicePaths)
@@ -60,7 +73,7 @@ export async function inspectController(target: DeploymentConfig, role: 'node' |
   const response = await request({ ...target, remotePort: target.remotePort + (role === 'coordinator' ? 1 : 0) }, token, '/aspera/v1/health', 'GET', undefined, signal, password)
   const parsed = z.object({ controller: controllerStatusSchema, features: z.array(z.string()) }).safeParse(response.value)
   if (response.status === 200 && parsed.success && parsed.data.features.includes('controller-readiness-v1')) {
-    return { ...parsed.data.controller, ...(!parsed.data.features.includes('controller-maintenance-v1') ? { legacy: true } : {}) }
+    return { ...parsed.data.controller, features: parsed.data.features, ...(!parsed.data.features.includes('controller-maintenance-v1') ? { legacy: true } : {}) }
   }
   const legacy = await remote(target, `python3 -c ${shellQuote(`import glob,json,pathlib,stat,subprocess
 p=pathlib.Path(${JSON.stringify(target.remoteRoot + '/state/' + role + '.pid')})
@@ -143,10 +156,11 @@ export async function prepareClusterServer(target: DeploymentConfig, source: Dep
  * @param token - control credential.
  * @param password - SSH credential.
  * @param signal - preparation cancellation.
+ * @param recoveryId - program-owned offline admission fence; absent for a fresh control directory.
  */
 export async function ensureClusterRole(target: DeploymentConfig, prepared: PreparedEnvironment,
   role: 'coordinator' | 'node', token: string,
-  password: string | undefined, signal: AbortSignal): Promise<void> {
+  password: string | undefined, signal: AbortSignal, recoveryId?: ControllerRepairId): Promise<void> {
   const control = { ...target, remotePort: target.remotePort + (role === 'coordinator' ? 1 : 0) }
   const compatible = (value: unknown) => {
     const health = z.object({ protocol: z.literal(4), role: z.literal(role), deploymentId: z.string().regex(/^[a-f0-9]{64}$/), features: z.array(z.string()).optional() }).safeParse(value)
@@ -157,15 +171,43 @@ export async function ensureClusterRole(target: DeploymentConfig, prepared: Prep
     const health = await request(control, token, '/aspera/v1/health', 'GET', undefined, signal, password)
     if (health.status === 200 && compatible(health.value)) {
       const status = z.object({ controller: controllerStatusSchema }).safeParse(health.value)
-      verifyController(status.success ? status.data.controller : await inspectController(target, role, token, password, signal), target, prepared, role)
+      const features = z.object({ features: z.array(z.string()) }).parse(health.value).features
+      verifyController(status.success ? { ...status.data.controller, features } : await inspectController(target, role, token, password, signal), target, prepared, role)
       return
     }
   } catch (error) { signal.throwIfAborted(); if (error instanceof ControllerDiagnostic) throw error }
   const root = target.remoteRoot
   const release = target.storagePlacement?.releaseRoot ?? `${root}/releases/${prepared.deploymentId}`
   const pidFile = `${root}/state/${role}.pid`
+  const profileName = `aspera-worker-${prepared.deploymentId}`
+  const home = `${root}/state/${role}-home`
+  if (recoveryId === undefined) {
+    const previous = await remote(target, `if [ -f ${shellQuote(pidFile)} ] || [ -d ${shellQuote(home + '/profiles')} ] || [ -d ${shellQuote(home + '/storages')} ]; then printf previous; fi`, signal, password)
+    if (previous === 'previous') throw new ControllerDiagnostic({ code: 'unavailable', role,
+      detail: 'The control endpoint is offline and its original profile or storage remains. Request repair_preparation_controller; the program must verify durable release before creating the selected release profile.' })
+  }
+  let recoveringActive = false
+  if (recoveryId !== undefined) {
+    const recovered = await remote(target, `python3 -c ${shellQuote(`import os,pathlib,json
+root=pathlib.Path(${JSON.stringify(root)}); found=[]
+for proc in pathlib.Path('/proc').iterdir():
+ if not proc.name.isdigit(): continue
+ try:
+  env=dict(item.split(b'=',1) for item in (proc/'environ').read_bytes().split(b'\\0') if b'=' in item)
+  expected={'DSH_CLUSTER_ROOT':str(root),'DSH_EXPERIMENT_ROLE':${JSON.stringify(role)},'DSH_EXPERIMENT_DEPLOYMENT_ID':${JSON.stringify(prepared.deploymentId)},'ASPERA_CONTROLLER_RECOVERY_ID':${JSON.stringify(recoveryId)}}
+  if not all(env.get(key.encode(),b'').decode()==value for key,value in expected.items()): continue
+  command=(proc/'cmdline').read_bytes().split(b'\\0')
+  if b'--profile' not in command or command[command.index(b'--profile')+1]!=${JSON.stringify(profileName)}.encode(): continue
+  found.append(proc.name)
+ except (FileNotFoundError,ProcessLookupError): continue
+if len(found)>1: raise RuntimeError('More than one process belongs to the original recovery')
+if found:
+ (root/'state'/${JSON.stringify(role + '.pid')}).write_text(found[0]+'\\n'); print('active')`)}`, signal, password)
+    recoveringActive = recovered.trim() === 'active'
+  }
   const active = await remote(target, `if [ -f ${shellQuote(pidFile)} ] && kill -0 "$(cat ${shellQuote(pidFile)})" 2>/dev/null; then printf active; fi`, signal, password)
-  if (active === 'active') throw new Error(`${role} on port ${control.remotePort} is running an incompatible or unavailable controller. Keep its original release until all tasks finish and cleanup is confirmed, then stop that controller before retrying.`)
+  if (active === 'active' && !recoveringActive) throw new Error(`${role} on port ${control.remotePort} is running an incompatible or unavailable controller. Keep its original release until all tasks finish and cleanup is confirmed, then stop that controller before retrying.`)
+  if (!recoveringActive) {
   await remote(target, `node --input-type=module -e ${shellQuote(`import { createServer } from 'node:net'; const server = createServer(); server.once('error', error => { console.error('Control port ${control.remotePort} is unavailable: ' + error.message); process.exitCode = 1 }); server.listen({ host: '127.0.0.1', port: ${control.remotePort}, exclusive: true }, () => server.close())`)}`, signal, password)
   const incomingToken = `${root}/secrets/${role}-${randomUUID()}.incoming`
   await installPrivateFile(target, incomingToken, token, signal, password)
@@ -181,6 +223,14 @@ ln ${shellQuote(incomingToken)} ${shellQuote(root + '/secrets/' + role + '.token
     DSH_EXPERIMENT_DEVICES: prepared.devicePaths.join(','), DSH_EXPERIMENT_BWRAP: prepared.backendPath,
     DSH_EXPERIMENT_GPU_SNAPSHOT: JSON.stringify(prepared.gpu),
     DSH_EXPERIMENT_HIDDEN_PATHS_JSON: JSON.stringify(prepared.hiddenPaths), DSH_EXPERIMENT_PORT: String(control.remotePort),
+    ...(recoveryId === undefined ? {} : { ASPERA_CONTROLLER_RECOVERY_ID: recoveryId }),
+  }
+  if (target.managedEnvironments !== undefined) {
+    const uvPath = (await remote(target, 'command -v uv || true', signal, password)).trim()
+    const pythonPath = (await remote(target, 'command -v python3', signal, password)).trim()
+    env.DSH_CLUSTER_ENVIRONMENT_POLICY_JSON = JSON.stringify({ ...managedEnvironmentPolicyForRelease(target.managedEnvironments,
+      prepared.requiredFeatures?.includes('managed-environment-install-v3') === true, prepared.requiredFeatures?.includes('storage-governance-v1') === true, prepared.requiredFeatures?.includes('purpose-storage-0.1.0') === true),
+      uvPath: uvPath.startsWith('/') ? uvPath : target.managedEnvironments.uvPath, pythonPath })
   }
   const executablePath = target.pathEntries?.length ? `export PATH=${shellQuote(target.pathEntries.join(':'))}:"$PATH"\n` : ''
   await remote(target, `set -eu
@@ -191,9 +241,10 @@ trap 'rmdir "$lock"' EXIT
 if [ -f ${shellQuote(pidFile)} ] && kill -0 "$(cat ${shellQuote(pidFile)})" 2>/dev/null; then exit 0; fi
 ${executablePath}${Object.entries(env).map(([name, value]) => `export ${name}=${shellQuote(value)}`).join('\n')}
 cd ${shellQuote(root + '/workspace')}
-node ${shellQuote(release + '/setup.mjs')} --worker
-setsid node ${shellQuote(release + '/node_modules/@deepseek-ai/dsh/lib/bin.js')} --profile aspera-worker </dev/null >>${shellQuote(root + '/logs/' + role + '.log')} 2>&1 &
+node --input-type=module -e ${shellQuote(controllerProfileProgram)} ${shellQuote(JSON.stringify({ root, role, release, deploymentId: prepared.deploymentId, operationId: recoveryId, timeoutMs: target.toolTimeoutMs }))}
+setsid node ${shellQuote(release + '/node_modules/@deepseek-ai/dsh/lib/bin.js')} --profile ${shellQuote(profileName)} </dev/null >>${shellQuote(root + '/logs/' + role + '.log')} 2>&1 &
 echo "$!" > ${shellQuote(pidFile)}`, signal, password)
+  }
   const deadline = Date.now() + target.toolTimeoutMs
   let lastError: unknown
   do {
@@ -202,7 +253,8 @@ echo "$!" > ${shellQuote(pidFile)}`, signal, password)
       const health = await request(control, token, '/aspera/v1/health', 'GET', undefined, signal, password)
       if (health.status === 200 && compatible(health.value)) {
         const status = z.object({ controller: controllerStatusSchema }).safeParse(health.value)
-        verifyController(status.success ? status.data.controller : await inspectController(target, role, token, password, signal), target, prepared, role)
+        const features = z.object({ features: z.array(z.string()) }).parse(health.value).features
+        verifyController(status.success ? { ...status.data.controller, features } : await inspectController(target, role, token, password, signal), target, prepared, role)
         return
       }
       lastError = new Error(`control HTTP ${health.status}`)

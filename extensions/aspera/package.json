@@ -6,6 +6,9 @@
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
   },
+  "asperaEnvironmentTools": { "uvVersion": "0.13.0", "pipVersion": "26.2.1", "reuseVersion": 1, "cleanupVersion": 1, "installVersion": 3, "storageVersion": 1, "storageFormat": "0.1.0" },
+  "asperaCompletionVersion": 1,
+  "asperaFinalizationVersion": 2,
   "scripts": {
     "build": "pnpm run build:host && pnpm run gen:typert && pnpm run build:client",
     "build:host": "tsc -b tsconfig.host.json",
@@ -18,9 +21,12 @@
     "update:desktop:resources": "node scripts/update-desktop-resources.mjs",
     "test:installed": "node scripts/test-installed.mjs",
     "test:worker": "node scripts/test-worker.mjs",
+    "test:preparation": "node scripts/test-preparation.mjs",
+    "test:completion": "node scripts/test-completion-review.mjs",
     "test:control": "node scripts/test-control.mjs",
     "test:api": "node scripts/test-api.mjs",
     "test:desktop:api": "node scripts/test-desktop-api.mjs",
+    "test:desktop:deepseek": "node scripts/test-desktop-deepseek.mjs",
     "pack": "node scripts/pack.mjs",
     "lint": "oxlint -c .oxlintrc.json packages apps scripts",
     "dsh": "node scripts/dsh.mjs",

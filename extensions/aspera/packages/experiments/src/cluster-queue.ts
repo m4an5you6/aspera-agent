@@ -55,6 +55,9 @@ export class ClusterQueue {
   }
 
   private async save(record: ClusterRecord, patch: Partial<ClusterRecord>): Promise<ClusterRecord> {
+    if (patch.state !== undefined && patch.state !== record.state && ['completed', 'blocked', 'failed', 'cancelled', 'interrupted'].includes(record.state)) {
+      throw new Error('Experiment already has a terminal outcome; late updates cannot restart it')
+    }
     const expires = patch.state !== undefined && ['cancelling', 'cancelled', 'interrupted', 'blocked', 'failed', 'completed'].includes(patch.state)
     const next = { ...record, ...patch, ...(expires && record.questions !== undefined ? {
       questions: record.questions.map(question => question.state === 'open' ? { ...question, state: 'expired' as const } : question),
@@ -126,8 +129,10 @@ export class ClusterQueue {
       }
       let released = false
       try { released = await this.executor.reconcile(record) } catch (error) { this.reportError(error) }
-      await this.save(record, { state: 'interrupted', resourcesReleased: released,
-        detail: released ? 'Execution was interrupted; submit a new experiment to retry.' : 'Node cleanup is unconfirmed; its allocation remains occupied.' })
+      const current = this.required(record.submission.experimentId)
+      const terminal = ['completed', 'blocked', 'failed', 'cancelled', 'interrupted'].includes(current.state)
+      await this.save(current, { state: terminal ? current.state : 'interrupted', resourcesReleased: released,
+        ...(terminal ? {} : { detail: released ? 'Execution was interrupted; submit a new experiment to retry.' : 'Node cleanup is unconfirmed; its allocation remains occupied.' }) })
     }
     this.kick()
   }
@@ -316,12 +321,14 @@ export class ClusterQueue {
       let outcome: ClusterOutcome
       const update = (patch: Pick<Partial<ClusterRecord>, 'state' | 'services' | 'progress' | 'executions'>) => this.serial(async () => {
         const current = this.required(id)
+        if (['completed', 'blocked', 'failed', 'cancelled', 'interrupted'].includes(current.state)) return
         await this.save(current, { ...patch, ...(['cancelling', 'waiting-reply'].includes(current.state) ? { state: current.state } : {}) })
       })
       try {
         if (restoring && this.executor.restore !== undefined) outcome = await this.executor.restore(record, signal, update)
         else outcome = await this.executor.run(record, signal, (sessionId, goalId) => this.serial(async () => {
           const current = this.required(id)
+          if (['completed', 'blocked', 'failed', 'cancelled', 'interrupted'].includes(current.state)) return
           await this.save(current, { sessionId, goalId, state: ['cancelling', 'waiting-reply'].includes(current.state) ? current.state : 'running' })
         }), update)
       } catch (error) {
@@ -331,6 +338,7 @@ export class ClusterQueue {
       }
       await this.serial(async () => {
         const current = this.required(id)
+        if (['completed', 'blocked', 'failed', 'cancelled', 'interrupted'].includes(current.state)) return
         await this.save(current, { ...outcome,
           ...(outcome.state === 'awaiting-approval' ? { approval: undefined } : {}),
           state: current.state === 'cancelling' ? outcome.resourcesReleased ? 'cancelled' : 'cancelling' : outcome.state })
@@ -362,17 +370,23 @@ export class ClusterQueue {
         return this.save(record, { state: 'cancelled' })
       }
       if (!record.resourcesReleased) {
+        if (['completed', 'blocked', 'failed', 'cancelled', 'interrupted'].includes(record.state)) {
+          this.active.get(id)?.abort.abort(new Error('experiment cleanup requested'))
+          return record
+        }
         const next = await this.save(record, { state: 'cancelling' })
         this.active.get(id)?.abort.abort(new Error('experiment cancelled'))
         return next
       }
       return record
     })
-    if (result.state === 'cancelling' && !this.active.has(id)) {
+    if (!result.resourcesReleased && !this.active.has(id)) {
       let released = false
       try { released = await this.executor.reconcile(result) } catch (error) { this.reportError(error) }
       await this.serial(async () => {
-        await this.save(this.required(id), { state: released ? 'cancelled' : 'cancelling', resourcesReleased: released })
+        const current = this.required(id)
+        const terminal = ['completed', 'blocked', 'failed', 'cancelled', 'interrupted'].includes(current.state)
+        await this.save(current, { state: terminal ? current.state : released ? 'cancelled' : 'cancelling', resourcesReleased: released })
       })
     }
     this.kick()

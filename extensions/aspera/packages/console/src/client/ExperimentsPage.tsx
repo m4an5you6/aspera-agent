@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import {
   Button, Checkbox, IconGoalOutlineRegular, IconPaperclipOutlineRegular,
-  IconPlusOutlineRegular, IconRefreshOutlineRegular, IconChevronLeftOutlineRegular, Input, Tag, Modal,
+  IconPlusOutlineRegular, IconRefreshOutlineRegular, IconChevronLeftOutlineRegular, Input, Tag, Modal, StateDot,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { FleetExperiment, ServerSettings, FleetServerInput } from '@aspera/dispatch/types'
 import { ExperimentList, ExperimentStatus, DeleteExperimentsDialog } from './ExperimentManagement.tsx'
@@ -20,7 +20,10 @@ import { experimentAttentionCount, attentionLabel, experimentTodos } from './att
 import { ExperimentQuestionCard } from './QuestionCard.tsx'
 import { ExperimentOverview } from './ExperimentOverview.tsx'
 import { ExecutionPlan } from './ExecutionPlan.tsx'
+import { ArchiveNotice } from './ArchiveNotice.tsx'
+import { useRunArchive } from './useRunArchive.ts'
 import type { PropsRenderFactories } from '@deepseek-ai/dsh-client-ui-slots'
+import { interruptionView, blockedPreparationTasks } from './interruption-view.ts'
 
 /** Actions and observable state owned by the plugin controller. */
 export interface ExperimentsInjected {
@@ -222,6 +225,7 @@ function NewExperiment({ controller, t, servers, state, draft }: ViewProps & {
 }
 
 function ExperimentDetail({ controller, t, row, state, onClone, renderFactorySlot }: ViewProps & PropsRenderFactories & { row: FleetExperiment; state: Snapshot; onClone: () => void }) {
+  const archive = useRunArchive(controller, row.request.experimentId, row.receipt !== undefined)
   const [tab, setTab] = useState<'overview' | 'agentRecords' | 'monitoring' | 'files' | 'services'>('overview')
   useEffect(() => { controller.setDetailView(tab) }, [controller, tab])
   const [deleting, setDeleting] = useState<string[]>()
@@ -229,25 +233,29 @@ function ExperimentDetail({ controller, t, row, state, onClone, renderFactorySlo
   const [logDestination, setLogDestination] = useState<{ serverId: string; commandId: string }>()
   const status = row.latest?.state ?? row.state
   const id = row.request.experimentId
+  useEffect(() => { if (state.storageFocus?.experimentId === id) setTab('overview') }, [id, state.storageFocus])
   const retrying = state.retrying.includes(id)
+  const interruption = state.interruptions.find(value => value.experimentId === id)
+  const stopping = interruptionView(row, interruption, state.interrupting.includes(id))
   const ended = ['completed', 'failed', 'blocked', 'cancelled', 'interrupted'].includes(status) && row.latest?.resourcesReleased !== false
   const title = row.request.name ?? (row.submission?.protocol === 4 ? row.submission.name : row.request.objective.split('\n')[0]?.slice(0, 120))
   const act = (operation: () => Promise<unknown>) => { void operation().catch(error => { controller.report(error) }) }
   return <article className={`${css.detail} ${tab === 'agentRecords' || tab === 'monitoring' ? css.readerDetail : ''}`}>
-    <header className={css.detailHeader}><Button variant="outline" size="sm" className={css.detailBack} icon={<IconChevronLeftOutlineRegular size={16} />} onClick={() => { controller.select(null) }}>{t('backToExperiments')}</Button><div className={css.detailHeading}><div className={css.titleLine}><h2 title={title}>{title}</h2><span role="status">{retrying ? <Tag tone="info">{t('retrying')}</Tag> : <ExperimentStatus row={row} t={t} />}</span></div>
+    <header className={css.detailHeader}><Button variant="outline" size="sm" className={css.detailBack} icon={<IconChevronLeftOutlineRegular size={16} />} onClick={() => { controller.select(null) }}>{t('backToExperiments')}</Button><div className={css.detailHeading}><div className={css.titleLine}><h2 title={title}>{title}</h2><span role="status">{retrying ? <Tag tone="info">{t('retrying')}</Tag> : <ExperimentStatus row={row} t={t} interruption={interruption} requesting={state.interrupting.includes(id)} />}</span></div>
       <p className={css.hint}>{row.servers.map(server => server.name).join(' · ')} · {t('coordinator')}: {row.coordinator.name} · {new Date(row.createdAt).toLocaleString()}{!state.registry.servers.some(server => server.id === row.coordinator.id) && <span> · {t('serverConfigurationRemoved')}</span>}</p></div>
       <div className={css.actions}><Button variant="ghost" size="sm" onClick={onClone}>{t('clone')}</Button><Button variant="ghost" size="sm" onClick={() => { act(() => controller.refresh()) }}>{t('refresh')}</Button>
-        <Button variant="outline" size="sm" disabled={ended} onClick={() => { act(() => controller.cancel(id)) }}>{t('cancel')}</Button><Button variant="ghost" size="sm" className={css.dangerText} onClick={() => { setDeleting([id]) }}>{t('deleteExperiment')}</Button></div>
+        <Button variant="outline" size="sm" disabled={ended && !stopping.blocked || stopping.busy} icon={stopping.busy ? <StateDot state="ongoing" /> : undefined} onClick={() => { act(() => controller.interrupt(id)) }}>{t(stopping.action)}</Button><Button variant="ghost" size="sm" disabled={stopping.busy || stopping.blocked} className={css.dangerText} onClick={() => { setDeleting([id]) }}>{t('deleteExperiment')}</Button></div>
     </header>
     {deleting !== undefined && <DeleteExperimentsDialog controller={controller} t={t} ids={deleting} close={() => { setDeleting(undefined) }} />}
     <nav className={css.detailTabs}>{(['overview', 'agentRecords', 'monitoring', 'files', 'services'] as const).map(key => <button key={key} aria-current={tab === key ? 'page' : undefined} onClick={() => { setTab(key) }}>{t(key)}</button>)}</nav>
-    {tab === 'agentRecords' && <AgentRecords renderFactorySlot={renderFactorySlot} row={row} controller={controller} t={t} onLog={(serverId, commandId) => { setLogDestination({ serverId, commandId }); setTab('monitoring') }} />}
-    {tab === 'monitoring' && <RuntimeMonitor row={row} controller={controller} t={t} {...(logDestination === undefined ? {} : { destination: logDestination })} />}
-    {tab === 'overview' && <ExperimentOverview row={row} t={t} retrying={retrying} execution={state.executionReads[id]} installations={state.installations.filter(value => value.experimentId === id)} onRetry={() => { act(() => controller.retry(id)) }} onView={setTab}>
+    {tab === 'agentRecords' && <AgentRecords renderFactorySlot={renderFactorySlot} row={row} controller={controller} t={t} offline={archive.status?.runtimeAvailable === false} onLog={(serverId, commandId) => { setLogDestination({ serverId, commandId }); setTab('monitoring') }} />}
+    {tab === 'monitoring' && <RuntimeMonitor row={row} controller={controller} t={t} offline={archive.status?.runtimeAvailable === false} {...(logDestination === undefined ? {} : { destination: logDestination })} />}
+    {tab === 'overview' && <ExperimentOverview controller={controller} row={row} t={t} retrying={retrying} activityConfirmed={archive.status?.runtimeAvailable} interruption={interruption} interrupting={state.interrupting.includes(id)} onInterrupt={() => { act(() => controller.interrupt(id)) }} blockingTasks={blockedPreparationTasks(row, state.experiments, state.interruptions)} onOpenTask={taskId => { controller.select(taskId) }} execution={state.executionReads[id]} installations={state.installations.filter(value => value.experimentId === id)} onRetry={() => { act(() => controller.retry(id)) }} onView={setTab}
+      archive={row.receipt === undefined ? undefined : <ArchiveNotice row={row} archive={archive} t={t} />}>
       {row.latest?.questions?.filter(question => question.state === 'open').map(question => <ExperimentQuestionCard key={question.questionId} controller={controller} t={t} question={question}
         records={state.streams[`${id}/events`]?.text.split('\n').filter(line => line.includes(question.sessionId)).join('\n') ?? ''} />)}
       {row.latest?.questions?.some(question => question.state === 'answered') && <p className={css.hint}>{t('replySaved')}</p>}
-      <ExecutionPlan row={row} t={t} execution={state.executionReads[id]} approving={approving} onApprove={() => {
+      <ExecutionPlan row={row} t={t} onRecords={() => { setTab('agentRecords') }} execution={state.executionReads[id]} approving={approving} activityConfirmed={interruption === undefined && archive.status?.runtimeAvailable !== false} approvalDisabled={stopping.busy || stopping.blocked} onApprove={() => {
         const plan = (row.latest ?? row.receipt)?.plan
         if (approving || plan === undefined) return
         setApproving(true)

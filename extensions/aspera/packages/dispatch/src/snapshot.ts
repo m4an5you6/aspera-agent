@@ -8,6 +8,7 @@ import { z } from 'zod'
 import { run } from './transport.ts'
 import { assertPublishedUiCompatibility } from './published-ui.ts'
 import { environmentRequirements } from './environment.ts'
+import type { EnvironmentRequirements } from './environment.ts'
 
 /** Private deployment archive; disposing it never changes installed releases. */
 export interface SourceSnapshot {
@@ -71,7 +72,8 @@ export async function snapshotSource(root: string, timeoutMs: number, signal?: A
     dependencies['@deepseek-ai/dsh-web-app'] = '0.2.0-rc.2'
     const application = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8'))
     const releaseManifest = { name: 'aspera-installed-release', private: true, type: 'module',
-      packageManager: application.packageManager, engines: application.engines, dependencies }
+      packageManager: application.packageManager, engines: application.engines, asperaEnvironmentTools: application.asperaEnvironmentTools,
+      asperaCompletionVersion: application.asperaCompletionVersion, asperaFinalizationVersion: application.asperaFinalizationVersion, dependencies }
     writeFileSync(join(source, 'package.json'), JSON.stringify(releaseManifest, null, 2) + '\n')
     copyFileSync(resolve(root, 'pnpm-workspace.yaml'), join(source, 'pnpm-workspace.yaml'))
     const patchRoot = resolve(root, 'patches')
@@ -108,7 +110,7 @@ function appendOverrides(source: string, overrides: Record<string, string>): voi
  * @param archive - retained or recovered original archive. @param expected - frozen deployment identity.
  * @returns original runtime requirements; a self-declared manifest alone is insufficient.
  */
-export async function verifySourceArchive(archive: string, expected: string): Promise<{ node: string; pnpm: string }> {
+export async function verifySourceArchive(archive: string, expected: string): Promise<EnvironmentRequirements> {
   const directory = mkdtempSync(join(tmpdir(), 'aspera-verify-'))
   const unpack = async (file: string, cwd: string) => {
     mkdirSync(cwd, { recursive: true })
