@@ -30,6 +30,10 @@ import { snapshotSource } from './snapshot.ts'
 import { InstallationRecovery } from './installation.ts'
 import { installationPolicySchema } from './installation-model.ts'
 import type { InstallationPolicy } from './installation-model.ts'
+import { storageGovernancePolicySchema } from '@aspera/runtime'
+import { transferExperimentInput } from './input-transfer.ts'
+import { PublicServiceChecks, publicServiceVerificationRouteSchema } from './service-verification.ts'
+import type { PublicServiceVerificationRoute } from './service-verification.ts'
 import { sshPasswordRef } from './ssh-account.ts'
 import { pinnedTargetSchema } from './deployment-settings.ts'
 import { fleetExperimentV5Schema, fleetRegistryV5Schema, fleetRequestV5Schema } from './fleet-schema-v5.ts'
@@ -54,11 +58,11 @@ import type { FleetCreateRequest, FleetExperiment, FleetRegistry, FleetServerInp
 import type { AnswerExperimentQuestion, ExperimentModels } from '@aspera/experiments'
 import { experimentRemovalBlocker, serverRemovalBlockers } from './server-usage.ts'
 import { executionProgressReadSchema } from '@aspera/experiments'
-import { StorageSelection } from './storage-selection.ts'
+import { StorageSelection, refreshStorageSelection } from './storage-selection.ts'
 import { preparationStorage } from './preparation-storage.ts'
 import { resolveTrainingNetwork } from './network-selection.ts'
 import { captureExperimentModels } from './models.ts'
-import { experimentPhases } from '@aspera/experiments'
+import { experimentPhases, experimentModelsSchema } from '@aspera/experiments'
 import { openPhaseModelContext, privateModelConfigurationSchema } from '@aspera/runtime'
 import { PhaseContextPolicyConfig } from '@aspera/runtime'
 import type { PhaseContextPolicy } from '@aspera/runtime'
@@ -80,11 +84,14 @@ import { RemoteInterruption } from './interruption-remote.ts'
 import type { InterruptionFacts, InterruptionMode } from './interruption-remote.ts'
 import { CompletionReviews } from './completion-review.ts'
 import { CompletionReader } from './completion-reader.ts'
+import { AcceptanceRecoveries } from './acceptance-recovery.ts'
+import { serviceSchema } from '@aspera/experiments'
 import { FinalizationRecords } from './finalization-records.ts'
 import { finalizationPolicySchema } from '@aspera/runtime'
+import { planningPolicySchema } from '@aspera/experiments'
 import type { FinalizationPolicy } from '@aspera/runtime'
 import { runCompletionReviewAgent } from './completion-agent.ts'
-import { redactCompletionData, redactCompletionText } from './completion-data.ts'
+import { redactCompletionData, redactCompletionText, redactCompletionScript } from './completion-data.ts'
 import { readCompletionTrace } from './completion-trace.ts'
 import { setTimeout as delay } from 'node:timers/promises'
 import { ExperimentEnvironments } from './managed-environments.ts'
@@ -159,11 +166,13 @@ export class ExperimentFleet {
   private readonly archives: RunArchives
   private readonly archiveReader: RunArchiveReader
   private readonly completionReviews: CompletionReviews
+  private readonly acceptanceRecoveries: AcceptanceRecoveries
   private readonly finalizationRecords: FinalizationRecords
   private readonly interruptions: ExperimentInterruptions
   private readonly environments: ExperimentEnvironments
   private readonly remoteInterruption: RemoteInterruption
   private readonly preparationSettlements = new Set<ExperimentId>()
+  private readonly publicServiceChecks: PublicServiceChecks
 
   private constructor(private readonly ctx: Context, private readonly store: Store, private readonly removals: Domain<typeof removalStoreSpec>,
     private readonly remoteTasks: Domain<typeof remoteTaskStoreSpec>,
@@ -173,13 +182,23 @@ export class ExperimentFleet {
     private readonly sshConnectionPolicy: SshConnectionPolicy, private readonly sandboxRepairPolicy: SandboxRepairPolicy,
     private readonly archivePolicy: RunArchivePolicy, private readonly agentContext: PhaseContextPolicy,
     private readonly environmentPolicy: ManagedEnvironmentPolicy, private readonly commandPolicy: PreparationCommandPolicy,
-    private readonly finalizationPolicy: FinalizationPolicy) {
+    private readonly finalizationPolicy: FinalizationPolicy, publicServiceVerificationRoute: PublicServiceVerificationRoute) {
+    this.publicServiceChecks = new PublicServiceChecks(resolve(resolveDshHome(), 'aspera-service-verifications'), { alive: id => !this.closing && !this.isRemoved(id),
+      call: async (id, operation, input, signal) => {
+        try { return await this.call(this.get(id), operation, { experimentId: id, ...input }, signal) }
+        catch (error) {
+          if (operation === 'service-verification-pending' && error instanceof CoordinatorRequestError && error.status === 404
+            && error.message === 'cluster route not found') return { supported: false, operations: [] }
+          throw error
+        }
+      }, report: error => this.ctx.logger.error('Public service verification: ' + String(error)),
+    }, this.finalizationPolicy.evidenceBytes, this.finalizationPolicy.readTimeoutMs, publicServiceVerificationRoute)
     this.environments = new ExperimentEnvironments(resolve(resolveDshHome(), 'aspera-environments'), {
       get: id => this.get(id), alive: id => !this.closing && !this.isRemoved(id), secrets: record => this.archiveSecrets(record), list: () => this.list(),
       program: managedEnvironmentProgram,
-      ssh: async (record, serverId, command, signal) => {
+      ssh: async (record, serverId, command, signal, input) => {
         const connection = await this.interruptionConnection(record, serverId)
-        return this.driver.remote(connection.target, command, signal, connection.password)
+        return this.driver.remote(connection.target, command, signal, connection.password, input)
       },
       node: async (record, serverId, operation, body, signal) => {
         const server = record.submission?.nodes.find(node => node.server.id === serverId)?.server
@@ -227,6 +246,7 @@ export class ExperimentFleet {
         const current = this.get(id)
         if (JSON.stringify(observed.submission) !== JSON.stringify(current.submission)) throw new Error('Archived status belongs to another submission')
         if ((current.latest?.revision ?? 0) < observed.revision) await this.store.table('experiments').put(id, { ...current, latest: observed })
+        if (['running', 'serving'].includes(observed.state)) this.publicServiceChecks.changed(id)
       }),
     }, this.archiveReader = new RunArchiveReader({ remoteResult: driver.remoteResult,
       connection: async (record, serverId) => {
@@ -265,8 +285,14 @@ export class ExperimentFleet {
         return { ...source, text: redactCompletionText(source.text, secrets.get(record.request.experimentId) ?? []), tail: redactCompletionText(source.tail, secrets.get(record.request.experimentId) ?? []) }
       },
       environment: (record, entry, signal) => reader.environment(record, entry, signal),
+      serviceIssues: async (record, signal) => {
+        if (this.acceptanceRecoveries.status(record.request.experimentId) !== undefined) return this.acceptanceRecoveries.serviceIssues(record.request.experimentId, signal)
+        return await reader.serviceRecoveryRequired(record, signal) ? [{ code: 'results', detail: 'Original public inference still requires a verified serving recovery.',
+          remedy: 'Use recoverExperimentAcceptance on this original task. Existing checkpoints are retained; do not retrain.' }] : []
+      },
       commit: (record, review, signal, assessment) => reader.commit(record, review, signal, assessment),
-      run: async (record, review, tools, signal) => runCompletionReviewAgent(ctx, record, review, tools, {
+      run: async (record, review, tools, signal) => runCompletionReviewAgent(ctx, { ...record,
+        acceptanceRecovery: this.acceptanceRecoveries.status(record.request.experimentId) }, review, tools, {
         snapshot: (value, lifetime) => reader.snapshot(value, lifetime),
         source: async (value, input, lifetime) => {
           const result = await reader.source(value, input, lifetime)
@@ -279,6 +305,28 @@ export class ExperimentFleet {
       finished: id => { secrets.delete(id) },
       report: error => { ctx.logger.error('Completion review: ' + String(error)) },
     }, this.finalizationPolicy)
+    this.acceptanceRecoveries = new AcceptanceRecoveries(resolve(resolveDshHome(), 'aspera-acceptance-recoveries'), {
+      get: id => this.get(id), alive: id => !this.isRemoved(id) && this.store.table('experiments').get(id) !== undefined,
+      candidates: id => this.list().filter(row => row.request.experimentId !== id).sort((left, right) => right.createdAt - left.createdAt),
+      source: (original, recovery, signal) => reader.acceptanceSource(original, recovery, signal),
+      observe: async (recovery, source, signal) => {
+        const observation = await reader.acceptanceObservation(recovery, source, signal), services = []
+        for (const node of recovery.submission!.nodes) {
+          const connection = await this.interruptionConnection(recovery, node.server.id)
+          const value = await this.driver.request({ ...connection.target, remotePort: node.server.remotePort }, await this.token(node.server, 'node'),
+            '/aspera/v4/node/services', 'POST', { experimentId: recovery.request.experimentId }, signal, connection.password)
+          if (value.status !== 200) throw new Error('Recovery service liveness is unavailable: ' + value.status)
+          const observed = z.array(serviceSchema).parse(value.value)
+          if (observed.some(service => service.experimentId !== recovery.request.experimentId || service.serverId !== node.server.id)) throw new Error('Recovery services belong to another node or experiment')
+          services.push(...observed)
+        }
+        return { ...observation, services }
+      },
+      evidence: (original, operation, observation, signal) => reader.saveAcceptanceEvidence(original, operation, observation, signal),
+      review: id => this.completionReviews.request(id), reviewStatus: id => this.completionReviews.status(id),
+      createRuntime: (original, previous, runtimeId, source, signal) => this.createAcceptanceRuntime(original, previous, runtimeId, source, reader, signal),
+      changed: () => ctx.emit('experiment-fleet/changed', { kind: 'experiments' }),
+    }, archivePolicy.archiveIntervalMs, this.finalizationPolicy.reconnectTimeoutMs)
   }
 
   /**
@@ -296,6 +344,7 @@ export class ExperimentFleet {
    * @param environmentPolicy - fixed installer, storage observations and package bounds.
    * @param commandPolicy - preparation command polling and exit-recovery limits.
    * @param finalizationPolicy - historical stage tolerances and finalization observation limits.
+   * @param publicServiceVerificationRoute - Host-owned direct or inherited HTTP routing for registered service checks.
    * @returns effect-owned fleet service.
    */
   static async open(ctx: Context, deployment: (server: ServerSettings) => PinnedDeployment,
@@ -308,7 +357,8 @@ export class ExperimentFleet {
     agentContext: PhaseContextPolicy = PhaseContextPolicyConfig({ compaction: {}, pruning: {} }),
     environmentPolicy: ManagedEnvironmentPolicy = managedEnvironmentPolicySchema.parse({}),
     commandPolicy: PreparationCommandPolicy = preparationCommandPolicySchema.parse({}),
-    finalizationPolicy: FinalizationPolicy = finalizationPolicySchema.parse({})): Promise<ExperimentFleet> {
+    finalizationPolicy: FinalizationPolicy = finalizationPolicySchema.parse({}),
+    publicServiceVerificationRoute: PublicServiceVerificationRoute = publicServiceVerificationRouteSchema.parse(undefined)): Promise<ExperimentFleet> {
     const store = await ctx.storage.domain.open(storeSpec)
     const removals = await ctx.storage.domain.open(removalStoreSpec)
     const remoteTasks = await ctx.storage.domain.open(remoteTaskStoreSpec)
@@ -324,7 +374,7 @@ export class ExperimentFleet {
     }
     const installations = await InstallationRecovery.open(ctx, installationPolicy, driver)
     const fleet = new ExperimentFleet(ctx, store, removals, remoteTasks, deployment, connectionCheckTimeoutMs, driver, installations,
-      controllerRepairPolicySchema.parse(controllerRepairPolicy).maxAttempts, resolveSshConnectionPolicy(sshConnectionPolicy), sandboxRepairPolicySchema.parse(sandboxRepairPolicy), runArchivePolicySchema.parse(archivePolicy), agentContext, managedEnvironmentPolicySchema.parse(environmentPolicy), preparationCommandPolicySchema.parse(commandPolicy), finalizationPolicySchema.parse(finalizationPolicy))
+      controllerRepairPolicySchema.parse(controllerRepairPolicy).maxAttempts, resolveSshConnectionPolicy(sshConnectionPolicy), sandboxRepairPolicySchema.parse(sandboxRepairPolicy), runArchivePolicySchema.parse(archivePolicy), agentContext, managedEnvironmentPolicySchema.parse(environmentPolicy), preparationCommandPolicySchema.parse(commandPolicy), finalizationPolicySchema.parse(finalizationPolicy), publicServiceVerificationRoute)
     ctx.effect(() => () => fleet.close(), 'experiment fleet: local preparations')
     if (store.table('registry').get('servers') === undefined) {
       await store.table('registry').put('servers', { servers: [] })
@@ -354,6 +404,7 @@ export class ExperimentFleet {
     fleet.environments.start()
     fleet.interruptions.resume()
     fleet.completionReviews.resume()
+    fleet.acceptanceRecoveries.resume()
     for (const record of fleet.list()) void fleet.environments.resume(record.request.experimentId).catch(error => { ctx.logger.error(`Environment cleanup recovery: ${String(error)}`) })
     return fleet
   }
@@ -544,12 +595,52 @@ export class ExperimentFleet {
     const review = this.completionReviews.status(record.request.experimentId), original = record.latest ?? record.receipt
     const matching = review !== undefined && review.submissionHash === createHash('sha256').update(JSON.stringify(record.submission)).digest('hex')
       && review.originalRevision === original?.revision && review.executionSessionId === original.sessionId
-    return { ...record, completionReviewAvailable: this.completionReviews.eligible(record),
+    return { ...record, acceptanceRecovery: this.acceptanceRecoveries.status(record.request.experimentId),
+      acceptanceParentId: this.acceptanceRecoveries.parentOf(record.request.experimentId), completionReviewAvailable: this.completionReviews.eligible(record),
       ...(matching ? { completionAssessment: this.completionReviews.assessment(record.request.experimentId) } : {}),
       ...(review === undefined ? {} : { completionReview: matching ? review : { ...review, phase: 'blocked' as const, detail: 'Original result identity changed; the previous review is not applicable.' } }) }
   }
   /** @param id - released completion-evidence failure. @returns the durable acknowledgement of read-only supplementation. */
   reviewCompletion(id: ExperimentId): import('@aspera/experiments').CompletionReview { return this.completionReviews.request(id) }
+  /** @param id - retained trained task. @param recoveryId - optional existing inference execution. @returns a checkpoint-bound recovery operation beneath the original task. */
+  recoverAcceptance(id: ExperimentId, recoveryId?: ExperimentId): Promise<import('@aspera/experiments').AcceptanceRecovery> { return this.acceptanceRecoveries.request(id, recoveryId) }
+  /** @param id - original task. @returns the retained recovery progress without starting work. */
+  acceptanceRecoveryStatus(id: ExperimentId): import('@aspera/experiments').AcceptanceRecovery | undefined { this.get(id); return this.acceptanceRecoveries.status(id) }
+  private async createAcceptanceRuntime(original: FleetExperiment, previous: FleetExperiment, runtimeId: ExperimentId,
+    source: import('@aspera/experiments').AcceptanceSource, reader: CompletionReader, lifetime: AbortSignal): Promise<void> {
+    const signal = AbortSignal.any([lifetime, AbortSignal.timeout(this.finalizationPolicy.readTimeoutMs)])
+    const fresh = await reader.snapshot(original, signal)
+    if (fresh.record.revision !== source.resultRevision || fresh.record.payloadHash !== source.submissionHash) throw new Error('Original training changed before recovery preparation')
+    const references = await reader.acceptanceReferences(previous, signal)
+    const files = await reader.acceptanceScripts(original, fresh.files ?? [], signal)
+    const secrets = await this.archiveSecrets(original)
+    const input = Buffer.from(JSON.stringify({ version: 1, source: redactCompletionData(source, secrets), previousExperimentId: previous.request.experimentId,
+      previousOutcome: redactCompletionData((previous.latest ?? previous.receipt)?.detail, secrets), references: redactCompletionData(references, secrets),
+      files: files.map(file => redactCompletionScript(file, secrets)), originalExecutions: redactCompletionData(fresh.record.executions, secrets),
+      originalObjective: redactCompletionText(original.submission!.objective, secrets), approvedOriginalPlan: redactCompletionData(fresh.record.plan, secrets) }) + '\n')
+    const models = original.models
+    if (models === undefined) throw new Error('Original phase models are unavailable')
+    const selections = Object.fromEntries(experimentPhases.map(phase => [phase, { provider: models[phase].provider, model: models[phase].model,
+      ...(models[phase].reasoningEffort === undefined ? {} : { reasoningEffort: models[phase].reasoningEffort }) }]))
+    const required = source.nodes.map(node => ({ serverId: node.serverId, step: node.step, modelName: node.modelName, publicUrl: node.publicUrl }))
+    const request: FleetCreateRequest = { experimentId: runtimeId, name: (original.request.name ?? 'Experiment') + ' · 验收恢复',
+      serverIds: original.request.serverIds, coordinatorId: original.coordinator.id, mode: original.request.mode,
+      models: experimentModelsSchema.parse(selections), files: [], uploads: [{ name: 'acceptance-source.json', size: input.length }],
+      objective: `This is an inference-only acceptance recovery operation beneath original experiment ${original.request.experimentId}; it is not new training. Preserve original results, fixed releases, environments, weights, checkpoints and logs. Required serving identity: ${JSON.stringify(required)}.\n\nRead acceptance-source.json completely. It contains program-inspected retained checkpoint identities, prior verified environment hints, prior Agent policy proposals, original execution entries and original configuration/script text. Hints and proposals require fresh tool verification and are not approval. Use the exact retained native endpoint via the protected snapshot tools; never retrain, reevaluate or create new adapters.\n\nContinue only the original unmet public inference acceptance. Reuse the retained corrected server code when suitable rather than rebuilding an unrelated backend. You own the remaining script choices and any corrections. Use the actual verified environment candidate and canonical base-model material; do not reinstall large dependencies, copy old environments or redownload verified weights. Read retention policy, independently estimate the small inference-only outputs and commit the correct budget. Earlier rejected proposals are reference options, not the original training retention policy. Request explicit Host approval if required; do not loop through equivalent capacity estimates.\n\nLoad the unquantized fixed base and the retained adapter in one GPU process, using framework offline loading and absolute managed interpreter paths. The model must actually generate. Register a private loopback backend and publish through the saved public mapping with program-managed authentication. Verify real public generation, model listing, and missing/wrong-credential rejection through verify_inference_service. If the service needs correction, use the dedicated stop tool and confirm release before replacement. Do not run an extra lifecycle exercise when the original required acceptance already passes. Keep the final accepted service running.\n\nSave a concise inference-only plan and actual step/effective execution records, distinguishing retained training from this serving operation. Request the program completion check and finish only after the required public checks and records pass. Reports do not replace program checks. Do not modify the original experiment or execute its scripts in its workspace. Read referenced source text and perform any permitted changes only in this recovery's own workspace. No archive.` }
+    request.objective += '\n\nSource entries retain sha256 for original file bytes; textSha256 hashes the supplied UTF-8 text and textRedacted identifies credential masking. Use textSha256 for copied-text checks. Masked source is a reference for your own reviewed script, not an executable byte-for-byte original. Original file proofs and credentials remain protected.'
+    signal.throwIfAborted()
+    let record = await this.create(request)
+    signal.throwIfAborted()
+    if (record.state === 'staging') {
+      for (let offset = 0; offset < input.length;) {
+        signal.throwIfAborted()
+        const chunk = input.subarray(offset, offset + 65536)
+        offset = this.upload(runtimeId, 'acceptance-source.json', offset, chunk.toString('base64')).nextOffset
+      }
+      signal.throwIfAborted(); record = await this.commitInputs(runtimeId)
+    }
+    if (record.state === 'failed') throw new Error(record.detail ?? 'Acceptance recovery preparation failed')
+  }
   /** @param id - original experiment. @returns saved assessment without network access. */
   completionReviewStatus(id: ExperimentId): import('@aspera/experiments').CompletionReview | undefined { this.get(id); return this.completionReviews.status(id) }
   /** @param id - original experiment. @returns saved stage and step supplements, without modifying the original result. */
@@ -738,6 +829,8 @@ export class ExperimentFleet {
   }
 
   private async finishLocalRemoval(id: ExperimentId): Promise<void> {
+    await this.publicServiceChecks.stop(id)
+    await this.acceptanceRecoveries.forget(id)
     await this.completionReviews.forget(id)
     await this.finalizationRecords.forget(id)
     await this.environments.remove(id)
@@ -752,6 +845,7 @@ export class ExperimentFleet {
       cleanupLocalInputs(this.uploadRoot, id)
       cleanupLocalInputs(resolve(resolveDshHome(), 'aspera-observations'), id)
       cleanupLocalInputs(resolve(resolveDshHome(), 'aspera-run-records'), id)
+      cleanupLocalInputs(resolve(resolveDshHome(), 'aspera-service-verifications'), id)
       if (this.remoteTasks.table('tasks').get(id) === undefined) await this.interruptions.forget(id)
       const next = { ...removal, localCleanup: 'complete' as const }
       if (next.work?.submissionHash === undefined && next.work?.nodes.every(node => node.pendingDirectory === undefined) && this.installations.pending(id).length === 0) delete next.work
@@ -1065,7 +1159,10 @@ export class ExperimentFleet {
       if (current.state !== 'failed') throw new Error('Only interrupted or failed preparation can be retried')
       const serverIds = [...new Set([current.coordinator.id, ...current.servers.map(server => server.id)])]
       const placements = current.preparation.placements
-      if (!this.installations.material(id) && (placements.length !== serverIds.length || serverIds.some(serverId =>
+      const beforeRelease = this.installations.has(id) && current.preparation.stage === 'inspecting'
+        && placements.length === 0 && current.preparation.inventories.length === 0
+        && !current.preparation.environments?.length && current.latest === undefined && current.receipt === undefined && !current.handoverRecorded
+      if (!beforeRelease && !this.installations.material(id) && (placements.length !== serverIds.length || serverIds.some(serverId =>
         !placements.some(placement => placement.serverId === serverId && /\/[a-f0-9]{64}$/.test(placement.releaseRoot))))) {
         throw new Error('Original release directories are missing from the preparation record; copy this experiment')
       }
@@ -1138,10 +1235,10 @@ export class ExperimentFleet {
       const storage = new StorageSelection(async (observation, experimentId, deploymentId, operation, input, operationSignal) =>
         preparationStorage({ ...observation, id: experimentId, deploymentId, operation, input, policy: this.environmentPolicy, signal: operationSignal,
           transport: {
-            run: async (server, command, activeSignal) => {
+            run: async (server, command, activeSignal, input) => {
               const target = server.id === record.coordinator.id ? record.coordinatorTarget : record.targets[record.servers.findIndex(item => item.id === server.id)]
               if (target === undefined) throw new Error('Preparation storage server is outside this experiment')
-              return this.driver.remote(target, command, activeSignal, await this.password(server))
+              return this.driver.remote(target, command, activeSignal, await this.password(server), input)
             },
             inspect: async (server, activeSignal) => {
               const target = server.id === record.coordinator.id ? record.coordinatorTarget : record.targets[record.servers.findIndex(item => item.id === server.id)]
@@ -1220,7 +1317,7 @@ export class ExperimentFleet {
         outputChars: target.preparationOutputChars, commandDeadline: operation === 'controller' ? undefined : this.installations.deadline(id, server.id),
         installation: operation === 'deployment' ? this.installations.tools(id, server.id, this.resolvedTarget(target), await this.password(server), handle.agent.session.id) : undefined,
         sandbox: new SandboxRepair({ experimentId: id, serverId: server.id, controlRoot: target.remoteRoot,
-          password: await this.password(server), policy: this.sandboxRepairPolicy }, this.driver),
+          password: await this.password(server), policy: this.sandboxRepairPolicy, minimumFreeBytes: this.environmentPolicy.minimumFreeBytes }, this.driver),
         progress: value => this.environmentProgress(id, value),
       })
       for (const server of unique) {
@@ -1249,13 +1346,26 @@ export class ExperimentFleet {
       let placements = record.preparation?.placements ?? []
       if (placements.length === 0) {
         if (pendingTarget.minimumFreeBytes === undefined) throw new Error('Storage reserve is absent from the pinned deployment policy')
-        placements = await storage.run(handle.agent, id, snapshot.digest, unique.map(server => {
+        const selected = await storage.run(handle.agent, id, snapshot.digest, unique.map(server => {
           const observed = inventories.find(value => value.serverId === server.id)
           if (observed === undefined) throw new Error('Server inventory is missing')
           return { server, inventory: observed.inventory }
         }), pendingTarget.minimumFreeBytes, installationSignal)
         await this.ctx.sessionPersistence.flush()
-        record = await this.preparationStage(id, 'preparing-storage', { placements })
+        record = await this.preparationStage(id, 'preparing-storage', selected)
+        placements = selected.placements; inventories = selected.inventories
+      } else {
+        const selected = await refreshStorageSelection({ id, digest: snapshot.digest, servers: unique,
+          saved: { placements, inventories }, signal: installationSignal,
+          inspect: (server, activeSignal) => this.onServer(server.id, activeSignal, async () => this.driver.inspectServerStorage(targetFor(server),
+            placements.find(row => row.serverId === server.id)!.candidate.directory, await this.password(server), activeSignal), id),
+        })
+        handle.agent.inject(createUserMessage({ source: { kind: 'aspera', experimentId: id }, content: [{ type: 'text',
+          text: JSON.stringify({ operation: 'verify-fixed-experiment-storage', experimentId: id, placements: selected.placements,
+            observedAt: selected.inventories.map(row => ({ serverId: row.serverId, observedAt: row.inventory.observedAt })) }) }] }))
+        await this.ctx.sessionPersistence.flush()
+        record = await this.preparationStage(id, 'preparing-storage', selected)
+        placements = selected.placements; inventories = selected.inventories
       }
       const resolvedServer = (server: ServerSettings): ClusterServer => {
         const placement = placements.find(value => value.serverId === server.id)
@@ -1300,7 +1410,7 @@ export class ExperimentFleet {
             const checked = checkEnvironment(observed, requirements, candidate.pathEntries)
             if (!checked.ready) throw new Error(checked.failures.join('\n'))
             const configured = { ...target, pathEntries: checked.toolchain.pathEntries }
-            await this.driver.prepareServerStorage(configured, placement, coordinatorPassword, operationSignal)
+            await this.driver.prepareServerStorage(configured, placement, coordinatorPassword, operationSignal, 0, requirements.registrationFormat === '0.1.3')
             return this.driver.prepareClusterServer(configured, snapshot, coordinatorPassword, operationSignal,
               () => this.installations.ensure(id, record.coordinator.id, configured, coordinatorPassword, operationSignal, { sessionId: handle.agent.session.id, callId }))
           }, this.installations.signal(id, record.coordinator.id, signal))
@@ -1326,7 +1436,7 @@ export class ExperimentFleet {
               const checked = checkEnvironment(observed, requirements, candidate.pathEntries)
               if (!checked.ready) throw new Error(checked.failures.join('\n'))
               const configured = { ...nodeTarget, pathEntries: checked.toolchain.pathEntries }
-              await this.driver.prepareServerStorage(configured, nodePlacement, password, operationSignal)
+              await this.driver.prepareServerStorage(configured, nodePlacement, password, operationSignal, 0, requirements.registrationFormat === '0.1.3')
               return this.driver.prepareClusterServer(configured, snapshot, password, operationSignal,
                 () => this.installations.ensure(id, server.id, configured, password, operationSignal, { sessionId: handle.agent.session.id, callId }))
             }, this.installations.signal(id, server.id, signal))
@@ -1392,11 +1502,15 @@ export class ExperimentFleet {
       await this.driver.verifyServerStorage(target, placement, coordinatorPassword, signal, files.reduce((total, file) => total + statSync(file).size, 0))
       const incoming = `${placement.runRoot}/inputs`
       await this.driver.remote(target, `umask 077; mkdir -p ${shellQuote(incoming)}`, signal, coordinatorPassword)
+      const transferTimeoutMs = storageGovernancePolicySchema.parse(this.environmentPolicy.governance ?? {}).materialTimeoutMs
+      const transferSignal = AbortSignal.any([signal, AbortSignal.timeout(transferTimeoutMs)])
+      const transferTarget = { ...target, toolTimeoutMs: transferTimeoutMs }
       for (const file of files) {
         const name = basename(file)
         const sha256 = await clusterFileHash(file)
-        if (inputs.find(input => input.name === name)?.sha256 !== sha256) throw new Error('Input changed during preparation')
-        await this.driver.copy(target, file, `${incoming}/${name}`, signal, coordinatorPassword)
+        const submitted = inputs.find(input => input.name === name)
+        if (submitted?.sha256 !== sha256) throw new Error('Input changed during preparation')
+        await transferExperimentInput(this.driver, transferTarget, placement, file, { ...submitted, size: statSync(file).size }, transferSignal, coordinatorPassword)
       }
       if (record.request.budget !== undefined || record.models === undefined) throw new Error('Legacy preparation cannot be converted to protocol 4; copy it to a new experiment')
       const submission = clusterSubmissionV4Schema.parse({ protocol: 4, experimentId: id, deploymentId: snapshot.digest,
@@ -1423,6 +1537,8 @@ export class ExperimentFleet {
         ...await this.driver.delegateClusterLogin(target, server, id, coordinatorPassword, signal),
       })))
       const runtime: ClusterPrivate = { submission, connections, modelCredentialFile, toolTimeoutMs: target.toolTimeoutMs,
+        ...(preparedCoordinator.requiredFeatures?.includes('documentation-pages-0.1.0') ? { documentationPolicy: planningPolicySchema.parse({
+          documentationReadTimeoutMs: target.documentationReadTimeoutMs, documentationPageBytes: target.documentationPageBytes }) } : {}),
         agentModel: selection }
       await this.driver.installPrivateFile(target, `${target.remoteRoot}/secrets/${id}.json`, JSON.stringify(runtime), signal, coordinatorPassword)
       for (const acceptance of controllerAcceptances.values()) await acceptance.verifyAcceptance(signal)
@@ -1620,6 +1736,7 @@ export class ExperimentFleet {
     }
     if ((this.get(id).latest?.revision ?? 0) > result.record.revision) return this.get(id)
     await this.accept(current, result.record)
+    if (['running', 'serving'].includes(result.record.state)) this.publicServiceChecks.changed(id)
     return this.serial(async () => {
       const current = this.get(id)
       if ((current.latest?.revision ?? 0) > result.record.revision) return current
@@ -1855,6 +1972,7 @@ export class ExperimentFleet {
   private async settleInterruption(record: InterruptionTask, original: ExperimentInterruptionStatus, signal: AbortSignal,
     update: (status: ExperimentInterruptionStatus) => void): Promise<ClusterRecord | undefined> {
     const id = record.request.experimentId
+    if (original.stopRequested) await this.publicServiceChecks.stop(id)
     let originalRecord: ClusterRecord | undefined
     if (record.submission === undefined && record.submissionHash !== undefined) {
       originalRecord = await this.originalTaskRecord(record, signal)
@@ -2237,6 +2355,12 @@ export class ExperimentFleet {
   storageUsage(id: ExperimentId): Promise<ExperimentStorageUsage> { return this.environments.usage(id) }
   /** @param id - retained experiment. @returns actual node capacity plans or an empty list before assessment. */
   storagePlan(id: ExperimentId) { return this.environments.plans(id) }
+  /** @param id - retained experiment. @returns node-bound retention policies and proposals. */
+  storagePolicies(id: ExperimentId) { return this.environments.storagePolicies(id) }
+  /** @param id - retained experiment. @param proposalId - proposed change. @param expectedRevision - original approved revision. @param approve - operator decision. @returns saved decision after node validation. */
+  decideStoragePolicy(id: ExperimentId, proposalId: string, expectedRevision: number, approve: boolean) { return this.environments.decideStoragePolicy(id, proposalId, expectedRevision, approve) }
+  /** @param id - retained task. @param proposalId - rejected Agent proposal. @param expectedRevision - approved revision. @returns an explicit successor preserving the original rejection. */
+  reconsiderStoragePolicy(id: ExperimentId, proposalId: string, expectedRevision: number) { return this.environments.reconsiderStoragePolicy(id, proposalId, expectedRevision) }
   /** @param id - retained experiment. @param serverId - assigned server. @param cursor - bounded scan continuation. @returns refreshed account-side storage measurements. */
   refreshStorage(id: ExperimentId, serverId: ExperimentServerId, cursor?: string) { return this.environments.refresh(id, serverId, cursor) }
   /** @param id - retained experiment. @returns reference-checked cleanup candidates. */
@@ -2301,6 +2425,8 @@ export class ExperimentFleet {
   /** Abort local preparations and flush all owned records. Remote accepted work remains independent. */
   async close(): Promise<void> {
     this.closing = true
+    await this.publicServiceChecks.close()
+    await this.acceptanceRecoveries.close()
     await this.completionReviews.close()
     await this.finalizationRecords.close()
     for (const pending of this.preparing.values()) pending.abort.abort(new Error('local dispatcher stopped'))

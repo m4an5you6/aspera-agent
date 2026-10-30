@@ -81,6 +81,7 @@ it('supplements a released blocked continuation without rewriting its original s
   const f = continuedFixture(), service = f.make(), before = JSON.stringify(f.original)
   f.owner.run = vi.fn<CompletionReviewOwner['run']>(async (_record, _review, tools, signal) => {
     expect((await tools.inspect(signal)).issues.map(value => value.code)).toContain('stages')
+    await expect(tools.registerStage({ ...f.registration, previousAttemptId: f.registration.attemptId }, signal)).rejects.toThrow('cannot retry training')
     await tools.registerStage(f.registration, signal)
     expect(await tools.verifyStage(f.serverId, 'phase2', signal)).toMatchObject({ ready: true, startStep: 30, additionalSteps: 200, endStep: 230 })
     await tools.record(JSON.stringify(f.entry), JSON.stringify(f.sources), 'record', signal)
@@ -100,6 +101,37 @@ it('requires actual final checkpoint and blocked finish evidence before opening 
   const service = f.make(); service.request(f.id); await settled(service, f.id)
   expect(service.status(f.id)).toMatchObject({ phase: 'blocked', detail: expect.stringContaining('endpoint') })
   expect(f.owner.run).not.toHaveBeenCalled(); expect(f.owner.commit).not.toHaveBeenCalled()
+})
+it('lets the Agent correct unverified evidence paths at the current revision while preserving the original training identity', async () => {
+  const f = continuedFixture(), service = f.make(), originalSource = f.owner.source
+  f.owner.source = vi.fn<CompletionReviewOwner['source']>(async (...args) => {
+    if (args[1].path === 'false') throw new Error('No such original evidence file: false')
+    return originalSource(...args)
+  })
+  f.owner.run = vi.fn<CompletionReviewOwner['run']>(async (_record, _review, tools, signal) => {
+    await tools.registerStage({ ...f.registration, baseControl: 'false' }, signal)
+    expect(await tools.verifyStage(f.serverId, 'phase2', signal)).toMatchObject({ ready: false })
+    const revision = (await tools.progress(signal)).assessment!.revision
+    await expect(tools.registerStage(f.registration, signal)).rejects.toThrow('revision')
+    await expect(tools.registerStage(f.registration, signal, revision - 1)).rejects.toThrow('revision')
+    await expect(tools.registerStage(stageRegistrationInputSchema.parse({ ...f.registration, attemptId: 'another-training' }), signal, revision)).rejects.toThrow('identity')
+    await tools.registerStage(f.registration, signal, revision)
+    expect(service.assessment(f.id)!.verifications).toEqual([])
+    const changedRevision = service.assessment(f.id)!.revision
+    await tools.registerStage(f.registration, signal, revision)
+    expect(service.assessment(f.id)!.revision).toBe(changedRevision)
+    expect(await tools.verifyStage(f.serverId, 'phase2', signal)).toMatchObject({ ready: true })
+    await expect(tools.registerStage({ ...f.registration, metrics: 'different.jsonl' }, signal,
+      service.assessment(f.id)!.revision)).rejects.toThrow('already verified')
+    await tools.block('Correction verified; original training and result preserved')
+  })
+  const before = JSON.stringify(f.original)
+  service.request(f.id); await settled(service, f.id)
+  expect(service.status(f.id)?.detail).toBe('Correction verified; original training and result preserved')
+  expect(JSON.stringify(f.original)).toBe(before)
+  expect(service.assessment(f.id)?.stages[0]).toMatchObject({ attemptId: f.registration.attemptId, commandId: 'train' })
+  expect(service.assessment(f.id)?.stages[0]?.baseControl).toBeUndefined()
+  expect(f.owner.commit).not.toHaveBeenCalled()
 })
 it('refuses a changed stage source during final verification even when both contents pass numeric checks', async () => {
   const f = continuedFixture(), service = f.make(), originalEnvironment = f.owner.environment
@@ -128,6 +160,17 @@ it('records and verifies a separate assessment without changing the original fai
   expect(JSON.stringify(f.original)).toBe(before); expect(f.owner.run).toHaveBeenCalledOnce(); expect(f.owner.commit).toHaveBeenCalledOnce()
   expect(service.request(f.id).operationId).toBe(first.operationId)
   expect(JSON.parse(readFileSync(resolve(f.root, `${f.id}.v1.json`), 'utf8')).entries).toHaveLength(1)
+})
+it('cannot accept recorded training while independent recovered public generation is still missing', async () => {
+  const f = fixture()
+  f.owner.serviceIssues = vi.fn<NonNullable<CompletionReviewOwner['serviceIssues']>>(async () => [{ code: 'results', detail: 'Public generation has not passed on the retained checkpoint', remedy: 'Continue inference recovery; never retrain' }])
+  f.owner.run = vi.fn<CompletionReviewOwner['run']>(async (_record, _review, tools, signal) => {
+    await tools.record(JSON.stringify(f.entry), JSON.stringify(f.sources), 'record', signal)
+    expect(await tools.verify(signal)).toMatchObject({ phase: 'collecting', check: { ready: false, issues: [expect.objectContaining({ code: 'results' })] } })
+    await tools.block('Waiting for independent recovered serving evidence')
+  })
+  const service = f.make(); service.request(f.id); await settled(service, f.id)
+  expect(service.status(f.id)?.phase).toBe('blocked'); expect(f.owner.commit).not.toHaveBeenCalled()
 })
 it('keeps the operation active when completion is requested before recording', async () => {
   const f = fixture(), service = f.make()

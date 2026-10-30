@@ -3,13 +3,24 @@ import { fromAny } from '@total-typescript/shoehorn'
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
 import { afterEach, expect, it, vi } from 'vitest'
-import { copy, remote, remoteResult } from '../src/transport.ts'
+import { copy, remote, remoteResult, run } from '../src/transport.ts'
 
 vi.mock('node:child_process', async importOriginal => ({ ...await importOriginal<typeof import('node:child_process')>(), spawn: vi.fn() }))
 
 afterEach(() => {
   vi.useRealTimers()
   vi.resetAllMocks()
+})
+
+it('includes a package manager failure written only to stdout', async () => {
+  const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: vi.fn() })
+  vi.mocked(spawn).mockReturnValue(fromAny<ReturnType<typeof spawn>, typeof child>(child))
+  const pending = run('pnpm', ['install', '--lockfile-only'], 30000)
+  const settled = expect(pending).rejects.toThrow('ERR_PNPM_NO_OFFLINE_META')
+  child.stdout.end('[ERR_PNPM_NO_OFFLINE_META] Missing registry metadata')
+  child.stderr.end()
+  child.emit('close', 1, null)
+  await settled
 })
 
 it.each([7, 255])('preserves remote exit %i separately from SSH connection failures', async exitCode => {

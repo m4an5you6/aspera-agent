@@ -16,6 +16,14 @@ const userData = resolve(directory, '用户 空间')
 const home = resolve(userData, 'dsh')
 const profile = resolve(home, 'profiles/aspera-desktop')
 const runtime = JSON.parse(readFileSync(resolve(output, 'aspera-desktop-build.json'), 'utf8')).runtimeSource
+assert.equal(JSON.parse(readFileSync(resolve(runtime, 'package.json'), 'utf8')).asperaEnvironmentTools.repairVersion, 1,
+  'The retained desktop executable must load environment repair resources')
+assert.equal(JSON.parse(readFileSync(resolve(runtime, 'package.json'), 'utf8')).asperaEnvironmentTools.materialFormat, '0.1.2',
+  'The retained desktop executable must load material source binding resources')
+assert.equal(JSON.parse(readFileSync(resolve(runtime, 'package.json'), 'utf8')).asperaEnvironmentTools.registrationFormat, '0.1.3',
+  'The retained desktop executable must load storage registration and diagnostic resources')
+assert.equal(JSON.parse(readFileSync(resolve(runtime, 'package.json'), 'utf8')).asperaEnvironmentTools.reuseVerificationVersion, 1,
+  'The retained desktop executable must load automatic historical source verification resources')
 mkdirSync(profile, { recursive: true })
 symlinkSync(resolve(runtime, 'node_modules'), resolve(profile, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir')
 writeFileSync(resolve(profile, 'aspera-desktop-profile.json'), JSON.stringify({ version: 1, runtime: resolve(runtime, 'node_modules') }))
@@ -37,6 +45,19 @@ try {
   app = await electron.launch({ executablePath: executable, env, timeout: 60000 })
   const page = await app.firstWindow()
   await page.waitForURL(url => url.hostname === '127.0.0.1', { timeout: 60000 })
+  const ownedOrigin = new URL(page.url()).origin
+  await app.evaluate(async ({ BrowserWindow }, origin) => {
+    const session = BrowserWindow.getAllWindows()[0].webContents.session
+    for (let index = 0; index < 80; index++) {
+      await session.cookies.set({ url: origin, name: 'dsh-auth-regression-' + index, value: 'x'.repeat(220), httpOnly: true })
+    }
+  }, ownedOrigin)
+  const navigation = await page.reload()
+  assert.equal(navigation?.status(), 200, 'Stored cookies from earlier Host ports must not overflow the navigation header')
+  assert.equal(await app.evaluate(async ({ BrowserWindow }, origin) =>
+    (await BrowserWindow.getAllWindows()[0].webContents.session.cookies.get({ url: origin }))
+      .filter(cookie => cookie.name.startsWith('dsh-auth-regression-')).length, ownedOrigin), 80,
+  'Routing must preserve stored cookies from earlier Host authorities')
   const result = await page.evaluate(async () => {
     const method = 'aspera/servers'
     const response = await fetch(new URL(`api/${method}`, location.href), { method: 'POST', headers: { 'content-type': 'application/json' },
@@ -55,6 +76,10 @@ try {
   assert.deepEqual(JSON.parse(recovery.body).result.value.installations, [], 'The original EXE loads the new installation snapshot')
   assert.deepEqual(JSON.parse(recovery.body).result.value.interruptions, [], 'The original EXE loads durable interruption progress')
   assert.ok(existsSync(resolve(runtime, 'node_modules/@aspera/dispatch/scripts/install-release.py')), 'The independently shipped installer is present')
+  assert.deepEqual(JSON.parse(readFileSync(resolve(runtime, 'package.json'), 'utf8')).asperaPlanningTools, { version: 1, formatVersion: '0.1.0', requirementsVersion: 1, inferenceVersion: 1 })
+  for (const file of ['plan-draft.js', 'plan-tools.js', 'framework-documentation.js', 'planning-store.js']) {
+    assert.ok(existsSync(resolve(runtime, 'node_modules/@aspera/runtime/lib', file)), 'The original EXE loads planning resources: ' + file)
+  }
   for (const file of ['lib/preparation-command.js', 'scripts/preparation-command.py']) {
     assert.ok(existsSync(resolve(runtime, 'node_modules/@aspera/dispatch', file)), 'The original EXE loads preparation exit and log recovery: ' + file)
   }

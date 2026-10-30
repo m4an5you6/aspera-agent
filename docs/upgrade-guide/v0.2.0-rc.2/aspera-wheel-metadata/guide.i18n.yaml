@@ -1,0 +1,16 @@
+# Bilingual-pair consistency record for guide.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write docs/upgrade-guide/v0.2.0-rc.2/aspera-wheel-metadata/guide.md
+/:
+  en: cecc1020d8f80019
+  zh: c13c8b54c8366940
+/aspera-input-wheel-repair-and-cache-eviction:
+  en: 52244b34f7b0b4f2
+  zh: 1482815e0cbae6aa
+/aspera-input-wheel-repair-and-cache-eviction/change:
+  en: c912c72b6f6ddb52
+  zh: fba68ef7d2b3fa75
+/aspera-input-wheel-repair-and-cache-eviction/migration:
+  en: c2cf55e14cbc7779
+  zh: 6630b38f1e02d6a3

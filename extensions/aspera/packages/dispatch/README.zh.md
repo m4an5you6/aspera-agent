@@ -11,6 +11,8 @@ kind: "package-bundle"
 
 提交多个独立 Goal、暂存输入，并在返回远端接管之前移交完整实验材料。重试期间保留服务器设置、凭据引用和发布身份。Aspera 页面与 Agent 工具共用任务服务，先保存完整回执，再完成身份匹配的派发 Goal。
 
+已有训练实验可通过[恢复验收](../../docs/completion-review.zh.md#recover-acceptance-on-the-original-experiment)关联现有推理工作。Host 在原完成复验前核对原生 checkpoint 和公网服务证明，不复制或重新激活训练。来源预览区分原文件摘要与提供文本摘要，同时保留凭据脱敏。
+
 ## 目录
 
 - [使用本包](#use-this-package)
@@ -26,13 +28,17 @@ kind: "package-bundle"
 <a id="use-this-package"></a>
 ## 使用本包
 
-管理 Host 在页面未打开时同步已接管实验，并通过现有轨迹、命令、日志、步骤及指标 Remote 提供已提交副本。`experimentArchiveStatus` 和 `syncExperimentArchive` 提供只读副本状态及立即补拉。[本机运行记录](../../docs/state-and-api.zh.md#local-running-records)说明版本 1 索引、SSH 补拉、可配置限制及删除生命周期；profile 退出时停止并等待所属读取，远端执行独立继续。
+管理 Host 在页面未打开时同步已接管实验，并通过现有轨迹、命令、日志、步骤及指标 Remote 提供已提交副本。队列尚未保存活动阶段的 Session id 时，可使用归属已核验的实验／节点 Agent 来源声明识别轨迹；声明缺失或有歧义时不能据此识别。`experimentArchiveStatus` 和 `syncExperimentArchive` 提供只读副本状态及立即补拉。[本机运行记录](../../docs/state-and-api.zh.md#local-running-records)说明版本 1 索引、SSH 补拉、可配置限制及删除生命周期；profile 退出时停止并等待所属读取，远端执行独立继续。
+
+打开归档时，每个实验读取一次目录清单来核对已提交区间，并检查目录身份没有变化。分块缺失、非文件条目和符号链接均被拒绝。读取分块时重新核对路径及内容摘要；启动核验不代替读取时的完整性检查，也不删除历史记录。
 
 生成的 `experimentExecutionProgress` Remote 从各实验的原调度主机读取批准计划的 Agent 上报。旧固定发布不支持时明确返回可用性，读取失败保留诊断，不替换运行时。[步骤进度](../../docs/state-and-api.zh.md#execution-step-progress)定义归属及兼容持久化规则。
 
 [工程启动](../../README.zh.md#start-the-management-page) 在已发布 DSH base/Web bundle 及本包 [cordis.patch.yml](cordis.patch.yml) 之上建立 `aspera` profile，装配接入层及管理页面。构建产物可以脱离 Harness 源码安装，[独立安装验证](../../scripts/test-installed.mjs) 检查同一 profile 和公开类型声明。
 
 `extensionRoot` 选择固定发布，`dataRoots` 允许读取本地输入文件，阶段快照标识私有模型凭据。`minimumFreeBytes` 配置保留空间，默认 1 GiB；`preparationOutputChars` 限制每条命令向模型返回的 stdout 和 stderr，默认各 65536 字符。准备使用所选 SSH 账号的现有权限，不依赖系统包白名单。操作、轮询和下载设置由 [Config](src/index.ts) 校验；随包配置读取 `ASPERA_DATA_ROOTS` 并兼容旧 `ASPERA_MODEL_CREDENTIAL_REFS`。连接检查只读取远端状态，不调用模型或配置依赖，区分 SSH 可达与依赖未就绪，磁盘清单可能缺失。
+
+`documentationReadTimeoutMs`（默认 30,000 毫秒）与 `documentationPageBytes`（默认 8,192 字节 UTF-8 正文）保存到新部署设置，用于[规划文档和草稿](../../docs/planning.zh.md)。已有实验保留原有缺省设置和固定发布。
 
 `connectionCheckTimeoutMs` 为整轮连接检查设置统一截止时间，默认 20000 毫秒。主机密钥探测、环境检查、磁盘、GPU 和控制服务共用取消信号。到期后关闭活动 SSH 连接并保存失败状态，结束后才能再次检查；保留带时间的历史成功信息。前台准备命令继续使用 `toolTimeoutMs`。自定义调用者在 `ExperimentFleet.open` 的可选驱动之前传入检查时限；驱动必须响应探测取消，并等待连接清理完成。
 
@@ -54,6 +60,8 @@ kind: "package-bundle"
 
 重试从原发布读取环境要求。应用和 DSH 清单都缺少 `engines` 时，已记录的 Aspera `0.1.1` / DSH `0.2.0-rc.2` / pnpm `11.7.0` 组合要求 Node `^22.19.0 || >=24.0.0`。发布记录、依赖声明及已安装的 DSH 版本必须一致。未知组合或无效的已声明要求会停止准备；当前应用的 Node 范围不会替代原发布要求。
 
+桌面资源保留封存的部署归档。派发前核对归档内容身份、已安装包文件和运行要求，再直接复用，无需从用户 npm 缓存重新解析依赖。源码构建优先使用缓存元数据，并补取固定依赖缺少的元数据。尚未保存任何发布或远端选盘记录的准备失败，可以保留实验和 Session 原地重试；已固定发布仍要求原材料。本机命令失败保留有长度限制的 stderr，stderr 为空时保留 stdout。
+
 `AsperaRemote` 提供类型化普通方法及可重连的快照流，`ExperimentFleet` 管理工具和 Web 相同的派发行为，`FleetDriver` 提供完整部署能力。输入写入有界且幂等，下载使用一次性票据，卸载会等待本地工作结束而不取消远端已接管的任务。
 
 -----
@@ -63,6 +71,8 @@ kind: "package-bundle"
 
 [interruption.ts](src/interruption.ts) 管理 Host 后台操作与持久版本 1 回执；[interruption-remote.ts](src/interruption-remote.ts) 解析原提交、凭据与固定 SSH 操作。任务收尾与控制进程恢复使用同一远端准入锁。Host 的准备队列各自保留生命周期，诊断期间仍可停止旧任务。控制进程修复在启动前核对授权范围内已经退出的旧任务，并向准备 Agent 返回回执；之后仍须完整复验。[受控中断](../../docs/state-and-api.zh.md#experiment-interruption)说明原结果保留、旧版本身份缺失、多节点确认、受阻重试和 API 兼容。
 
+[controller-script.ts](src/controller-script.ts) 通过 SSH 标准输入传送完整脚本及原授权，使用短 Python 启动命令，完整解析后才执行脚本。修复在停止在线控制进程前检查这条只读路径。已确认停止的操作沿用原操作和固定发布恢复；重复恢复不再次停止进程，也不增加尝试次数。解除维护前核对替代进程归属，成功回执保留之前的失败诊断。
+
 [环境验收](src/deploy.ts)通过完整执行沙箱检查工作目录写入、目录隔离、凭据隐藏及 CUDA 访问。Shell 探测在 Node 安装前检查所需命名空间。已确认的拒绝将检查项、退出码及原始 stdout/stderr 通过[准备工具](src/environment-preparation.ts)返回；原准备 Agent 请求修复和程序复验。proc 挂载失败参见[沙箱兼容修复](#sandbox-compatibility-repair)。移除隔离参数、将宿主 `/proc` 绑定进最终沙箱或 Agent 声称完成都不能证明就绪。
 
 [控制进程恢复](../../docs/state-and-api.zh.md#controller-readiness)说明在线维护与通过 SSH 恢复已退出的控制进程。`repair_preparation_controller` 保留原运行目录，核对资源释放，并发布独立的固定版本 profile。控制端口不可达不能证明账号或云平台策略阻塞。
@@ -70,9 +80,11 @@ kind: "package-bundle"
 <a id="sandbox-compatibility-repair"></a>
 ### 沙箱兼容修复
 
-`repair_preparation_sandbox` 仅接受当前步骤的服务器 id。程序发现原生 bubblewrap、util-linux 的 `unshare`/`setpriv` 及 `sha256sum`，使用账号已有权限实测私有 PID/proc 父环境。内层 user/PID/mount/IPC/UTS 隔离、私有 `/proc`、精确设备授权以及凭据和目录遮蔽仍为必需；`no_new_privs` 和空能力集合阻止权限提升。本地探测通过后，在已记录诊断中提供专用工具，不仅凭 `EPERM` 推断宿主策略阻塞。缺少工具、账号现有权限不足及探测失败保留各自证据。检查连接不会执行此修复探测或调用模型。
+`repair_preparation_sandbox` 仅接受当前步骤的服务器 id。程序发现原生 bubblewrap、util-linux 的 `unshare`/`setpriv`、`env` 及 `sha256sum`，使用账号已有权限实测私有 PID/proc 父环境。启动器在创建命名空间后恢复默认 TERM/INT 处理，准备阶段核验子进程实际终止。内层 user/PID/mount/IPC/UTS 隔离、私有 `/proc`、精确设备授权以及凭据和目录遮蔽仍为必需；`no_new_privs` 和空能力集合阻止权限提升。本地探测通过后，在已记录诊断中提供专用工具，不仅凭 `EPERM` 推断宿主策略阻塞。缺少工具、账号现有权限不足及探测失败保留各自证据。检查连接不会执行此修复探测或调用模型。
 
-工具在所选控制目录的 `tools/sandbox` 下安装仅账号所有者可访问的内容寻址启动器和版本 1 描述文件。复用时核对现有材料，不覆盖文件；原生程序或启动器摘要变化时拒绝复用。解析出的程序目录在复验中优先使用，并通过现有程序路径字段保存，供部署、控制进程启动及正式命令统一使用。已运行控制进程保留配置；更换其后端仍须单独通过空闲维护流程。配置成功不能证明就绪：Agent 必须调用 `verify_preparation_environment`，全部节点通过完整检查后才能交接。存在可用修复时，不能跳过它直接报告账号修复已穷尽。
+工具在所选控制目录的 `tools/sandbox` 下安装仅账号所有者可访问的内容寻址启动器和版本 1 描述文件。原生程序缺少临时文件系统容量限制时，可按封闭发布的 `sandbox-native.json` 配方，在私有 `tools/sandbox-native` 代次中编译。固定源码及工具摘要和账号已有的已签名软件包元数据用于核验构建输入；仅提取私有 libcap 头文件，不安装系统软件包。复用核对程序和运行库摘要；独立版本 1 索引及尝试回执保留未决退出。`sandboxNativeBuildTimeoutMs` 默认 300000，`sandboxNativeBuildBytes` 默认 67108864，并继续检查既有可用空间余量。
+
+解析出的程序目录在复验中优先使用，并通过现有程序路径字段保存，供部署、控制进程启动及正式命令统一使用。清单的 `sandboxVersion: 1` 要求控制进程具备 `bounded-sandbox-launch-v1` 才能复用。已运行控制进程保留配置；更换其后端仍须单独通过空闲维护流程。配置成功不能证明就绪：Agent 必须调用 `verify_preparation_environment`，全部节点通过完整检查后才能交接。诊断工作区和隐藏目录先完成挂载，再将其父目录设为只读；命名空间、凭据、设备和临时空间上限继续核验。存在可用修复时，不能跳过它直接报告账号修复已穷尽。
 
 `sandboxRepairProbeTimeoutMs` 默认 15000、`sandboxRepairCleanupTimeoutMs` 默认 1000、`sandboxRepairPollIntervalMs` 默认 20，`sandboxRepairMaxAttempts` 默认每个实验/服务器最多两次安装。自定义 fleet 调用者在 SSH 策略后传入解析后的配置。复用已安装且匹配的材料不消耗新次数。前台修复命令沿用准备待确认命令的归属记录；独立版本 1 回执绑定实验、服务器、Session、工具调用及退出。探测清理从 TERM 升级到 KILL，核对进程身份和私有 PID 命名空间后才写退出回执。取消、断线或未决操作须先核对，再允许新的修改；不修改宿主 sysctl、AppArmor 策略或驱动。确认账号没有兼容权限时，提供具体的云平台操作要求。
 
@@ -105,14 +117,14 @@ kind: "package-bundle"
 
 固定发布声明时，环境要求包含固定 uv 版本。准备 Agent 安装基础工具，执行阶段通过节点环境服务请求依赖。本机空间与清理 Remote 使用保存的节点归属，离线时保留原检查时间，删除本机记录前等待读写结束。`ExperimentFleet.open` 在 `agentContext` 后接受可选 `ManagedEnvironmentPolicy`；配置与恢复细节见[受管环境](../../docs/managed-environments.zh.md)。
 
-GPU 与控制进程检查使用实际身份和启动授权。准备 Agent 可以请求限定范围的控制进程修复工具；程序复验和最终交接检查判定就绪。空闲维护先阻止新任务，再按身份重启。`controllerRepairMaxAttempts` 默认两次，由独立恢复回执保留。[控制进程就绪](../../docs/state-and-api.zh.md#controller-readiness)定义占用、未知退出和原发布兼容。自定义 `FleetDriver` 提供方实现 `inspectController`。
+GPU 与控制进程检查使用实际身份、所选固定发布和启动授权。准备 Agent 可以请求限定范围的控制进程修复工具；程序复验和最终交接检查判定就绪。空闲维护先阻止新任务，再按身份重启。`controllerRepairMaxAttempts` 默认两次，由独立恢复回执保留。[控制进程就绪](../../docs/state-and-api.zh.md#controller-readiness)定义占用、未知退出和原发布兼容。自定义 `FleetDriver` 提供方实现 `inspectController`。
 
 派发工具列出不含凭据的服务器、提交明确的服务器组并读取实验状态。所选准备模型在同一 Session 中通过有日志的工具修复失败检查，SSH 凭据不进入模型输入。非零退出返回诊断，退出未确认则阻止重复修改。Agent 文字不能替代工作目录写入、隔离、凭据隐藏、GPU 和网络验收。已通过的检查进入 Agent 收件箱而不唤醒模型，由循环在首条系统消息之后纳入上下文。要求和回执使用现有 Session 事件；**本机派发完成，远端实验已接管**仅在保存回执后出现，ID 和版本比较防止完成已编辑的 Goal。
 
 <a id="preparation-command-recovery"></a>
 ## 准备命令恢复
 
-`run_preparation_command` 在已具备 Python 的节点上独立于 SSH 监督命令。命令、下载与重试共用 `toolTimeoutMs`，并受安装轮次剩余期限约束。日志及版本 1 的请求、进程、状态和事件记录保留在原准备目录。重新连接只读取原命令；只有确认退出才清除待核验标记。旧命令退出不明时继续阻塞。仅有 Shell 时，Python 引导保留直接日志文件并使用系统 `timeout` 工具。
+`run_preparation_command` 在已具备 Python 的节点上独立于 SSH 监督命令。短启动命令接收完整 UTF-8 输入，核对长度和 SHA-256 后才创建命令。命令、下载与重试共用 `toolTimeoutMs`，并受安装轮次剩余期限约束。日志及版本 1 的请求、进程、状态和事件记录保留在原准备目录。重新连接只读取原命令；只有确认退出才清除待核验标记。旧命令退出不明时继续阻塞。仅有 Shell 时，Python 引导保留直接日志文件并使用系统 `timeout` 工具。
 
 准备 Agent 通过 `prepare_preparation_tool` 配置发布要求的固定 uv。程序优先复用已有匹配程序、已验证 wheel 或服务器缓存中的未完成材料，再获取缺失内容。程序检查 Python／平台标签和 SHA-256，恢复支持的断点下载，并返回供 `verify_preparation_environment` 使用的程序目录。训练依赖保持独立。控制进程使用当前 SSH 路径；缓存中的 uv 路径纳入已验证工具链。
 
@@ -125,9 +137,13 @@ Host 独立于可见实验保留最小[远端任务身份](src/remote-task.ts)�
 
 `remoteTaskStatus(id)` 读取已保存进度。`settleRemoteTask({taskId, mode})` 发起 Host 管理的 `reconcile` 或明确的 `interrupt` 操作。既有中断与控制进程修复共用退出核验、准入保护和释放实现。自动收尾要求原调度控制进程退出或存在可信终态，并确认全部原 Agent、命令和服务退出。未知节点与活动任务保留占用。服务器卡片展示已删除任务进度和重试；连接检查不进行收尾。[持久化与恢复](../../docs/state-and-api.zh.md#remote-task-settlement)定义兼容及文件保留规则。
 
-[完成复验](../../docs/completion-review.zh.md) 使用原执行模型，在独立 Session 中运行标准受限 DSH Agent。Host 管理后台读取、来源核验、独立回执、取消和删除，原失败结果不变。JSON 证据脱敏保留结构，补录一次返回全部字段不匹配项，本机轨迹分页读取原持久补录 Session。
+[完成复验](../../docs/completion-review.zh.md) 使用原执行模型，在独立 Session 中运行标准受限 DSH Agent。Host 管理后台读取、来源核验、独立回执、取消和删除，原失败结果不变。模型视图区分当前评估与历史结果，优先展示未闭环步骤和经过独立检查的关联服务。Agent 可使用当前验收记录版本更正未通过核验的阶段路径；训练身份与已通过的绑定固定不变。JSON 证据脱敏保留结构，补录一次返回全部字段不匹配项，本机轨迹分页读取原持久补录 Session。
 
-[存储治理](../../docs/storage-governance.zh.md) 在控制进程启动前使用同一准备 Session 和所选 SSH 账号。远端访问失败时，Host 提供正式元数据，管理可取消读取，并暴露保存的容量计划及明确请求的有限盘点刷新。空间观察保留原时间和连接错误；清理选择绑定程序生成的候选。
+[存储治理](../../docs/storage-governance.zh.md) 在控制进程启动前使用同一准备 Session 和所选 SSH 账号。远端访问失败时，Host 提供正式元数据，管理可取消读取，并暴露保存的容量计划及明确请求的有限盘点刷新。存储选择和重试一起提交目录安排及匹配的磁盘观察，继续核对固定身份与容量。观察保留各自时间和连接错误；清理选择绑定程序生成的候选。
+
+[输入传输](src/input-transfer.ts) 对整批上传使用配置中的 `managedEnvironments.governance.materialTimeoutMs`。重试只跳过归属匹配、内容完整且符合提交摘要的文件；不完整文件须重新传送，交接前进行完整校验。密码 SFTP 使用库的并行上传，在写数据前设置私有权限，认证后的传输不会自动重放。
+
+准备阶段在交接前核验有容量上限的只读诊断。Host 可以通过官方 Git 对象确认 ModelScope 数据集提交；[材料核验](../../docs/storage-governance.zh.md)说明程序要求、上限和文件检查。
 
 <a id="known-limitations-and-deferred-work"></a>
 ## 已知限制和后续工作

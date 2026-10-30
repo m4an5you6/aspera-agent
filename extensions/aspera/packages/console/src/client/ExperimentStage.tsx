@@ -27,11 +27,13 @@ export function ExperimentStage({ row, t, retrying, onRetry, onRecords, onMonito
 }) {
   const { phase, status, local, issue, attention, busy, remote } = experimentProgress(row)
   const stopping = interruptionView(row, interruption, interrupting)
+  const recoveryPhase = row.acceptanceRecovery?.phase
+  const recoveryLabel = recoveryPhase === 'recovering' ? 'recoveringInference' : recoveryPhase === 'verifying' ? 'verifyingRecoveredInference' : undefined
   const active = status === 'reviewing' || stopping.busy || !stopping.blocked && interruption?.phase !== 'released' && ((busy && (local || activityConfirmed !== false)) || retrying)
   const stopped = issue || status === 'cancelled' || interruption !== undefined
-  const step = status === 'reviewing' ? t(row.completionReview?.phase === 'verifying' ? 'reviewVerifying' : 'reviewCollecting')
+  const step = status === 'reviewing' ? t(recoveryLabel ?? (row.completionReview?.phase === 'verifying' ? 'reviewVerifying' : 'reviewCollecting'))
     : remote?.progress?.phase || (local && row.preparation !== undefined ? t(row.preparation.stage) : undefined)
-  const title = status === 'reviewing' ? t(row.completionReview?.phase === 'verifying' ? 'reviewVerifying' : 'reviewCollecting') : status === 'revalidated' ? t('revalidated') : status === 'review-blocked' ? t('review-blocked') : stopping.busy ? t('interruptingExperiment') : stopping.blocked ? t('interruptionBlocked') : stopping.userInterrupted ? t('interruptedByUser') : !local && busy && activityConfirmed === false ? t('archiveRuntimeUnconfirmed') : retrying ? t('retryingPreparation') : local && issue ? t('preparationFailed')
+  const title = status === 'reviewing' ? t(recoveryLabel ?? (row.completionReview?.phase === 'verifying' ? 'reviewVerifying' : 'reviewCollecting')) : status === 'revalidated' ? t('revalidated') : status === 'review-blocked' ? t('review-blocked') : stopping.busy ? t('interruptingExperiment') : stopping.blocked ? t('interruptionBlocked') : stopping.userInterrupted ? t('interruptedByUser') : !local && busy && activityConfirmed === false ? t('archiveRuntimeUnconfirmed') : retrying ? t('retryingPreparation') : local && issue ? t('preparationFailed')
     : issue && phase === 2 ? t('executionStopped') : phase === 1 && ['preparing', 'planning'].includes(status) ? t('planningWork') : status === 'running' ? t('executionWork')
       : status === 'completed' ? t('resultsReady') : local && busy ? t('preparationWork') : t(status)
   const tone = stopping.blocked ? 'attention' : stopping.busy || retrying ? 'active' : attention ? 'attention' : (status === 'completed' || status === 'revalidated') ? 'complete' : active ? 'active' : 'idle'

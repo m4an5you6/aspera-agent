@@ -41,7 +41,7 @@ export function installStorageReplay(ctx, observedCalls, environmentCalls = []) 
     }
     if (input === undefined) { yield* next(); return }
     const names = (options.tools ?? []).map(tool => tool.name).sort()
-    const expectedTools = ['inspect_server_storage', 'select_experiment_storage', 'inspect_preparation_environment', 'run_preparation_command', 'prepare_preparation_tool', 'verify_preparation_environment', 'report_preparation_blocked',
+    const expectedTools = ['inspect_server_storage', 'verify_server_storage', 'select_experiment_storage', 'inspect_preparation_environment', 'run_preparation_command', 'prepare_preparation_tool', 'prepare_experiment_materials', 'verify_preparation_environment', 'report_preparation_blocked',
       'inspect_preparation_installation', 'probe_preparation_source', 'switch_preparation_source', 'repair_preparation_controller', 'repair_preparation_sandbox',
       'assess_experiment_storage', 'inspect_experiment_materials', 'preview_experiment_cache_cleanup', 'cleanup_experiment_cache'].sort()
     if (JSON.stringify(names) !== JSON.stringify(expectedTools)) throw new Error('Preparation tool scope changed: ' + names.join(','))

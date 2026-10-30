@@ -1,12 +1,11 @@
 /** SSH interruption operations validate the original submission and account-owned ledger. */
-import { readFileSync } from 'node:fs'
 import { z } from 'zod'
 import { clusterRecordSchema, clusterStateSchema, experimentInterruptionSchema, serverIdSchema } from '@aspera/experiments'
 import type { ClusterRecord, ExperimentId, ExperimentInterruptionStatus, ExperimentServerId } from '@aspera/experiments'
 import type { DeploymentConfig } from './deploy.ts'
 import type { InterruptionTask } from './interruption.ts'
 import type { FleetDriver } from './fleet.ts'
-import { shellQuote } from './transport.ts'
+import { runControllerScript } from './controller-script.ts'
 
 /** Public release evidence; command-ready means exit was checked, before ledger settlement. */
 export const interruptionFactsSchema = z.object({ serverId: serverIdSchema, agentsExited: z.boolean(), commandsReleased: z.boolean(),
@@ -21,7 +20,6 @@ export const interruptionFactsSchema = z.object({ serverId: serverIdSchema, agen
 export type InterruptionFacts = z.infer<typeof interruptionFactsSchema>
 /** Fixed operations are selected by the program, never by the preparation model. */
 export type InterruptionMode = 'inspect' | 'fence' | 'stop' | 'settle' | 'complete' | 'publish' | 'unfence'
-const program = readFileSync(new URL('../scripts/controller-recovery.py', import.meta.url), 'utf8')
 
 /** Program-resolved requests cannot change the original release, server, process ids or directory assignment. */
 export class RemoteInterruption {
@@ -34,7 +32,7 @@ export class RemoteInterruption {
   async discover(input: { target: DeploymentConfig; serverId: ExperimentServerId; experimentIds: ExperimentId[]; password?: string },
     signal: AbortSignal): Promise<ClusterRecord[]> {
     const request = { mode: 'discover', root: input.target.remoteRoot, serverId: input.serverId, role: 'coordinator', experimentIds: input.experimentIds }
-    const raw = JSON.parse(await this.driver.remote(input.target, `python3 -c ${shellQuote(program)} ${shellQuote(JSON.stringify(request))}`, signal, input.password))
+    const raw = await runControllerScript(this.driver, input.target, request, signal, input.password)
     const records = z.object({ records: z.array(clusterRecordSchema) }).parse(raw).records
     for (const record of records) {
       if (!input.experimentIds.includes(record.submission.experimentId) || record.submission.protocol !== 4
@@ -54,7 +52,7 @@ export class RemoteInterruption {
     const request = { mode: `interrupt-${mode}`, root: target.remoteRoot, serverId, role: 'coordinator', server, submission, status,
       basePort: target.remotePort, port: target.remotePort + 1, timeoutSeconds: target.toolTimeoutMs / 1000, cleanupSeconds: this.cleanupMs / 1000,
       ...(facts === undefined ? {} : { expectedDigest: facts.digest }) }
-    return JSON.parse(await this.driver.remote(target, `python3 -c ${shellQuote(program)} ${shellQuote(JSON.stringify(request))}`, signal, password))
+    return runControllerScript(this.driver, target, request, signal, password)
   }
   /** @param input - program-owned original record, target, credentials and journal. @param mode - bounded operation.
    * @param signal - attempt lifetime. @param facts - preceding inspection for writes. @returns validated release facts or the confirmed terminal result.

@@ -26,11 +26,11 @@ function fixture(maxAttempts = 2) {
   const pending: string[] = []; let stopped = false
   const inspectController = vi.fn(async () => structuredClone(status))
   const ensure = vi.fn(async () => { status = { ...controllerFixture(target), bootId: controllerBootIdSchema.parse('cpu-replacement') } })
-  const run = vi.fn(async (_target, script: string) => {
-    if (script.includes('"mode":"')) {
-      const operation = JSON.parse(script.slice(script.lastIndexOf(" '{") + 2, -1))
+  const run = vi.fn<FleetDriver['remote']>(async (_target, script, _signal, _password, input) => {
+    if (input !== undefined) {
+      const operation = JSON.parse(input).request
       if (operation.mode === 'inspect') return JSON.stringify({ version: 1, state: 'offline', root: target.remoteRoot, role: 'node',
-        home: target.remoteRoot + '/state/node-home', hostBootId: 'cpu-host', digest: 'f'.repeat(64), savedPid: null,
+        home: target.remoteRoot + '/state/node-home', hostBootId: 'cpu-host-boot', digest: 'f'.repeat(64), savedPid: null,
         releaseBinding: '/old-release', processes: [], blockers: [], records: [], converged: [] })
       if (operation.mode === 'begin') return JSON.stringify({ version: 1, operationId: operation.operationId, phase: 'fenced',
         directory: operation.directory, role: 'node', release: operation.release })
@@ -64,6 +64,18 @@ it('rejects a healthy control process with the old nvidia2 grant before its reus
   })
   expect(remote).not.toHaveBeenCalled()
 })
+it.each(['node', 'coordinator'] as const)('refuses a healthy %s from another fixed release despite matching features and devices', async role => {
+  const status = controllerFixture(target, role)
+  const features = ['public-inference-v1', 'controller-readiness-v1', 'controller-maintenance-v1']
+  const prepared = { ...preparedFixture('b'.repeat(64)), requiredFeatures: features }
+  vi.mocked(request).mockResolvedValue({ status: 200, value: { protocol: 4, role, deploymentId: status.deploymentId, features, controller: status } })
+  await expect(ensureClusterRole(target, prepared, role, 'private-token', undefined, AbortSignal.timeout(1000))).rejects.toMatchObject({
+    diagnostic: { code: 'configuration-outdated', expected: { deploymentId: prepared.deploymentId }, controller: { deploymentId: status.deploymentId } },
+  })
+  expect(remote).not.toHaveBeenCalled()
+  status.deploymentId = prepared.deploymentId
+  expect(verifyController({ ...status, features }, target, prepared, role)).toMatchObject({ deploymentId: prepared.deploymentId })
+})
 it('accepts reordered authorization but distinguishes UUID, device mapping and access changes', () => {
   const prepared = preparedFixture(); prepared.gpu.devicePaths.push('/dev/nvidiactl'); const status = controllerFixture(target)
   status.policy.gpu = structuredClone(prepared.gpu); status.actualGpu = structuredClone(prepared.gpu)
@@ -73,6 +85,26 @@ it('accepts reordered authorization but distinguishes UUID, device mapping and a
   expect(() => verifyController(status, target, prepared, 'node')).toThrow('hardware-changed')
   status.actualGpu = undefined; status.gpuError = 'CUDA device permission denied'
   expect(() => verifyController(status, target, prepared, 'node')).toThrow('unavailable')
+})
+it('requires command output support before reusing a healthy controller', () => {
+  const prepared = { ...preparedFixture(), requiredFeatures: ['command-output-v1', 'command-wait-identity-v1', 'managed-material-recovery-v1', 'planning-requirements-v1'] }, status = controllerFixture(target)
+  expect(() => verifyController(status, target, prepared, 'node')).toThrow('command-output-v1')
+  status.features = ['command-output-v1']
+  expect(() => verifyController(status, target, prepared, 'node')).toThrow('command-wait-identity-v1')
+  status.features.push('command-wait-identity-v1')
+  expect(() => verifyController(status, target, prepared, 'node')).toThrow('managed-material-recovery-v1')
+  status.features.push('managed-material-recovery-v1')
+  expect(() => verifyController(status, target, prepared, 'node')).toThrow('planning-requirements-v1')
+  status.features.push('planning-requirements-v1')
+  expect(verifyController(status, target, prepared, 'node')).toBe(status)
+})
+it.each(['bounded-sandbox-launch-v1', 'short-temporary-paths-v1', 'stage-attempt-recovery-v1', 'stage-evidence-reading-v1', 'stage-evidence-reading-v2', 'stage-checkpoint-evidence-v3', 'stage-checkpoint-evidence-v4', 'checkpoint-protection-v1', 'agent-recovery-v1', 'public-inference-verification-v1', 'readonly-source-consumers-v1', 'readonly-source-consumers-v2', 'historical-environment-precheck-v1', 'managed-wheel-metadata-v1', 'managed-wheel-metadata-v2', 'managed-manager-cache-v1', 'managed-input-sharing-v1', 'managed-release-asset-sharing-v1'])('requires %s before controller reuse and retains fixed-launch behavior', feature => {
+  const prepared = { ...preparedFixture(), requiredFeatures: [feature] }
+  const status = controllerFixture(target)
+  expect(() => verifyController(status, target, prepared, 'node')).toThrow(feature)
+  status.features = [feature]
+  expect(verifyController(status, target, prepared, 'node')).toBe(status)
+  expect(() => verifyController(status, target, preparedFixture(), 'node')).toThrow('selected release must retain')
 })
 it('requires fixed-release environment capabilities before reusing a healthy controller', async () => {
   const status = controllerFixture(target)
@@ -107,6 +139,31 @@ it('keeps an original older release off an installer-v3 controller', () => {
   const prepared = { ...preparedFixture(), requiredFeatures: ['managed-environment-install-v2'] }
   expect(() => verifyController(status, target, prepared, 'node')).toThrow('original release installer')
 })
+it('requires lock-refusal receipts before controller reuse and retains older fixed-release behavior', () => {
+  const status = controllerFixture(target)
+  const prepared = { ...preparedFixture(), requiredFeatures: ['managed-environment-lock-receipt-v1'] }
+  expect(() => verifyController(status, target, prepared, 'node')).toThrow('managed-environment-lock-receipt-v1')
+  status.features = prepared.requiredFeatures
+  expect(verifyController(status, target, prepared, 'node')).toBe(status)
+  expect(() => verifyController(status, target, preparedFixture(), 'node')).toThrow('selected release must retain')
+})
+it('requires published dependency requirements before reusing a controller for corrected storage trials', () => {
+  const status = controllerFixture(target)
+  const prepared = { ...preparedFixture(), requiredFeatures: ['storage-requirement-ledger-v1'] }
+  expect(() => verifyController(status, target, prepared, 'node')).toThrow('storage-requirement-ledger-v1')
+  status.features = prepared.requiredFeatures
+  expect(verifyController(status, target, prepared, 'node')).toBe(status)
+  expect(() => verifyController(status, target, preparedFixture(), 'node')).toThrow('selected release must retain')
+})
+it('requires source-binding capability and preserves the original material implementation for older releases', () => {
+  const status = controllerFixture(target)
+  const prepared = { ...preparedFixture(), requiredFeatures: ['targeted-materials-0.1.1', 'material-source-bindings-0.1.2'] }
+  status.features = ['targeted-materials-0.1.1']
+  expect(() => verifyController(status, target, prepared, 'node')).toThrow('material-source-bindings-0.1.2')
+  status.features = prepared.requiredFeatures
+  expect(verifyController(status, target, prepared, 'node')).toBe(status)
+  expect(() => verifyController(status, target, { ...prepared, requiredFeatures: ['targeted-materials-0.1.1'] }, 'node')).toThrow('older fixed source')
+})
 it('distinguishes unchanged UUIDs with a different device path and missing auxiliary devices', () => {
   const status = controllerFixture(target); const prepared = preparedFixture()
   status.actualGpu!.gpus[0]!.devicePath = '/dev/nvidia5'; status.actualGpu!.devicePaths = ['/dev/nvidia5']
@@ -130,11 +187,43 @@ it.each(['experiments', 'allocations', 'commands', 'services'] as const)('does n
   expect(f.pending).toEqual([]); expect(f.request).not.toHaveBeenCalled(); expect(f.ensure).not.toHaveBeenCalled()
 })
 it('holds an ambiguous stop across recovery and never launches or kills twice', async () => {
-  const f = fixture(); f.run.mockImplementation(async (_target, script: string) => { if (script.includes('pidfd_send_signal')) throw new Error('SSH cancelled before exit receipt'); return '{}' })
+  const f = fixture(); const original = f.run.getMockImplementation()!
+  f.run.mockImplementation(async (...args) => { if (args[1].includes('pidfd_send_signal')) throw new Error('SSH cancelled before exit receipt'); return original(...args) })
   await expect(f.runRepair()).rejects.toThrow('SSH cancelled')
   const resumed = new ControllerRepair(f.input, f.driver)
   await expect(resumed.reconcile(f.pending[0]!, AbortSignal.timeout(1000))).rejects.toThrow('unconfirmed')
   expect(f.ensure).not.toHaveBeenCalled(); expect(f.run.mock.calls.filter(([, script]) => script.includes('pidfd_send_signal'))).toHaveLength(1)
+})
+it('keeps the original controller running when the complete read-only request cannot be transported', async () => {
+  const f = fixture(); f.run.mockRejectedValue(new Error('input channel failed'))
+  await expect(f.runRepair()).rejects.toThrow('input channel failed')
+  expect(f.pending).toEqual([]); expect(f.request).not.toHaveBeenCalled(); expect(f.ensure).not.toHaveBeenCalled()
+  expect(f.run.mock.calls.some(call => call[1].includes('pidfd_send_signal'))).toBe(false)
+})
+it('resumes a stopped controller whose post-stop inspection failed without spending another attempt', async () => {
+  const f = fixture(1); const original = f.run.getMockImplementation()!
+  let inspections = 0
+  f.run.mockImplementation(async (...args) => {
+    if (args[4] !== undefined && JSON.parse(args[4]).request.mode === 'inspect' && ++inspections === 2) {
+      throw new Error('/bin/bash: Argument list too long')
+    }
+    return original(...args)
+  })
+  await expect(f.runRepair()).rejects.toThrow('Argument list too long')
+  expect(f.ensure).not.toHaveBeenCalled()
+  const path = resolve(process.env.DSH_HOME!, 'aspera-controller-repairs', f.input.experimentId, `${f.input.serverId}-node.v2.json`)
+  const before = JSON.parse(readFileSync(path, 'utf8'))
+  expect(before.attempts).toHaveLength(1); expect(before.attempts[0].offline).toBeUndefined()
+  f.run.mockImplementation(original); f.inspectController.mockRejectedValueOnce(new Error('Original control endpoint is offline'))
+  const resumed = new ControllerRepair(f.input, f.driver)
+  await resumed.repair(AbortSignal.timeout(1000), async () => { throw new Error('Cannot create another operation') })
+  await resumed.reconcile(f.pending[0]!, AbortSignal.timeout(1000))
+  const after = JSON.parse(readFileSync(path, 'utf8'))
+  expect(after.attempts).toHaveLength(1)
+  expect(after.attempts[0]).toMatchObject({ id: before.attempts[0].id, phase: 'completed',
+    detail: expect.stringContaining('Argument list too long') })
+  expect(f.run.mock.calls.filter(call => call[1].includes('pidfd_send_signal'))).toHaveLength(1)
+  expect(f.ensure).toHaveBeenCalledOnce()
 })
 it('refuses the configured attempt limit and stale handover acceptance', async () => {
   const f = fixture(0); await expect(f.runRepair()).rejects.toThrow('attempt limit'); expect(f.request).not.toHaveBeenCalled()
@@ -185,12 +274,12 @@ it('recovers a confirmed stop without repeating the stop or resetting the attemp
   await expect(f.runRepair()).rejects.toThrow('SSH lost')
   f.inspectController.mockRejectedValueOnce(new Error('control port is closed'))
   const previousRun = f.run.getMockImplementation()!
-  f.run.mockImplementation(async (_target, script: string) => script.includes('"mode":"') ? previousRun(_target, script)
-    : script.includes('/exited') ? 'unknown' : JSON.stringify({ operationId: f.status.maintenance, exited: true }))
+  f.run.mockImplementation(async (...args) => args[4] !== undefined ? previousRun(...args)
+    : args[1].includes('/exited') ? 'unknown' : JSON.stringify({ operationId: f.status.maintenance, exited: true }))
   const resumed = new ControllerRepair(f.input, f.driver)
   await resumed.reconcile(f.pending[0]!, AbortSignal.timeout(1000))
   expect(f.ensure).toHaveBeenCalledTimes(2)
-  expect(f.run.mock.calls.filter(([, script]) => script.includes('pidfd_send_signal') && !script.includes('"mode":"'))).toHaveLength(1)
+  expect(f.run.mock.calls.filter(([, script]) => script.includes('pidfd_send_signal'))).toHaveLength(1)
 })
 it('recovers an offline endpoint under a durable fence without sending maintenance to the dead role', async () => {
   const f = fixture(); f.inspectController.mockRejectedValueOnce(new Error('(SSH) Channel open failure: Connection refused'))
@@ -198,7 +287,7 @@ it('recovers an offline endpoint under a durable fence without sending maintenan
   expect(f.request).not.toHaveBeenCalled()
   expect(f.ensure).toHaveBeenCalledOnce()
   expect(f.ensure).toHaveBeenCalledWith(f.input.target, f.input.prepared, 'node', f.input.token, f.input.password, expect.any(AbortSignal), expect.any(String))
-  expect(f.run.mock.calls.filter(([, script]) => script.includes('pidfd_send_signal') && !script.includes('"mode":"'))).toHaveLength(0)
+  expect(f.run.mock.calls.filter(([, script]) => script.includes('pidfd_send_signal'))).toHaveLength(0)
   const journal = JSON.parse(readFileSync(resolve(process.env.DSH_HOME!, 'aspera-controller-repairs', f.input.experimentId, `${f.input.serverId}-node.v2.json`), 'utf8'))
   expect(journal).toMatchObject({ version: 2, attempts: [{ phase: 'completed', offline: { state: 'offline' } }] })
 })
@@ -210,9 +299,9 @@ it('returns SSH-derived offline evidence when the control health channel is refu
 it('does not start an offline controller while SSH evidence contains an unreleased command', async () => {
   const f = fixture(); f.inspectController.mockRejectedValueOnce(new Error('Connection refused'))
   const previousRun = f.run.getMockImplementation()!
-  f.run.mockImplementation(async (_target, script: string) => {
-    const value = await previousRun(_target, script)
-    if (!script.includes('"mode":"inspect"')) return value
+  f.run.mockImplementation(async (...args) => {
+    const value = await previousRun(...args)
+    if (args[4] === undefined || JSON.parse(args[4]).request.mode !== 'inspect') return value
     return JSON.stringify({ ...JSON.parse(value), state: 'occupied', blockers: [{ kind: 'command', id: 'original-command', reason: 'Exit unconfirmed' }] })
   })
   await expect(f.runRepair()).rejects.toMatchObject({ diagnostic: { code: 'occupied' } })
@@ -221,18 +310,18 @@ it('does not start an offline controller while SSH evidence contains an unreleas
 it('retains the admission fence until recovered process ownership can be confirmed without launching again', async () => {
   const f = fixture(); f.inspectController.mockRejectedValueOnce(new Error('Connection refused'))
   const previousRun = f.run.getMockImplementation()!
-  f.run.mockImplementation(async (_target, script: string) => {
-    if (script.includes('Recovered process belongs to another operation')) throw new Error('Recovered process belongs to another operation')
-    return previousRun(_target, script)
+  f.run.mockImplementation(async (...args) => {
+    if (args[1].includes('Recovered process belongs to another operation')) throw new Error('Recovered process belongs to another operation')
+    return previousRun(...args)
   })
   await expect(f.runRepair()).rejects.toThrow('another operation')
-  expect(f.run.mock.calls.some(([, script]) => script.includes('"mode":"complete"'))).toBe(false)
+  expect(f.run.mock.calls.some(call => call[4] !== undefined && JSON.parse(call[4]).request.mode === 'complete')).toBe(false)
   f.run.mockImplementation(previousRun)
   const resumed = new ControllerRepair(f.input, f.driver)
   await resumed.reconcile(f.pending[0]!, AbortSignal.timeout(1000))
   expect(f.ensure).toHaveBeenCalledOnce()
-  expect(f.run.mock.calls.filter(([, script]) => script.includes('"mode":"begin"'))).toHaveLength(1)
-  expect(f.run.mock.calls.filter(([, script]) => script.includes('"mode":"complete"'))).toHaveLength(1)
+  expect(f.run.mock.calls.filter(call => call[4] !== undefined && JSON.parse(call[4]).request.mode === 'begin')).toHaveLength(1)
+  expect(f.run.mock.calls.filter(call => call[4] !== undefined && JSON.parse(call[4]).request.mode === 'complete')).toHaveLength(1)
 })
 it('rejects a saved attempt when either process or offline evidence belongs to another server', async () => {
   const f = fixture(); await f.runRepair()
@@ -285,8 +374,8 @@ it('adopts program-confirmed old task receipts before starting the independent f
   const run = f.run.getMockImplementation()!
   f.run.mockImplementation(async (...args) => {
     const reply = await run(...args)
-    if (args[1].includes('"mode":"begin"')) {
-      const operation = JSON.parse(args[1].slice(args[1].lastIndexOf(" '{") + 2, -1))
+    if (args[4] !== undefined && JSON.parse(args[4]).request.mode === 'begin') {
+      const operation = JSON.parse(args[4]).request
       return JSON.stringify({ ...JSON.parse(reply), interruptions: [{ version: 1, experimentId: oldId, operationId: operation.operationId,
         submissionHash: 'b'.repeat(64), reason: 'controller-recovery', stopRequested: false, phase: 'released', startedAt: 1, updatedAt: 1,
         nodes: [{ serverId: f.input.serverId, name: server.name, phase: 'released', agentsExited: true, commandsReleased: true, servicesReleased: true, updatedAt: 1 }], result }] })

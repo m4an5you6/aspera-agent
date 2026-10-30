@@ -8,7 +8,6 @@ import {
 import type { FleetExperiment, ServerSettings, FleetServerInput } from '@aspera/dispatch/types'
 import { ExperimentList, ExperimentStatus, DeleteExperimentsDialog } from './ExperimentManagement.tsx'
 import { ServerCards, ServerPassword } from './ServerManagement.tsx'
-import type { InferenceService, ServiceAccessInfo } from '@aspera/experiments/types'
 import type { InjectFace, PropsLocale, PropsRuntime, TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import type { ExperimentsController } from './controller.ts'
 import css from './ExperimentsPage.module.css'
@@ -24,6 +23,7 @@ import { ArchiveNotice } from './ArchiveNotice.tsx'
 import { useRunArchive } from './useRunArchive.ts'
 import type { PropsRenderFactories } from '@deepseek-ai/dsh-client-ui-slots'
 import { interruptionView, blockedPreparationTasks } from './interruption-view.ts'
+import { InferenceServices } from './InferenceServices.tsx'
 
 /** Actions and observable state owned by the plugin controller. */
 export interface ExperimentsInjected {
@@ -41,7 +41,7 @@ type ViewProps = { controller: ExperimentsController; t: TranslateNS<'experiment
  * @returns experiment navigation glyph.
  */
 export function ExperimentsIcon({ size, useExperiments, t }: PropsRuntime<'sidebar.panellist'> & PageProps) {
-  const count = useExperiments(value => experimentAttentionCount(value.experiments))
+  const count = useExperiments(value => experimentAttentionCount(value.experiments.filter(row => row.acceptanceParentId === undefined)))
   return <span className={css.navIcon}><IconGoalOutlineRegular size={size} />{count > 0 && <span className={css.badge} aria-label={t('pendingCount', { count })}>{attentionLabel(count)}</span>}</span>
 }
 
@@ -52,12 +52,13 @@ export function ExperimentsIcon({ size, useExperiments, t }: PropsRuntime<'sideb
  */
 export function ExperimentsPage({ controller, useExperiments, t, renderFactorySlot }: PageProps) {
   const state = useExperiments(value => value)
+  const topLevel = state.experiments.filter(row => row.acceptanceParentId === undefined)
   const view = state.view
   const setView = (value: Snapshot['view']) => { controller.navigate(value) }
-  const todos = experimentTodos(state.experiments).filter(todo => !state.preferences.dismissed.includes(todo.key))
+  const todos = experimentTodos(topLevel).filter(todo => !state.preferences.dismissed.includes(todo.key))
   const [draft, setDraft] = useState<FleetExperiment | undefined>()
   const [filter, setFilter] = useState<'all' | 'pending' | 'running' | 'queued' | 'completed' | 'failed'>('all')
-  const pendingCount = experimentAttentionCount(state.experiments)
+  const pendingCount = experimentAttentionCount(topLevel)
   useEffect(() => { controller.setVisible(true); return () => { controller.setVisible(false) } }, [controller])
   const detail = state.experiments.find(row => row.request.experimentId === state.selectedId)
   const act = (operation: () => Promise<unknown>) => { void operation().catch((error: unknown) => { controller.report(error) }) }
@@ -73,12 +74,12 @@ export function ExperimentsPage({ controller, useExperiments, t, renderFactorySl
     <div className={css.content}>
     {view === 'list' && detail === undefined && todos.length > 0 && <aside className={css.todoBanner} role="status"><div><span>{t('todoHint', { count: new Set(todos.map(todo => todo.experimentId)).size })}</span><small>{t('todoResourceHint')}</small></div><Button variant="outline" size="sm" onClick={() => { const todo = todos[0]; if (todo !== undefined) controller.select(todo.experimentId) }}>{t('viewTodo')}</Button><button className={css.todoClose} aria-label={t('dismissTodo')} onClick={() => { controller.dismissTodos() }}>×</button></aside>}
     {view !== 'list' && <div className={css.actions}><Button variant="ghost" size="sm" onClick={() => { controller.select(null); setView('list') }}>{t('back')}</Button></div>}
-    {view === 'services' ? <section className={css.list}><p className={css.hint}>{t('serviceHint')}</p>{state.experiments.every(row => !row.latest?.services.length) && <p className={css.empty}>{t('serviceEmpty')}</p>}{state.experiments.map(row => <Services key={row.request.experimentId} controller={controller} t={t} row={row} />)}</section> : view === 'servers' ? <Servers controller={controller} t={t} state={state} />
+    {view === 'services' ? <InferenceServices controller={controller} t={t} rows={state.experiments} /> : view === 'servers' ? <Servers controller={controller} t={t} state={state} />
       : view === 'new' ? <NewExperiment key={draft?.request.experimentId ?? 'new'} controller={controller} t={t}
         servers={state.registry.servers} state={state} draft={draft} />
         : detail !== undefined ? <ExperimentDetail key={detail.request.experimentId} renderFactorySlot={renderFactorySlot} controller={controller} t={t} row={detail} state={state} onClone={() => {
           controller.select(null); setDraft(detail); setView('new')
-        }} /> : <ExperimentList controller={controller} t={t} rows={state.experiments} pendingOnly={filter === 'pending'} onPendingChange={pending => { setFilter(pending ? 'pending' : 'all') }} onClone={row => { setDraft(row); setView('new') }} />}
+        }} /> : <ExperimentList controller={controller} t={t} rows={topLevel} pendingOnly={filter === 'pending'} onPendingChange={pending => { setFilter(pending ? 'pending' : 'all') }} onClone={row => { setDraft(row); setView('new') }} />}
 
     </div>
   </section>
@@ -262,7 +263,7 @@ function ExperimentDetail({ controller, t, row, state, onClone, renderFactorySlo
         void controller.approve(id, plan.revision).catch(error => { controller.report(error) }).finally(() => { setApproving(false) })
       }} />
     </ExperimentOverview>}
-    {tab === 'services' && <div className={css.overview}>{(row.latest?.services.length ?? 0) === 0 && <p className={css.empty}>{t('serviceEmpty')}</p>}<Services controller={controller} t={t} row={row} /></div>}
+    {tab === 'services' && <div className={css.overview}><InferenceServices controller={controller} t={t} rows={state.experiments} experimentId={id} offline={archive.status?.runtimeAvailable === false} /></div>}
     {tab === 'files' && <section className={css.overview} aria-label={t('files')}>
       {state.filesTruncated && <p>{t('fileTruncated')}</p>}{state.files.length === 0 && <p className={css.empty}>{t('noOutput')}</p>}
       {state.files.map(file => <div key={`${file.serverId}/${file.path}`} className={css.file}>
@@ -272,60 +273,4 @@ function ExperimentDetail({ controller, t, row, state, onClone, renderFactorySlo
       </div>)}
     </section>}
   </article>
-}
-
-function Services({ controller, t, row }: ViewProps & { row: FleetExperiment }) {
-  const [response, setResponse] = useState<string>()
-  const [path, setPath] = useState('/')
-  const [method, setMethod] = useState<'GET' | 'POST'>('GET')
-  const [body, setBody] = useState('')
-  const blocked = controller.store.getSnapshot().experiments.filter(task => task.request.experimentId !== row.request.experimentId
-    && task.waitingFor.some(id => row.servers.some(server => server.id === id)))
-  return <section className={css.list}>
-    {blocked.length > 0 && <p>{t('serviceBlocks', { goals: blocked.map(task => task.request.objective).join(' · ') })}</p>}
-    {(row.latest?.services ?? []).map(service => <article key={service.id} className={css.card}>
-      <h3>{row.request.name ?? row.request.objective.split('\n')[0]}</h3><p>{row.servers.find(server => server.id === service.serverId)?.name} · {t(service.state)}</p>
-      <p>{t('modelArtifact')}: {service.modelPath}</p><p>{service.id} · 127.0.0.1:{service.port}</p>
-      {service.modelName !== undefined && <p>{t('servedModel')}: {service.modelName}</p>}
-      {service.external !== undefined && <PublicService key={service.id} controller={controller} t={t} service={service} />}
-      {service.detail !== undefined && <p role="alert">{service.detail}</p>}
-      <details><summary>{t('execution')}</summary><pre className={css.log}>{service.command}</pre></details>
-      <div className={css.fields}>
-        <label>{t('servicePath')}<Input value={path} onChange={event => { setPath(event.target.value) }} /></label>
-        <div className={css.field}><span>{t('httpMethod')}</span><Selection label={t('httpMethod')} value={method}
-          options={[{ value: 'GET', label: 'GET' }, { value: 'POST', label: 'POST' }]} onChange={setMethod} /></div>
-      </div>
-      {method === 'POST' && <label>{t('serviceBody')}<textarea value={body} onChange={event => { setBody(event.target.value) }} rows={3} /></label>}
-      <div className={css.actions}>
-        <Button variant="outline" disabled={service.state !== 'healthy'} onClick={() => { void controller.accessService(row.request.experimentId, service.id, path, method, method === 'POST' ? body : undefined).then(setResponse).catch(error => { controller.report(error) }) }}>{t('accessService')}</Button>
-        <Button variant="outline" disabled={service.released} onClick={() => { void controller.stopService(row.request.experimentId, service.id).catch(error => { controller.report(error) }) }}>{t('stopService')}</Button>
-      </div>
-    </article>)}
-    {response !== undefined && <pre className={css.log}>{response}</pre>}
-  </section>
-}
-
-function PublicService({ controller, t, service }: ViewProps & { service: InferenceService }) {
-  const [access, setAccess] = useState<ServiceAccessInfo>()
-  const [busy, setBusy] = useState(false)
-  const external = service.external
-  if (external === undefined) return null
-  const show = async () => {
-    setBusy(true)
-    try { setAccess(await controller.serviceAccessInfo(service.experimentId, service.id)) }
-    catch (error) { controller.report(error) }
-    finally { setBusy(false) }
-  }
-  const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'"
-  return <section className={css.list} aria-label={t('publicInferenceSettings')}>
-    <p>{t('externalInferenceUrl')}: <code>{external.url}</code> · {t('mappedPort')}: {external.port}</p>
-    <div className={css.actions}><Tag tone={external.state === 'reachable' ? 'success' : external.state === 'unreachable' ? 'warning' : 'neutral'}>{t(`external-${external.state}`)}</Tag>
-      {external.checkedAt !== undefined && <time>{new Date(external.checkedAt).toLocaleString()}</time>}</div>
-    <p className={css.hint}>{t('externalCheckHint')}</p>
-    {external.detail !== undefined && <p role="alert" className={css.error}>{external.detail}</p>}
-    {!service.released && external.state !== 'stopped' && <>
-      <Button variant="outline" disabled={busy} onClick={() => { if (access !== undefined) setAccess(undefined); else void show() }}>{access === undefined ? t('showServiceAccess') : t('hideServiceAccess')}</Button>
-      {access !== undefined && <><p className={css.hint}>{t('serviceKeyHint')}</p><pre className={css.log}>{`curl ${quote(access.url.replace(/\/$/, '') + service.healthPath)} -H ${quote('Authorization: Bearer ' + access.token)}`}</pre></>}
-    </>}
-  </section>
 }

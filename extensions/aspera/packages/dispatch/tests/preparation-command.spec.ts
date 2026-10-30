@@ -1,5 +1,5 @@
 /** Preparation recovery follows one remote identity and imports complete, deduplicated logs. */
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
@@ -7,7 +7,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { experimentIdSchema, observationSourceIdSchema, serverIdSchema } from '@aspera/experiments'
 import { readObservation } from '@aspera/runtime'
 import type { ObservationSource } from '@aspera/experiments'
-import { preparationCommandPolicySchema, recoverPreparationCommand } from '../src/preparation-command.ts'
+import { preparationCommandPolicySchema, preparationCommandTransfer, recoverPreparationCommand } from '../src/preparation-command.ts'
 import type { PreparationCommandDriver } from '../src/preparation-command.ts'
 
 const roots: string[] = []
@@ -28,6 +28,31 @@ function fixture() {
     '/owned/preparation/' + source.commandId, root, source, policy, 'private-secret', signal, stop)
   return { root, source, page, driver, recover }
 }
+
+it('streams a large Unicode launcher with a bounded command and checks complete input before starting', () => {
+  const f = fixture()
+  const command = 'printf "%s" "修复材料\n引号\'"\n'.repeat(12000)
+  const transfer = preparationCommandTransfer({ directory: '/owned/preparation/' + f.source.commandId,
+    cacheDirectory: '/owned/cache', command, source: f.source, timeoutMs: 300000,
+    policy: preparationCommandPolicySchema.parse({}), python: '/usr/bin/python3' })
+  expect(Buffer.byteLength(transfer.script)).toBeLessThan(4096)
+  expect(Buffer.byteLength(transfer.input ?? '')).toBeGreaterThan(200000)
+  expect(transfer.script).not.toContain('修复材料')
+  expect(transfer.input).toContain('request.v1.json')
+  expect(transfer.script).toContain(createHash('sha256').update(transfer.input ?? '').digest('hex'))
+  expect(transfer.script).toContain(String(Buffer.byteLength(transfer.input ?? '')))
+  expect(transfer.script.indexOf('hashlib.sha256')).toBeLessThan(transfer.script.indexOf('parent.mkdir'))
+})
+
+it('keeps Python bootstrap on the shell-only path', () => {
+  const f = fixture()
+  const transfer = preparationCommandTransfer({ directory: '/owned/preparation/' + f.source.commandId,
+    cacheDirectory: '/owned/cache', command: 'install-python', source: f.source, timeoutMs: 300000,
+    policy: preparationCommandPolicySchema.parse({}) })
+  expect(transfer.input).toBeUndefined()
+  expect(transfer.script).toContain('printf shell')
+  expect(transfer.script).toContain('install-python')
+})
 
 it('reconnects only to read the original command and preserves its failure and redacted logs', async () => {
   const f = fixture()

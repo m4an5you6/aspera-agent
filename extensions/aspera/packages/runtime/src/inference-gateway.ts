@@ -84,6 +84,13 @@ export async function openInferenceGateway(service: InferenceService, config: In
       const value = req.headers[name]
       if (typeof value === 'string') headers[name] = value
     }
+    const declaredLength = req.headers['content-length']
+    if (declaredLength !== undefined) {
+      if (typeof declaredLength !== 'string' || !/^\d+$/.test(declaredLength)) { req.resume(); reply(res, 400, { error: 'Invalid inference request length' }); return }
+      const length = Number(declaredLength)
+      if (!Number.isSafeInteger(length) || length > config.requestBytes) { req.resume(); reply(res, 413, { error: 'Inference request exceeds the configured size' }); return }
+      headers['content-length'] = String(length)
+    }
     const upstream = request({ hostname: '127.0.0.1', port: service.port, path, method: req.method, headers,
       signal: lifetime.signal }, response => {
       const output: Record<string, string> = { 'cache-control': 'no-store' }

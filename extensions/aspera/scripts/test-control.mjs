@@ -87,6 +87,9 @@ try {
   assert.equal(healthy.controller.policy.gpu.gpus[0].devicePath, '/dev/nvidia5')
   assert.ok(healthy.features.includes('controller-maintenance-v1'))
   assert.ok(healthy.features.includes('managed-environment-reuse-v1'))
+  assert.ok(healthy.features.includes('managed-environment-repair-v1'))
+  assert.ok(healthy.features.includes('material-source-bindings-0.1.2'))
+  for (const feature of ['storage-registration-0.1.3', 'bounded-diagnostics-0.1.3', 'command-admission-0.1.3', 'storage-reuse-verification-v1']) assert.ok(healthy.features.includes(feature), feature)
   const maintenance = { operationId: randomUUID(), bootId: healthy.controller.bootId, policyDigest: healthy.controller.policyDigest }
   assert.equal((await control.request('maintenance-begin', maintenance, false)).status, 401)
   assert.equal((await control.request('maintenance-begin', { ...maintenance, bootId: 'stale-process' })).status, 400)

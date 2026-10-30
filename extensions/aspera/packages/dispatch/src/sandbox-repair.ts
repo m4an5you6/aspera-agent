@@ -1,6 +1,7 @@
 /** Account-scoped, immutable bubblewrap compatibility launchers and their measured diagnostics. */
 import { readFileSync } from 'node:fs'
 import { posix } from 'node:path'
+import { gzipSync } from 'node:zlib'
 import { z } from 'zod'
 import { experimentIsolationArgs } from '@aspera/runtime'
 import { executableDirectoriesSchema } from '@aspera/experiments'
@@ -14,6 +15,8 @@ export const sandboxRepairPolicySchema = z.object({
   cleanupTimeoutMs: z.number().int().min(100).max(10000).default(1000),
   pollIntervalMs: z.number().int().min(1).max(1000).default(20),
   maxAttempts: z.number().int().min(0).max(10).default(2),
+  nativeBuildTimeoutMs: z.number().int().min(1000).max(1800000).default(300000),
+  nativeBuildBytes: z.number().int().min(1048576).max(1073741824).default(67108864),
 })
 
 /** Resolved compatibility repair limits; repeated use of an installed launcher costs no attempt. */
@@ -21,7 +24,9 @@ export type SandboxRepairPolicy = z.infer<typeof sandboxRepairPolicySchema>
 
 const launcherSchema = z.object({ version: z.literal(1), path: z.string().startsWith('/'), digest: z.string().regex(/^[a-f0-9]{64}$/) })
 const evidence = z.object({ version: z.literal(1), strategy: z.literal('private-proc'), reason: z.string().min(1),
-  stdout: z.string(), stderr: z.string(), exitCode: z.number().int().nullable(), requiresPlatformAction: z.boolean() })
+  stdout: z.string(), stderr: z.string(), exitCode: z.number().int().nullable(), requiresPlatformAction: z.boolean(),
+  nativeBuild: z.object({ version: z.string(), state: z.enum(['available', 'configured', 'failed', 'unknown']), receipt: z.string().optional(),
+    exitCode: z.number().int().nullable().optional(), exitConfirmed: z.boolean().optional(), detail: z.string().optional() }).optional() })
 const diagnosticSchema = z.discriminatedUnion('state', [
   evidence.extend({ state: z.literal('available') }),
   evidence.extend({ state: z.literal('configured'), launcher: launcherSchema, pathEntries: executableDirectoriesSchema }),
@@ -52,9 +57,16 @@ export interface SandboxRepairInput {
   controlRoot?: string
   password?: string
   policy: SandboxRepairPolicy
+  minimumFreeBytes: number
 }
 
-const program = readFileSync(new URL('../scripts/repair-sandbox.py', import.meta.url), 'utf8')
+const nativeBuilder = readFileSync(new URL('../scripts/build-sandbox-native.py', import.meta.url), 'utf8')
+const program = 'NATIVE_BUILDER_SOURCE=' + JSON.stringify(nativeBuilder) + '\n' + nativeBuilder + '\n'
+  + readFileSync(new URL('../scripts/repair-sandbox.py', import.meta.url), 'utf8')
+const sourceSchema = z.object({ version: z.string(), url: z.string().url(), sha256: z.string().regex(/^[a-f0-9]{64}$/), bytes: z.number().int().positive() })
+const nativeRecipe = z.object({ version: z.literal(1), architecture: z.literal('x86_64'), bubblewrap: sourceSchema,
+  tools: z.array(sourceSchema.extend({ name: z.string().regex(/^[a-z]+$/), filename: z.string().regex(/^[\w.-]+\.whl$/), executable: z.string().optional() })).length(3),
+}).parse(JSON.parse(readFileSync(new URL('../scripts/sandbox-native.json', import.meta.url), 'utf8')))
 
 /** Installs a private-PID/proc launcher using only privileges already held by the selected account. */
 export class SandboxRepair implements SandboxRepairTools {
@@ -69,8 +81,11 @@ export class SandboxRepair implements SandboxRepairTools {
       controlRoot: this.input.controlRoot ?? posix.join(observation.home, '.local/share/aspera', this.input.serverId),
       adoptLegacyControlRoot: this.input.controlRoot !== undefined,
       bwrap, python, isolationArgs: experimentIsolationArgs(), ...this.input.policy,
+      nativeRecipe, minimumFreeBytes: this.input.minimumFreeBytes,
+      nativeBuildTimeoutMs: Math.min(this.input.policy.nativeBuildTimeoutMs, Math.max(100, target.toolTimeoutMs - this.input.policy.cleanupTimeoutMs - 1000)),
       probeTimeoutMs: Math.min(this.input.policy.probeTimeoutMs, Math.max(100, target.toolTimeoutMs - this.input.policy.cleanupTimeoutMs - 1000)) }
-    return `${shellQuote(python)} -c ${shellQuote(program)} ${shellQuote(JSON.stringify(request))}`
+    const loader = 'import base64,gzip;exec(gzip.decompress(base64.b64decode(' + JSON.stringify(gzipSync(program).toString('base64')) + ')))'
+    return `${shellQuote(python)} -c ${shellQuote(loader)} ${shellQuote(JSON.stringify(request))}`
   }
 
   private missing(): SandboxRepairDiagnostic {

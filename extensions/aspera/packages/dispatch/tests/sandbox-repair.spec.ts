@@ -2,6 +2,7 @@
 import { randomUUID } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { gunzipSync } from 'node:zlib'
 import { expect, it, vi } from 'vitest'
 import { experimentIdSchema, serverIdSchema } from '@aspera/experiments'
 import { SandboxRepair, sandboxRepairPolicySchema } from '../src/sandbox-repair.ts'
@@ -19,7 +20,7 @@ function fixture() {
     signal: null, timedOut: false, cancelled: false, exitConfirmed: true }
   const remoteResult = vi.fn<EnvironmentDriver['remoteResult']>(async () => result)
   const tools = new SandboxRepair({ serverId, experimentId, password: 'private-account-secret',
-    policy: sandboxRepairPolicySchema.parse({}) }, { remoteResult })
+    policy: sandboxRepairPolicySchema.parse({}), minimumFreeBytes: 0 }, { remoteResult })
   const target = { host: 'node', sshPort: 22, remotePort: 43019, toolTimeoutMs: 30000 }
   const signal = new AbortController().signal
   return { tools, remoteResult, result, diagnostic, target, signal, serverId, experimentId, observation: readyEnvironment() }
@@ -35,7 +36,10 @@ it('resolves all repair locations and preserves shared isolation without putting
   expect(serialized).toContain(f.experimentId)
   expect(serialized).toContain('--unshare-user')
   expect(serialized).toContain('--cap-drop')
-  expect(serialized).toContain('sandbox-repair-receipt')
+  const encoded = /base64\.b64decode\("([A-Za-z0-9+/=]+)"\)/.exec(call?.[1] ?? '')?.[1]
+  expect(encoded).toBeDefined()
+  expect(gunzipSync(Buffer.from(encoded!, 'base64')).toString('utf8')).toContain('sandbox-repair-receipt')
+  expect(call?.[1].length).toBeLessThan(24000)
   // The SSH credential is a private transport argument, never part of the remote program or model result.
   const script = call?.[1]
   expect(script).not.toContain('private-account-secret')
@@ -81,4 +85,5 @@ it('requires cancellation before dispatching an installation', async () => {
 
 it.runIf(process.platform === 'linux')('checks Linux ownership, idempotence, corruption refusal and supervised cleanup', () => {
   expect(() => execFileSync('python3', [fileURLToPath(new URL('./sandbox_repair_test.py', import.meta.url))], { timeout: 30000 })).not.toThrow()
+  expect(() => execFileSync('python3', [fileURLToPath(new URL('./sandbox_native_test.py', import.meta.url))], { timeout: 30000 })).not.toThrow()
 })

@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { resolve, posix } from 'node:path'
 import { satisfies, valid, validRange } from 'semver'
 import { z } from 'zod'
-import { serverEnvironmentSchema, preparedToolchainSchema } from '@aspera/experiments'
+import { serverEnvironmentSchema, preparedToolchainSchema, planningReleaseSchema } from '@aspera/experiments'
 import type { ServerEnvironment, PreparedToolchain } from '@aspera/experiments'
 import { remote, remoteResult, RemoteCommandError, shellQuote } from './transport.ts'
 import type { Target } from './transport.ts'
@@ -11,13 +11,16 @@ import { SavedReleaseUnavailable, verifySavedRelease } from './cluster-deploy.ts
 import { experimentIsolationArgs } from '@aspera/runtime'
 
 /** Runtime requirements owned by the source release manifest. */
-export interface EnvironmentRequirements { node: string; pnpm: string; uv?: string; pip?: string }
+export interface EnvironmentRequirements { node: string; pnpm: string; uv?: string; pip?: string; registrationFormat?: '0.1.3' }
 
 const environmentTools = z.object({ uvVersion: z.string().regex(/^\d+\.\d+\.\d+$/), pipVersion: z.string().regex(/^\d+\.\d+(?:\.\d+)?$/).optional(),
-  reuseVersion: z.literal(1).optional(), cleanupVersion: z.literal(1).optional(), installVersion: z.union([z.literal(2), z.literal(3)]).optional(), storageVersion: z.literal(1).optional(), storageFormat: z.literal('0.1.0').optional() })
+  sandboxIpcVersion: z.literal(1).optional(), readonlyConsumerVersion: z.union([z.literal(1), z.literal(2)]).optional(),
+  reusePrecheckVersion: z.literal(1).optional(), wheelMetadataRepairVersion: z.union([z.literal(1), z.literal(2)]).optional(), managerCacheVersion: z.literal(1).optional(), inputSharingVersion: z.literal(1).optional(), releaseAssetSharingVersion: z.literal(1).optional(),
+  reuseVersion: z.literal(1).optional(), cleanupVersion: z.literal(1).optional(), installVersion: z.union([z.literal(2), z.literal(3)]).optional(), storageVersion: z.literal(1).optional(), storageFormat: z.literal('0.1.0').optional(), materialFormat: z.enum(['0.1.1', '0.1.2']).optional(), registrationFormat: z.literal('0.1.3').optional(), reuseVerificationVersion: z.literal(1).optional(), repairVersion: z.literal(1).optional(), storagePreflightVersion: z.literal(2).optional(), canonicalDatasetVersion: z.literal(1).optional(), sandboxVersion: z.literal(1).optional(), commandOutputVersion: z.literal(1).optional(), commandIdentityVersion: z.literal(1).optional(), materialRecoveryVersion: z.literal(1).optional(), lockReceiptVersion: z.literal(1).optional(), requirementLedgerVersion: z.literal(1).optional() })
   .strict().refine(value => value.installVersion !== 3 || value.pipVersion !== undefined, 'Installer v3 requires an exact pip version').optional()
 
 const enginesSchema = z.object({ node: z.string().min(1).refine(value => validRange(value) !== null, 'Invalid Node engine range') })
+const stageEvidenceVersion = z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4)]).optional()
 // Historical release requirements stay fixed when the local application changes its Node support.
 const legacyNodeEngines: Readonly<Record<string, string | undefined>> = {
   '0.1.1/0.2.0-rc.2/pnpm@11.7.0': '^22.19.0 || >=24.0.0',
@@ -30,11 +33,11 @@ const legacyNodeEngines: Readonly<Record<string, string | undefined>> = {
  * @returns Node engine range and fixed pnpm, uv and installer pip versions when declared.
  */
 export function environmentRequirements(root: string, identity?: { extension: string; dsh: string }): EnvironmentRequirements {
-  const manifest = z.object({ engines: enginesSchema.optional(),
-    packageManager: z.string().regex(/^pnpm@\d+\.\d+\.\d+$/), asperaEnvironmentTools: environmentTools }).parse(JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')))
+  const manifest = z.object({ engines: enginesSchema.optional(), asperaCheckpointProtectionVersion: z.literal(1).optional(), asperaAgentRecoveryVersion: z.literal(1).optional(),
+    packageManager: z.string().regex(/^pnpm@\d+\.\d+\.\d+$/), asperaEnvironmentTools: environmentTools, asperaPlanningTools: planningReleaseSchema.optional(), asperaStageAttemptVersion: z.literal(1).optional(), asperaStageEvidenceVersion: stageEvidenceVersion, asperaServiceVerificationVersion: z.literal(1).optional(), asperaServiceLifecycleVersion: z.literal(1).optional(), asperaInferenceCheckpointVersion: z.literal(1).optional() }).parse(JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')))
   const node = manifest.engines?.node ?? (identity === undefined ? undefined : legacyNodeEngines[`${identity.extension}/${identity.dsh}/${manifest.packageManager}`])
   if (node === undefined) throw new Error('Original release has no recorded Node requirement')
-  return { node, pnpm: manifest.packageManager.slice(5), ...(manifest.asperaEnvironmentTools === undefined ? {} : { uv: manifest.asperaEnvironmentTools.uvVersion,
+  return { node, pnpm: manifest.packageManager.slice(5), ...(manifest.asperaEnvironmentTools?.registrationFormat === undefined ? {} : { registrationFormat: manifest.asperaEnvironmentTools.registrationFormat }), ...(manifest.asperaEnvironmentTools === undefined ? {} : { uv: manifest.asperaEnvironmentTools.uvVersion,
     ...(manifest.asperaEnvironmentTools.pipVersion === undefined ? {} : { pip: manifest.asperaEnvironmentTools.pipVersion }) }) }
 }
 
@@ -50,8 +53,8 @@ export function environmentRequirements(root: string, identity?: { extension: st
 export async function installedEnvironmentRequirements(target: Target, release: string, digest: string, password?: string, signal?: AbortSignal): Promise<EnvironmentRequirements> {
   const identity = await verifySavedRelease(target, release, digest, password, signal)
   try {
-    const manifest = z.object({ packageManager: z.string().regex(/^pnpm@\d+\.\d+\.\d+$/), engines: enginesSchema.optional(),
-      dependencies: z.object({ '@deepseek-ai/dsh': z.literal(identity.dsh) }), asperaEnvironmentTools: environmentTools })
+    const manifest = z.object({ packageManager: z.string().regex(/^pnpm@\d+\.\d+\.\d+$/), engines: enginesSchema.optional(), asperaCheckpointProtectionVersion: z.literal(1).optional(), asperaAgentRecoveryVersion: z.literal(1).optional(),
+      dependencies: z.object({ '@deepseek-ai/dsh': z.literal(identity.dsh) }), asperaEnvironmentTools: environmentTools, asperaPlanningTools: planningReleaseSchema.optional(), asperaStageAttemptVersion: z.literal(1).optional(), asperaStageEvidenceVersion: stageEvidenceVersion, asperaServiceVerificationVersion: z.literal(1).optional(), asperaServiceLifecycleVersion: z.literal(1).optional(), asperaInferenceCheckpointVersion: z.literal(1).optional() })
       .parse(JSON.parse(await remote(target, `cat ${shellQuote(release + '/package.json')}`, signal, password)))
     let node = manifest.engines?.node
     if (node === undefined) {
@@ -60,7 +63,7 @@ export async function installedEnvironmentRequirements(target: Target, release: 
       node = dsh.engines?.node ?? legacyNodeEngines[`${identity.extension}/${identity.dsh}/${manifest.packageManager}`]
     }
     if (node === undefined) throw new Error(`No recorded Node requirement for Aspera ${identity.extension}, DSH ${identity.dsh}, ${manifest.packageManager}`)
-    return { node, pnpm: manifest.packageManager.slice(5), ...(manifest.asperaEnvironmentTools === undefined ? {} : { uv: manifest.asperaEnvironmentTools.uvVersion,
+    return { node, pnpm: manifest.packageManager.slice(5), ...(manifest.asperaEnvironmentTools?.registrationFormat === undefined ? {} : { registrationFormat: manifest.asperaEnvironmentTools.registrationFormat }), ...(manifest.asperaEnvironmentTools === undefined ? {} : { uv: manifest.asperaEnvironmentTools.uvVersion,
       ...(manifest.asperaEnvironmentTools.pipVersion === undefined ? {} : { pip: manifest.asperaEnvironmentTools.pipVersion }) }) }
   } catch (error) {
     signal?.throwIfAborted()
@@ -93,6 +96,10 @@ done
 if command -v bwrap >/dev/null 2>&1; then
   bwrap ${experimentIsolationArgs().map(shellQuote).join(' ')} -- true
   sandbox_status=$?
+  if [ "$sandbox_status" -eq 0 ]; then
+    bwrap ${experimentIsolationArgs().map(shellQuote).join(' ')} --size 1048576 --tmpfs /tmp -- true
+    sandbox_status=$?
+  fi
 else sandbox_status=127; fi
 printf 'ASPERA_SANDBOX=%s\\n' "$sandbox_status"
 `, signal, password)

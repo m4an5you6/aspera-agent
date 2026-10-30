@@ -101,7 +101,7 @@ def listening(port, timeout):
 def service_listening(row, timeout):
     ports = [row["port"]]
     if row.get("external") is not None:
-        ports.append(row["external"]["internalPort"])
+        ports.append(row["external"]["port"])
     return any(listening(port, timeout) for port in set(ports))
 
 

@@ -9,20 +9,35 @@
   en: 2d42ccdd16c4deff
   zh: d2db2e009050ae74
 /server-storage-and-fixed-materials/table-of-contents:
-  en: 7156723c44eeac66
-  zh: 23b07bd69be70d30
+  en: 04eef4739361d388
+  zh: 10f0b4f5045396f8
 /server-storage-and-fixed-materials/account-inventory:
-  en: 7a6e8d43120c3ac3
-  zh: 1dbd15a7e9988bb7
+  en: cf4a925fdff1dde6
+  zh: 558b2420dc4ab391
+/server-storage-and-fixed-materials/storage-registration:
+  en: b3dae8c4abe98d97
+  zh: 4819ed0d778494ec
 /server-storage-and-fixed-materials/historical-environments:
-  en: eddd0f5567f47bbe
-  zh: f6fc24752c4d16bb
+  en: 541f323349f6865c
+  zh: 836b5437cb0a48df
 /server-storage-and-fixed-materials/capacity-and-cleanup:
   en: f7324af90417fe80
   zh: b019434c81d90b04
 /server-storage-and-fixed-materials/fixed-model-and-dataset-materials:
-  en: 43d948755689cc72
-  zh: c3bd594611984885
+  en: bb4c7f779a2e4b73
+  zh: 20b3aa2689057302
+/server-storage-and-fixed-materials/targeted-material-verification:
+  en: 7e393abb833b1616
+  zh: 1633d08ffdb0f064
+/server-storage-and-fixed-materials/automatic-historical-reuse:
+  en: 9240c3a7e928ad02
+  zh: 36d21acb5f2cb580
+/server-storage-and-fixed-materials/environment-preflight-and-retention-policies:
+  en: 12ff7b150b624dd0
+  zh: ba7bb24547604982
+/server-storage-and-fixed-materials/agent-selected-environment-repair:
+  en: f9fd46130643f66f
+  zh: 7dc4e732660f737b
 /server-storage-and-fixed-materials/records-and-compatibility:
-  en: 91a4bd8ccb790d94
-  zh: 5169075c1d214644
+  en: 476b1bb8aad64c91
+  zh: b424d480f3cf1bd4

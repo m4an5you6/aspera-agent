@@ -17,15 +17,21 @@ export function completionFixture(ctx, runPath, controlPath) {
     const task = tasks.get(id)
     if (task === undefined) { yield* next(); return }
     assert.equal(options.model, 'qwen-execution'); assert.deepEqual((options.tools ?? []).map(tool => tool.name).sort(), expected)
+    assert.ok(text.includes('current retrospective acceptance'), 'The review must distinguish current assessment from retained historical outcomes')
+    assert.ok(text.includes('do not keep the supplement blocked solely because the old service failed'), 'Associated program evidence must be usable without rerunning inference')
     const index = turns.get(id) ?? 0; turns.set(id, index + 1)
     const assessment = options.messages.filter(message => message.role === 'tool').flatMap(message => message.content
       .filter(block => block.type === 'text' && block.text.trimStart().startsWith('{')).map(block => JSON.parse(block.text)))
       .findLast(value => value.assessment?.experimentId === id)?.assessment
+    const correctedStage = { stageId: 'phase2', serverId: task.entry.serverId, attemptId: 'original-phase2', commandId: 'train',
+      parameters: 'stage-args.json', trainerState: 'outputs/checkpoint-230/trainer_state.json', resumeState: 'outputs/checkpoint-30/trainer_state.json', metrics: 'metrics.jsonl' }
     const actions = task.mode === 'continuation' ? [
       ['get_experiment_requirements', {}], ['inspect_experiment_completion', {}], ['get_experiment_commands', {}],
       ['get_experiment_execution_progress', {}], ['read_original_execution_trace', {}], ['list_experiment_files', {}],
-      ['register_experiment_stage', { json: JSON.stringify({ stageId: 'phase2', serverId: task.entry.serverId, attemptId: 'original-phase2', commandId: 'train',
-        parameters: 'stage-args.json', trainerState: 'outputs/checkpoint-230/trainer_state.json', resumeState: 'outputs/checkpoint-30/trainer_state.json', metrics: 'metrics.jsonl' }) }],
+      ['register_experiment_stage', { json: JSON.stringify({ ...correctedStage, baseControl: 'false' }) }],
+      ['verify_experiment_stage', { json: JSON.stringify({ serverId: task.entry.serverId, stageId: 'phase2' }) }],
+      ['get_experiment_execution_progress', {}],
+      ['register_experiment_stage', { json: JSON.stringify(correctedStage), expected_revision: assessment?.revision ?? 0 }],
       ['verify_experiment_stage', { json: JSON.stringify({ serverId: task.entry.serverId, stageId: 'phase2' }) }],
       ['get_experiment_execution_progress', {}],
       ['record_experiment_execution', { json: JSON.stringify(task.entry), sources_json: JSON.stringify(task.sources) }],
@@ -43,7 +49,7 @@ export function completionFixture(ctx, runPath, controlPath) {
     ]
     if (task.mode !== 'continuation' && index >= 4) assert.ok(text.includes('has no recorded framework'), 'Missing evidence must be returned without completing the review Goal')
     if (task.mode !== 'continuation' && index >= 10) assert.ok(text.includes('outside this experiment'), 'Cross-node evidence must be rejected')
-    if (task.mode !== 'continuation' && index >= 10) for (const field of ['parameters.max_steps', 'parameters.num_train_epochs', 'evaluation.eval_loss', 'missing.safetensors', 'availableKeys']) {
+    if (task.mode !== 'continuation' && task.mode !== 'blocked' && index >= 10) for (const field of ['parameters.max_steps', 'parameters.num_train_epochs', 'evaluation.eval_loss', 'missing.safetensors', 'availableKeys']) {
       assert.ok(text.includes(field), 'All evidence mismatches must be diagnosed together: ' + field)
     }
     if (task.mode !== 'continuation' && index >= 8) {
@@ -66,6 +72,10 @@ export function completionFixture(ctx, runPath, controlPath) {
   }, { global: true })
   return {
     calls,
+    retry(id) {
+      const task = tasks.get(id); assert.ok(task)
+      task.mode = 'passed'; turns.set(id, 0)
+    },
     async seed(record, save, mode = 'passed') {
       const id = record.submission.experimentId, node = record.submission.nodes[0], serverId = node.server.id
       const original = clusterRecordSchema.parse({ ...record, state: 'failed', resourcesReleased: true, revision: record.revision + 1,
@@ -109,7 +119,7 @@ export function completionFixture(ctx, runPath, controlPath) {
         script: 'train.py', parameters: 'args.json', training: 'train.log', evaluation: 'metrics.json', inference: 'infer_results.json', artifact: entry.artifacts[0] }
       const task = { original, mode, runRoot, controlRoot, releaseRoot, entry, sources: Object.entries(files).map(([purpose, path]) => ({ serverId, purpose, path })),
         progress: { version: 1, experimentId: id, planRevision: original.plan.revision, sessionId: original.sessionId, revision: 1, updatedAt: original.updatedAt,
-          steps: original.plan.steps.map((_step, index) => ({ step: index + 1, state: mode === 'continuation' && index === 1 ? 'pending' : 'completed', updatedAt: original.updatedAt })) },
+          steps: original.plan.steps.map((_step, index) => ({ step: index + 1, state: mode === 'continuation' && index === 1 ? 'blocked' : 'completed', updatedAt: original.updatedAt })) },
         commands: [{ experimentId: id, serverId, commandId: 'train', command: 'pyenv/bin/python train.py --max_steps ' + entry.parameters.max_steps, state: 'completed', exitCode: 0, released: true, streams: ['stdout', 'stderr'] }] }
       tasks.set(id, task); turns.delete(id)
       const history = readFileSync(resolve(runRoot, 'events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse).filter(row => row.sessionId === original.sessionId)
@@ -122,7 +132,7 @@ export function completionFixture(ctx, runPath, controlPath) {
     },
     catalog(id) { const task = tasks.get(id); return task === undefined ? undefined : { processes: task.commands, progress: task.progress } },
     async remote(script, signal) {
-      const operation = /JSON\.stringify\((inspectCompletionIdentity|inspectCompletionFile|inspectCompletionSession|inspectHistoricalEnvironment|saveCompletionReview|saveCompletionAssessment|inspectExperimentFinalization|listCompletionFiles)\(/.exec(script)?.[1]
+      const operation = /JSON\.stringify\((inspectCompletionIdentity|inspectCompletionFile|inspectCompletionSession|inspectHistoricalEnvironment|saveCompletionReview|saveCompletionAssessment|inspectExperimentFinalization|listCompletionFiles|inspectCompletionServiceRequirements)\(/.exec(script)?.[1]
       if (operation === undefined) return undefined
       const encoded = script.match(/[A-Za-z0-9+/=]{80,}/g)?.at(-1), request = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'))
       const task = tasks.get(request.experimentId); assert.ok(task, 'Review read must target a seeded original task')

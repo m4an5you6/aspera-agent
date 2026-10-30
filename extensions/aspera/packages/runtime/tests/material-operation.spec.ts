@@ -4,6 +4,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { materialOperationSchema } from '@aspera/experiments'
 import { prepareMaterialAndWait } from '../src/material-operation.ts'
 import { managedEnvironmentPolicySchema } from '../src/managed-environment.ts'
+import { ClusterNodeOperationError } from '../src/cluster-runtime.ts'
 
 beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(1000000) })
 afterEach(() => { vi.useRealTimers() })
@@ -36,6 +37,20 @@ it('recovers a lost response by querying the original operation and retaining it
   Object.assign(f.value, { state: 'blocked', detail: 'digest mismatch', exitConfirmed: true, admissionReleased: true, exitCode: 1 })
   await vi.advanceTimersByTimeAsync(1000)
   expect(await work).toMatchObject({ state: 'blocked', detail: 'digest mismatch', deadline: 8200000 }); expect(f.submit).toHaveBeenCalledOnce()
+})
+it('returns an authenticated request rejection without polling a nonexistent replacement operation', async () => {
+  const f = fixture()
+  f.submit.mockRejectedValueOnce(new ClusterNodeOperationError(400, 'Equivalent material verification already exists; recover original operation'))
+  await expect(prepareMaterialAndWait(f.options)).rejects.toThrow('Equivalent material verification')
+  expect(f.read).not.toHaveBeenCalled()
+})
+it('returns a confirmed settlement failure immediately instead of misreporting a verification timeout', async () => {
+  const f = fixture()
+  Object.assign(f.value, { state: 'completed', exitConfirmed: true, settlementError: 'Original material receipt could not be committed' })
+  const result = await prepareMaterialAndWait(f.options)
+  expect(result).toMatchObject({ state: 'unknown', detail: expect.stringContaining('receipt could not be committed'),
+    last: { state: 'completed', admissionReleased: false, deadline: 8200000 } })
+  expect(f.read).toHaveBeenCalledOnce(); expect(f.submit).toHaveBeenCalledOnce()
 })
 it('does not accept a different node or invent counters when connection recovery fails', async () => {
   const f = fixture(); f.read.mockResolvedValueOnce({ ...f.value, serverId: randomUUID() })

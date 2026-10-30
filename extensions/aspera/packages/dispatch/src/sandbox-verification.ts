@@ -2,7 +2,7 @@
 import type { RemoteCommandResult } from './transport.ts'
 
 /** Independent checks performed with the complete experiment launch. */
-export type SandboxVerificationStage = 'sandbox-launch' | 'workspace-isolation' | 'credential-isolation' | 'gpu-access'
+export type SandboxVerificationStage = 'sandbox-launch' | 'workspace-isolation' | 'credential-isolation' | 'gpu-access' | 'diagnostic-isolation'
 
 /** Program-observed failure, including the unchanged remote command output. */
 export interface SandboxVerificationDiagnostic {

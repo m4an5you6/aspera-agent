@@ -1,0 +1,25 @@
+# Bilingual-pair consistency record for public-inference.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write extensions/aspera/docs/public-inference.md
+/public-inference-verification:
+  en: eb9982e523b48058
+  zh: c57f8c1dc45949ce
+/public-inference-verification/agent-and-program-responsibilities:
+  en: 598a9011616624f6
+  zh: 6815b13a4ce6a02b
+/public-inference-verification/use-the-inference-page:
+  en: def3ea3450c23893
+  zh: 159ebe05fe1004b7
+/public-inference-verification/service-replacement:
+  en: ec154f6ff31543ad
+  zh: df0c3d95385ac890
+/public-inference-verification/retained-checkpoint-recovery:
+  en: f4e0f8538a148351
+  zh: 3b9b4453c008c092
+/public-inference-verification/waiting-and-recovery:
+  en: 1e7e630edb76ab5a
+  zh: 5e92d7d347106860
+/public-inference-verification/records-and-compatibility:
+  en: 4c53ca7fb8dd1219
+  zh: 0547b8842dbb90af

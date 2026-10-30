@@ -16,7 +16,7 @@ import { preparationRecordSchema } from '../src/installation-model.ts'
 import type { FleetExperiment } from '../src/types.ts'
 import { request, remote, prepareSshHostKey, resolveSshConnectionPolicy } from '../src/transport.ts'
 import { snapshotSource } from '../src/snapshot.ts'
-import { prepareClusterServer } from '../src/cluster-deploy.ts'
+import { prepareClusterServer, inspectController } from '../src/cluster-deploy.ts'
 import { installPrivateFile } from '../src/deploy.ts'
 import { inventory } from '../../experiments/tests/fixtures.ts'
 import type { NetworkParticipant } from '../src/network-selection.ts'
@@ -80,7 +80,7 @@ function receipt(submission: ClusterSubmission) {
     resourcesReleased: true, updatedAt: 1, handover: '本机派发完成，远端实验已接管' })
 }
 
-async function fixture() {
+async function fixture(documentationPolicy?: { documentationReadTimeoutMs: number; documentationPageBytes: number }) {
   const tables = new Map<string, Map<string, unknown>>()
   const records = new Map<string, FleetExperiment>()
   const failingLocalTables = new Set<string>()
@@ -122,14 +122,13 @@ async function fixture() {
   let localRepo = '/original-source'
   const deployment = (server: Parameters<Parameters<typeof ExperimentFleet.open>[1]>[0]) => ({ ...server, localRepo,
     dataRoots: [], preparationOutputChars: 65536, tokenRef: 'TOKEN', agentCredentialRefs: [], controlPollIntervalMs: 1000,
-    toolTimeoutMs: 30000, minimumFreeBytes: 1024 })
+    toolTimeoutMs: 30000, minimumFreeBytes: 1024, ...documentationPolicy })
   const open = async (policy = resolveSshConnectionPolicy({})) => { const fleet = await ExperimentFleet.open(ctx,
     deployment, 20000, undefined, undefined, undefined, policy, undefined, runArchivePolicySchema.parse({ archiveEnabled: false })); fleets.push(fleet); return fleet }
   const fleet = await open()
-  vi.mocked(remote).mockImplementation(async (_target, script) => {
-    const offset = script.lastIndexOf('{"mode":"interrupt-')
-    if (offset < 0) return ''
-    const input = JSON.parse(script.slice(offset))
+  vi.mocked(remote).mockImplementation(async (_target, _script, _signal, _password, payload) => {
+    if (payload === undefined) return ''
+    const input = JSON.parse(payload).request
     if (['interrupt-inspect', 'interrupt-fence', 'interrupt-settle'].includes(input.mode)) return JSON.stringify({
       serverId: input.serverId, agentsExited: true, commandsReleased: true, servicesReleased: true,
       commandsReady: true, servicesReady: true, digest: 'a'.repeat(64), hostBootId: 'cpu-host', blockers: [], agents: [], commands: [],
@@ -174,10 +173,9 @@ function offlineTask(f: Awaited<ReturnType<typeof deletedRemoteFixture>>, option
   const finished = clusterRecordSchema.parse({ ...record, payloadHash: f.digest, state: 'interrupted', resourcesReleased: true, revision: 2,
     detail: 'Original controller exited; all original task work was confirmed stopped' })
   vi.mocked(request).mockRejectedValue(new Error('CPU fixture controller is offline'))
-  vi.mocked(remote).mockImplementation(async (_target, script) => {
-    const offset = script.indexOf('{"mode":"')
-    if (offset < 0) throw new Error('Unexpected fixture SSH command')
-    const input: { mode: string; serverId: ExperimentServerId; status?: ExperimentInterruptionStatus } = JSON.parse(script.slice(offset))
+  vi.mocked(remote).mockImplementation(async (_target, _script, _signal, _password, payload) => {
+    if (payload === undefined) throw new Error('Unexpected fixture SSH command')
+    const input: { mode: string; serverId: ExperimentServerId; status?: ExperimentInterruptionStatus } = JSON.parse(payload).request
     modes.push(input.mode)
     if (input.mode === 'discover') return JSON.stringify({ records: [record] })
     const facts: InterruptionFacts = { serverId: input.serverId, agentsExited: !options.active, commandsReleased: released,
@@ -451,6 +449,20 @@ it('keeps the selected reasoning effort when model settings change during prepar
   expect(f.fleet.list()[0]!.agentModel.reasoningEffort).toBe('high')
   const transfer = vi.mocked(installPrivateFile).mock.calls.find(([, path]) => path.endsWith(`/secrets/${row.request.experimentId}.json`))
   expect(JSON.parse(transfer![2]).agentModel.reasoningEffort).toBe('high')
+  expect(JSON.parse(transfer![2])).not.toHaveProperty('documentationPolicy')
+})
+
+it('transfers pinned document limits only to releases with the planning capability', async () => {
+  const limits = { documentationReadTimeoutMs: 5000, documentationPageBytes: 4096 }, f = await fixture(limits)
+  const features = ['planning-drafts-0.1.0', 'documentation-pages-0.1.0']
+  vi.mocked(prepareClusterServer).mockResolvedValue({ ...preparedFixture(), requiredFeatures: features })
+  vi.mocked(inspectController).mockImplementation(async (target, role) => ({ ...controllerFixture(target, role), features }))
+  const row = await f.fleet.create({ models: modelSelections, experimentId: randomUUID(), objective: 'Plan with fixed document limits',
+    coordinatorId: f.a.id, serverIds: [f.a.id], mode: 'automatic' })
+  limits.documentationReadTimeoutMs = 90000
+  await vi.waitFor(() => { expect(f.fleet.list()[0]!.handoverRecorded).toBe(true) })
+  const transfer = vi.mocked(installPrivateFile).mock.calls.find(([, path]) => path.endsWith(`/secrets/${row.request.experimentId}.json`))
+  expect(JSON.parse(transfer![2]).documentationPolicy).toEqual({ documentationReadTimeoutMs: 5000, documentationPageBytes: 4096 })
 })
 
 it('recovers a lost handover reply after reload and records the full receipt once', async () => {
@@ -569,8 +581,39 @@ it('resumes a failed directory creation with the same experiment, release, Sessi
   expect(resumed.list()[0]?.preparation?.placements).toEqual(saved.preparation?.placements)
   expect(resumed.list()[0]?.sessionId).toBe(saved.sessionId)
   expect(resumed.list()[0]?.goalId).toBe(saved.goalId)
-  expect(inspectServerStorage).toHaveBeenCalledTimes(1)
+  expect(inspectServerStorage).toHaveBeenCalledTimes(2)
   expect(vi.mocked(prepareServerStorage).mock.calls.some(([target]) => target.host === 'different-host')).toBe(false)
+})
+
+it('retries a failed preparation with aligned fresh inventory and the original directory and release identities', async () => {
+  const f = await fixture()
+  vi.mocked(prepareServerStorage).mockRejectedValueOnce(new Error('temporary disk failure'))
+  const row = await f.fleet.create({ models: modelSelections, experimentId: randomUUID(), objective: 'retry after cache cleanup',
+    coordinatorId: f.b.id, serverIds: [f.b.id], mode: 'automatic' })
+  await vi.waitFor(() => { expect(f.records.get(row.request.experimentId)?.state).toBe('failed'); expect(f.live.size).toBe(0) })
+  const saved = structuredClone(f.records.get(row.request.experimentId)!)
+  saved.preparation!.inventories[0]!.inventory.candidates[0]!.availableBytes = 15_331_328
+  saved.preparation!.placements[0]!.candidate.availableBytes = 3_285_319_680
+  f.records.set(row.request.experimentId, saved)
+  vi.mocked(inspectServerStorage).mockImplementation(async (_target, directory) => {
+    const fresh = inventory(directory); fresh.observedAt = 2; fresh.candidates[0]!.availableBytes = 3_100_000_000
+    return fresh
+  })
+  await f.fleet.retry(row.request.experimentId)
+  await vi.waitFor(() => { expect(f.records.get(row.request.experimentId)?.handoverRecorded).toBe(true) })
+  const current = f.records.get(row.request.experimentId)!
+  const selected = current.preparation!.placements[0]!
+  expect(selected).toMatchObject({ runRoot: saved.preparation!.placements[0]!.runRoot,
+    releaseRoot: saved.preparation!.placements[0]!.releaseRoot, experimentId: row.request.experimentId })
+  expect(selected.candidate.availableBytes).toBe(3_100_000_000)
+  expect(current.preparation!.inventories[0]!.inventory.candidates[0]).toEqual(selected.candidate)
+  expect(current.sessionId).toBe(saved.sessionId)
+  expect(current.goalId).toBe(saved.goalId)
+  expect(current.models).toEqual(saved.models)
+  expect(current.submission?.deploymentId).toBe('a'.repeat(64))
+  if (current.submission?.protocol !== 4) throw new Error('Expected the original protocol-4 submission')
+  expect(current.submission.inventories[0]?.inventory.candidates[0]).toEqual(current.submission.coordinator.storagePlacement.candidate)
+  expect(snapshotSource).toHaveBeenCalledOnce()
 })
 
 it('reuses the saved remote release when the local application changes before retry', async () => {
@@ -636,6 +679,19 @@ it('keeps a failed protocol-4 experiment intact when its retained original mater
   expect(failed.preparation?.placements).toEqual(original.preparation?.placements)
   expect(snapshotSource).toHaveBeenCalledOnce()
   expect(f.complete).not.toHaveBeenCalled()
+})
+
+it('retries a failed local snapshot without requiring remote release directories', async () => {
+  const f = await fixture()
+  vi.mocked(snapshotSource).mockRejectedValueOnce(new Error('ERR_PNPM_NO_OFFLINE_META'))
+  const row = await f.fleet.create({ models: modelSelections, experimentId: randomUUID(), objective: 'local snapshot recovery', coordinatorId: f.a.id, serverIds: [f.a.id], mode: 'automatic' })
+  await vi.waitFor(() => { expect(f.records.get(row.request.experimentId)?.state).toBe('failed'); expect(f.live.size).toBe(0) })
+  expect(prepareClusterServer).not.toHaveBeenCalled()
+  await f.fleet.retry(row.request.experimentId)
+  await vi.waitFor(() => { expect(f.records.get(row.request.experimentId)?.handoverRecorded).toBe(true) })
+  expect(snapshotSource).toHaveBeenCalledTimes(2)
+  expect(f.records.get(row.request.experimentId)?.sessionId).toBe(row.sessionId)
+  expect(f.records.get(row.request.experimentId)?.models).toEqual(row.models)
 })
 
 it('blocks legacy preparation with neither original directories nor a retained archive', async () => {
@@ -1084,8 +1140,8 @@ it('recovers a completed original remote receipt without repeating cancel or pro
     result: { ...running.latest!, state: 'cancelled', resourcesReleased: true, revision: 3 } }
   const modes: string[] = []
   vi.mocked(request).mockClear()
-  vi.mocked(remote).mockImplementation(async (_target, script) => {
-    const input = JSON.parse(script.slice(script.lastIndexOf('{"mode":"interrupt-')))
+  vi.mocked(remote).mockImplementation(async (_target, _script, _signal, _password, payload) => {
+    const input = JSON.parse(payload!).request
     modes.push(input.mode)
     return JSON.stringify(['interrupt-inspect', 'interrupt-fence'].includes(input.mode) ? {
       serverId: input.serverId, agentsExited: true, commandsReleased: true, servicesReleased: true,

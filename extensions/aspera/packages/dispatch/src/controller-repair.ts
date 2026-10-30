@@ -140,7 +140,7 @@ export class ControllerRepair implements ControllerRepairTools {
     this.acceptance = verifyController(await this.status(signal), this.input.target, this.prepared, this.input.role)
     if (this.acceptance.bootId === attempt.expected?.bootId) throw new Error('Original controller was not replaced by this repair')
     if (this.acceptance.deploymentId !== this.prepared.deploymentId) throw new Error('Recovered controller uses another fixed release')
-    if (attempt.offline !== undefined) {
+    {
       const current = this.acceptance
       if (current.processStart === undefined || current.hostBootId === undefined) throw new Error('Recovered controller has no verifiable Linux process identity')
       await this.driver.remote(this.input.target, `python3 -c ${shellQuote(`import pathlib
@@ -150,10 +150,10 @@ if (base/'stat').read_text().rsplit(')',1)[1].split()[19]!=${JSON.stringify(curr
 env=dict(item.split(b'=',1) for item in (base/'environ').read_bytes().split(b'\\0') if b'=' in item)
 expected={'DSH_CLUSTER_ROOT':${JSON.stringify(this.input.target.remoteRoot)},'DSH_EXPERIMENT_ROLE':${JSON.stringify(this.input.role)},'DSH_EXPERIMENT_DEPLOYMENT_ID':${JSON.stringify(this.prepared.deploymentId)},'ASPERA_CONTROLLER_RECOVERY_ID':${JSON.stringify(attempt.id)}}
 if not all(env.get(key.encode(),b'').decode()==value for key,value in expected.items()): raise RuntimeError('Recovered process belongs to another operation')`)}`, signal, this.input.password)
-      await this.recovery().complete(this.recoveryOperation(attempt), signal)
     }
+    if (attempt.offline !== undefined) await this.recovery().complete(this.recoveryOperation(attempt), signal)
     await this.driver.remote(this.input.target, `printf '0\\n' > ${shellQuote(attempt.directory + '/exited')}`, signal, this.input.password)
-    attempt.phase = 'completed'; delete attempt.detail; this.save()
+    attempt.phase = 'completed'; this.save()
   }
   /** @param directory - saved command ownership. @param signal - recovery lifetime. @returns confirmation before another mutation can begin. */
   async reconcile(directory: string, signal: AbortSignal): Promise<void> {
@@ -169,7 +169,10 @@ if not all(env.get(key.encode(),b'').decode()==value for key,value in expected.i
     const exited = await this.driver.remote(this.input.target, `if [ -f ${shellQuote(directory + '/stopped.json')} ]; then cat ${shellQuote(directory + '/stopped.json')}; else printf '{}'; fi`, signal, this.input.password)
     const stop = z.object({ operationId: z.literal(attempt.id), exited: z.literal(true) }).safeParse(JSON.parse(exited))
     if (current !== undefined || (!stop.success && attempt.offline === undefined)) throw new Error(`Controller repair outcome remains unconfirmed at ${directory}; its command will not be rerun`)
-    if (attempt.offline === undefined) attempt.offline = await this.recovery().inspect(signal)
+    if (attempt.offline === undefined) {
+      attempt.offline = await this.recovery().inspect(signal)
+      this.save()
+    }
     await this.beginRecovery(attempt, signal)
     attempt.phase = 'starting'; this.save()
     await this.driver.ensureClusterRole(this.input.target, this.prepared, this.input.role, this.input.token, this.input.password, signal, attempt.id)
@@ -201,6 +204,8 @@ if not all(env.get(key.encode(),b'').decode()==value for key,value in expected.i
     if (expected.root !== this.input.target.remoteRoot || expected.role !== this.input.role || expected.processStart === undefined || expected.hostBootId === undefined) throw new Error('Controller process identity cannot authorize a safe restart')
     if (expected.maintenance !== undefined) throw new Error('Another maintenance operation owns this controller')
     if (this.receipt.attempts.length >= this.receipt.maxAttempts) throw new Error('Controller repair attempt limit reached; inspect the saved receipts')
+    const preflight = await this.recovery().inspect(signal)
+    if (preflight.hostBootId !== expected.hostBootId) throw new Error('Host identity changed before controller maintenance')
     const id = controllerRepairIdSchema.parse(randomUUID()); const directory = `${this.remoteDirectory}/${id}`
     const attempt: Receipt['attempts'][number] = { id, expected, phase: 'beginning', directory, startedAt: Date.now() }
     this.receipt.attempts.push(attempt); this.save(); await pending(directory)

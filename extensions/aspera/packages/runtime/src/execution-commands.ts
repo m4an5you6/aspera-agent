@@ -6,9 +6,10 @@ import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
 import { z } from 'zod'
-import { clusterCommandSchema, commandWaitSchema, serverIdSchema, serviceSchema } from '@aspera/experiments'
+import { clusterCommandSchema, commandWaitSchema, serverIdSchema, serviceSchema, writeExperimentEvidenceSchema, experimentEvidenceReceiptSchema } from '@aspera/experiments'
 import type { CommandWait, ExperimentServerId } from '@aspera/experiments'
-import { clusterCommandStatuses, clusterNodeRequest, ClusterNodeOperationError } from './cluster-runtime.ts'
+import { clusterCommandStatuses, clusterNodeRequest } from './cluster-runtime.ts'
+import { CommandAdmissionRejected } from './command-admission.ts'
 import type { ClusterPrivate, ClusterRuntimeConfig } from './cluster-runtime.ts'
 import { serverRunRoot } from './storage.ts'
 import { finalizationPolicySchema } from './finalization-policy.ts'
@@ -28,17 +29,38 @@ export function installExecutionCommands(ctx: Context, runtime: ClusterPrivate, 
   const output = { schema: { type: 'string' as const }, render: (_args: object, value: string) => [{ type: 'text' as const, text: value }] }
   const presentCall = (args: object) => ({ card: 'generic' as const, title: 'Aspera command', kind: 'execute' as const, rawInput: args })
   const allowed = (serverId: ExperimentServerId) => { if (!runtime.submission.nodes.some(node => node.server.id === serverId)) throw new Error('Command node is outside the original allocation') }
-  const wait = async (serverId: ExperimentServerId, commandId: string, signal: AbortSignal, command?: string) => {
+  const logs = (serverId: ExperimentServerId, commandId: string) => Object.fromEntries((['stdout', 'stderr'] as const).map(stream => [stream,
+    { tool: 'read_experiment_file', server_id: serverId, command_id: commandId, stream, offset: 0 }]))
+  const wait = async (serverId: ExperimentServerId, commandId: string, signal: AbortSignal, command?: string, operation: 'run' | 'diagnostic' = 'run', submit = true) => {
     allowed(serverId)
     mkdirSync(directory, { recursive: true, mode: 0o700 })
     const path = resolve(directory, serverId + '_' + commandId + '.json')
     const prior = existsSync(path) ? commandWaitSchema.parse(JSON.parse(readFileSync(path, 'utf8'))) : undefined
     if (prior !== undefined && (prior.experimentId !== runtime.submission.experimentId || prior.serverId !== serverId || prior.commandId !== commandId)) throw new Error('Command wait journal ownership changed')
     return waitExperimentCommand({ experimentId: runtime.submission.experimentId, serverId, commandId, startedAt: prior?.startedAt ?? Date.now(), signal, policy,
-      ...(command === undefined ? {} : { submit: (lifetime: AbortSignal) => clusterNodeRequest(runtime, serverId, 'run', { commandId, command }, lifetime) }),
+      prior, ...(command === undefined ? {} : { requestHash: digest(command), purpose: operation }),
+      ...(command === undefined || !submit ? {} : { submit: (lifetime: AbortSignal) => clusterNodeRequest(runtime, serverId, operation, { commandId, command }, lifetime) }),
       read: lifetime => clusterNodeRequest(runtime, serverId, 'command-status', { commandId }, lifetime),
       save: row => writeFileAtomic(path, JSON.stringify(row) + '\n', { mode: 0o600 }) })
   }
+  ctx.effect(() => ctx.tools.register(defineTool({ name: 'run_experiment_diagnostic',
+    description: 'Run an Agent-chosen diagnostic without reserving training capacity. Workspace, registered environments and verified materials are read-only; credentials/control paths and GPU devices are hidden. Only bounded private temporary storage is writable. Program enforces configured time and log limits and waits for the actual exit. Read stdout/stderr using the returned logs references through read_experiment_file; workspace logs/<run_id>.log is not created. Reuse run_id and identical content after a lost reply. This cannot install, download persistent materials, train or release the experiment. Use write_experiment_evidence for small reports.',
+    parameters: { server_id: { type: 'string', required: true }, run_id: { type: 'string', required: true }, command: { type: 'string', required: true } }, output, presentCall,
+    execute: async (args, execution) => {
+      const input = clusterCommandSchema.parse({ commandId: args.run_id, command: args.command })
+      if (/^(?:service|environment|material)-/.test(input.commandId)) throw new Error('Diagnostics cannot use reserved managed-operation names')
+      const serverId = serverIdSchema.parse(args.server_id)
+      const result = await wait(serverId, input.commandId, execution.signal, input.command, 'diagnostic')
+      return JSON.stringify({ ...result, ...(result.state === 'rejected' ? {} : { logs: logs(serverId, input.commandId) }) })
+    } })))
+  ctx.effect(() => ctx.tools.register(defineTool({ name: 'write_experiment_evidence',
+    description: 'Write bounded UTF-8 evidence without running a shell or requiring a training storage budget. json: operationId UUID, path under configs/, reports/ or artifacts/diagnostics/, content string, format text|json. Existing different content cannot be overwritten. Retry the identical operation after disconnect; the program returns byte count and SHA-256. This does not assert that Agent statements are program-verified.',
+    parameters: { server_id: { type: 'string', required: true }, json: { type: 'string', required: true } }, output, presentCall,
+    execute: async (args, execution) => {
+      const serverId = serverIdSchema.parse(args.server_id); allowed(serverId)
+      return JSON.stringify(experimentEvidenceReceiptSchema.parse(await clusterNodeRequest(runtime, serverId, 'write-evidence',
+        writeExperimentEvidenceSchema.parse(JSON.parse(args.json)), execution.signal)))
+    } })))
   const waitAll = async (signal: AbortSignal) => {
     const statuses = await clusterCommandStatuses(runtime, signal), results: CommandWait[] = []
     const services = (await Promise.all(runtime.submission.nodes.map(node => clusterNodeRequest(runtime, node.server.id, 'services', {}, signal))))
@@ -49,7 +71,7 @@ export function installExecutionCommands(ctx: Context, runtime: ClusterPrivate, 
     return results
   }
   ctx.effect(() => ctx.tools.register(defineTool({ name: 'run_experiment_command',
-    description: 'Run one confined command and WAIT for its actual terminal state and process cleanup. The exclusive tool remains pending while the node works; no shell sleep or model log polling is needed. Reuse run_id and identical command after a lost response. Connection failure returns unknown and retains the original command; never launch a replacement. Use run_experiment_command_group for concurrent rendezvous participants, and dedicated inference tools for resident services.',
+    description: 'Run one confined command and WAIT for its actual terminal state and process cleanup. Run training in the FOREGROUND using its registered stage commandId as run_id; background descendants are stopped when the command exits. The exclusive tool remains pending while the node works; no shell sleep or model log polling is needed. Reuse run_id and identical command after a lost response; settled failed IDs return their original result. A confirmed failed released training attempt can use register_experiment_stage with previousAttemptId before a new command ID. Connection failure returns unknown and retains the original command; never launch a replacement. Use run_experiment_command_group for concurrent rendezvous participants, and dedicated inference tools for resident services.',
     parameters: { server_id: { type: 'string', required: true }, run_id: { type: 'string', required: true }, command: { type: 'string', required: true } }, output, presentCall,
     execute: async (args, execution) => {
       const input = clusterCommandSchema.parse({ commandId: args.run_id, command: args.command })
@@ -57,7 +79,8 @@ export function installExecutionCommands(ctx: Context, runtime: ClusterPrivate, 
       const serverId = serverIdSchema.parse(args.server_id); allowed(serverId)
       await beforeLaunch?.(serverId, input.commandId, execution.signal)
       const result = await wait(serverId, input.commandId, execution.signal, input.command)
-      return JSON.stringify(result.state === 'settled' ? { ...result.result, wait: result } : { state: result.state, detail: result.detail, wait: result })
+      return JSON.stringify(result.state === 'settled' ? { ...result.result, wait: result, logs: logs(serverId, input.commandId) }
+        : { state: result.state, detail: result.detail, wait: result, ...(result.state === 'rejected' ? {} : { logs: logs(serverId, input.commandId) }) })
     } })))
   ctx.effect(() => ctx.tools.register(defineTool({ name: 'get_experiment_commands',
     description: 'Read actual command exits. wait=true waits for the existing ordinary commands to settle through the same exclusive waiter; it does not merely sleep once. It never launches commands.',
@@ -82,17 +105,23 @@ export function installExecutionCommands(ctx: Context, runtime: ClusterPrivate, 
       await writeFileAtomic(path, JSON.stringify(group) + '\n', { mode: 0o600 })
       const starts = await Promise.allSettled(group.commands.map(member => clusterNodeRequest(runtime, member.serverId, 'run', { commandId: member.commandId, command: member.command }, signal)))
       if (starts.some(value => value.status === 'rejected')) {
-        if (!starts.some(value => value.status === 'rejected' && value.reason instanceof ClusterNodeOperationError)) {
+        const refusals = starts.map((value, index) => {
+          const member = group.commands[index]!
+          return value.status === 'rejected' && value.reason instanceof CommandAdmissionRejected
+            && value.reason.receipt.experimentId === runtime.submission.experimentId && value.reason.receipt.serverId === member.serverId
+            && value.reason.receipt.commandId === member.commandId && value.reason.receipt.requestHash === digest(member.command) ? value.reason : undefined
+        })
+        if (!refusals.some(value => value !== undefined)) {
           return JSON.stringify({ state: 'unknown', detail: 'A launch response was lost; observe the original group without resubmitting or stopping it solely because of a transport failure',
-            waits: await Promise.all(group.commands.map(member => wait(member.serverId, member.commandId, signal))) })
+            waits: await Promise.all(group.commands.map(member => wait(member.serverId, member.commandId, signal, member.command, 'run', false))) })
         }
-        const stops = await Promise.allSettled(group.commands.map(member => clusterNodeRequest(runtime, member.serverId, 'stop-command',
+        const stops = await Promise.allSettled(group.commands.map((member, index) => refusals[index] !== undefined ? refusals[index]!.receipt : clusterNodeRequest(runtime, member.serverId, 'stop-command',
           { commandId: member.commandId, commandHash: digest(member.command) }, signal)))
         return JSON.stringify({ state: 'startup-failed', starts: starts.map(value => value.status === 'rejected' ? String(value.reason) : value.value),
           stops: stops.map(value => value.status === 'rejected' ? { state: 'unknown', detail: String(value.reason) } : value.value),
-          waits: await Promise.all(group.commands.map(member => wait(member.serverId, member.commandId, signal))) })
+          waits: await Promise.all(group.commands.map((member, index) => refusals[index] !== undefined ? refusals[index]!.receipt : wait(member.serverId, member.commandId, signal, member.command, 'run', false))) })
       }
-      return JSON.stringify({ operationId: group.operationId, waits: await Promise.all(group.commands.map(member => wait(member.serverId, member.commandId, signal))) })
+      return JSON.stringify({ operationId: group.operationId, waits: await Promise.all(group.commands.map(member => wait(member.serverId, member.commandId, signal, member.command, 'run', false))) })
     } })))
   return waitAll
 }

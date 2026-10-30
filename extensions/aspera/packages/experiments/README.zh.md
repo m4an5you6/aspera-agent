@@ -11,6 +11,8 @@ kind: "package-library"
 
 建立持久实验队列，整组分配所有请求的服务器，使不共享服务器的任务并行，并保留无法核实的占用。使用管理页面和节点共用的定义解析固定请求及完整回执。通过包含代次的游标和受限路径读取有界日志及输出清单。进程执行由独立的提供方实现。
 
+[acceptance-recovery.ts](src/acceptance-recovery.ts) 定义绑定 checkpoint 的服务恢复及独立版本 1 记录。[原任务恢复](../../docs/completion-review.zh.md#recover-acceptance-on-the-original-experiment)说明准入与原结果保留规则。
+
 ## 目录
 
 - [使用本包](#use-this-package)
@@ -31,6 +33,10 @@ kind: "package-library"
 问题和回复与队列修改串行处理。暂停前保存未回答问题，交付前保存一份经校验的回复，重试使用原问题版本。取消使未回答问题过期，恢复过程报告中断而不启动新的 Agent。[状态与接口](../../docs/state-and-api.zh.md)定义兼容性和回复身份。
 
 调度进程维护与任务接收共用串行机制。`beginMaintenance` 要求不存在等待、计划、执行或服务中的任务，也没有未确认释放的资源；操作身份阻止其他调用者解除维护状态。[controller-protocol.ts](src/controller-protocol.ts) 校验 GPU 观测、进程身份和经过认证的维护请求，不改变实验提交或 Session 数据。
+
+[inference-checkpoint.ts](src/inference-checkpoint.ts)定义独立版本 1 的 adapter 快照记录。[推理恢复](../../docs/public-inference.zh.md)说明释放检查、发布恢复和只读使用；原训练结果及队列／提交格式保持不变。
+
+可选的 `ExperimentPlan.workload` 区分新训练与纯推理。[计划说明](../../docs/planning.zh.md)定义阶段校验、历史默认值及持久化兼容；框架名称不决定这一选择。
 
 -----
 

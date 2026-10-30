@@ -1,7 +1,7 @@
 /** Loopback OpenAI-compatible responses reached through the published pi-ai adapter. */
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { readFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { workerResponses } from './worker.mjs'
 
 export async function createWorkerApi() {
@@ -18,6 +18,7 @@ export async function createWorkerApi() {
       assert.equal(body.stream, true)
       Object.assign(observed, JSON.parse(readFileSync(config.observed, 'utf8')))
       current.requests += 1
+      writeFileSync(config.observed + '.requests', String(current.requests))
       response.writeHead(200, { 'content-type': 'text/event-stream' })
       const send = (delta, finish_reason = null) => response.write(`data: ${JSON.stringify({
         id: 'worker-response', object: 'chat.completion.chunk', created: 1, model: body.model,

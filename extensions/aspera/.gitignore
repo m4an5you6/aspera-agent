@@ -3,4 +3,5 @@ lib/
 .dsh-home/
 .artifacts/
 *.tsbuildinfo
+__pycache__/
 apps/desktop/resources/badges/

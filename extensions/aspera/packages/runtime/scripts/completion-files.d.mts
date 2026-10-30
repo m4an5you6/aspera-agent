@@ -16,3 +16,17 @@ export function saveCompletionReview(request: Omit<CompletionFileRequest, 'path'
 export function saveCompletionAssessment(request: Omit<CompletionFileRequest, 'path'> & { assessment: import('@aspera/experiments').CompletionAssessment }): { sha256: string }
 /** @param request - original coordinator and journal bounds. @returns lightweight finalization observations. */
 export function inspectExperimentFinalization(request: Omit<CompletionFileRequest, 'path'> & { maxEntries: number }): import('@aspera/experiments').ExperimentFinalizationStatus
+/** Original and recovery assignments are supplied by the Host's saved submissions. */
+export interface AcceptanceFileRequest extends Omit<CompletionFileRequest, 'path'> { controlRoot: string; releaseRoot: string; deploymentId: string; node: import('@aspera/experiments').ClusterNode; maxEntries: number }
+/** @param request - released original and associated inference runtime. @returns checkpoint and public requirements for Host validation. */
+export function inspectAcceptanceSource(request: AcceptanceFileRequest & { recovery: AcceptanceFileRequest; expectedStep: number }): unknown
+/** @param request - owned inference runtime. @returns scoped program journals for Host validation. */
+export function inspectAcceptanceRuntime(request: AcceptanceFileRequest & { coordinator: boolean }): unknown
+/** @param request - released original. @returns whether earlier independent public checks require serving recovery. */
+export function inspectCompletionServiceRequirements(request: AcceptanceFileRequest): { required: boolean }
+/** @param request - released earlier recovery. @returns previous environment and policy hints without publishing or approving them. */
+export function inspectAcceptanceReferences(request: AcceptanceFileRequest): unknown
+/** @param request - bounded program-selected original scripts/configurations. @returns retained source text and hashes without execution. */
+export function inspectAcceptanceScripts(request: AcceptanceFileRequest & { paths: string[]; readBytes: number }): { serverId: string; path: string; sha256: string; text: string }[]
+/** @param request - original assignment and program-accepted linkage. @returns its separate immutable evidence path and digest. */
+export function saveAcceptanceEvidence(request: AcceptanceFileRequest & { operation: { experimentId: string; operationId: string; source: { experimentId: string }; recoveryExperimentId: string }; observation: { experimentId: string } }): { path: string; sha256: string }

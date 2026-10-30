@@ -19,5 +19,6 @@
   "cumulativeAndAdditionalStepsSeparated": true,
   "stageToolsCalledByRestrictedAgent": true,
   "originalStepReportsRetained": true,
+  "blockedReviewGoalResumedWithSameIdentity": true,
   "gpuAcceptance": "not run"
 }

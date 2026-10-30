@@ -1,10 +1,9 @@
 /** SSH evidence and offline recovery fences retain the existing controller home and storage. */
-import { readFileSync } from 'node:fs'
 import { z } from 'zod'
 import { experimentIdSchema } from '@aspera/experiments'
 import type { ExperimentId, ExperimentServerId, ControllerRepairId, ClusterSubmission } from '@aspera/experiments'
 import type { DeploymentConfig } from './deploy.ts'
-import { shellQuote } from './transport.ts'
+import { runControllerScript } from './controller-script.ts'
 import type { FleetDriver } from './fleet.ts'
 
 /** Version-1 read-only account evidence; an offline process alone does not prove task release. */
@@ -19,8 +18,6 @@ export const offlineControllerSchema = z.object({ version: z.literal(1), state: 
 
 /** Parsed public diagnostics bound to an assigned control role. */
 export type OfflineController = z.infer<typeof offlineControllerSchema>
-
-const program = readFileSync(new URL('../scripts/controller-recovery.py', import.meta.url), 'utf8')
 
 /** Operations resolve all paths, release identity and counterpart credentials without model input. */
 export class ControllerRecovery {
@@ -38,7 +35,7 @@ export class ControllerRecovery {
       allowedExperimentIds: this.input.allowedExperimentIds ?? [], allowedServerIds: this.input.allowedServerIds ?? [this.input.serverId],
       allowedSubmissions: this.input.allowedSubmissions ?? [],
       ...(operation === undefined ? {} : { operationId: operation.id, directory: operation.directory, runRoot: operation.runRoot, expectedDigest: operation.digest }) }
-    return JSON.parse(await this.driver.remote(target, `python3 -c ${shellQuote(program)} ${shellQuote(JSON.stringify(request))}`, signal, this.input.password))
+    return runControllerScript(this.driver, target, request, signal, this.input.password)
   }
 
   /** @param signal - read-only inspection lifetime. @returns current process, profile and durable occupancy evidence. */

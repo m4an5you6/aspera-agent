@@ -1,3 +1,4 @@
+import { experimentStoragePolicySchema } from './storage-policy.ts'
 /** Versioned cluster requests and durable experiment receipts. */
 import { z } from 'zod'
 import { brandString } from '@deepseek-ai/dsh-brand'
@@ -158,14 +159,18 @@ export const planSchema = z.object({
   revision: z.number().int().positive(), summary: z.string().min(1).max(20_000),
   steps: z.array(z.string().min(1).max(10_000)).min(1).max(100),
   frameworks: z.array(z.object({ name: z.string().min(1), version: z.string().min(1), documentation: z.string().url().startsWith('https://') }).strict()).max(16),
+  workload: z.enum(['training', 'inference']).describe('Declare inference only when no new training is requested; framework names do not determine the workload. Omitted values retain legacy training checks.').optional(),
   createdAt: z.number().int(),
   stages: z.array(stageRequirementSchema).max(100).optional(),
+  storagePolicy: experimentStoragePolicySchema.optional(),
   conditionalSteps: z.array(z.object({ step: z.number().int().min(1).max(100),
     trigger: z.literal('command-failure'), commandIds: z.array(z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/)).min(1).max(64),
   }).strict()).max(100).optional(),
 }).strict()
 /** Durable execution plan and version-specific documentation. */
 export type ExperimentPlan = z.infer<typeof planSchema>
+/** Model-authored plan fields; revision and creation time are assigned on commit. */
+export const planInputSchema = planSchema.omit({ revision: true, createdAt: true })
 /** User confirmation refers to one immutable plan revision. */
 export const approvalSchema = z.object({ planRevision: z.number().int().positive(), approvedAt: z.number().int(), by: z.enum(['user', 'policy']) }).strict()
 /** Versions and parameters actually used by a preparation or training step. */
@@ -286,6 +291,7 @@ export const clusterCommandResultSchema = z.object({
   commandId: z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/), state: z.enum(['starting', 'running', 'completed', 'failed',
     'cancelled', 'interrupted']),
   exitCode: z.number().int().nullable(), released: z.boolean(), detail: z.string().optional(),
+  purpose: z.literal('diagnostic').optional(),
 }).strict()
 /** Process facts exposed to the experiment Agent. */
 export type ClusterCommandResult = z.infer<typeof clusterCommandResultSchema>

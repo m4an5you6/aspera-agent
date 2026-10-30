@@ -11,6 +11,10 @@ English | [中文](README.zh.md)
 
 Manage remote experiments in a dedicated page while keeping ordinary conversations available. Add password servers, submit consecutive Goals, confirm plans and inspect progress, receipts, messages, node logs and outputs. Access and stop private inference services, with the queued experiments they block shown in context. The Host owns task state; browser unload only ends page effects.
 
+[Original-task recovery](../../docs/completion-review.md#recover-acceptance-on-the-original-experiment) keeps recovery progress, its Agent trajectory and associated inference services on the original detail page. Service actions use the associated execution identity; the original blocked result remains visible.
+
+The inference page prioritizes connection information and separately dated process/public status. Original and recovery aliases share one service entry; unreleased failures remain current and released services collapse into history. Per-service request fields and results survive navigation in client memory; keys stay outside that store and clear on service or page changes. [Calling examples and managed requests](../../docs/public-inference.md#use-the-inference-page) explain the default PowerShell example, optional copying with a key, cURL and confirmed stops.
+
 ## Table of Contents
 
 - [Use this package](#use-this-package)

@@ -24,6 +24,8 @@ export interface DeploymentConfig extends Target {
   readonly tokenRef: string
   /** Interval for observing remote control process transitions. */
   readonly controlPollIntervalMs: number
+  readonly documentationReadTimeoutMs?: number
+  readonly documentationPageBytes?: number
   readonly managedEnvironments?: import('@aspera/runtime').ManagedEnvironmentPolicy
 }
 
@@ -148,8 +150,50 @@ if manifest.get('asperaEnvironmentTools',{}).get('installVersion') in (2,3): req
 if manifest.get('asperaEnvironmentTools',{}).get('installVersion')==3: required.append('managed-environment-install-v3')
 if manifest.get('asperaEnvironmentTools',{}).get('storageVersion')==1: required.extend(['storage-governance-v1','historical-environment-borrow-v1','managed-materials-v1'])
 if manifest.get('asperaEnvironmentTools',{}).get('storageFormat')=='0.1.0': required.append('purpose-storage-0.1.0')
+if manifest.get('asperaEnvironmentTools',{}).get('materialFormat') in ('0.1.1','0.1.2'): required.append('targeted-materials-0.1.1')
+if manifest.get('asperaEnvironmentTools',{}).get('materialFormat')=='0.1.2': required.append('material-source-bindings-0.1.2')
+if manifest.get('asperaEnvironmentTools',{}).get('registrationFormat')=='0.1.3': required.extend(['storage-registration-0.1.3','bounded-diagnostics-0.1.3','command-admission-0.1.3'])
+if manifest.get('asperaEnvironmentTools',{}).get('reuseVerificationVersion')==1: required.append('storage-reuse-verification-v1')
+if manifest.get('asperaEnvironmentTools',{}).get('reusePrecheckVersion')==1: required.append('historical-environment-precheck-v1')
+if manifest.get('asperaEnvironmentTools',{}).get('wheelMetadataRepairVersion') in (1,2): required.append('managed-wheel-metadata-v1')
+if manifest.get('asperaEnvironmentTools',{}).get('wheelMetadataRepairVersion')==2: required.append('managed-wheel-metadata-v2')
+if manifest.get('asperaEnvironmentTools',{}).get('managerCacheVersion')==1: required.append('managed-manager-cache-v1')
+if manifest.get('asperaEnvironmentTools',{}).get('inputSharingVersion')==1: required.append('managed-input-sharing-v1')
+if manifest.get('asperaEnvironmentTools',{}).get('releaseAssetSharingVersion')==1: required.append('managed-release-asset-sharing-v1')
+if manifest.get('asperaEnvironmentTools',{}).get('repairVersion')==1: required.append('managed-environment-repair-v1')
+if manifest.get('asperaEnvironmentTools',{}).get('storagePreflightVersion')==2: required.append('storage-preflight-v2')
+if manifest.get('asperaEnvironmentTools',{}).get('canonicalDatasetVersion')==1: required.append('canonical-modelscope-dataset-v1')
+if manifest.get('asperaEnvironmentTools',{}).get('sandboxVersion')==1: required.append('bounded-sandbox-launch-v1')
+if manifest.get('asperaEnvironmentTools',{}).get('sandboxIpcVersion')==1: required.append('short-temporary-paths-v1')
+if manifest.get('asperaEnvironmentTools',{}).get('commandOutputVersion')==1: required.append('command-output-v1')
+if manifest.get('asperaEnvironmentTools',{}).get('commandIdentityVersion')==1: required.append('command-wait-identity-v1')
+if manifest.get('asperaEnvironmentTools',{}).get('materialRecoveryVersion')==1: required.append('managed-material-recovery-v1')
+if manifest.get('asperaEnvironmentTools',{}).get('lockReceiptVersion')==1: required.append('managed-environment-lock-receipt-v1')
+if manifest.get('asperaEnvironmentTools',{}).get('requirementLedgerVersion')==1: required.append('storage-requirement-ledger-v1')
 if manifest.get('asperaCompletionVersion')==1: required.append('completion-evidence-v1')
 if manifest.get('asperaFinalizationVersion')==2: required.append('experiment-finalization-v2')
+if manifest.get('asperaStageAttemptVersion')==1: required.append('stage-attempt-recovery-v1')
+if 'asperaStageEvidenceVersion' in manifest and manifest['asperaStageEvidenceVersion'] not in (1,2,3,4): raise RuntimeError('Unsupported stage evidence version')
+if manifest.get('asperaStageEvidenceVersion') in (1,2,3,4): required.append('stage-evidence-reading-v1')
+if manifest.get('asperaStageEvidenceVersion') in (2,3,4): required.append('stage-evidence-reading-v2')
+if manifest.get('asperaStageEvidenceVersion') in (3,4): required.append('stage-checkpoint-evidence-v3')
+if manifest.get('asperaStageEvidenceVersion')==4: required.append('stage-checkpoint-evidence-v4')
+if 'asperaCheckpointProtectionVersion' in manifest and manifest['asperaCheckpointProtectionVersion']!=1: raise RuntimeError('Unsupported checkpoint protection version')
+if manifest.get('asperaCheckpointProtectionVersion')==1: required.append('checkpoint-protection-v1')
+if 'asperaAgentRecoveryVersion' in manifest and manifest['asperaAgentRecoveryVersion']!=1: raise RuntimeError('Unsupported Agent recovery version')
+if manifest.get('asperaAgentRecoveryVersion')==1: required.append('agent-recovery-v1')
+if manifest.get('asperaServiceVerificationVersion')==1: required.append('public-inference-verification-v1')
+if manifest.get('asperaServiceLifecycleVersion') not in (None,1): raise SystemExit('Unsupported inference service lifecycle version')
+if manifest.get('asperaServiceLifecycleVersion')==1: required.append('inference-service-lifecycle-v1')
+if manifest.get('asperaInferenceCheckpointVersion') not in (None,1): raise SystemExit('Unsupported inference checkpoint snapshot version')
+if manifest.get('asperaInferenceCheckpointVersion')==1: required.append('inference-checkpoint-snapshots-v1')
+if manifest.get('asperaEnvironmentTools',{}).get('readonlyConsumerVersion') in (1,2): required.append('readonly-source-consumers-v1')
+if manifest.get('asperaEnvironmentTools',{}).get('readonlyConsumerVersion')==2: required.append('readonly-source-consumers-v2')
+planning=manifest.get('asperaPlanningTools')
+if planning is not None and (not isinstance(planning,dict) or set(planning)-{'version','formatVersion','requirementsVersion','inferenceVersion'} or planning.get('version')!=1 or planning.get('formatVersion')!='0.1.0' or 'requirementsVersion' in planning and planning['requirementsVersion']!=1 or 'inferenceVersion' in planning and planning['inferenceVersion']!=1): raise RuntimeError('Unsupported fixed-release planning tools format')
+if planning is not None: required.extend(['planning-drafts-0.1.0','documentation-pages-0.1.0'])
+if planning is not None and planning.get('requirementsVersion')==1: required.append('planning-requirements-v1')
+if planning is not None and planning.get('inferenceVersion')==1: required.append('inference-plan-v1')
 hidden=[str(root/'secrets'),str(root/'state')]
 ssh=pathlib.Path.home()/'.ssh'
 if ssh.is_dir(): hidden.append(str(ssh))
@@ -165,9 +209,14 @@ print(json.dumps({'backendPath':sys.argv[1],'devicePaths':devices,'hiddenPaths':
   const spec = { backendPath: observed.backendPath, workspaceRoot: p.workspace, devicePaths: observed.devicePaths,
     hiddenPaths: [...observed.hiddenPaths, p.root, ...observed.namespaceRoots] }
   const launch = (command: readonly string[]) => experimentSandboxArgv(spec, command).map(shellQuote).join(' ')
+  const diagnosticProbeBytes = 1024 * 1024
+  const diagnostic = experimentSandboxArgv({ ...spec, diagnosticTemporaryBytes: diagnosticProbeBytes }, ['python3', '-c',
+    `import os; s=os.statvfs('/tmp'); assert s.f_blocks*s.f_frsize<=${diagnosticProbeBytes}, 'Diagnostic temporary storage is not bounded'; open('/tmp/aspera-probe','w').write('ok')`]).map(shellQuote).join(' ')
   const script = `set -eu
 printf 'ASPERA_VERIFY_STAGE=sandbox-launch\\n' >&2
-${launch(['true'])}
+${launch(['python3', '-c', "import signal; assert not any(signal.getsignal(value) == signal.SIG_IGN for value in (signal.SIGTERM, signal.SIGINT)), 'Sandbox command ignores SIGTERM/SIGINT; repair its private launcher'"])}
+printf 'ASPERA_VERIFY_STAGE=diagnostic-isolation\\n' >&2
+${diagnostic}
 umask 077
 secret_probe=${shellQuote(p.root + '/secrets/probe-' + randomUUID())}
 printf 'private' > "$secret_probe"
@@ -190,7 +239,7 @@ printf 'DSH_DEVICES=%s\\nDSH_BWRAP=%s\\nDSH_HIDDEN=%s\\n' ${shellQuote(observed.
   catch (error) {
     signal?.throwIfAborted()
     if (!(error instanceof RemoteCommandError) || !error.result.exitConfirmed || error.result.cancelled || error.result.timedOut) throw error
-    const stages: SandboxVerificationStage[] = ['sandbox-launch', 'workspace-isolation', 'credential-isolation', 'gpu-access']
+    const stages: SandboxVerificationStage[] = ['sandbox-launch', 'diagnostic-isolation', 'workspace-isolation', 'credential-isolation', 'gpu-access']
     const stage = stages.filter(value => error.result.stderr.includes('ASPERA_VERIFY_STAGE=' + value)).at(-1) ?? 'sandbox-launch'
     throw new SandboxVerificationError(stage, observed.backendPath, error.result)
   }

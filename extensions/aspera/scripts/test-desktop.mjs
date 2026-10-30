@@ -60,6 +60,33 @@ try {
   })
   await page.waitForURL(url => url.hostname === '127.0.0.1', { timeout: 60000 })
   await openAspera(page, page.url())
+  desktopChecks: {
+  if (process.argv.includes('--case=clipboard')) {
+    const previousClipboard = await app.evaluate(({ clipboard }) => clipboard.readText())
+    try {
+      await app.evaluate(({ BrowserWindow }) => { const owned = BrowserWindow.getAllWindows()[0]; owned.focus(); owned.webContents.focus() })
+      const text = ['Aspera clipboard · 中文 · "quoted"', 'second line'].join(process.platform === 'win32' ? '\r\n' : '\n')
+      await page.evaluate(value => {
+        const button = document.createElement('button'); button.id = 'clipboard-write-smoke'; button.textContent = 'Copy clipboard fixture'
+        button.onclick = () => { void navigator.clipboard.writeText(value).then(() => { button.dataset.result = 'written' }).catch(error => { button.dataset.result = error.name }) }
+        document.body.append(button)
+      }, text)
+      await page.locator('#clipboard-write-smoke').click()
+      await expect(page.locator('#clipboard-write-smoke')).toHaveAttribute('data-result', 'written')
+      assert.equal(await app.evaluate(({ clipboard }) => clipboard.readText()), text)
+      assert.equal(await page.evaluate(async () => { try { await navigator.clipboard.readText(); return 'allowed' } catch (error) { return error.name } }), 'NotAllowedError')
+      await page.evaluate(() => {
+        const frame = document.createElement('iframe'); frame.id = 'clipboard-frame-smoke'; document.body.append(frame)
+      })
+      const frame = page.frameLocator('#clipboard-frame-smoke')
+      assert.equal(await frame.locator('body').evaluate(async () => { try { await navigator.clipboard.writeText('forbidden frame'); return 'allowed' } catch (error) { return error.name } }), 'NotAllowedError')
+      assert.equal(await app.evaluate(({ clipboard }) => clipboard.readText()), text)
+      writeFileSync(resolve(root, '.artifacts/desktop-clipboard-regression.json'), JSON.stringify({ checkedAt: new Date().toISOString(), mode: 'packaged', ownedWrite: true, readDenied: true, childFrameDenied: true, executable }, null, 2) + '\n')
+    } finally { await app.evaluate(({ clipboard }, text) => { clipboard.writeText(text) }, previousClipboard) }
+    await quit()
+    console.log('Desktop clipboard: owned focused writes pass; reads and embedded-frame writes stay denied.')
+    break desktopChecks
+  }
   await checkModelPickerLayout(page, output, 'desktop', size => app.evaluate(({ BrowserWindow }, dimensions) => {
     BrowserWindow.getAllWindows()[0].setContentSize(dimensions.width, dimensions.height)
   }, size))
@@ -183,6 +210,7 @@ try {
   await page.screenshot({ path: resolve(output, 'narrow-window.png'), fullPage: true })
   await quit()
   console.log('Packaged desktop: official typography/caption, real plugin installation and restart activation, native shortcut, menu dismissal, isolated renderer, tray and graceful Host shutdown passed.')
+  }
 } catch (error) {
   if (page !== undefined && !page.isClosed()) {
     const details = page.getByRole('button', { name: /查看安装详情|View install details/i })

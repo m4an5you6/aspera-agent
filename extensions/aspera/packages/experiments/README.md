@@ -11,6 +11,8 @@ English | [中文](README.zh.md)
 
 Build a persistent experiment queue that allocates every requested server together, allows disjoint tasks to run concurrently and retains uncertain allocations. Parse immutable requests and complete receipts using the same definitions as the management page and nodes. Read bounded logs and output metadata with generation-aware cursors and confined paths. Process execution is supplied by a separate provider.
 
+[acceptance-recovery.ts](src/acceptance-recovery.ts) defines checkpoint-bound serving recovery and independent version-1 records. [Original-task recovery](../../docs/completion-review.md#recover-acceptance-on-the-original-experiment) owns admission and retained-outcome rules.
+
 ## Table of Contents
 
 - [Use this package](#use-this-package)
@@ -31,6 +33,10 @@ Earlier queued tasks sharing a server precede later tasks. Waiting for approval 
 Questions and replies are serialized with queue mutations. Persist an open question before pausing, save one validated reply before delivery, and use the original question revision for retries. Cancellation expires open questions; recovery reports interrupted work rather than launching a new Agent. [State and APIs](../../docs/state-and-api.md) defines compatibility and reply identities.
 
 Coordinator maintenance uses the same serialization as admission. `beginMaintenance` requires no waiting, planning, execution or serving tasks and no unconfirmed resources; its operation identity prevents another caller from removing the fence. [controller-protocol.ts](src/controller-protocol.ts) validates GPU observations, process identities and authenticated maintenance requests without changing experiment submissions or Session data.
+
+[inference-checkpoint.ts](src/inference-checkpoint.ts) defines independent version-1 adapter snapshot records. [Inference recovery](../../docs/public-inference.md) owns release checks, publication recovery and read-only use; the original training results and queue/submission formats remain unchanged.
+
+Optional `ExperimentPlan.workload` separates new training from pure inference. [Planning](../../docs/planning.md) defines stage validation, historical defaults and persistence compatibility; framework names do not determine this choice.
 
 -----
 

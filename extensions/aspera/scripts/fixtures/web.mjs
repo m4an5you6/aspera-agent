@@ -1,3 +1,4 @@
+import assert from 'node:assert/strict'
 /** Test-only CPU provider: real DSH Sessions, durable scheduling, Web Remotes and profile-launched services. */
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync, appendFileSync, copyFileSync, writeFileSync, readFileSync, existsSync, renameSync, statSync } from 'node:fs'
@@ -28,6 +29,16 @@ export async function apply(ctx, config) {
   if (config.role === 'service') {
     ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/health', handler: (_req, res) => { res.end('healthy') } }))
     ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/', handler: (_req, res) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ prediction: 'CPU fixture response' })) } }))
+    ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/v1/chat/completions', handler: async (req, res) => {
+      try {
+        assert.equal(req.method, 'POST')
+        const chunks = []; for await (const chunk of req) chunks.push(chunk)
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+        assert.equal(body.model, 'cpu-fixture'); assert.equal(body.messages[0].role, 'user'); assert.equal(body.stream, false)
+        res.setHeader('content-type', 'application/json')
+        res.end(JSON.stringify({ model: body.model, choices: [{ message: { role: 'assistant', content: 'CPU fixture response: ' + body.messages[0].content } }] }))
+      } catch (error) { res.writeHead(400); res.end(String(error)) }
+    } }))
     writeFileSync(config.ready + '.incoming', JSON.stringify({ port: ctx.webServer.port }))
     renameSync(config.ready + '.incoming', config.ready)
     process.stdout.write('CPU fixture service ready\n')
@@ -61,6 +72,7 @@ export async function apply(ctx, config) {
   const preparationCommands = []
   const preparationReceipts = new Map()
   const configuredHosts = new Set()
+  const storageObservationCounts = new Map()
   const repairedSandboxes = new Set()
   let handshakeFixture
   let handshakeProbe
@@ -69,10 +81,12 @@ export async function apply(ctx, config) {
   const installations = new Map()
   const overviewModes = new Map()
   const managedCacheCleaned = new Set()
+  const managedReferencesReleased = new Set()
+  const storagePolicyFixtures = new Map()
   function overviewRecord(record) {
     const mode = overviewModes.get(record.submission.experimentId)
     if (mode === undefined) return record
-    const running = ['running', 'partial', 'invalid-total', 'read-failure'].includes(mode.name)
+    const running = ['running', 'partial', 'invalid-total', 'read-failure', 'storage-repair'].includes(mode.name)
     const state = running ? 'running' : ['blocked', 'long', 'storage-shortage'].includes(mode.name) ? 'blocked' : mode.name === 'cancelled' ? 'cancelled' : 'completed'
     const internal = { run_experiment_command_attempts: 11, run_experiment_command_successes: 0, distinct_run_ids_attempted: 11,
       goal_rounds_with_same_failure: 5, gpu_probe_completed: 0, environment_created: 0, model_downloaded: 0, dataset_prepared: 0,
@@ -255,7 +269,8 @@ export async function apply(ctx, config) {
         : target.host === 'ssh-handshake.fixture' ? 'CPU SSH handshake recovered after 3 connection attempts' : 'CPU environment fixture',
       }
     },
-    remoteResult: async (target, script, _signal, _password, output) => {
+    remoteResult: async (target, wire, _signal, _password, output, input) => {
+      const script = input !== undefined && wire.includes('Preparation launcher input') ? input : wire
       if (script.includes('function archiveCatalog(request)')) {
         if (archiveRemoteOffline) throw new Error('SSH archive read failed: ECONNREFUSED observations.test')
         const encoded = script.match(/[A-Za-z0-9+/=]{80,}/g)?.at(-1)
@@ -326,7 +341,15 @@ export async function apply(ctx, config) {
       await hostKeyGate?.promise
       if (failConnection) throw new Error('Timed out while waiting for handshake')
     },
-    inspectServerStorage: async (target, directory) => inventory(directory ?? '/fixture/data/' + target.host),
+    inspectServerStorage: async (target, directory) => {
+      const observed = inventory(directory ?? '/fixture/data/' + target.host)
+      if (target.host === 'preparation-recovery.fixture') {
+        const count = (storageObservationCounts.get(target.host) ?? 0) + 1
+        storageObservationCounts.set(target.host, count)
+        if (count > 1) { observed.observedAt = 2; observed.candidates[0].availableBytes = 3_285_319_680 }
+      }
+      return observed
+    },
     cleanupServerStorage: async (_target, placement, names) => { if (failCleanup) throw new Error('CPU fixture cleanup temporarily unavailable'); cleanupCalls.push({ serverId: placement.serverId, experimentId: placement.experimentId, path: placement.runRoot, names }) },
     prepareServerStorage: async (_target, placement) => placement.candidate,
     verifyServerStorage: async (_target, placement) => placement.candidate,
@@ -368,13 +391,14 @@ export async function apply(ctx, config) {
     describeClusterNode: async server => ({ server, backendPath: '/fixture/bwrap', devicePaths: ['/dev/nvidia0'], hiddenPaths: [], gpuInfo: 'CPU test provider only (UUID: GPU-11111111-1111-1111-1111-111111111111)' }),
     delegateClusterLogin: async () => ({ knownHostsFile: '/fixture/private/known_hosts' }),
     installPrivateFile: async (_target, destination, content) => { const file = path(destination); mkdirSync(dirname(file), { recursive: true }); writeFileSync(file, content) },
-    remote: async (target, script, signal) => {
+    remote: async (target, script, signal, _password, input) => {
+      if (script === 'node --input-type=module -') script = input
       const review = await completion.remote(script, signal)
       if (review !== undefined) return review
       const preparation = [...preparationReceipts].find(([directory]) => script.includes('/command.py') && script.includes(directory))
       if (preparation !== undefined) return JSON.stringify(preparation[1])
-      if (script.includes('"mode":"')) {
-        const request = JSON.parse(script.slice(script.lastIndexOf(" '{") + 2, -1))
+      if (input !== undefined) {
+        const request = JSON.parse(input).request
         if (request.mode === 'discover') return JSON.stringify({ records: request.experimentIds.map(id => deletedTaskRecords.get(id) ?? queue.get(id)).filter(Boolean) })
         if (request.mode.startsWith('interrupt-')) {
           interruptionCalls.push({ experimentId: request.submission.experimentId, operationId: request.status.operationId, mode: request.mode })
@@ -413,7 +437,7 @@ export async function apply(ctx, config) {
         }
         const orphan = [...deletedTaskRecords.values()].find(record => record.submission.coordinator.id === request.serverId && !record.resourcesReleased)
         if (request.mode === 'inspect') return JSON.stringify({ version: 1, state: orphan !== undefined || target.host.includes('offline-blocked') ? 'occupied' : 'offline',
-          root: target.remoteRoot, role: request.role, home: target.remoteRoot + '/state/' + request.role + '-home', hostBootId: 'cpu-host',
+          root: target.remoteRoot, role: request.role, home: target.remoteRoot + '/state/' + request.role + '-home', hostBootId: 'cpu-host-boot',
           digest: 'e'.repeat(64), savedPid: null, releaseBinding: '/fixture/old-fixed-release', processes: [],
           blockers: orphan !== undefined ? [{ kind: 'experiment', id: orphan.submission.experimentId, reason: 'Deleted original task still has an unreleased allocation' }]
             : target.host.includes('offline-blocked') ? [{ kind: 'command', id: 'old-command', reason: 'Original command exit is not confirmed' }] : [],
@@ -478,8 +502,30 @@ export async function apply(ctx, config) {
       if (operation === 'cancel') return { status: 200, value: await queue.cancel(id, body.submission) }
       const record = overviewRecord(queue.get(id))
       if (record === undefined) throw new Error('experiment not found')
+      if (operation === 'storage-policy-status' || operation === 'storage-policy-decide') {
+        const node = record.submission.nodes.find(node => node.server.host === _target.host) ?? record.submission.nodes[0]
+        const key = id + '/' + node.server.id
+        if (overviewModes.get(id)?.name !== 'storage-repair') return { status: 200, value: { current: null, proposals: [] } }
+        if (!storagePolicyFixtures.has(key)) {
+          const policy = { artifact: 'adapter', checkpointCount: 2, optimizerState: true, schedulerState: true, recoveryPoints: ['checkpoint-30'],
+            outputMinimumBytes: 0, checkpointMinimumBytes: 0, basis: 'Keep approved recovery files' }
+          const current = { version: 1, experimentId: id, serverId: node.server.id, proposalId: randomUUID(), planRevision: record.plan?.revision ?? 1,
+            expectedRevision: 0, revision: 1, policy, reason: 'Original retained contents', requestHash: 'a'.repeat(64), state: 'approved', createdAt: 100, updatedAt: 100 }
+          storagePolicyFixtures.set(key, { current, proposals: [{ ...current, proposalId: randomUUID(), expectedRevision: 1, policy: { ...policy, checkpointCount: 1 },
+            reason: 'Keep one recovery file after the measured validation', state: 'pending' }] })
+        }
+        const value = storagePolicyFixtures.get(key)
+        if (operation === 'storage-policy-status') return { status: 200, value }
+        const proposal = value.proposals.find(row => row.proposalId === body.proposalId)
+        assert.ok(proposal); assert.equal(body.expectedRevision, proposal.expectedRevision)
+        proposal.state = body.approve ? 'approved' : 'rejected'; proposal.revision = body.approve ? 2 : 1; proposal.updatedAt = 200
+        if (body.approve) value.current = proposal
+        return { status: 200, value: proposal }
+      }
       if (operation === 'environment-storage' || operation === 'environment-preview' || operation === 'environment-cleanup' || operation === 'storage-inspect') {
         const node = record.submission.nodes.find(node => node.server.host === _target.host) ?? record.submission.nodes[0]
+        const storageMode = overviewModes.get(id)?.name
+        const repairing = storageMode === 'storage-repair'
         const catalog = { version: 1, serverId: node.server.id, checkedAt: 100, complete: true, entriesScanned: 176, roots: [], historicalEnvironments: [], diagnostics: [],
           volumes: [{ id: '1'.repeat(64), directory: '/', filesystem: 'overlay', source: 'CPU fixture system', capacityBytes: 30 * 1024 ** 3,
             availableBytes: 1667948544, accountWritable: true, sandboxWritable: null, measuredBytes: 1024, unattributedBytes: 10 * 1024 ** 3,
@@ -488,13 +534,23 @@ export async function apply(ctx, config) {
             availableBytes: 20 * 1024 ** 3, accountWritable: true, sandboxWritable: false, measuredBytes: 26 * 1024 ** 3, unattributedBytes: 4 * 1024 ** 3,
             categories: [{ kind: 'environment', logicalBytes: 26 * 1024 ** 3, allocatedBytes: 26 * 1024 ** 3, files: 176 }] }] }
         if (operation === 'storage-inspect') return { status: 200, value: catalog }
+        if (operation === 'environment-preview' && repairing) return { status: 200, value: { serverId: node.server.id, checkedAt: 100, fingerprint: 'd'.repeat(64), candidates: [], eligible: true,
+          referenceRepairs: managedReferencesReleased.has(id + '/' + node.server.id) ? [] : [
+            { id: '6'.repeat(64), sourceExperimentId: '00000000-0000-4000-8000-000000000004', environmentId: 'removed-training', eligible: true, checkedAt: 100,
+              evidenceHash: '7'.repeat(64), detail: 'CPU fixture: original removal and resource release verified; retained logs are unchanged' },
+            { id: '5'.repeat(64), sourceExperimentId: '00000000-0000-4000-8000-000000000005', environmentId: 'unconfirmed-training', eligible: false, checkedAt: 100,
+              detail: 'CPU fixture: original process exit is unconfirmed; reference remains protected' }] } }
         if (operation === 'environment-preview') return { status: 200, value: { serverId: node.server.id, checkedAt: 100, fingerprint: 'd'.repeat(64),
           candidates: managedCacheCleaned.has(id + '/' + node.server.id) ? [] : [{ id: 'e'.repeat(64), kind: 'package', bytes: 1048576, reason: 'CPU fixture: confirmed unused managed package' }], eligible: true } }
         if (operation === 'environment-cleanup') {
+          if (repairing) {
+            if (JSON.stringify(body.nodes?.[0]?.candidateIds) !== '[]' || JSON.stringify(body.nodes?.[0]?.referenceRepairIds) !== JSON.stringify(['6'.repeat(64)])) throw new Error('Reference-only confirmation selected unexpected files or references')
+            await delay(200); managedReferencesReleased.add(id + '/' + node.server.id)
+            return { status: 200, value: { serverId: node.server.id, state: 'completed', reclaimedBytes: 0, repairedReferences: ['6'.repeat(64)], checkedAt: Date.now() } }
+          }
           await delay(200); managedCacheCleaned.add(id + '/' + node.server.id)
           return { status: 200, value: { serverId: node.server.id, state: 'completed', reclaimedBytes: 1048576, checkedAt: Date.now() } }
         }
-        const storageMode = overviewModes.get(id)?.name
         const placement = node.server.storagePlacement
         const trainingNamespace = placement.controlRoot + '/training-storage-v1'
         const trainingWorkspace = trainingNamespace + '/runs/' + id + '/workspace'
@@ -504,6 +560,22 @@ export async function apply(ctx, config) {
         return { status: 200, value: { serverId: node.server.id, name: node.server.name, checkedAt: Date.now(), source: 'remote', availableBytes: 20_000_000_000,
           capacityBytes: 40_000_000_000, workspaceBytes: 16_000_000, sharedBytes: 1048576, reclaimableBytes: managedCacheCleaned.has(id + '/' + node.server.id) ? 0 : 1048576, legacy: [], complete: true,
           catalog,
+          ...(repairing ? { diagnostics: [{ version: 1, experimentId: id, serverId: node.server.id, operationId: id, environmentId: 'training', id: '4'.repeat(64),
+            code: 'content-mismatch', detail: 'Historical distribution content differs from its RECORD: decord-0.6.0.dist-info/top_level.txt', package: 'decord',
+            expectedBytes: 17, actualBytes: 7, sourceFingerprint: 'a'.repeat(64), checkedAt: 100 }],
+          repairPlans: [{ version: 1, id: '3'.repeat(64), experimentId: id, serverId: node.server.id, environmentId: 'training', sourceOperationId: id,
+            requestHash: 'a'.repeat(64), sourceFingerprint: 'b'.repeat(64), diagnosticIds: ['4'.repeat(64)], strategy: 'rebuild-from-materials',
+            requirements: ['tiny-fixture==1.0'], modules: ['tiny_fixture'], requireCuda: false, packages: ['decord'], checkedAt: 100,
+            downloadBytes: null, copyBytes: null, peakBytes: null, detail: 'CPU fixture: Agent may rebuild the current environment; historical source is retained' }] } : {}),
+          ...(storageMode === 'running' ? { materialOperations: [{ version: 1, experimentId: id, serverId: node.server.id,
+            operationId: node.server.id, materialId: '9'.repeat(64), requestHash: 'a'.repeat(64), action: 'verify',
+            state: node.server.id === record.submission.nodes[0].server.id ? 'running' : 'completed',
+            stage: node.server.id === record.submission.nodes[0].server.id ? 'discovering' : 'completed',
+            startedAt: record.updatedAt - 1000, deadline: record.updatedAt + 300000, updatedAt: record.updatedAt,
+            downloadedBytes: 0, reusedBytes: node.server.id === record.submission.nodes[0].server.id ? 0 : 4096,
+            exitConfirmed: node.server.id !== record.submission.nodes[0].server.id, admissionReleased: node.server.id !== record.submission.nodes[0].server.id,
+            reuse: { state: node.server.id === record.submission.nodes[0].server.id ? 'discovering' : 'verified',
+              complete: node.server.id !== record.submission.nodes[0].server.id, diagnostics: [] } }] } : {}),
           ...(fallback ? { arrangement: { version: 1, formatVersion: '0.1.0', experimentId: id, serverId: node.server.id,
             controlRoot: placement.controlRoot, dataWorkspace: placement.workspaceRoot, environmentWorkspace: trainingWorkspace, environmentNamespace: trainingNamespace,
             appliedAt: record.submission.createdAt, eventId: id.replaceAll('-', '') + node.server.id.replaceAll('-', ''),
@@ -511,6 +583,7 @@ export async function apply(ctx, config) {
             volume: { directory: '/', filesystem: 'overlay', source: 'CPU fixture system', device: '1' },
             history: [{ time: record.submission.createdAt, action: 'system-fallback', reason: 'CPU display fixture; no GPU work' }] } } : {}),
           storagePlan: { version: 1, experimentId: id, serverId: node.server.id, operationId: id, requestHash: 'a'.repeat(64), checkedAt: 100,
+            ...(repairing ? { mode: 'preview', coverage: { scope: 'declared', complete: false, coveredMaterialIds: [], unresolved: ['Full model requirement is not covered'] } } : {}),
             state: shortage ? 'insufficient' : 'ready', formatVersion: '0.1.0', peakSafetyFactor: 1.2, environmentId: 'training', requirements: ['tiny-fixture==1.0'], materialIds: ['9'.repeat(64)], detail: 'CPU fixture: per-volume budget',
             volumes: [{ directory: '/fixture/data', availableBytes: (shortage ? 4 : 20) * 1024 ** 3, reservedBytes: 4096,
               requiredBytes: 2 * 1024 ** 3 + Math.ceil((shortage ? 32 * 1024 ** 3 : 1024) * 1.2),
@@ -534,7 +607,7 @@ export async function apply(ctx, config) {
             runtime: { version: 1, experimentId: id, serverId: node.server.id, operationId: id, environmentId: 'training', deploymentId: record.submission.deploymentId,
               startedAt: record.updatedAt - 120000, deadline: record.updatedAt + 1680000, updatedAt: record.updatedAt, exitConfirmed: record.state !== 'running', exitCode: record.state === 'running' ? null : 0, admissionReleased: record.state !== 'running' },
             operation: { version: 1, experimentId: id, serverId: node.server.id, operationId: id, environmentId: 'training', requestHash: 'a'.repeat(64), action: 'create',
-              state: 'completed', startedAt: record.updatedAt - 120000, updatedAt: record.updatedAt, commandId: 'environment-' + id, exitConfirmed: true, exitCode: 0 } }],
+              state: repairing ? 'running' : 'completed', startedAt: record.updatedAt - 120000, updatedAt: record.updatedAt, commandId: 'environment-' + id, exitConfirmed: !repairing, exitCode: repairing ? null : 0, ...(repairing ? { action: 'repair' } : {}) } }],
           reusePlans: [{ version: 1, experimentId: id, serverId: node.server.id, operationId: id, environmentId: 'training',
             requirementsHash: 'a'.repeat(64), pythonAbi: 'cpython-312-fixture', uvVersion: '0.13.0', stage: record.state === 'running' ? 'reusing' : 'completed',
             packages: [{ name: 'tiny-fixture', version: '1.0', wheelHash: 'b'.repeat(64), decision: 'shared' }], downloadBytes: 0,
@@ -589,11 +662,13 @@ export async function apply(ctx, config) {
       if (owned?.service?.id !== body.serviceId) throw new Error('service is outside this experiment')
       if (operation === 'stop-service') { await stop(id); return { status: 200, value: owned.service } }
       if (operation === 'service-access-info') {
+        await serviceKeyGate?.promise
         if (owned.stopping || owned.gateway === undefined) throw new Error('Public service is not active')
         return { status: 200, value: owned.gateway.access() }
       }
       if (operation === 'access-service') {
-        const response = await fetch(`http://127.0.0.1:${owned.service.port}${body.path}`)
+        const response = await fetch(`http://127.0.0.1:${owned.service.port}${body.path}`, { method: body.method,
+          ...(body.method === 'POST' ? { headers: { 'content-type': 'application/json' }, body: body.body } : {}) })
         return { status: 200, value: { status: response.status, body: await response.text() } }
       }
       throw new Error('Unknown CPU fixture operation: ' + operation)
@@ -604,19 +679,43 @@ export async function apply(ctx, config) {
     undefined, undefined, undefined, undefined, undefined, undefined, managedEnvironmentPolicySchema.parse({ storageIntervalMs: 1000 }))
   const retry = fleet.retry.bind(fleet)
   fleet.retry = async id => { await retryGate?.promise; return retry(id) }
+  let serviceView
+  let serviceKeyGate
+  const snapshot = fleet.snapshot.bind(fleet)
+  fleet.snapshot = () => {
+    const value = snapshot()
+    if (serviceView === undefined) return value
+    const owner = value.experiments.find(row => row.request.experimentId === serviceView.owner)
+    const current = owner?.latest?.services[0]
+    if (current === undefined) return value
+    const history = { ...current, id: serviceView.history, state: 'failed', released: true, updatedAt: current.createdAt - 1,
+      detail: 'CPU retained startup failure', external: { ...current.external, state: 'stopped' } }
+    const pending = { ...current, id: serviceView.pending, state: 'unhealthy', released: false, modelName: 'cpu-unconfirmed',
+      detail: 'CPU process exit unconfirmed', external: { ...current.external, state: 'unreachable' } }
+    const source = { ...owner, request: { ...owner.request, experimentId: serviceView.parent, name: 'CPU service source', objective: 'CPU service source' },
+      submission: undefined, receipt: undefined, latest: { ...owner.latest, state: 'blocked', resourcesReleased: true,
+        submission: { ...owner.latest.submission, experimentId: serviceView.parent }, services: [current, history, pending] } }
+    return { ...value, experiments: [source, ...value.experiments.map(row => row === owner ? { ...row, acceptanceParentId: serviceView.parent,
+      latest: { ...row.latest, services: [current, history, pending] } } : row)] }
+  }
   new AsperaRemote(ctx, fleet, new ExperimentDownloads(ctx, fleet, 60000), policy)
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: '/aspera-test', handler: async (req, res) => {
     try {
     const url = new URL(req.url, 'http://localhost')
     const id = url.searchParams.get('id')
     const kind = url.pathname.split('/').at(-1)
-    if (kind.startsWith('completion-')) {
+    if (kind === 'service-view') serviceView = { owner: id, parent: randomUUID(), history: randomUUID(), pending: randomUUID() }
+    if (kind === 'service-view-clear') serviceView = undefined
+    if (kind === 'hold-service-key') serviceKeyGate = Promise.withResolvers()
+    if (kind === 'release-service-key') { serviceKeyGate?.resolve(); serviceKeyGate = undefined }
+    if (kind === 'completion-retry') completion.retry(id)
+    else if (kind.startsWith('completion-')) {
       await completion.seed(queue.get(id), record => store.table('experiments').put(id, record), kind.slice('completion-'.length))
       await fleet.refresh(id)
     }
     if (kind.startsWith('overview-')) {
       const name = kind.slice('overview-'.length)
-      if (!['running', 'blocked', 'cancelled', 'completed', 'legacy', 'partial', 'invalid-total', 'read-failure', 'long', 'storage-fallback', 'storage-shortage'].includes(name)
+      if (!['running', 'blocked', 'cancelled', 'completed', 'legacy', 'partial', 'invalid-total', 'read-failure', 'long', 'storage-fallback', 'storage-shortage', 'storage-repair'].includes(name)
         || queue.get(id)?.submission.objective !== 'CPU overview review') throw new Error('Unknown overview fixture or experiment')
       await fleet.archives.settled(id)
       overviewModes.set(id, { name, revision: (overviewModes.get(id)?.revision ?? 2) + 1, updatedAt: Date.now() })

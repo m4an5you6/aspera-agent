@@ -23,7 +23,7 @@ import { ReleaseInstallationPending } from './deploy.ts'
 import type { EnvironmentProgress, PreparationCommand } from './types.ts'
 import type { InstallationTools } from './installation.ts'
 import { installationSourceProbeIdSchema } from './installation-model.ts'
-import { preparationCommandScript, recoverPreparationCommand, preparationCommandSource, preparationCommandPolicySchema } from './preparation-command.ts'
+import { preparationCommandTransfer, recoverPreparationCommand, preparationCommandSource, preparationCommandPolicySchema } from './preparation-command.ts'
 import type { PreparationCommandPolicy, RecoveredPreparationCommand } from './preparation-command.ts'
 
 /** Injectable SSH operations are shared by production tools and the profile replay. */
@@ -110,7 +110,7 @@ export class EnvironmentPreparation {
       presentCall: args => ({ ...presentCall(args), title: 'Aspera controller repair' }),
       execute: async (args, exec) => JSON.stringify(await this.owner(args.server_id).repair(exec.signal)) })))
     ctx.effect(() => ctx.tools.register(defineTool({ name: 'repair_preparation_sandbox',
-      description: 'Request the program-owned private-PID/proc compatibility launcher on the assigned server. The program measures feasibility, preserves every inner bubblewrap namespace and device grant, drops all capabilities, installs an immutable content-addressed launcher and records its exit. Uses only existing account privileges; never changes host kernel policy. No PID, path or isolation flags may be supplied. Afterwards call verify_preparation_environment; configuration alone does not complete preparation.',
+      description: 'Repair the assigned account sandbox using the fixed program recipe. If native bubblewrap lacks --size, build the pinned compatible version in private tool directories from verified sources, fixed small build-tool wheels and extracted signed distro headers; never install OS packages or change old controllers or training dependencies. Then measure and install the private-PID/proc compatibility launcher, preserving every namespace/device grant and zero capabilities. The supervised operation retains logs, limits and exit receipts. No PID, path or isolation flags may be supplied. Afterwards call verify_preparation_environment; configuration alone does not complete preparation.',
       parameters: { server_id: { type: 'string', required: true } }, output,
       presentCall: args => ({ ...presentCall(args), title: 'Aspera sandbox repair' }),
       execute: async (args, exec) => JSON.stringify(await this.owner(args.server_id).repairSandbox(exec.signal, exec.callId)) })))
@@ -360,11 +360,12 @@ done`, lifetime, input.password)
           const cacheDirectory = posix.join(observation.home, '.cache/aspera/preparation', input.serverId)
           let transport: RemoteCommandResult | undefined
           try {
+            const transfer = preparationCommandTransfer({ directory: pending.directory, cacheDirectory, command: script, source, timeoutMs,
+              policy: this.commandPolicy, python: python?.startsWith('/') ? python : undefined, uvVersion: input.requirements.uv,
+              uvPath: observation.programs.find(program => program.name === 'uv')?.path })
             transport = await driver.remoteResult({ ...target, toolTimeoutMs: python?.startsWith('/') ? this.commandPolicy.readTimeoutMs
               : timeoutMs + this.commandPolicy.stopGraceMs + this.commandPolicy.readTimeoutMs },
-              preparationCommandScript({ directory: pending.directory, cacheDirectory, command: script, source, timeoutMs,
-                policy: this.commandPolicy, python: python?.startsWith('/') ? python : undefined, uvVersion: input.requirements.uv,
-                uvPath: observation.programs.find(program => program.name === 'uv')?.path }), lifetime, input.password)
+              transfer.script, lifetime, input.password, undefined, transfer.input)
           } catch (error) {
             await progress('configuring-environment', `SSH reader stopped; checking the original command: ${String(error)}`)
           }

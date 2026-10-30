@@ -90,7 +90,7 @@ Host 先持久保存完整回执，再追加接管消息并完成派发 Goal。�
 <a id="controller-readiness"></a>
 ## 控制进程就绪与恢复
 
-准备 Agent 在原 Session 中调用环境探测、`repair_preparation_controller` 和复验。程序比较实际 GPU UUID、可访问字符设备和控制进程启动授权；集合排序避免顺序不同产生误报。交接重新核对全部验收过的控制进程身份和配置摘要，新节点分配时独立再次探测硬件。已提交的 GPU 要求变化时，复制实验而不改写记录。
+准备 Agent 在原 Session 中调用环境探测、`repair_preparation_controller` 和复验。程序要求控制进程的固定发布与所选实验一致，再比较实际 GPU UUID、可访问字符设备和启动授权；集合排序避免顺序不同产生误报。功能一致不能授权复用其他发布。交接重新核对全部验收过的控制进程身份和配置摘要，新节点分配时独立再次探测硬件。已提交的 GPU 要求变化时，复制实验而不改写记录。
 
 经过认证的健康接口声明 `controller-readiness-v1` 和 `controller-maintenance-v1`。维护操作检查调度端等待及活动任务、节点分配、命令和推理服务，再原子阻止新任务接入。修复工具自行解析 PID、Linux 启动身份、宿主启动身份、路径和固定发布，等待身份匹配的进程退出及端口释放后启动该发布。占用、未知及旧维护接口情形保留具体阻塞。限定进程字段仅允许在启动 GPU 证据和原发布匹配时只读复用；缺少证据不视为兼容。
 
@@ -104,6 +104,12 @@ Host 先持久保存完整回执，再追加接管消息并完成派发 Goal。�
 
 <a id="api-consumers"></a>
 ## 接口使用方
+
+独立版本 1 的 `input-sharing-v1` 回执将已释放输入快照合并绑定当前实验及节点、认证内容、原文件身份和已完成替换。清理增加 `input-duplicate`，由 `inputSharingVersion: 1` 和 `managed-input-sharing-v1` 启用。独立 `release-asset-sharing-v1` 记录及 `release-asset-duplicate` 覆盖已知、不可变且空闲的发布资源，要求 `releaseAssetSharingVersion: 1`/`managed-release-asset-sharing-v1`。路径与字节保留；原文件时间存于回执。Session 和协议代次不变。
+
+wheel 与缓存持久类型确认：独立版本 1 的 `input-verifications-v1`、`wheel-derivations-v1` 和 `cache-maintenance-v1` 将输入摘要、派生构建、未变载荷和包管理器退出结果绑定所属节点及操作。操作专属证明和管理器回执纳入归档。可选 `PrepareExperimentEnvironment.repairWheelMetadata` 要求显式修复计划；清理新增 `manager-cache`。旧记录继续可读。清单 `wheelMetadataRepairVersion: 2` 与 `managerCacheVersion: 1` 要求复用和交接前具备 `managed-wheel-metadata-v1`/`managed-wheel-metadata-v2` 与 `managed-manager-cache-v1`。协议 4、fleet 6 和 Session 格式不变。
+
+工具快照持久类型确认：`storage-tool-observations-v1/<serverId>/<snapshotId>.json` 除原节点检查外，支持完整 `EnvironmentOperationStatus` 和 `EnvironmentOperation`。读取方区分操作身份，继续读取旧检查，核对实验归属，并对已保存原文分页，不改写回执。版本 1 外层和旧文件保留，协议 4、fleet 6 及 Session 格式不变。
 
 持久类型确认：可选 `EnvironmentOperation.cleanup`/`recovery` 和 `EnvironmentStorageNode.cleanups`/`recoveries` 引用独立版本 1 清理与恢复文件。缺少字段的旧记录继续可读，原失败回执及时间保持原样，当前挂载 ID 只进入诊断。清单 `asperaEnvironmentTools.cleanupVersion: 1` 要求复用控制进程前确认 `managed-environment-cleanup-v1`。类型及生成的 Remote 使用方同步更新，协议 4、本机存储域 6 和 Session 格式不变。
 
@@ -125,6 +131,8 @@ Host 先持久保存完整回执，再追加接管消息并完成派发 Goal。�
 
 <a id="execution-step-progress"></a>
 ## 执行步骤进度
+
+checkpoint 持久类型声明：[保留记录](../packages/runtime/src/checkpoint-protection.ts)在各节点运行目录新增私有版本 1 的 `checkpoint-protection-v1/registrations` 和 `sealed` 文件，绑定原实验／节点、批准阶段、尝试、命令、必需恢复目录及实测文件身份。只读归档发现包含这两类记录，实验专属删除随运行目录清理。挂载 ID 仅实时核对，不保存为重启后的授权。协议 4、fleet 6、Session 格式及原阶段记录不变；旧固定发布不隐含这项 checkpoint 保护。
 
 持久化类型变更确认：[执行进度定义](../packages/experiments/src/execution-progress.ts)在调度主机的实验专属运行目录新增独立的第 1 代文件。记录绑定实验 ID、批准的计划版本、从 1 开始的步骤序号和执行 Session，保存自身记录版本、各步骤状态、简短说明、调用 ID 和程序时间。现有计划、`progress.json`、fleet 第 `6` 代、远端协议／存储第 `4` 代和 Session 事件不变。实验专属清理随运行目录删除此文件。
 

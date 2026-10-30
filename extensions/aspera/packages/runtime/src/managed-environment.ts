@@ -1,5 +1,5 @@
 /** Node-owned environment operations use the existing managed-process lifetime and independent v1 files. */
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, lstatSync, statSync } from 'node:fs'
 import { writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
 import { resolve, dirname, isAbsolute, relative, sep } from 'node:path'
@@ -10,7 +10,7 @@ import s from '@deepseek-ai/schemastery'
 import { prepareExperimentEnvironmentSchema, experimentEnvironmentSchema, environmentOperationSchema, environmentStorageNodeSchema,
   experimentCachePreviewSchema, environmentOperationIdSchema, experimentCacheResultSchema, environmentLaunchSchema,
   environmentCleanupSchema, environmentRecoverySchema, environmentRuntimeSchema, environmentReusePlanSchema,
-  prepareExperimentMaterialsSchema, materialOperationSchema, storageOperationIdSchema } from '@aspera/experiments'
+  prepareExperimentMaterialsSchema, materialOperationSchema, storageOperationIdSchema, storageEvidenceContextSchema } from '@aspera/experiments'
 import type { MaterialOperation } from '@aspera/experiments'
 import type { ClusterNode, ExperimentId, PrepareExperimentEnvironment, EnvironmentOperation, EnvironmentStorageNode,
   ExperimentCachePreview, ExperimentCacheResult, EnvironmentLaunch, EnvironmentRuntime, EnvironmentReusePlan } from '@aspera/experiments'
@@ -18,6 +18,14 @@ import { serverRunRoot } from './storage.ts'
 import { experimentSandboxArgv } from './experiment-sandbox.ts'
 import { storageGovernancePolicySchema, StorageGovernancePolicyConfig, readBorrowedEnvironments, managedTrainingWorkspace } from './storage-governance.ts'
 import type { StorageGovernancePolicy } from './storage-governance.ts'
+
+/** A failed read retains its diagnostic location separately from its repeatable failure description. */
+export class EnvironmentInspectionError extends Error {
+  /** @param detail - observed failure without an attempt-specific diagnostic path. @param diagnostics - saved stdout, stderr and exit records. */
+  constructor(readonly detail: string, readonly diagnostics: string) {
+    super(detail + '; diagnostics: ' + diagnostics)
+  }
+}
 
 /** Deployment-varying installer, space and scanner bounds. */
 export const managedEnvironmentPolicySchema = z.object({ uvVersion: z.string().regex(/^\d+\.\d+\.\d+$/).default('0.13.0'),
@@ -33,7 +41,10 @@ export const managedEnvironmentPolicySchema = z.object({ uvVersion: z.string().r
   operationPollIntervalMs: z.number().int().min(100).default(1000),
   operationReconnectTimeoutMs: z.number().int().min(1000).max(600000).default(60000),
   governance: storageGovernancePolicySchema.optional(),
-}).strict()
+}).strict().refine(value => storageGovernancePolicySchema.parse(value.governance ?? {}).metadataProbeTimeoutMs < value.readTimeoutMs,
+  'Canonical metadata probe timeout must be shorter than the outer environment read timeout')
+  .refine(value => storageGovernancePolicySchema.parse(value.governance ?? {}).scanTimeoutMs < value.readTimeoutMs,
+    'Storage scan page timeout must be shorter than the outer environment read timeout')
 /** Resolved node policy supplied by profile configuration. */
 export type ManagedEnvironmentPolicy = z.infer<typeof managedEnvironmentPolicySchema>
 /**
@@ -44,11 +55,12 @@ export type ManagedEnvironmentPolicy = z.infer<typeof managedEnvironmentPolicySc
  * @param supportsPurposeStorage - release supports business storage format 0.1.0 settings.
  * @returns only settings understood by that release.
  */
-export function managedEnvironmentPolicyForRelease(policy: ManagedEnvironmentPolicy, supportsInstallerV3: boolean, supportsStorage = false, supportsPurposeStorage = false): Omit<ManagedEnvironmentPolicy, 'pipVersion' | 'governance'> & { pipVersion?: string; governance?: Omit<StorageGovernancePolicy, 'systemReserveBytes' | 'systemReserveRatio' | 'dataReserveBytes' | 'dataReserveRatio' | 'peakSafetyFactor' | 'capacityRecheckMs'> } {
+export function managedEnvironmentPolicyForRelease(policy: ManagedEnvironmentPolicy, supportsInstallerV3: boolean, supportsStorage = false, supportsPurposeStorage = false, supportsTargetedMaterials = false): Omit<ManagedEnvironmentPolicy, 'pipVersion' | 'governance'> & { pipVersion?: string; governance?: Omit<StorageGovernancePolicy, 'systemReserveBytes' | 'systemReserveRatio' | 'dataReserveBytes' | 'dataReserveRatio' | 'peakSafetyFactor' | 'capacityRecheckMs' | 'metadataProbeTimeoutMs'> } {
   const { pipVersion, governance, ...previous } = policy
+  const { metadataProbeTimeoutMs: _probe, ...compatible } = governance ?? storageGovernancePolicySchema.parse({})
   const { systemReserveBytes: _systemBytes, systemReserveRatio: _systemRatio, dataReserveBytes: _dataBytes, dataReserveRatio: _dataRatio,
-    peakSafetyFactor: _peak, capacityRecheckMs: _recheck, ...legacy } = governance ?? storageGovernancePolicySchema.parse({})
-  return { ...previous, ...(supportsInstallerV3 ? { pipVersion } : {}), ...(supportsStorage && governance !== undefined ? { governance: supportsPurposeStorage ? governance : legacy } : {}) }
+    peakSafetyFactor: _peak, capacityRecheckMs: _recheck, ...legacy } = compatible
+  return { ...previous, ...(supportsInstallerV3 ? { pipVersion } : {}), ...(supportsStorage && governance !== undefined ? { governance: supportsPurposeStorage ? supportsTargetedMaterials ? governance : compatible : legacy } : {}) }
 }
 /** Profile settings for both the manager and Host's bounded read-only storage observations. */
 export const ManagedEnvironmentPolicyConfig: s<ManagedEnvironmentPolicy> = s.object({
@@ -81,17 +93,18 @@ function readManagedJson(path: string): unknown {
 }
 /** @returns the shipped helper for read-only SSH observations and confirmed reference release. */
 export function managedEnvironmentProgram(): string {
-  return readFileSync(new URL('../scripts/storage-placement.py', import.meta.url), 'utf8') + '\n' + readFileSync(new URL('../scripts/storage-governance.py', import.meta.url), 'utf8') + '\n' + readFileSync(new URL('../scripts/managed-environment.py', import.meta.url), 'utf8')
+  return ['storage-placement.py', 'environment-repair.py', 'wheel-metadata.py', 'manager-cache.py', 'input-sharing.py', 'storage-governance.py', 'storage-reuse.py', 'storage-preflight.py', 'managed-environment.py']
+    .map(name => readFileSync(new URL('../scripts/' + name, import.meta.url), 'utf8')).join('\n')
 }
 /** Trusted helper inputs include saved placement, fixed tools and the actual sandbox argv. */
-export function managedEnvironmentConfig(binding: Binding, policy: ManagedEnvironmentPolicy, action: string): object {
+export function managedEnvironmentConfig(binding: Binding, policy: ManagedEnvironmentPolicy, action: string) {
   const placement = binding.node.server.storagePlacement
   if (placement === undefined || placement.experimentId !== binding.experimentId || placement.serverId !== binding.node.server.id) {
     throw new Error('Managed environments require the original saved storage placement')
   }
   const argv = experimentSandboxArgv({ backendPath: binding.node.backendPath, workspaceRoot: placement.workspaceRoot,
     devicePaths: binding.node.devicePaths, hiddenPaths: binding.hiddenPaths }, ['true'])
-  return { action, placement, policy, serverName: binding.node.server.name, deploymentId: binding.deploymentId,
+  return { action, placement, policy, serverName: binding.node.server.name, deploymentId: binding.deploymentId, reuseVerificationVersion: 1, repairVersion: 1, storagePreflightVersion: 2, managerCacheVersion: 1, inputSharingVersion: 1, releaseAssetSharingVersion: 1,
     uvPath: policy.uvPath, pythonPath: policy.pythonPath, backendPath: binding.node.backendPath, devicePaths: binding.node.devicePaths,
     gpuInfo: binding.node.gpuInfo, sandboxBase: argv.slice(0, -2), governancePolicy: storageGovernancePolicySchema.parse(policy.governance ?? {}) }
 }
@@ -211,20 +224,22 @@ export class ManagedEnvironments {
     return value
   }
 
-  /** @param binding - saved node ownership. @param request - checked operation. @returns an owned manager command and a stable request file. */
-  command(binding: Binding, raw: PrepareExperimentEnvironment): { argv: string[]; commandId: string } {
+  /** @param binding - saved node ownership. @param raw - checked operation. @param evidenceContext - original approved plan and execution Session. @returns an owned manager command and a stable request file. */
+  command(binding: Binding, raw: PrepareExperimentEnvironment, evidenceContext?: z.infer<typeof storageEvidenceContextSchema>): { argv: string[]; commandId: string } {
     const request = prepareExperimentEnvironmentSchema.parse(raw)
     const run = serverRunRoot(binding.node.server, binding.experimentId)
     const folder = resolve(run, 'environment-requests-v1')
     mkdirSync(folder, { recursive: true, mode: 0o700 })
     const path = resolve(folder, request.operationId + '.json')
-    const value = JSON.stringify({ ...managedEnvironmentConfig(binding, this.policy, 'prepare'), request })
+    const value = JSON.stringify({ ...managedEnvironmentConfig(binding, this.policy, 'prepare'), request,
+      ...(evidenceContext === undefined ? {} : { evidenceContext }) })
     if (existsSync(path)) {
-      const original = z.object({ request: prepareExperimentEnvironmentSchema, deploymentId: z.string(),
+      const original = z.object({ request: prepareExperimentEnvironmentSchema, deploymentId: z.string(), evidenceContext: storageEvidenceContextSchema.optional(),
         placement: z.object({ experimentId: z.string(), serverId: z.string(), workspaceRoot: z.string() }) }).parse(readManagedJson(path))
       if (JSON.stringify(original.request) !== JSON.stringify(request) || original.deploymentId !== binding.deploymentId
         || original.placement.experimentId !== binding.experimentId || original.placement.serverId !== binding.node.server.id
-        || original.placement.workspaceRoot !== binding.node.server.storagePlacement?.workspaceRoot) throw new Error('Environment operation identity is bound to different content')
+        || original.placement.workspaceRoot !== binding.node.server.storagePlacement?.workspaceRoot
+        || JSON.stringify(original.evidenceContext) !== JSON.stringify(evidenceContext)) throw new Error('Environment operation identity is bound to different content or evidence context')
     } else writeFileSync(path, value, { flag: 'wx', mode: 0o600 })
     return { argv: [this.policy.pythonPath, fileURLToPath(new URL('../scripts/managed-environment.py', import.meta.url)), path], commandId: 'environment-' + request.operationId }
   }
@@ -336,19 +351,22 @@ export class ManagedEnvironments {
   }
 
   /** @param binding - original node. @param operationId - repeated cleanup identity. @param fingerprint - preview digest. @returns owned cleanup argv. */
-  cleanupCommand(binding: Binding, operationId: string, fingerprint: string, candidateIds?: string[]): { argv: string[]; commandId: string } {
+  cleanupCommand(binding: Binding, operationId: string, fingerprint: string, candidateIds?: string[], referenceRepairIds?: string[]): { argv: string[]; commandId: string } {
     const id = environmentOperationIdSchema.parse(operationId)
     const path = resolve(serverRunRoot(binding.node.server, binding.experimentId), 'environment-cleanup-requests-v1', id + '.json')
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
     const value = JSON.stringify({ ...managedEnvironmentConfig(binding, this.policy, 'cleanup'), operationId: id, fingerprint,
-      ...(candidateIds === undefined ? {} : { candidateIds: [...candidateIds].sort() }) })
+      ...(candidateIds === undefined ? {} : { candidateIds: [...candidateIds].sort() }),
+      ...(referenceRepairIds === undefined ? {} : { referenceRepairIds: [...referenceRepairIds].sort() }) })
     if (existsSync(path)) {
       const original = z.object({ operationId: environmentOperationIdSchema, fingerprint: z.string(), deploymentId: z.string(), candidateIds: z.array(z.string()).optional(),
+        referenceRepairIds: z.array(z.string()).optional(),
         placement: z.object({ experimentId: z.string(), serverId: z.string(), workspaceRoot: z.string() }) }).parse(readManagedJson(path))
       if (original.operationId !== id || original.fingerprint !== fingerprint || original.deploymentId !== binding.deploymentId
         || original.placement.experimentId !== binding.experimentId || original.placement.serverId !== binding.node.server.id
         || original.placement.workspaceRoot !== binding.node.server.storagePlacement?.workspaceRoot
-        || JSON.stringify(original.candidateIds) !== JSON.stringify(candidateIds === undefined ? undefined : [...candidateIds].sort())) throw new Error('Cleanup identity is bound to another preview or selection')
+        || JSON.stringify(original.candidateIds) !== JSON.stringify(candidateIds === undefined ? undefined : [...candidateIds].sort())
+        || JSON.stringify(original.referenceRepairIds) !== JSON.stringify(referenceRepairIds === undefined ? undefined : [...referenceRepairIds].sort())) throw new Error('Cleanup identity is bound to another preview or selection')
     }
     else writeFileSync(path, value, { flag: 'wx', mode: 0o600 })
     return { argv: [this.policy.pythonPath, fileURLToPath(new URL('../scripts/managed-environment.py', import.meta.url)), path], commandId: 'environment-cleanup-' + id }
@@ -360,17 +378,18 @@ export class ManagedEnvironments {
   }
 
   /** @param binding - allocated destination. @param input - validated content-bound request. @returns durable material manager argv and original lifetime. */
-  materialCommand(binding: Binding, input: object): { argv: string[]; commandId: string; deadline: number; registration: object } {
+  materialCommand(binding: Binding, input: object, evidenceContext?: { sessionId: string; planRevision: number }): { argv: string[]; commandId: string; deadline: number; registration: object } {
     const request = prepareExperimentMaterialsSchema.parse(input)
     const root = resolve(serverRunRoot(binding.node.server, binding.experimentId), 'material-requests-v1')
     mkdirSync(root, { recursive: true, mode: 0o700 })
     const path = resolve(root, request.operationId + '.json')
     const value = { ...managedEnvironmentConfig(binding, this.policy, 'material-prepare'), request, materialCommandId: 'material-' + request.operationId,
-      deadline: Date.now() + storageGovernancePolicySchema.parse(this.policy.governance ?? {}).materialTimeoutMs }
+      deadline: Date.now() + storageGovernancePolicySchema.parse(this.policy.governance ?? {})[request.action === 'verify' ? 'verificationTimeoutMs' : 'materialTimeoutMs'],
+      ...(evidenceContext === undefined ? {} : { evidenceContext }) }
     if (existsSync(path)) {
       const original = z.object({ request: prepareExperimentMaterialsSchema, deadline: z.number().int(), placement: z.object({ experimentId: z.string(), serverId: z.string() }) }).parse(readManagedJson(path))
       if (original.placement.experimentId !== binding.experimentId || original.placement.serverId !== binding.node.server.id
-        || original.request.materialId !== request.materialId || original.request.budgetId !== request.budgetId
+        || original.request.materialId !== request.materialId || original.request.budgetId !== request.budgetId || original.request.reuseCandidateId !== request.reuseCandidateId
         || request.action !== 'recover' && original.request.action !== request.action) throw new Error('Material operation belongs to different content')
       value.deadline = original.deadline
       if (request.action === 'recover') {
@@ -379,11 +398,11 @@ export class ManagedEnvironments {
         const retry = resolve(root, request.operationId + '.attempt-' + attempt + '.json')
         writeFileSync(retry, JSON.stringify(value), { flag: 'wx', mode: 0o600 })
         return { argv: [this.policy.pythonPath, fileURLToPath(new URL('../scripts/managed-environment.py', import.meta.url)), retry],
-          commandId: value.materialCommandId, deadline: value.deadline, registration: { request, deadline: value.deadline, materialCommandId: value.materialCommandId } }
+          commandId: value.materialCommandId, deadline: value.deadline, registration: { request, deadline: value.deadline, materialCommandId: value.materialCommandId, ...(evidenceContext === undefined ? {} : { evidenceContext }) } }
       }
     } else writeFileSync(path, JSON.stringify(value), { flag: 'wx', mode: 0o600 })
     return { argv: [this.policy.pythonPath, fileURLToPath(new URL('../scripts/managed-environment.py', import.meta.url)), path],
-      commandId: value.materialCommandId, deadline: value.deadline, registration: { request, deadline: value.deadline, materialCommandId: value.materialCommandId } }
+      commandId: value.materialCommandId, deadline: value.deadline, registration: { request, deadline: value.deadline, materialCommandId: value.materialCommandId, ...(evidenceContext === undefined ? {} : { evidenceContext }) } }
   }
 
   /** @param binding - allocated destination. @param operationId - original material acquisition. @returns its immutable request after checking allocation identity. */
@@ -404,18 +423,27 @@ export class ManagedEnvironments {
     return value
   }
 
-  private async read(value: object, signal?: AbortSignal): Promise<unknown> {
+  private async read<T extends ReturnType<typeof managedEnvironmentConfig>>(value: T, signal?: AbortSignal): Promise<unknown> {
     const timeout = AbortSignal.timeout(this.policy.readTimeoutMs)
     const child = this.ctx.subprocess.spawn({ argv: [this.policy.pythonPath, fileURLToPath(new URL('../scripts/managed-environment.py', import.meta.url))],
       cwd: process.cwd(), signal: signal === undefined ? timeout : AbortSignal.any([timeout, signal]), graceMs: this.policy.readTimeoutMs,
       env: { PYTHONDONTWRITEBYTECODE: '1' }, stdio: { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' } })
-    let output = ''; let error = ''
-    child.stdout?.on('data', (chunk: Buffer) => { output += chunk.toString('utf8'); if (Buffer.byteLength(output) > this.policy.readBytes) child.terminate() })
-    child.stderr?.on('data', (chunk: Buffer) => { error = (error + chunk.toString('utf8')).slice(-65536) })
+    let output = ''; let error = ''; let outputLimited = false
+    const limit = () => { outputLimited = true; child.terminate() }
+    child.stdout?.on('data', (chunk: Buffer) => { output += chunk.toString('utf8'); if (Buffer.byteLength(output) > this.policy.readBytes) limit() })
+    child.stderr?.on('data', (chunk: Buffer) => { error += chunk.toString('utf8'); if (Buffer.byteLength(error) > this.policy.readBytes) limit() })
     child.stdin?.end(JSON.stringify(value))
     const exit = await child.done
-    if (!await child.waitForExit(AbortSignal.timeout(this.policy.readTimeoutMs))) throw new Error('Environment inspection process exit is unconfirmed')
-    if (exit.exitCode !== 0 || timeout.aborted || signal?.aborted) throw new Error(`Environment inspection failed: ${error || output}`)
+    const exitConfirmed = await child.waitForExit(AbortSignal.timeout(this.policy.readTimeoutMs))
+    if (!exitConfirmed || exit.exitCode !== 0 || timeout.aborted || signal?.aborted || outputLimited) {
+      const reason = signal?.aborted ? 'cancelled' : timeout.aborted ? 'read-timeout' : outputLimited ? 'output-limit' : !exitConfirmed ? 'exit-unconfirmed' : 'process-failed'
+      const directory = resolve(value.placement.runRoot, 'environment-read-diagnostics-v1', randomUUID())
+      await writeFileAtomic(resolve(directory, 'stderr.log'), error, { mode: 0o600 })
+      await writeFileAtomic(resolve(directory, 'stdout.log'), output, { mode: 0o600 })
+      await writeFileAtomic(resolve(directory, 'result.v1.json'), JSON.stringify({ version: 1, experimentId: value.placement.experimentId,
+        serverId: value.placement.serverId, action: value.action, reason, checkedAt: Date.now(), exitConfirmed, exit }), { mode: 0o600 })
+      throw new EnvironmentInspectionError(`Environment inspection ${reason}: ${error || output}`, directory)
+    }
     return JSON.parse(output)
   }
 }

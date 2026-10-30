@@ -5,7 +5,7 @@ import { resolve } from 'node:path'
 import { z } from 'zod'
 import { completionReviewSchema, completionSourceInputSchema, completionSourceSchema, executionEntrySchema,
   legacyCompletionEvidenceError, agentRecordRequestSchema, agentRecordSchema, completionReviewIdSchema } from '@aspera/experiments'
-import type { CompletionReview, CompletionCheck, CompletionSourceInput, CompletionSource, CompletionSupplement, HistoricalEnvironment,
+import type { CompletionReview, CompletionCheck, CompletionIssue, CompletionSourceInput, CompletionSource, CompletionSupplement, HistoricalEnvironment,
   ClusterRecord, ExecutionProgress, ExperimentProcess, ExperimentId, ExperimentServerId, AgentRecord, AgentRecordRequest, AgentRecordPage } from '@aspera/experiments'
 import { checkExperimentCompletion, redactObservation } from '@aspera/runtime'
 import { legacyTrainingStages, inspectRegisteredStage, finalizationPolicySchema } from '@aspera/runtime'
@@ -29,6 +29,7 @@ export interface CompletionReviewOwner {
   changed(): void
   redact(record: FleetExperiment, data: unknown): unknown
   trace(review: CompletionReview, request: AgentRecordRequest): Promise<AgentRecordPage | undefined>
+  serviceIssues?(record: FleetExperiment, signal: AbortSignal): Promise<CompletionIssue[]>
   finished?(id: ExperimentId): void
   report?(error: unknown): void
 }
@@ -41,7 +42,10 @@ export interface CompletionReviewTools {
   event(event: AgentRecord): void
   requirements(): StageRequirement[]
   progress(signal: AbortSignal): Promise<{ original?: ExecutionProgress; assessment?: CompletionAssessment }>
-  registerStage(input: StageRegistrationInput, signal: AbortSignal): Promise<StageRegistration>
+  /** @param input - original training identity and existing evidence paths. @param signal - review lifetime.
+   * @param expectedRevision - current assessment revision required for corrections. @returns registered evidence; passed bindings stay fixed.
+   */
+  registerStage(input: StageRegistrationInput, signal: AbortSignal, expectedRevision?: number): Promise<StageRegistration>
   verifyStage(serverId: ExperimentServerId, stageId: string, signal: AbortSignal): Promise<StageVerification>
   reportStep(input: { step: number; state: ReviewStep['state']; detail: string; sources: CompletionSourceInput[]; expectedRevision: number }, callId: string, signal: AbortSignal): Promise<CompletionAssessment>
 }
@@ -219,6 +223,9 @@ export class CompletionReviews {
     const row = this.status(id)!, record = this.owner.get(id), fresh = await this.owner.snapshot(record, signal)
     this.assertOriginal(row, fresh)
     const assessment = this.assessment(id), requirements = this.requirements(id), issues: CompletionCheck['issues'] = []
+    if (this.owner.serviceIssues !== undefined) issues.push(...await this.owner.serviceIssues(record, signal))
+    else if (fresh.record.services.some(service => service.external !== undefined)) issues.push({ code: 'results',
+      detail: 'Historical public inference has no independent recovery verification.', remedy: 'Recover and verify the existing public service before completion review.' })
     for (const node of fresh.record.submission.nodes) for (const requirement of requirements) {
       const registration = assessment?.stages.find(stage => stage.serverId === node.server.id && stage.stageId === requirement.stageId)
       if (registration === undefined) issues.push({ code: 'stages', serverId: node.server.id, detail: 'Missing historical stage registration: ' + requirement.stageId, remedy: 'Use register_experiment_stage with existing files and the program-returned approved requirements; never retrain.' })
@@ -254,8 +261,10 @@ export class CompletionReviews {
     return {
       requirements: () => this.requirements(id),
       progress: async inputSignal => { const signal = lifetime(inputSignal); active(); const fresh = await this.owner.snapshot(this.owner.get(id), signal); active(); this.assertOriginal(this.status(id)!, fresh); return { original: fresh.progress, assessment: this.assessment(id) } },
-      registerStage: (request, inputSignal) => this.serial(async () => {
-        const signal = lifetime(inputSignal), row = active(), record = this.owner.get(id), input = stageRegistrationInputSchema.parse(request)
+      registerStage: (request, inputSignal, expectedRevision) => this.serial(async () => {
+        const signal = lifetime(inputSignal), row = active(), record = this.owner.get(id)
+        if (request.previousAttemptId !== undefined) throw new Error('Historical completion review cannot retry training or replace original attempts')
+        const { previousAttemptId: _previous, ...input } = stageRegistrationInputSchema.parse(request)
         if (!record.submission!.nodes.some(node => node.server.id === input.serverId)) throw new Error('Historical stage node is outside the original experiment')
         const requirement = this.requirements(id).find(stage => stage.stageId === input.stageId)
         if (requirement === undefined) throw new Error('Stage is absent from the program-confirmed original requirements')
@@ -265,11 +274,20 @@ export class CompletionReviews {
           planRevision: row.planRevision, sessionId: row.executionSessionId, requirement, registeredAt: Date.now(), historical: true })
         const prior = current.stages.find(stage => stage.stageId === input.stageId && stage.serverId === input.serverId)
         if (prior !== undefined) {
-          if (hash({ ...prior, registeredAt: 0 }) !== hash({ ...registration, registeredAt: 0 })) throw new Error('Historical stage registration conflicts with its existing attempt and requirements')
-          return prior
+          if (hash({ ...prior, registeredAt: 0 }) === hash({ ...registration, registeredAt: 0 })) return prior
+          if (prior.attemptId !== registration.attemptId || prior.commandId !== registration.commandId || hash(prior.requirement) !== hash(registration.requirement)) {
+            throw new Error('Historical training identity and approved requirements cannot change during evidence correction')
+          }
+          if (current.verifications.some(value => value.stageId === input.stageId && value.serverId === input.serverId && value.ready)) {
+            throw new Error('Historical stage evidence is already verified; its binding cannot be replaced')
+          }
+          if (expectedRevision !== current.revision) throw new Error('Stage evidence correction requires the current assessment.revision as expected_revision; read get_experiment_execution_progress before retrying')
         }
         signal.throwIfAborted(); active()
-        this.saveAssessment({ ...current, stages: [...current.stages, registration], revision: current.revision + 1, updatedAt: Date.now() }); return registration
+        this.saveAssessment({ ...current,
+          stages: [...current.stages.filter(value => value.stageId !== input.stageId || value.serverId !== input.serverId), registration],
+          verifications: current.verifications.filter(value => value.stageId !== input.stageId || value.serverId !== input.serverId),
+          revision: current.revision + 1, updatedAt: Date.now() }); return registration
       }),
       verifyStage: (serverId, stageId, inputSignal) => this.serial(async () => {
         const signal = lifetime(inputSignal); active()

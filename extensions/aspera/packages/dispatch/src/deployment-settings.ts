@@ -2,6 +2,7 @@
 import { z } from 'zod'
 import { storagePlacementSchema, inferenceMappingSchema } from '@aspera/experiments'
 import { executableDirectoriesSchema } from '@aspera/experiments'
+import { planningPolicySchema } from '@aspera/experiments'
 
 /** Concrete server and preparation policy captured when a task is admitted. */
 export const pinnedTargetSchema = z.object({
@@ -14,6 +15,8 @@ export const pinnedTargetSchema = z.object({
   preparationOutputChars: z.number().int().min(1024).max(2_000_000).default(65536),
   tokenRef: z.string(), agentCredentialRefs: z.array(z.string()), toolTimeoutMs: z.number().int(),
   controlPollIntervalMs: z.number().int().min(100).default(1000),
+  documentationReadTimeoutMs: planningPolicySchema.shape.documentationReadTimeoutMs.unwrap().optional(),
+  documentationPageBytes: planningPolicySchema.shape.documentationPageBytes.unwrap().optional(),
   minimumFreeBytes: z.number().int().positive().optional(),
   inferenceMapping: inferenceMappingSchema.optional(),
 })

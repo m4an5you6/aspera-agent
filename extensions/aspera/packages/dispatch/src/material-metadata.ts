@@ -1,6 +1,7 @@
 /** Canonical provider metadata can be fetched by the local Host without transferring model payloads. */
 import { z } from 'zod'
 import type { inspectExperimentMaterialsSchema } from '@aspera/experiments'
+import { fetchModelScopeDatasetMetadata } from './modelscope-metadata.ts'
 
 /**
  * Read bounded metadata from the canonical provider and verify its immutable identity.
@@ -9,10 +10,15 @@ import type { inspectExperimentMaterialsSchema } from '@aspera/experiments'
  */
 export async function fetchCanonicalMaterialMetadata(options: {
   request: z.infer<typeof inspectExperimentMaterialsSchema>; readBytes: number; readTimeoutMs: number;
-  signal: AbortSignal; fetcher: typeof fetch;
+  signal: AbortSignal; fetcher: typeof fetch; pollIntervalMs: number;
+  gitReader?: typeof fetchModelScopeDatasetMetadata;
 }): Promise<unknown> {
   const { request, signal, readBytes, readTimeoutMs, fetcher } = options
-  if (request.provider !== 'huggingface') throw new Error('Canonical immutable metadata requires a provider-attested revision; mirror parameters are insufficient')
+  if (request.provider === 'modelscope') {
+    const value = await (options.gitReader ?? fetchModelScopeDatasetMetadata)(options)
+    z.object({ sha: z.literal(request.revision), id: z.literal(request.repository) }).parse(value)
+    return value
+  }
   const prefix = request.kind === 'dataset' ? 'datasets/' : 'models/'
   const response = await fetcher('https://huggingface.co/api/' + prefix + request.repository + '/revision/' + request.revision + '?blobs=true',
     { signal: AbortSignal.any([signal, AbortSignal.timeout(readTimeoutMs)]), redirect: 'error' })

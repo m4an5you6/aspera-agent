@@ -1,7 +1,5 @@
 /** Password-only SSH commands, SFTP uploads and receiver channels with host-key verification. */
-import { createReadStream } from 'node:fs'
 import { request as httpRequest } from 'node:http'
-import { pipeline } from 'node:stream/promises'
 import { setTimeout as delay } from 'node:timers/promises'
 import ssh2 from 'ssh2'
 import type { Client, ClientChannel, SFTPWrapper } from 'ssh2'
@@ -111,9 +109,12 @@ export async function passwordRemote(target: Target, password: string | undefine
  * @param password - private password.
  * @param command - quoted remote program.
  * @param signal - operation cancellation.
+ * @param output - optional complete output capture.
+ * @param input - optional UTF-8 standard input, sent once after the command channel opens.
  * @returns remote exit evidence; authentication and connection failures reject.
  */
-export async function passwordResult(target: Target, password: string | undefined, command: string, signal?: AbortSignal, output?: import('./transport.ts').CommandOutputSink): Promise<RemoteCommandResult> {
+export async function passwordResult(target: Target, password: string | undefined, command: string, signal?: AbortSignal,
+  output?: import('./transport.ts').CommandOutputSink, input?: string): Promise<RemoteCommandResult> {
   const result: RemoteCommandResult = { stdout: '', stderr: '', exitCode: null, signal: null, timedOut: false, cancelled: false, exitConfirmed: false }
   let started = false
   try {
@@ -137,6 +138,7 @@ export async function passwordResult(target: Target, password: string | undefine
         if (code !== undefined) { result.exitCode = code; result.exitConfirmed = true }
         resolve(result)
       })
+      if (input !== undefined) channel.end(input, 'utf8')
     })
     }))
   } catch (error) {
@@ -169,7 +171,10 @@ export function passwordCopy(
       })
     })
     try {
-      await pipeline(createReadStream(localPath), sftp.createWriteStream(remotePath, { mode: 0o600 }), { signal: lifetime })
+      lifetime.throwIfAborted()
+      await new Promise<void>((resolve, reject) => {
+        sftp.fastPut(localPath, remotePath, { mode: 0o600 }, error => { if (error) reject(error); else resolve() })
+      })
       return ''
     } finally {
       sftp.end()

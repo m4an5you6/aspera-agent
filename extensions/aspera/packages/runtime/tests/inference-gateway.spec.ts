@@ -17,13 +17,16 @@ async function listen(server: Server): Promise<number> {
   if (typeof address !== 'object' || address === null) throw new Error('Fixture listener has no port')
   return address.port
 }
-async function fixture(url?: string) {
+async function fixture(url?: string, requireContentLength = false) {
   mkdirSync(resolve('.artifacts'), { recursive: true })
   const root = mkdtempSync(resolve('.artifacts/inference-gateway-'))
   cleanup.push(async () => { rmSync(root, { recursive: true, force: true }) })
   const seen: { path: string; authorization: string | undefined; body: string }[] = []
   const backend = createServer((req, res) => {
     if (req.url === '/health') { res.end('ok'); return }
+    if (requireContentLength && typeof req.headers['content-length'] !== 'string') {
+      req.resume(); res.writeHead(411); res.end('Content-Length required'); return
+    }
     let body = ''
     req.on('data', chunk => { body += String(chunk) })
     req.on('end', () => {
@@ -64,6 +67,27 @@ it('requires a service-only Bearer key and forwards streaming POST bodies withou
   expect(await f.gateway.probe()).toMatchObject({ state: 'unreachable', detail: expect.stringContaining('503') })
   await f.gateway.close()
   await expect(fetch(f.address)).rejects.toThrow()
+})
+
+it('preserves a known UTF-8 request length for backends that do not accept chunked uploads', async () => {
+  const f = await fixture(undefined, true), access = f.gateway.access(), body = '{"prompt":"你好，模型"}'
+  const response = await fetch(access.url + '/v1/chat/completions', { method: 'POST',
+    headers: { authorization: 'Bearer ' + access.token, 'content-type': 'application/json' }, body })
+  expect(response.status).toBe(200)
+  expect(await response.text()).toContain('[DONE]')
+  expect(f.seen).toEqual([{ path: '/v1/chat/completions', authorization: undefined, body }])
+})
+
+it('keeps unknown-length uploads streaming and refuses declared oversized bodies before forwarding', async () => {
+  const f = await fixture(), access = f.gateway.access()
+  const body = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(Buffer.from('{"stream":')); controller.enqueue(Buffer.from('true}')); controller.close() } })
+  const request: RequestInit & { duplex: 'half' } = { method: 'POST', duplex: 'half', headers: { authorization: 'Bearer ' + access.token }, body }
+  const response = await fetch(access.url + '/v1/chat/completions', request)
+  expect(response.status).toBe(200); expect(await response.text()).toContain('[DONE]')
+  expect(f.seen).toHaveLength(1)
+  const oversized = await fetch(access.url + '/v1/chat/completions', { method: 'POST', headers: { authorization: 'Bearer ' + access.token }, body: 'x'.repeat(1025) })
+  expect(oversized.status).toBe(413); await oversized.body?.cancel()
+  expect(f.seen).toHaveLength(1)
 })
 
 it('reports a different service and refuses redirected health checks', async () => {

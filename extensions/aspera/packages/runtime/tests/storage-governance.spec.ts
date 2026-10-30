@@ -90,7 +90,13 @@ it('does not project storage settings into an original installer release', () =>
   const policy = managedEnvironmentPolicySchema.parse({ governance: storageGovernancePolicySchema.parse({}) })
   expect(managedEnvironmentPolicyForRelease(policy, true).governance).toBeUndefined()
   expect(managedEnvironmentPolicyForRelease(policy, true, true).governance).not.toHaveProperty('systemReserveBytes')
-  expect(managedEnvironmentPolicyForRelease(policy, true, true, true).governance).toEqual(policy.governance)
+  expect(managedEnvironmentPolicyForRelease(policy, true, true, true).governance).not.toHaveProperty('metadataProbeTimeoutMs')
+  expect(managedEnvironmentPolicyForRelease(policy, true, true, true, true).governance).toEqual(policy.governance)
+})
+it('requires the canonical probe to settle before the outer inspection timeout', () => {
+  expect(managedEnvironmentPolicySchema.safeParse({ readTimeoutMs: 10000 }).success).toBe(false)
+  expect(managedEnvironmentPolicySchema.safeParse({ readTimeoutMs: 10000, governance: { metadataProbeTimeoutMs: 5000, scanTimeoutMs: 5000 } }).success).toBe(true)
+  expect(managedEnvironmentPolicySchema.safeParse({ readTimeoutMs: 10000, governance: { metadataProbeTimeoutMs: 5000, scanTimeoutMs: 10000 } }).success).toBe(false)
 })
 
 it('accepts a program-recorded hard-link stamp without rewriting a prior material publication and rejects later content changes', () => {
@@ -119,4 +125,33 @@ it('accepts a program-recorded hard-link stamp without rewriting a prior materia
   expect(materialReadonlyPaths(f.run, f.root)).toEqual([directory]); expect(readFileSync(publication)).toEqual(before)
   writeFileSync(file, 'changed unverified weights')
   expect(() => materialReadonlyPaths(f.run, f.root)).toThrow(/identity changed/)
+})
+
+it('reads experiment-owned material publications without a mutable global catalog and retains compatible source protection', () => {
+  const f = fixture(), id = 'f'.repeat(64), source = { sourceExperimentId: f.value.sourceExperimentId, runRoot: f.source, directory: f.directory }
+  const observed = statSync(f.file, { bigint: true })
+  const publication = resolve(f.run, 'material-publications-0.1.2', id + '.json')
+  const binding = resolve(f.run, 'material-bindings-v1', id + '.json')
+  const lease = resolve(f.root, 'state/storage-governance-v1/material-source-leases', f.value.experimentId + '-' + id + '.json')
+  const manifest = { version: 1, formatVersion: '0.1.2', id, experimentId: f.value.experimentId, serverId: f.value.serverId,
+    kind: 'model', provider: 'huggingface', repository: 'fixture/model', revision: 'a'.repeat(40), directory: f.directory, historicalSource: source,
+    files: [{ path: 'package.py', bytes: Number(observed.size), algorithm: 'sha256', hash: createHash('sha256').update(readFileSync(f.file)).digest('hex'),
+      url: 'https://huggingface.co/fixture', mtimeNs: observed.mtimeNs.toString(), ctimeNs: observed.ctimeNs.toString() }],
+    totalBytes: Number(observed.size), verifiedBytes: Number(observed.size), missingBytes: 0, unknownBytes: 0, state: 'ready', checkedAt: 1,
+    volume: { source: 'fixture-volume', filesystem: 'ext4', directory: 'fixture-mount' } }
+  const publish = (value: typeof manifest) => {
+    writeFileSync(publication, JSON.stringify(value))
+    writeFileSync(binding, JSON.stringify({ version: 1, formatVersion: '0.1.2', experimentId: f.value.experimentId, serverId: f.value.serverId,
+      materialId: id, directory: f.directory, manifestHash: createHash('sha256').update(readFileSync(publication)).digest('hex'), readonly: true, checkedAt: 1 }))
+  }
+  for (const path of [publication, binding, lease]) mkdirSync(dirname(path), { recursive: true })
+  writeFileSync(lease, JSON.stringify({ version: 1, serverId: f.value.serverId, materialId: id, ...source })); publish(manifest)
+  expect(materialReadonlyPaths(f.run, f.root)).toEqual([f.directory])
+  rmSync(f.lease)
+  expect(() => assertStorageSourceAvailable(f.root, f.value.sourceExperimentId)).toThrow(/Historical model\/data/)
+  publish({ ...manifest, experimentId: f.value.sourceExperimentId })
+  expect(() => materialReadonlyPaths(f.run, f.root)).toThrow(/another experiment/)
+  publish(manifest)
+  writeFileSync(resolve(f.source, '.aspera-owner.json'), JSON.stringify({ version: 1, serverId: f.value.serverId, experimentId: randomUUID() }))
+  expect(() => materialReadonlyPaths(f.run, f.root)).toThrow(/source owner/)
 })

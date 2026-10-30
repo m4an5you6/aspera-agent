@@ -11,6 +11,11 @@
   "timeoutRecovered": true,
   "originalCommandSubmissions": 1,
   "independentVerification": true,
+  "storageSelection": {
+    "changedFreeSpace": true,
+    "matchingObservationSaved": true,
+    "submissionConsistent": true
+  },
   "deletedTaskRecovery": {
     "calls": [
       "inspect_preparation_environment",

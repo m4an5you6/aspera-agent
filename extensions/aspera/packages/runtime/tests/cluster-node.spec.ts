@@ -15,20 +15,97 @@ import { JsonStorageBackend } from '@deepseek-ai/dsh-storage-json'
 import { afterEach, expect, it, vi } from 'vitest'
 import { z } from 'zod'
 import { createClusterNode } from '../src/cluster-node.ts'
+import { CommandAdmissionRejected } from '../src/command-admission.ts'
+import { finalizationPolicySchema } from '../src/finalization-policy.ts'
 import { clusterNodeSchema, experimentIdSchema, processLogPageSchema, experimentProcessSchema, observationPolicySchema } from '@aspera/experiments'
 import type { StoragePlacement } from '@aspera/experiments'
 import { placement } from '../../experiments/tests/fixtures.ts'
 import { verifyStorage } from '../scripts/storage.mjs'
 import { probeControllerGpu } from '../src/controller.ts'
 import { controllerStatusSchema } from '@aspera/experiments'
-import { ManagedEnvironments, managedEnvironmentPolicySchema } from '../src/managed-environment.ts'
+import { ManagedEnvironments, managedEnvironmentPolicySchema, EnvironmentInspectionError } from '../src/managed-environment.ts'
 import type { ManagedEnvironmentPolicy } from '../src/managed-environment.ts'
 import { prepareExperimentEnvironmentSchema } from '@aspera/experiments'
+import { storageToolResult, storageToolPageSchema } from '../src/storage-tool-result.ts'
+import { prepareExperimentMaterialsSchema, materialOperationSchema } from '@aspera/experiments'
+import { stageRegistrationSchema } from '@aspera/experiments'
+import { CheckpointProtection } from '../src/checkpoint-protection.ts'
+import { serverRunRoot } from '../src/storage.ts'
+import { inferenceCheckpointCandidateSchema } from '@aspera/experiments'
 vi.mock('../src/controller.ts', async importOriginal => ({ ...await importOriginal<typeof import('../src/controller.ts')>(),
   probeControllerGpu: vi.fn(async () => ({ gpus: [{ uuid: 'GPU-11111111-1111-1111-1111-111111111111', name: 'CPU fixture GPU', devicePath: '/dev/nvidia0' }], devicePaths: ['/dev/nvidia0'] })) }))
 vi.mock('../scripts/storage.mjs', () => ({ verifyStorage: vi.fn((value: StoragePlacement) => value.candidate) }))
 const cleanup: (() => Promise<void>)[] = []
+
+it('protects approved checkpoint files from the next ordinary cleanup command', async () => {
+  const f = await fixture(), id = experimentIdSchema.parse(randomUUID())
+  const node = { ...f.node, server: { ...f.node.server, storagePlacement: placement(f.node.server.id, id, f.config.root) },
+    gpuInfo: 'GPU 0 (UUID: GPU-11111111-1111-1111-1111-111111111111)' }
+  await f.handler('allocate', { experimentId: id, deploymentId: 'a'.repeat(64), protocol: 4, node })
+  const root = serverRunRoot(node.server, id), workspace = resolve(root, 'workspace')
+  const files = ['trainer_state.json', 'adapter_model.safetensors', 'optimizer.pt', 'scheduler.pt']
+  const stage = stageRegistrationSchema.parse({ version: 1, experimentId: id, serverId: f.node.server.id,
+    sessionId: 'execution', planRevision: 1, registeredAt: 1, historical: false, stageId: 'stage1', attemptId: 'a1', commandId: 'train1',
+    parameters: 'args.json', trainerState: 'metrics/state.json', metrics: 'metrics/train.jsonl', requirement: {
+      stageId: 'stage1', planStep: 1, title: 'Preserve saved checkpoint', framework: 'transformers', startStep: 0,
+      additionalSteps: 2, endStep: 2, metricScope: 'stage', loggingSteps: 1,
+      scheduler: { mode: 'fresh', type: 'linear', learningRate: 0.001, totalSteps: 2, warmupSteps: 0 },
+      requiredFiles: files.map(name => 'checkpoints/protected/checkpoint-2/' + name) } })
+  await new CheckpointProtection(root, workspace, id, f.node.server.id).register(stage)
+  await f.handler('run', { experimentId: id, commandId: 'train1', command: 'train-fixture' })
+  const checkpoint = resolve(workspace, 'checkpoints/protected/checkpoint-2')
+  mkdirSync(checkpoint, { recursive: true })
+  for (const name of files) writeFileSync(resolve(checkpoint, name), name === 'trainer_state.json' ? '{"global_step":2}' : 'preserved')
+  f.handles[0]!.settle()
+  await vi.waitFor(async () => expect(await f.handler('command-status', { experimentId: id, commandId: 'train1' })).toMatchObject({ result: { state: 'completed', released: true } }))
+  await f.handler('run', { experimentId: id, commandId: 'format-evidence', command: 'rm -rf checkpoints/protected/checkpoint-2' })
+  const argv = f.spawn.mock.calls.at(-1)![0].argv
+  expect(argv.some((item, index) => item === '--ro-bind' && argv[index + 1] === checkpoint && argv[index + 2] === checkpoint)).toBe(true)
+})
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
+
+it('recovers a completed material verification after its exit settlement failed without relaunching it', async () => {
+  const f = await fixture(), id = experimentIdSchema.parse(randomUUID())
+  const node = { ...f.node, server: { ...f.node.server, storagePlacement: placement(f.node.server.id, id, f.config.root) },
+    gpuInfo: 'GPU 0 (UUID: GPU-11111111-1111-1111-1111-111111111111)' }
+  await f.handler('allocate', { experimentId: id, deploymentId: 'a'.repeat(64), protocol: 4, node })
+  const request = prepareExperimentMaterialsSchema.parse({ operationId: randomUUID(), materialId: 'c'.repeat(64), action: 'verify' })
+  let value = materialOperationSchema.parse({ version: 1, experimentId: id, serverId: node.server.id, operationId: request.operationId,
+    materialId: request.materialId, requestHash: 'd'.repeat(64), commandId: 'material-' + request.operationId, action: 'verify', state: 'requested',
+    startedAt: Date.now(), deadline: Date.now() + 60000, updatedAt: Date.now(), downloadedBytes: 0, reusedBytes: 0, exitConfirmed: false, admissionReleased: false })
+  let attempts = 0
+  const status = vi.spyOn(ManagedEnvironments.prototype, 'materialStatus').mockImplementation(() => value)
+  const original = vi.spyOn(ManagedEnvironments.prototype, 'materialOriginal').mockReturnValue(request)
+  const command = vi.spyOn(ManagedEnvironments.prototype, 'materialCommand').mockReturnValue({ argv: ['fixture-material'], commandId: value.commandId!, deadline: value.deadline, registration: request })
+  const governance = vi.spyOn(ManagedEnvironments.prototype, 'governance').mockImplementation(async (_binding, action) => {
+    if (action === 'material-settle') {
+      attempts += 1
+      if (attempts === 1) throw new Error('transient settlement write failure')
+      value = { ...value, exitConfirmed: true, admissionReleased: true, exitCode: 0 }; return value
+    }
+    return value
+  })
+  try {
+    await f.handler('material-prepare', { experimentId: id, ...request })
+    expect(await f.handler('material-prepare', { experimentId: id, ...request, action: 'recover' })).toMatchObject({ state: 'requested', admissionReleased: false })
+    expect(attempts).toBe(0); expect(f.spawn).toHaveBeenCalledOnce()
+    value = { ...value, state: 'completed', exitConfirmed: true }
+    f.handles[0]!.settle()
+    await vi.waitFor(() => { expect(attempts).toBe(1) })
+    await new Promise<void>(done => setImmediate(done))
+    expect(await f.handler('material-status', { experimentId: id, operationId: request.operationId })).toMatchObject({ admissionReleased: false,
+      settlementError: expect.stringContaining('transient settlement write failure') })
+    const failurePath = resolve(node.server.storagePlacement.runRoot, 'material-operations-v1', request.operationId, 'settlement-failure.v1.json')
+    const failure = JSON.parse(readFileSync(failurePath, 'utf8'))
+    writeFileSync(failurePath, JSON.stringify({ ...failure, experimentId: randomUUID() }))
+    await expect(f.handler('material-status', { experimentId: id, operationId: request.operationId })).rejects.toThrow('belongs to another operation')
+    writeFileSync(failurePath, JSON.stringify(failure))
+    expect(await f.handler('material-prepare', { experimentId: id, ...request, action: 'recover' })).toMatchObject({ state: 'completed', exitConfirmed: true, admissionReleased: true })
+    expect(attempts).toBe(2); expect(f.spawn).toHaveBeenCalledOnce()
+    expect(existsSync(resolve(f.config.root, 'state/environment-fences', id + '.json'))).toBe(false)
+    expect(existsSync(failurePath)).toBe(false)
+  } finally { governance.mockRestore(); command.mockRestore(); original.mockRestore(); status.mockRestore() }
+})
 async function loopbackPort(hold = false): Promise<number> {
   const listener = createServer()
   await new Promise<void>((ready, reject) => { listener.once('error', reject); listener.listen(0, '127.0.0.1', ready) })
@@ -70,6 +147,7 @@ async function fixture(policy: Partial<ManagedEnvironmentPolicy> = {}) {
   effect: (setup: () => () => Promise<void>) => { disposers.push(setup()) }, logger: { error: vi.fn(), debug: vi.fn() },
   })
   const config = { root, backendPath: '/usr/bin/bwrap', hiddenPaths: [], bootId: 'boot-1', chunkBytes: 1024, fileLimit: 10, cleanupTimeoutMs: 1000,
+    finalization: finalizationPolicySchema.parse({ diagnostics: { timeoutMs: 1000, logBytes: 1024 } }),
     deploymentId: 'a'.repeat(64), gpuSnapshot: { gpus: [{ uuid: 'GPU-11111111-1111-1111-1111-111111111111', name: 'CPU fixture GPU', devicePath: '/dev/nvidia0' }], devicePaths: ['/dev/nvidia0'] },
     serviceRequestTimeoutMs: 1000, serviceRequestBytes: 1024, devicePaths: ['/dev/nvidia0'],
     observations: observationPolicySchema.parse({ intervalMs: 60000 }), managedEnvironments: managedEnvironmentPolicySchema.parse(policy) }
@@ -146,6 +224,25 @@ it('records rejected environment startup and releases its fence without inventin
   const startup = JSON.parse(readFileSync(resolve(node.server.storagePlacement.runRoot, 'environment-launches-v1', request.operationId + '.json'), 'utf8'))
   expect(startup.state).toBe('not-started')
 })
+it('passes the actual node inspection response through the tool parser and preserves a scan failure', async () => {
+  const f = await fixture(); const id = experimentIdSchema.parse(randomUUID())
+  const node = { ...f.node, server: { ...f.node.server, storagePlacement: placement(f.node.server.id, id, f.config.root) },
+    gpuInfo: 'GPU 0 (UUID: GPU-11111111-1111-1111-1111-111111111111)' }
+  await f.handler('allocate', { experimentId: id, deploymentId: 'a'.repeat(64), protocol: 4, node })
+  const inspect = vi.spyOn(ManagedEnvironments.prototype, 'inspect').mockResolvedValue({
+    serverId: node.server.id, name: 'node', checkedAt: 123, source: 'remote', availableBytes: 17, capacityBytes: 30,
+    workspaceBytes: 0, sharedBytes: 0, reclaimableBytes: 0, environments: [], legacy: [], complete: false,
+  })
+  cleanup.push(async () => { inspect.mockRestore() })
+  const options = { runRoot: node.server.storagePlacement.runRoot, experimentId: id, serverId: node.server.id, maxBytes: 4096 }
+  const value = await f.handler('environment-inspect', { experimentId: id })
+  expect(await storageToolResult({ ...options, value })).toMatchObject({ availableBytes: 17, complete: false })
+  inspect.mockRejectedValueOnce(new Error('Original environment reference remains unconfirmed'))
+  const failed = JSON.parse(JSON.stringify(await storageToolResult({ ...options, value: await f.handler('environment-inspect', { experimentId: id }) })))
+  expect(failed).not.toHaveProperty('availableBytes')
+  expect(await storageToolResult({ ...options, page: storageToolPageSchema.parse(failed.sections.diagnostics.page) }))
+    .toMatchObject({ rows: ['Error: Original environment reference remains unconfirmed'] })
+})
 it('keeps legacy missing-command operations fenced and gives pending receipts stable times', async () => {
   const f = await fixture(); const id = experimentIdSchema.parse(randomUUID())
   const node = { ...f.node, server: { ...f.node.server, storagePlacement: placement(f.node.server.id, id, f.config.root) },
@@ -188,6 +285,34 @@ it('keeps lightweight installation status pending until the process group exits 
   expect(manager.runtime(binding, request.operationId)).toMatchObject({ exitConfirmed: true, exitCode: 0, admissionReleased: true, deadline: lifetime.deadline })
   await expect(f.handler('environment-status', { experimentId: experimentIdSchema.parse(randomUUID()), operationId: request.operationId })).rejects.toThrow('allocation')
 })
+it('confirms environment failure evidence only for the bound plan and Session after process release', async () => {
+  const f = await fixture(); const id = experimentIdSchema.parse(randomUUID())
+  const node = { ...f.node, server: { ...f.node.server, storagePlacement: placement(f.node.server.id, id, f.config.root) },
+    gpuInfo: 'GPU 0 (UUID: GPU-11111111-1111-1111-1111-111111111111)' }
+  await f.handler('allocate', { experimentId: id, deploymentId: 'a'.repeat(64), protocol: 4, node })
+  const request = prepareExperimentEnvironmentSchema.parse({ operationId: randomUUID(), environmentId: 'training', action: 'create', requirements: ['tiny-fixture==1'] })
+  const evidenceContext = { sessionId: 'aspera-execution-' + id, planRevision: 1 }
+  await f.handler('environment-prepare', { experimentId: id, ...request, evidenceContext })
+  const savedRequest = JSON.parse(readFileSync(resolve(node.server.storagePlacement.runRoot, 'environment-requests-v1', request.operationId + '.json'), 'utf8'))
+  expect(savedRequest.evidenceContext).toEqual(evidenceContext)
+  await expect(f.handler('environment-prepare', { experimentId: id, ...request, evidenceContext: { ...evidenceContext, planRevision: 2 } })).rejects.toThrow('different plan or Session')
+  const reference = { kind: 'environment-operation', id: request.operationId, serverId: node.server.id }
+  const input = { experimentId: id, reference, evidenceContext }
+  expect(await f.handler('storage-requirement-evidence', input)).toBeNull()
+  await expect(f.handler('storage-requirement-evidence', { ...input, evidenceContext: { ...evidenceContext, planRevision: 2 } })).rejects.toThrow('another plan or Session')
+  await expect(f.handler('storage-requirement-evidence', { ...input, evidenceContext: { ...evidenceContext, sessionId: 'foreign-session' } })).rejects.toThrow('another plan or Session')
+  await expect(f.handler('storage-requirement-evidence', { ...input, reference: { ...reference, serverId: randomUUID() } })).rejects.toThrow('another node')
+  const manager = new ManagedEnvironments(f.ctx)
+  const binding = { experimentId: id, node, deploymentId: 'a'.repeat(64), controlRoot: f.config.root, hiddenPaths: [] }
+  const folder = resolve(node.server.storagePlacement.runRoot, 'environment-operations-v1', request.operationId)
+  mkdirSync(folder, { recursive: true })
+  writeFileSync(resolve(folder, 'receipt.v1.json'), JSON.stringify({ ...manager.receipt(binding, request), state: 'blocked', exitConfirmed: true, exitCode: 1, detail: 'Historical distribution differs from its RECORD' }))
+  expect(await f.handler('storage-requirement-evidence', input)).toBeNull()
+  f.handles[0]!.settle(1)
+  await vi.waitFor(async () => { expect(await f.handler('environment-status', { experimentId: id, operationId: request.operationId })).toMatchObject({ state: 'failed', admissionReleased: true }) })
+  expect(await f.handler('storage-requirement-evidence', input)).toMatchObject({ experimentId: id, serverId: node.server.id,
+    ...evidenceContext, reference, detail: expect.stringContaining('other repair choices are not disproved') })
+})
 it.each(['timeout', 'cancelled'] as const)('retains the original installer deadline and records %s separately from its actual exit', async reason => {
   const f = await fixture({ timeoutMs: reason === 'timeout' ? 1000 : 1800000, stopTimeoutMs: 2000 }); const id = experimentIdSchema.parse(randomUUID())
   const node = { ...f.node, server: { ...f.node.server, storagePlacement: placement(f.node.server.id, id, f.config.root) },
@@ -217,9 +342,91 @@ it('uses maintenance capacity checks for owned cleanup while retaining ordinary 
   await f.handler('allocate', { experimentId: id, deploymentId: 'a'.repeat(64), protocol: 4, node })
   vi.mocked(verifyStorage).mockImplementationOnce(() => { throw new Error('Insufficient storage') })
   await expect(f.handler('run', { experimentId: id, commandId: 'train', command: 'true' })).rejects.toThrow('Insufficient storage')
+  const receipt = JSON.parse(readFileSync(resolve(node.server.storagePlacement.runRoot, 'command-admissions-0.1.3/train.json'), 'utf8'))
+  expect(receipt).toMatchObject({ experimentId: id, commandId: 'train', state: 'rejected', processState: 'not-started', requestHash: createHash('sha256').update('true').digest('hex') })
+  await expect(f.handler('run', { experimentId: id, commandId: 'train', command: 'different content' })).rejects.toThrow('bound to different content')
+  expect(f.spawn).not.toHaveBeenCalled()
   await f.handler('environment-cleanup', { experimentId: id, operationId: randomUUID(), nodes: [{ serverId: f.node.server.id, fingerprint: 'a'.repeat(64) }] })
   expect(verifyStorage).toHaveBeenLastCalledWith(node.server.storagePlacement, 0, true)
   expect(f.spawn).toHaveBeenCalledOnce()
+})
+
+it('restores a released native adapter through node requests and protects the snapshot in the next command', async () => {
+  const f = await fixture(), sourceId = experimentIdSchema.parse(randomUUID()), targetId = experimentIdSchema.parse(randomUUID())
+  const savedNode = (id: typeof sourceId) => ({ ...f.node, server: { ...f.node.server, storagePlacement: placement(f.node.server.id, id, f.config.root) },
+    gpuInfo: 'GPU 0 (UUID: GPU-11111111-1111-1111-1111-111111111111)' })
+  const sourceNode = savedNode(sourceId)
+  await f.handler('allocate', { experimentId: sourceId, deploymentId: 'a'.repeat(64), protocol: 4, node: sourceNode })
+  const originalRun = serverRunRoot(sourceNode.server, sourceId), originalWorkspace = resolve(originalRun, 'workspace')
+  writeFileSync(resolve(originalRun, '.aspera-owner.json'), JSON.stringify({ version: 1, experimentId: sourceId, serverId: f.node.server.id }))
+  const folder = 'outputs/checkpoint-2', files = ['adapter_model.safetensors', 'adapter_config.json', 'trainer_state.json', 'optimizer.pt', 'scheduler.pt']
+  mkdirSync(resolve(originalWorkspace, folder), { recursive: true })
+  for (const name of files) writeFileSync(resolve(originalWorkspace, folder, name), name === 'trainer_state.json' ? '{"global_step":2}' : 'retained test bytes')
+  const stage = stageRegistrationSchema.parse({ version: 1, experimentId: sourceId, serverId: f.node.server.id, sessionId: 'original', planRevision: 1,
+    stageId: 'trained', attemptId: 'original', commandId: 'train', registeredAt: 1, historical: false,
+    trainerState: folder + '/trainer_state.json', parameters: 'args.json', metrics: 'metrics.jsonl',
+    requirement: { stageId: 'trained', title: 'Native adapter', planStep: 1, framework: 'transformers', startStep: 0, additionalSteps: 2, endStep: 2,
+      metricScope: 'stage', loggingSteps: 1, scheduler: { mode: 'fresh', type: 'linear', learningRate: 0.0001, warmupSteps: 0, totalSteps: 2 }, requiredFiles: files.map(name => folder + '/' + name) } })
+  const retained = new CheckpointProtection(originalRun, originalWorkspace, sourceId, f.node.server.id)
+  await retained.register(stage)
+  await retained.mounts('read-only-history', [{ commandId: 'train', state: 'completed', exitCode: 0, released: true }])
+  expect(await f.handler('release', { experimentId: sourceId })).toEqual({ released: true })
+  const wrapper = JSON.parse(readFileSync(resolve(f.storageRoot, 'aspera_node/allocations', sourceId + '.json'), 'utf8'))
+  mkdirSync(resolve(f.storageRoot, 'aspera_node/commands'), { recursive: true })
+  writeFileSync(resolve(f.storageRoot, 'aspera_node/commands', sourceId + '_train.json'), JSON.stringify({ ...wrapper,
+    record: { experimentId: sourceId, commandId: 'train', command: 'original completed training', state: 'completed', exitCode: 0, released: true } }))
+  const node = await f.restart(true), targetNode = savedNode(targetId)
+  await node('allocate', { experimentId: targetId, deploymentId: 'a'.repeat(64), protocol: 4, node: targetNode })
+  const targetRun = serverRunRoot(targetNode.server, targetId)
+  writeFileSync(resolve(targetRun, '.aspera-owner.json'), JSON.stringify({ version: 1, experimentId: targetId, serverId: f.node.server.id }))
+  const discovered = z.object({ candidates: z.array(inferenceCheckpointCandidateSchema) }).parse(await node('inference-checkpoints', { experimentId: targetId, sourceExperimentId: sourceId }))
+  expect(discovered.candidates).toHaveLength(1)
+  const request = { experimentId: targetId, sourceExperimentId: sourceId, checkpointId: discovered.candidates[0]!.checkpointId, operationId: randomUUID() }
+  const prepared = z.object({ adapterPath: z.string(), snapshot: z.object({ state: z.literal('ready') }) }).parse(await node('inference-checkpoint-prepare', request))
+  expect(await node('inference-checkpoint-prepare', request)).toMatchObject(prepared)
+  await node('run', { experimentId: targetId, commandId: 'verify-snapshot', command: 'python verify.py' })
+  const argv = f.spawn.mock.calls[0]![0].argv
+  expect(argv.some((value, index) => value === '--ro-bind' && argv[index + 1] === prepared.adapterPath && argv[index + 2] === prepared.adapterPath)).toBe(true)
+  expect(readFileSync(resolve(originalWorkspace, folder, 'adapter_model.safetensors'), 'utf8')).toBe('retained test bytes')
+  f.handles[0]!.settle()
+})
+it('runs diagnostics with read-only mounts, bounded output and an independent lifetime', async () => {
+  const f = await fixture(), id = experimentIdSchema.parse(randomUUID())
+  await f.handler('allocate', { experimentId: id, deploymentId: 'a'.repeat(64), budget, deadline, node: f.node })
+  const input = { experimentId: id, commandId: 'diagnose', command: 'inspect current mount' }
+  await f.handler('diagnostic', input)
+  const argv = f.spawn.mock.calls[0]![0].argv
+  expect(argv).toContain('--size'); expect(argv).not.toContain('--bind'); expect(argv).not.toContain('--dev-bind')
+  f.handles[0]!.stdout.write('x'.repeat(4096))
+  expect(f.handles[0]!.terminate).toHaveBeenCalled()
+  f.handles[0]!.settle(143)
+  await vi.waitFor(async () => { expect(await f.handler('command-status', { experimentId: id, commandId: 'diagnose' })).toMatchObject({ result: { released: true, purpose: 'diagnostic', detail: expect.stringContaining('log limit') } }) })
+  await expect(f.handler('run', input)).rejects.toThrow('purpose')
+  await f.handler('diagnostic', { ...input, commandId: 'timed' })
+  await vi.waitFor(() => { expect(f.handles[1]!.terminate).toHaveBeenCalled() }, { timeout: 5000 })
+  f.handles[1]!.settle(143)
+  await vi.waitFor(async () => { expect(await f.handler('command-status', { experimentId: id, commandId: 'timed' })).toMatchObject({ result: { released: true, detail: expect.stringContaining('time limit') } }) })
+})
+it('does not certify a missing command when an original process identity is retained', async () => {
+  const f = await fixture(), id = experimentIdSchema.parse(randomUUID())
+  await f.handler('allocate', { experimentId: id, deploymentId: 'a'.repeat(64), budget, deadline: Date.now() - 1, node: f.node })
+  const folder = resolve(f.config.root, 'runs', id, 'process-identities'); mkdirSync(folder, { recursive: true })
+  writeFileSync(resolve(folder, 'probe.v1.json'), '{}')
+  try { await f.handler('run', { experimentId: id, commandId: 'probe', command: 'true' }); expect.fail('expired command was accepted') }
+  catch (error) { expect(error).not.toBeInstanceOf(CommandAdmissionRejected) }
+  expect(f.spawn).not.toHaveBeenCalled()
+})
+it('keeps diagnostic workspace access when a saved environment grant cannot be verified', async () => {
+  const f = await fixture(), id = experimentIdSchema.parse(randomUUID())
+  await f.handler('allocate', { experimentId: id, deploymentId: 'a'.repeat(64), budget, deadline, node: f.node })
+  const folder = resolve(f.config.root, 'runs', id, 'environment-borrowings-v1'); mkdirSync(folder, { recursive: true })
+  writeFileSync(resolve(folder, 'training.json'), '{}')
+  const result = await f.handler('diagnostic', { experimentId: id, commandId: 'inspect-storage', command: 'df -h .' })
+  expect(result).toMatchObject({ purpose: 'diagnostic', detail: expect.stringContaining('registered environment/material access is unavailable') })
+  const argv = f.spawn.mock.calls[0]![0].argv
+  expect(argv).not.toContain('--bind'); expect(argv).not.toContain('--dev-bind')
+  f.handles[0]!.settle()
+  await vi.waitFor(async () => { expect(await f.handler('command-status', { experimentId: id, commandId: 'inspect-storage' })).toMatchObject({ result: { released: true } }) })
 })
 it('rejects completion evidence naming an unregistered environment without launching an inspector', async () => {
   const f = await fixture(); const id = experimentIdSchema.parse(randomUUID())
@@ -228,6 +435,24 @@ it('rejects completion evidence naming an unregistered environment without launc
       gpuInfo: 'GPU 0 (UUID: GPU-11111111-1111-1111-1111-111111111111)' } })
   await expect(f.handler('environment-acceptance', { experimentId: id, environments: ['unmanaged-venv'] })).resolves.toMatchObject({ verified: false, detail: expect.stringContaining('not registered') })
   expect(f.spawn).not.toHaveBeenCalled()
+})
+it('keeps the same acceptance failure stable while retaining each diagnostic location', async () => {
+  const f = await fixture(), id = experimentIdSchema.parse(randomUUID())
+  const node = { ...f.node, server: { ...f.node.server, storagePlacement: placement(f.node.server.id, id, f.config.root) },
+    gpuInfo: 'GPU 0 (UUID: GPU-11111111-1111-1111-1111-111111111111)' }
+  await f.handler('allocate', { experimentId: id, deploymentId: 'a'.repeat(64), protocol: 4, node })
+  const read = vi.spyOn(ManagedEnvironments.prototype, 'governance')
+    .mockRejectedValueOnce(new EnvironmentInspectionError('Environment inspection process-failed: source still occupied', 'diagnostics/first'))
+    .mockRejectedValueOnce(new EnvironmentInspectionError('Environment inspection process-failed: source still occupied', 'diagnostics/second'))
+  try {
+    writeFileSync(resolve(node.server.storagePlacement.runRoot, 'storage-plan.v1.json'), JSON.stringify({ version: 1,
+      experimentId: id, serverId: node.server.id, operationId: randomUUID(), requestHash: 'b'.repeat(64), checkedAt: 1,
+      state: 'ready', environmentId: 'training', requirements: [], materialIds: [], volumes: [], detail: 'CPU fixture budget' }))
+    const first = await f.handler('environment-acceptance', { experimentId: id })
+    const second = await f.handler('environment-acceptance', { experimentId: id })
+    expect(first).toMatchObject({ verified: false, detail: 'Error: Environment inspection process-failed: source still occupied', diagnostics: 'diagnostics/first' })
+    expect(second).toMatchObject({ verified: false, detail: 'Error: Environment inspection process-failed: source still occupied', diagnostics: 'diagnostics/second' })
+  } finally { read.mockRestore() }
 })
 it('keeps another operation fenced when an old cleanup requests recovery', async () => {
   const f = await fixture(); const id = experimentIdSchema.parse(randomUUID())
@@ -283,7 +508,8 @@ it('scopes command observations and verifies command contents before a group sto
   const f = await fixture(), id = experimentIdSchema.parse(randomUUID())
   await f.handler('allocate', { experimentId: id, deploymentId: 'a'.repeat(64), protocol: 2, node: f.node })
   await f.handler('run', { experimentId: id, commandId: 'member', command: 'group member' })
-  await expect(f.handler('command-status', { experimentId: id, commandId: 'member' })).resolves.toMatchObject({ experimentId: id, serverId: f.node.server.id, result: { commandId: 'member', state: 'running', released: false } })
+  await expect(f.handler('command-status', { experimentId: id, commandId: 'member' })).resolves.toMatchObject({ experimentId: id, serverId: f.node.server.id,
+    requestHash: createHash('sha256').update('group member').digest('hex'), result: { commandId: 'member', state: 'running', released: false } })
   await expect(f.handler('command-status', { experimentId: randomUUID(), commandId: 'member' })).rejects.toThrow('absent')
   await expect(f.handler('stop-command', { experimentId: id, commandId: 'member', commandHash: 'a'.repeat(64) })).rejects.toThrow('contents differ')
   expect(f.handles[0]!.terminate).not.toHaveBeenCalled()
@@ -322,6 +548,9 @@ it('separates command output streams and refuses a cursor for a different source
   const request = { experimentId: id, serverId: f.node.server.id, commandId: 'train', stream: 'stdout' as const }
   const first = processLogPageSchema.parse(await f.handler('process-log', request))
   expect(Buffer.from(first.chunk.data, 'base64').toString()).toBe('step 1\n')
+  const bounded = processLogPageSchema.parse(await f.handler('process-log', { ...request, limit: 3 }))
+  expect(Buffer.from(bounded.chunk.data, 'base64').toString()).toBe('ste')
+  expect(bounded.cursor.offset).toBe(3); expect(bounded.chunk.eof).toBe(false)
   f.handles[0]!.stdout.write('step 2\n')
   const next = processLogPageSchema.parse(await f.handler('process-log', { ...request, cursor: first.cursor }))
   expect(Buffer.from(next.chunk.data, 'base64').toString()).toBe('step 2\n')
@@ -405,6 +634,10 @@ it('refuses excess GPU grants and verifies staged input content before execution
   expect(await f.handler('input', input)).toEqual({ nextOffset: 3 })
   await expect(f.handler('input', { ...input, data: Buffer.from('xyz').toString('base64') })).rejects.toThrow('different bytes')
   await expect(f.handler('verify-input', { experimentId: id, name: 'data.txt', sha256: 'b'.repeat(64) })).rejects.toThrow('digest mismatch')
+  const sha256 = createHash('sha256').update('abc').digest('hex')
+  expect(await f.handler('verify-input', { experimentId: id, name: 'data.txt', sha256 })).toEqual({ verified: true })
+  const verified = resolve(serverRunRoot(f.node.server, id), 'input-verifications-v1', createHash('sha256').update('data.txt').digest('hex') + '.json')
+  expect(JSON.parse(readFileSync(verified, 'utf8'))).toMatchObject({ version: 1, experimentId: id, name: 'data.txt', sha256 })
 })
 
 it('retains a process handle after incomplete cleanup and confirms it on a later cancellation', async () => {
@@ -441,6 +674,11 @@ it('deduplicates service launches and ignores an old health reply after confirme
     await f.handler('register-service', request)
     expect(f.spawn).toHaveBeenCalledOnce()
     await expect(f.handler('register-service', { ...request, command: 'different' })).rejects.toThrow('different content')
+    await expect(f.handler('stop-service', { experimentId: randomUUID(), serviceId: request.id })).rejects.toThrow('outside this experiment')
+    expect(await f.handler('stop-service', { experimentId: id, serviceId: request.id })).toMatchObject({ state: 'stopped', released: true })
+    expect(f.handles[0]!.terminate).toHaveBeenCalledOnce()
+    expect(await f.handler('register-service', { ...request, id: randomUUID(), command: 'python repaired-serve.py' })).toMatchObject({ state: 'starting', released: false })
+    expect(f.spawn).toHaveBeenCalledTimes(2)
   } finally { reply.resolve(new Response()); fetchMock.mockRestore() }
 })
 

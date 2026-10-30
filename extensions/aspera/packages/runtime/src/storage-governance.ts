@@ -4,9 +4,9 @@ import { createHash } from 'node:crypto'
 import { resolve, dirname, relative, isAbsolute, sep } from 'node:path'
 import { z } from 'zod'
 import s from '@deepseek-ai/schemastery'
-import { borrowedEnvironmentSchema, experimentMaterialBindingSchema, experimentMaterialSchema, storageArrangementSchema } from '@aspera/experiments'
+import { borrowedEnvironmentSchema, experimentMaterialBindingSchema, experimentMaterialSchema, storageArrangementSchema, storageRegistrationSchema } from '@aspera/experiments'
 import type { BorrowedEnvironment, ExperimentMaterial } from '@aspera/experiments'
-import { inspectStorage } from '../scripts/storage.mjs'
+import { inspectStorage, parseMounts } from '../scripts/storage.mjs'
 
 /** @param runRoot - original run. @param workspace - original data workspace. @param controlRoot - trusted node control root.
  * @returns a separately registered training workspace after owner and filesystem verification, or the original workspace.
@@ -43,6 +43,7 @@ export const storageGovernancePolicySchema = z.object({
   verificationTimeoutMs: z.number().int().min(1000).max(1800000).default(300000),
   materialTimeoutMs: z.number().int().min(1000).max(2147483647).default(7200000),
   metadataWaitTimeoutMs: z.number().int().min(1000).max(600000).default(120000),
+  metadataProbeTimeoutMs: z.number().int().min(100).max(120000).default(10000),
   networkReadTimeoutMs: z.number().int().min(1000).max(120000).default(30000),
   transferChunkBytes: z.number().int().min(65536).max(16777216).default(1048576),
   metadataBytes: z.number().int().min(65536).max(32000000).default(8388608),
@@ -68,6 +69,7 @@ export const StorageGovernancePolicyConfig: s<StorageGovernancePolicy> = s.objec
   verificationTimeoutMs: s.number().step(1).min(1000).max(1800000).default(300000),
   materialTimeoutMs: s.number().step(1).min(1000).max(2147483647).default(7200000),
   metadataWaitTimeoutMs: s.number().step(1).min(1000).max(600000).default(120000),
+  metadataProbeTimeoutMs: s.number().step(1).min(100).max(120000).default(10000),
   networkReadTimeoutMs: s.number().step(1).min(1000).max(120000).default(30000),
   transferChunkBytes: s.number().step(1).min(65536).max(16777216).default(1048576),
   metadataBytes: s.number().step(1).min(65536).max(32000000).default(8388608),
@@ -100,12 +102,37 @@ function materialFileCurrent(controlRoot: string, serverId: string, file: Experi
   const record = resolve(controlRoot, 'state/storage-governance-v1/file-objects', key + '.json')
   if (!existsSync(record)) return false
   const proof = z.object({ version: z.literal(1), serverId: z.string(), materialId: z.string(), path: z.string(), relativePath: z.string(),
-    algorithm: z.string(), hash: z.string(), bytes: z.number().int().nonnegative(), mtimeNs: z.string(), ctimeNs: z.string() }).strict().parse(readOwned(record))
+    algorithm: z.string(), hash: z.string(), bytes: z.number().int().nonnegative(), mtimeNs: z.string(), ctimeNs: z.string(), registrationId: z.string().optional() }).strict().parse(readOwned(record))
   if (proof.serverId !== serverId || proof.hash !== file.hash || proof.algorithm !== file.algorithm || proof.bytes !== file.bytes) return false
   checkAncestors(proof.path)
+  assertStorageRegistration(controlRoot, proof.path, proof.registrationId)
   const linked = statSync(proof.path, { bigint: true })
   return linked.dev === observed.dev && linked.ino === observed.ino && linked.size === observed.size && observed.mtimeNs.toString() === proof.mtimeNs
     && observed.ctimeNs.toString() === proof.ctimeNs && linked.ctimeNs === observed.ctimeNs
+}
+
+/** Check the registration that authorized a source, including its current root inode and device.
+ * @param controlRoot - trusted controller root. @param path - verified source. @param expected - registration captured during verification.
+ * @returns after the source is confirmed on the registered filesystem.
+ */
+export function assertStorageRegistration(controlRoot: string, path: string, expected?: string): void {
+  const folder = resolve(controlRoot, 'state/storage-governance-v1/registrations-0.1.3/current')
+  const rows = (existsSync(folder) ? readdirSync(folder) : []).filter(name => name.endsWith('.json'))
+    .map(name => storageRegistrationSchema.parse(readOwned(resolve(folder, name))))
+    .filter(row => resolve(path) === resolve(row.directory) || resolve(path).startsWith(resolve(row.directory) + sep))
+    .sort((a, b) => b.directory.length - a.directory.length)
+  const row = rows[0]
+  if (row?.registrationId !== expected) throw new Error('Source verification belongs to a previous storage registration; verify the current source')
+  if (row === undefined) return
+  checkAncestors(row.directory)
+  const identity = statSync(row.directory), lines = readFileSync('/proc/self/mountinfo', 'utf8').trim().split('\n')
+  const mounts = parseMounts(lines.join('\n'))
+  const mount = mounts.filter(value => row.directory === value.mountPoint || row.directory.startsWith(value.mountPoint === '/' ? '/' : value.mountPoint + '/'))
+    .sort((a, b) => b.mountPoint.length - a.mountPoint.length)[0]
+  const mountId = mount === undefined ? undefined : Number(lines[mounts.indexOf(mount)]!.split(' ')[0])
+  if (String(identity.dev) !== row.snapshot.device || String(identity.ino) !== row.snapshot.inode
+    || mount?.source !== row.snapshot.mount.source || mount.filesystem !== row.snapshot.mount.filesystem || mount.mountPoint !== row.snapshot.mount.directory
+    || mount.readOnly !== row.snapshot.mount.readonly || mountId !== row.snapshot.mount.mountId) throw new Error('Registered storage filesystem changed; inspect and verify it again')
 }
 
 /**
@@ -136,6 +163,8 @@ export function readBorrowedEnvironments(runRoot: string, controlRoot?: string):
   const owner = z.object({ version: z.literal(1), experimentId: z.string(), serverId: z.string() }).strict().parse(readOwned(resolve(runRoot, '.aspera-owner.json')))
   return readdirSync(root).filter(name => name.endsWith('.json')).map(name => {
     const value = borrowedEnvironmentSchema.parse(readOwned(resolve(root, name)))
+    if (controlRoot !== undefined) assertStorageRegistration(controlRoot, value.directory, value.registrationId)
+    else if (value.registrationId !== undefined) throw new Error('Registered source requires its controller root')
     if (value.experimentId !== owner.experimentId || value.serverId !== owner.serverId || value.environmentId + '.json' !== name) throw new Error('Historical environment grant belongs to another experiment')
     const source = z.object({ version: z.literal(1), experimentId: z.string(), serverId: z.string() }).strict().parse(readOwned(resolve(value.sourceRunRoot, '.aspera-owner.json')))
     if (source.experimentId !== value.sourceExperimentId || source.serverId !== value.serverId) throw new Error('Historical environment source owner changed')
@@ -180,18 +209,27 @@ export function materialReadonlyPaths(runRoot: string, controlRoot: string): str
   return readdirSync(root).filter(name => name.endsWith('.json')).map(name => {
     const binding = experimentMaterialBindingSchema.parse(readOwned(resolve(root, name)))
     if (binding.experimentId !== owner.experimentId || binding.serverId !== owner.serverId || name !== binding.materialId + '.json') throw new Error('Material binding belongs to another experiment')
-    const catalog = experimentMaterialSchema.parse(readOwned(resolve(controlRoot, 'state/storage-governance-v1/materials', name)))
-    if (catalog.id !== binding.materialId || catalog.serverId !== owner.serverId || catalog.directory !== binding.directory) throw new Error('Material catalog identity differs from its binding')
-    const publication = resolve(controlRoot, 'state/storage-governance-v1/material-publications', name)
+    const modern = binding.formatVersion === '0.1.2'
+    if (!modern) {
+      const catalog = experimentMaterialSchema.parse(readOwned(resolve(controlRoot, 'state/storage-governance-v1/materials', name)))
+      if (catalog.id !== binding.materialId || catalog.serverId !== owner.serverId || catalog.directory !== binding.directory) throw new Error('Material catalog identity differs from its binding')
+    }
+    const publication = modern ? resolve(runRoot, 'material-publications-0.1.2', name) : resolve(controlRoot, 'state/storage-governance-v1/material-publications', name)
     const manifest = experimentMaterialSchema.parse(readOwned(publication))
+    assertStorageRegistration(controlRoot, manifest.directory, manifest.registrationId)
+    if (modern && manifest.experimentId !== owner.experimentId) throw new Error('Material publication belongs to another experiment')
     if (createHash('sha256').update(readFileSync(publication)).digest('hex') !== binding.manifestHash) throw new Error('Material publication differs from its retained reference')
     if (manifest.id !== binding.materialId || manifest.serverId !== owner.serverId || manifest.state !== 'ready' || manifest.directory !== binding.directory) throw new Error('Material is not a published server-owned snapshot')
     const mounted = inspectStorage({ directory: manifest.directory }).candidates.find(value => value.directory === manifest.directory)?.mount
     if (mounted?.source !== manifest.volume.source || mounted.filesystem !== manifest.volume.filesystem || mounted.mountPoint !== manifest.volume.directory) throw new Error('Material data-volume identity changed')
     if (manifest.historicalSource !== undefined) {
       const source = manifest.historicalSource
+      const marker = z.object({ version: z.literal(1), experimentId: z.string(), serverId: z.string() }).strict().parse(readOwned(resolve(source.runRoot, '.aspera-owner.json')))
+      const sourceRelative = relative(resolve(source.runRoot, 'workspace'), manifest.directory)
+      if (marker.experimentId !== source.sourceExperimentId || marker.serverId !== owner.serverId || source.directory !== manifest.directory
+        || !sourceRelative || sourceRelative === '..' || sourceRelative.startsWith('..' + sep) || isAbsolute(sourceRelative)) throw new Error('Historical material source owner or path changed')
       const lease = z.object({ version: z.literal(1), serverId: z.string(), materialId: z.string(), sourceExperimentId: z.string(), runRoot: z.string(), directory: z.string() }).strict()
-        .parse(readOwned(resolve(controlRoot, 'state/storage-governance-v1/material-source-leases', name)))
+        .parse(readOwned(resolve(controlRoot, 'state/storage-governance-v1/material-source-leases', modern ? owner.experimentId + '-' + name : name)))
       if (lease.serverId !== owner.serverId || lease.materialId !== manifest.id || lease.sourceExperimentId !== source.sourceExperimentId
         || lease.runRoot !== source.runRoot || lease.directory !== manifest.directory) throw new Error('Historical material lease differs from its publication')
     }

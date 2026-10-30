@@ -94,8 +94,9 @@ const phaseLabels = { preparation: 'phasePreparation', planning: 'phasePlanning'
 /** @param props - experiment, official renderer and API. @returns read-only official trajectories without a composer. */
 export function AgentRecords({ controller, row, t, onLog, renderFactorySlot, offline = false }: { controller: ExperimentsController; row: FleetExperiment;
   t: TranslateNS<'experiments'>; onLog: (serverId: string, commandId: string) => void; offline?: boolean } & PropsRenderFactories) {
-  const [phase, setPhase] = useState<ExperimentPhase | 'review'>(() => {
+  const [phase, setPhase] = useState<ExperimentPhase | 'review' | 'recovery'>(() => {
     if (row.completionReview !== undefined) return 'review'
+    if (row.acceptanceRecovery !== undefined) return 'recovery'
     const current = experimentProgress(row).phase
     return current >= 2 ? 'execution' : current === 1 ? 'planning' : 'preparation'
   })
@@ -103,6 +104,13 @@ export function AgentRecords({ controller, row, t, onLog, renderFactorySlot, off
     planning: new TraceFeed(controller, row.request.experimentId, 'planning'), execution: new TraceFeed(controller, row.request.experimentId, 'execution') }))
   const progress = experimentProgress(row)
   const operationId = row.completionReview?.operationId
+  const recoveryId = row.acceptanceRecovery?.pendingRuntimeId ?? row.acceptanceRecovery?.recoveryExperimentId
+  const recoveryRow = recoveryId === undefined ? row : controller.store.getSnapshot().experiments.find(value => value.request.experimentId === recoveryId)
+    ?? { ...row, request: { ...row.request, experimentId: recoveryId } }
+  const recoveryStage = experimentProgress(recoveryRow).phase
+  const recoveryPhase = recoveryStage === 0 ? 'preparation' : recoveryStage === 1 ? 'planning' : 'execution'
+  const recoveryFeed = useMemo(() => recoveryId === undefined ? undefined : new TraceFeed(controller, recoveryId, recoveryPhase), [controller, recoveryId, recoveryPhase])
+  useEffect(() => { recoveryFeed?.activate(); return () => { recoveryFeed?.dispose() } }, [recoveryFeed])
   const reviewFeed = useMemo(() => operationId === undefined ? undefined : new TraceFeed(controller, row.request.experimentId, 'execution', operationId), [controller, row.request.experimentId, operationId])
   useEffect(() => { reviewFeed?.activate(); return () => { reviewFeed?.dispose() } }, [reviewFeed])
   useEffect(() => { for (const feed of Object.values(feeds)) feed.activate(); return () => { for (const feed of Object.values(feeds)) feed.dispose() } }, [feeds])
@@ -110,12 +118,15 @@ export function AgentRecords({ controller, row, t, onLog, renderFactorySlot, off
     const state = index < progress.phase ? 'completed' : index > progress.phase ? 'idle' : progress.issue ? 'failed' : progress.busy ? 'running' : 'idle'
     return <button key={value} type="button" aria-pressed={phase === value} data-state={state} onClick={() => { setPhase(value) }}>
       <span aria-hidden>{state === 'completed' ? '✓' : state === 'failed' ? '×' : state === 'running' ? '●' : '○'}</span>{t(phaseLabels[value])}</button>
-  })}{reviewFeed !== undefined && <button type="button" aria-pressed={phase === 'review'} onClick={() => { setPhase('review') }}>{t('reviewTrace')}</button>}</div>
+  })}{recoveryFeed !== undefined && <button type="button" aria-pressed={phase === 'recovery'} onClick={() => { setPhase('recovery') }}>{t('inferenceRecoveryTrace')}</button>}
+    {reviewFeed !== undefined && <button type="button" aria-pressed={phase === 'review'} onClick={() => { setPhase('review') }}>{t('reviewTrace')}</button>}</div>
   return <section className={css.officialRecords} aria-label={t('agentRecords')}>
     {phases.map(value => <PhaseTrace key={value} active={phase === value} phase={value} feed={feeds[value]} row={row} t={t}
       toolbar={toolbar} renderFactorySlot={renderFactorySlot} controller={controller} onLog={onLog} offline={offline && value !== 'preparation'} />)}
     {reviewFeed !== undefined && <PhaseTrace key={operationId} active={phase === 'review'} phase="execution" feed={reviewFeed} row={row} t={t}
       toolbar={toolbar} renderFactorySlot={renderFactorySlot} controller={controller} onLog={onLog} offline />}
+    {recoveryFeed !== undefined && <PhaseTrace key={recoveryId + '/' + recoveryPhase} active={phase === 'recovery'} phase={recoveryPhase} feed={recoveryFeed} row={recoveryRow} t={t}
+      toolbar={toolbar} renderFactorySlot={renderFactorySlot} controller={controller} onLog={() => { controller.select(recoveryId!) }} offline={false} />}
   </section>
 }
 

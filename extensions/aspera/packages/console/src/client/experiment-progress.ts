@@ -12,7 +12,9 @@ export const experimentPhases = ['prepareEnvironment', 'makePlan', 'executePlan'
 export function experimentProgress(row: FleetExperiment) {
   const remote = row.latest ?? row.receipt
   const review = row.completionReview
-  const status: NonNullable<FleetExperiment['latest']>['state'] | FleetExperiment['state'] | 'revalidated' | 'reviewing' | 'review-blocked' = review?.phase === 'passed' && review.remoteCommitted && review.check?.ready === true && review.originalRevision === remote?.revision ? 'revalidated'
+  const recovery = row.acceptanceRecovery
+  const recovering = recovery !== undefined && ['recovering', 'verifying', 'reviewing'].includes(recovery.phase)
+  const status: NonNullable<FleetExperiment['latest']>['state'] | FleetExperiment['state'] | 'revalidated' | 'reviewing' | 'review-blocked' = recovering ? 'reviewing' : recovery?.phase === 'blocked' ? 'review-blocked' : review?.phase === 'passed' && review.remoteCommitted && review.check?.ready === true && review.originalRevision === remote?.revision ? 'revalidated'
     : review?.phase === 'collecting' || review?.phase === 'verifying' ? 'reviewing'
       : review?.phase === 'blocked' ? 'review-blocked' : remote?.state ?? row.state
   const local = row.receipt === undefined && remote === undefined

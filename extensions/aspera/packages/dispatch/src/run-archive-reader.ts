@@ -99,15 +99,24 @@ export class RunArchiveReader {
     if (live !== undefined && serverId === record.coordinator.id) catalog.record = live
     for (const current of [live, catalog.record]) if (current !== undefined && JSON.stringify(current.submission) !== JSON.stringify(record.submission)) throw new Error('Archive receipt does not match this fixed submission')
     const current = catalog.record ?? record.latest ?? record.receipt
-    catalog.sources = catalog.sources.filter(source => source.kind !== 'trace' ||
-      (source.phase === 'planning' ? current?.planningSessionId !== undefined : current?.sessionId !== undefined))
     for (const source of catalog.sources) {
       if (posix.isAbsolute(source.path) || source.path.split(/[\\/]/).includes('..')) throw new Error('Archive catalog path is outside its experiment')
       if (source.source !== undefined && (source.source.experimentId !== record.request.experimentId || source.source.serverId !== serverId)) throw new Error('Archive source belongs to another experiment or node')
+    }
+    const session = (phase: 'planning' | 'execution', saved: string | undefined): string | undefined => {
+      if (saved !== undefined) return saved
+      if (!catalog.sources.some(source => source.kind === 'trace' && source.phase === phase)) return undefined
+      const declared = new Set(catalog.sources.flatMap(source => source.source?.kind === 'agent' && source.source.phase === phase
+        && source.source.sessionId !== undefined ? [source.source.sessionId] : []))
+      if (declared.size > 1) throw new Error('Archive phase has multiple declared Agent Sessions without a confirmed queue identity: ' + phase)
+      return declared.values().next().value
+    }
+    const sessions = { planning: session('planning', current?.planningSessionId), execution: session('execution', current?.sessionId) }
+    catalog.sources = catalog.sources.filter(source => source.kind !== 'trace' || sessions[source.phase === 'planning' ? 'planning' : 'execution'] !== undefined)
+    for (const source of catalog.sources) {
       if (source.kind === 'trace') {
         if (serverId !== record.coordinator.id) throw new Error('Archive trace is not on its recorded coordinator')
-        const expected = source.phase === 'planning' ? current?.planningSessionId ?? `aspera-plan-${record.request.experimentId}` : current?.sessionId ?? `aspera-execution-${record.request.experimentId}`
-        source.sessionId = expected
+        source.sessionId = sessions[source.phase === 'planning' ? 'planning' : 'execution']
       }
     }
     if (catalog.progress !== undefined && (catalog.progress.experimentId !== record.request.experimentId || catalog.progress.planRevision !== current?.plan?.revision

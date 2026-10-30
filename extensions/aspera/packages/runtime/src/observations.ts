@@ -88,14 +88,15 @@ export function importObservation(root: string, source: ObservationSource, rows:
   }
 }
 
-/** Captures complete command output, with timestamps and stream order, before tool-result truncation. */
+/** Captures timestamped command output; a configured byte ceiling marks omitted output incomplete. */
 export class ObservationWriter {
   private readonly decoders = { stdout: new StringDecoder('utf8'), stderr: new StringDecoder('utf8') }
   private readonly pending = { stdout: '', stderr: '' }
   private readonly secretTail = { stdout: false, stderr: false }
   private readonly path: string
   private closed = false
-  constructor(private readonly root: string, private readonly source: ObservationSource, private readonly secrets: readonly string[] = []) {
+  private truncated = false
+  constructor(private readonly root: string, private readonly source: ObservationSource, private readonly secrets: readonly string[] = [], private readonly maxBytes?: number) {
     registerObservation(root, source)
     this.path = sourcePath(root, source.id, 'jsonl')
     appendFileSync(this.path, '', { mode: 0o600 })
@@ -103,6 +104,7 @@ export class ObservationWriter {
   /** @param stream - actual process output pipe. @param chunk - received bytes. */
   append(stream: 'stdout' | 'stderr', chunk: Buffer | string): void {
     if (this.closed) throw new Error('Observation capture has ended')
+    if (this.truncated) return
     let text = typeof chunk === 'string' ? chunk : this.decoders[stream].write(chunk)
     if (this.secretTail[stream]) {
       const delimiter = text.search(/[\s,"'};]/)
@@ -122,15 +124,21 @@ export class ObservationWriter {
     }
   }
   private write(stream: 'stdout' | 'stderr', text: string): void {
+    if (this.truncated) return
     // Each JSONL record is bounded so a history read can always make progress.
     const safe = redactObservation(text, this.secrets)
     for (let index = 0; index < safe.length;) {
       let end = Math.min(safe.length, index + 4096)
       if (end < safe.length && /[\uD800-\uDBFF]/.test(safe[end - 1]!)) end--
-      appendFileSync(this.path, JSON.stringify({ seq: statSync(this.path).size, time: Date.now(), stream, text: safe.slice(index, end) }) + '\n', { mode: 0o600 })
+      const size = statSync(this.path).size
+      const row = JSON.stringify({ seq: size, time: Date.now(), stream, text: safe.slice(index, end) }) + '\n'
+      if (this.maxBytes !== undefined && size + Buffer.byteLength(row) > this.maxBytes) { this.truncated = true; return }
+      appendFileSync(this.path, row, { mode: 0o600 })
       index = end
     }
   }
+  /** Whether the configured capture ceiling omitted output. */
+  get limited(): boolean { return this.truncated }
   /** @param complete - whether the command's complete output and exit were observed. */
   close(complete = true): void {
     if (this.closed) return
@@ -138,7 +146,7 @@ export class ObservationWriter {
     for (const stream of ['stdout', 'stderr'] as const) {
       this.write(stream, this.pending[stream] + this.decoders[stream].end()); this.pending[stream] = ''
     }
-    registerObservation(this.root, { ...this.source, complete })
+    registerObservation(this.root, { ...this.source, complete: complete && !this.truncated })
   }
 }
 

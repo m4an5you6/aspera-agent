@@ -3,6 +3,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { materialOperationSchema } from '@aspera/experiments'
 import type { MaterialOperation, ExperimentId, ExperimentServerId, StorageOperationId, StorageObjectId } from '@aspera/experiments'
 import type { ManagedEnvironmentPolicy } from './managed-environment.ts'
+import { ClusterNodeOperationError } from './cluster-runtime.ts'
 
 /** A lost connection preserves available evidence without inventing a material ID or byte counters. */
 export interface UnconfirmedMaterialOperation {
@@ -30,7 +31,11 @@ export async function prepareMaterialAndWait(options: {
     ...(last === undefined ? {} : { last }) })
   signal.throwIfAborted()
   try { await options.submit(requestSignal()) }
-  catch (error) { signal.throwIfAborted(); failure = error; failedSince = Date.now() }
+  catch (error) {
+    signal.throwIfAborted()
+    if (error instanceof ClusterNodeOperationError && error.status >= 400 && error.status < 500) throw error
+    failure = error; failedSince = Date.now()
+  }
   for (;;) {
     signal.throwIfAborted()
     try {
@@ -41,6 +46,7 @@ export async function prepareMaterialAndWait(options: {
       if (last !== undefined && (last.deadline !== value.deadline || last.startedAt !== value.startedAt || last.requestHash !== value.requestHash)) return unknown('Original material request or deadline changed; inspect the retained acquisition receipts')
       last = value; failedSince = undefined
       if ((value.state === 'completed' || value.state === 'blocked') && value.exitConfirmed && value.admissionReleased) return value
+      if (value.settlementError !== undefined) return unknown('Material process settlement requires recovery of this original operation: ' + value.settlementError)
       if (Date.now() >= value.deadline + policy.stopTimeoutMs) return unknown('Material budget expired; original process exit and admission release still require recovery')
     } catch (error) {
       signal.throwIfAborted(); failure = error; failedSince ??= Date.now()

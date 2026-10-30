@@ -11,12 +11,14 @@ import { checkServerManagement, checkExperimentManagement } from './test-managem
 import { checkStageLayout, checkOverviewPhase } from './test-stage-layout.mjs'
 import { checkExecutionOverview } from './test-overview.mjs'
 import { checkInterruption } from './test-interruption-ui.mjs'
+import { checkInferenceServices, checkServiceConnection, stopFixtureService } from './test-service-ui.mjs'
 
 import { fixtureOptions, fixtureProvider } from './fixtures/models.mjs'
 
 const root = resolve(import.meta.dirname, '..')
 const expect = baseExpect.configure({ timeout: 40000 })
 const focusedOverview = process.argv.includes('--case=overview')
+const focusedServices = process.argv.includes('--case=services')
 // Fresh published DSH profiles have measured 128 s cold starts on Windows; readiness still requires the profile's own signal.
 const profileStartupMs = 180000
 mkdirSync(resolve(root, '.artifacts'), { recursive: true })
@@ -136,7 +138,13 @@ try {
     assert.equal(response.status(), 200, JSON.stringify(value))
     return value
   }
-  if (focusedOverview) {
+  if (focusedServices) {
+    const services = await checkInferenceServices(page, control, create, browser, app.url, externalUrl, resolve(root, '.artifacts'))
+    assert.deepEqual(errors, [])
+    writeFileSync(resolve(root, '.artifacts/inference-services-regression.json'), JSON.stringify(services, null, 2) + '\n')
+    verified = true
+    console.log('Production inference services: authenticated calls, aliases, state isolation, history, themes and release passed.')
+  } else if (focusedOverview) {
     const overview = await checkExecutionOverview(page, control, create, browser, app.url, resolve(root, '.artifacts'))
     assert.deepEqual(errors, [])
     writeFileSync(resolve(root, '.artifacts/overview-regression.json'), JSON.stringify(overview, null, 2) + '\n')
@@ -268,27 +276,15 @@ try {
   const downloaded = await downloadEvent
   assert.equal(readFileSync(await downloaded.path(), 'utf8'), 'local output\n')
   await page.getByRole('button', { name: /^(推理服务|Inference services)$/ }).last().click()
-  await expect(page.getByText(/外部地址已验证|External address verified/, { exact: true })).toBeVisible()
-  assert.equal((await page.request.get(externalUrl)).status(), 401)
-  await page.getByRole('button', { name: /查看调用信息与密钥|Show calling information and key/ }).click()
-  const keyExample = page.locator('pre').filter({ hasText: 'Authorization: Bearer' })
-  await expect(keyExample).toBeVisible()
-  const serviceKey = (await keyExample.innerText()).match(/Bearer ([a-f0-9]{64})/)[1]
-  assert.equal(JSON.stringify(await control()).includes(serviceKey), false)
-  assert.equal((await page.request.get(externalUrl, { headers: { authorization: 'Bearer ' + serviceKey } })).status(), 200)
-  await page.getByRole('button', { name: /隐藏调用信息|Hide calling information/ }).click()
-  await page.getByRole('button', { name: /^(通过受管理的连接访问|Access through managed connection)$/ }).click()
-  await expect(page.locator('pre').last()).toContainText('CPU fixture response')
-  await page.screenshot({ path: resolve(root, '.artifacts/web-service.png'), fullPage: true })
+  await checkServiceConnection(page, control, externalUrl, resolve(root, '.artifacts'))
   await page.close()
   page = await context.newPage()
   await openAspera(page, app.url)
   await page.getByRole('button').filter({ has: page.getByText('CPU semi experiment', { exact: true }) }).click()
   await expect(page.locator('header').getByRole('status')).toHaveText(/服务中|Serving/, { timeout: profileStartupMs })
   await page.getByRole('button', { name: /^(推理服务|Inference services)$/ }).last().click()
-  await page.getByRole('button', { name: /^(停止服务|Stop service)$/ }).click()
+  await stopFixtureService(page, control)
   await expect(page.locator('header').getByRole('status')).toHaveText(/已完成|Completed/)
-  await expect(page.getByText(/外部访问已停止|External access stopped/, { exact: true })).toBeVisible()
   await page.getByRole('button', { name: /^(返回实验|Back to experiments)$/ }).click()
   await page.getByRole('button').filter({ has: page.getByText('CPU shared experiment', { exact: true }) }).click()
   await expect(page.locator('header').getByRole('status')).toHaveText(/服务中|Serving/, { timeout: profileStartupMs })

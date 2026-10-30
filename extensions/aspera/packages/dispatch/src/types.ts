@@ -134,6 +134,10 @@ export interface DeletedExperiment {
 
 /** Concrete input and execution evidence for one independently dispatched experiment. */
 export interface FleetExperiment {
+  /** Presentation-only recovery execution and checkpoint-bound public checks; raw terminal results remain unchanged. */
+  acceptanceRecovery?: import('@aspera/experiments/types').AcceptanceRecovery
+  /** Presentation-only original task owning this inference recovery runtime. */
+  acceptanceParentId?: ExperimentId
   /** Presentation-only supplementary assessment; never written into fleet generation 6. */
   completionReview?: import('@aspera/experiments/types').CompletionReview
   /** Presentation-only original-result-bound stage and step supplements. */
@@ -185,6 +189,7 @@ export interface PinnedDeployment {
   pathEntries?: string[]
   preparationOutputChars: number
   toolTimeoutMs: number; controlPollIntervalMs: number;
+  documentationReadTimeoutMs?: number; documentationPageBytes?: number;
   minimumFreeBytes?: number
   inferenceMapping?: InferenceMapping
 }

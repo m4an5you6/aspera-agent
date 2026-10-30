@@ -11,6 +11,7 @@ import { FinalizationPolicyConfig } from './finalization-policy.ts'
 
 export * from '@aspera/experiments'
 export { inspectServerStorage, prepareServerStorage, verifyServerStorage, cleanupServerStorage, resolveStoragePlacement, serverRunRoot, serverReleaseRoot } from './storage.ts'
+export { pythonMainInput } from './python-input.ts'
 export { clusterFileHash, readClusterPrivate, clusterPrivateSchema, clusterAgentModelSchema } from './cluster-runtime.ts'
 export { ObservationWriter, observationSources, readObservation, redactObservation, importObservation } from './observations.ts'
 export { readTraceAttachment } from './trace-attachments.ts'
@@ -36,12 +37,15 @@ export const Config: z<Config> = z.object({
   gpuSnapshot: z.union([z.const(undefined), z.object({ gpus: z.array(z.object({ uuid: z.string(), name: z.string(), devicePath: z.string() })), devicePaths: z.array(z.string()) })]),
   chunkBytes: z.number().step(1).min(1024).max(65536).default(65536),
   fileLimit: z.number().step(1).min(1).default(1000),
+  storageToolResultBytes: z.number().step(1).min(4096).max(65536).default(8192),
   cleanupTimeoutMs: z.number().step(1).min(1000).default(30000),
   serviceRequestTimeoutMs: z.number().step(1).min(1000).default(300000),
   serviceRequestBytes: z.number().step(1).min(1024).default(16777216),
   pollIntervalMs: z.number().step(1).min(100).default(1000),
   documentationHosts: z.array(z.string()).default(['github.com', 'raw.githubusercontent.com', 'docs.nvidia.com', 'unsloth.ai', 'docs.unsloth.ai', 'swift.readthedocs.io', 'huggingface.co']),
   documentationBytes: z.number().step(1).min(1024).default(1048576),
+  documentationReadTimeoutMs: z.number().step(1).min(1).max(2_147_483_647).default(30000),
+  documentationPageBytes: z.number().step(1).min(1024).max(65536).default(8192),
   goalContinuationWindow: z.number().step(1).min(2).max(10000).default(128),
   agentContext: PhaseContextPolicyConfig.default({}),
   managedEnvironments: ManagedEnvironmentPolicyConfig.default({}),

@@ -119,6 +119,15 @@ class RecoveryTests(unittest.TestCase):
         with patch.object(recovery, "listening", return_value=True):
             self.assertEqual(recovery.run(self.request)["state"], "occupied")
 
+    def test_public_service_checks_the_saved_backend_and_mapping_ports(self):
+        service = {"port": 18000, "external": {"url": "https://example.invalid:8443", "port": 3000, "state": "reachable"}}
+        with patch.object(recovery, "listening", side_effect=lambda port, timeout: port == 3000) as check:
+            self.assertTrue(recovery.service_listening(service, 1))
+            self.assertIn(3000, {call.args[0] for call in check.call_args_list})
+        with patch.object(recovery, "listening", return_value=False) as check:
+            self.assertFalse(recovery.service_listening(service, 1))
+            self.assertEqual({call.args[0] for call in check.call_args_list}, {18000, 3000})
+
     def test_confirmed_service_release_preserves_node_and_queue_failure_results(self):
         self.record("node", "aspera_node", "allocations", self.experiment, {"experimentId": self.experiment, "released": True})
         self.record("node", "aspera_node", "commands", self.experiment + "_cmd", {"experimentId": self.experiment, "released": True})

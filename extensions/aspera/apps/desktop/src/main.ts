@@ -5,11 +5,12 @@ import { existsSync, mkdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { prepareDesktopProfile } from './profile.ts'
 import { DesktopHost } from './host-process.ts'
-import { isOwnedNavigation, isExternalLink } from './protocol.ts'
+import { allowClipboardWrite, isOwnedNavigation, isExternalLink } from './protocol.ts'
 import { shellCopy } from './locales.ts'
 import { installNativeBridge } from './native.ts'
 import z from 'zod'
 import { attentionCountSchema, attentionArtwork } from './attention.ts'
+import { installHostCookieRouting } from './host-cookies.ts'
 
 const application = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const runtime = app.isPackaged ? resolve(process.resourcesPath, 'runtime.asar') : resolve(application, '../..')
@@ -100,8 +101,15 @@ else {
     window.on('hide', updateAttention); window.on('show', updateAttention)
     window.on('close', event => { if (!quitting && tray !== undefined) { event.preventDefault(); window?.hide() } else app.quit() })
     window.webContents.on('render-process-gone', (_event, details) => { void showFailure(new Error(`Application page stopped: ${details.reason}`)) })
-    window.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => { callback(false) })
-    window.webContents.session.setPermissionCheckHandler(() => false)
+    const allowPermission = (contents: Electron.WebContents | null, permission: string, mainFrame: boolean,
+      requestingUrl: string | undefined, requestingOrigin?: string) => allowClipboardWrite({ permission,
+      owned: contents !== null && contents === window?.webContents, focused: contents?.isFocused() ?? false,
+      mainFrame, origin: ownedOrigin, currentUrl: contents?.getURL() ?? '', requestingUrl, requestingOrigin })
+    window.webContents.session.setPermissionRequestHandler((contents, permission, callback, details) => {
+      callback(allowPermission(contents, permission, details.isMainFrame, details.requestingUrl))
+    })
+    window.webContents.session.setPermissionCheckHandler((contents, permission, requestingOrigin, details) =>
+      allowPermission(contents, permission, details.isMainFrame, details.requestingUrl, requestingOrigin))
     const applicationMenu = Menu.buildFromTemplate([
       { label: 'Aspera', submenu: [{ label: copy.open, click: showWindow }, { type: 'separator' }, { label: copy.quit, click: () => { app.quit() } }] },
       { label: copy.view, submenu: [{ label: copy.reload, role: 'reload' }, { label: copy.tools, role: 'toggleDevTools', accelerator: 'F12' }] },
@@ -153,6 +161,8 @@ else {
     if (quitting || window.isDestroyed()) return
     const origin = new URL(url).origin
     ownedOrigin = origin
+    const disposeCookieRouting = installHostCookieRouting(window.webContents.session, origin)
+    app.once('will-quit', disposeCookieRouting)
     const external = (destination: string): void => { if (isExternalLink(destination)) void shell.openExternal(destination).catch(error => { console.error(error.message) }) }
     window.webContents.on('will-navigate', (event, destination) => {
       if (!isOwnedNavigation(destination, origin)) { event.preventDefault(); external(destination) }

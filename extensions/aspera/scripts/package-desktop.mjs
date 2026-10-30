@@ -35,6 +35,7 @@ try {
   if (stage === undefined) await extract({ file: snapshot.archive, cwd: runtime, strict: true })
   else assert.equal(JSON.parse(readFileSync(resolve(runtime, 'aspera-release.json'), 'utf8')).deploymentId,
     snapshot.digest, 'Desktop stage belongs to a different frozen release')
+  copyFileSync(snapshot.archive, resolve(runtime, 'aspera-release.tar'))
   const manifestPath = resolve(runtime, 'package.json'); const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
   const previousDependencies = JSON.stringify(manifest.dependencies)
   manifest.dependencies.pnpm = '11.7.0'
@@ -48,9 +49,9 @@ try {
   writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n')
   const store = dirname((await command(process.execPath, [pnpm, 'store', 'path'], root)).trim())
   if (stage === undefined || previousDependencies !== JSON.stringify(manifest.dependencies)) {
-    await command(process.execPath, [pnpm, '--dir', runtime, 'install', '--lockfile-only', '--offline', '--ignore-scripts'], root)
+    await command(process.execPath, [pnpm, '--dir', runtime, 'install', '--lockfile-only', '--prefer-offline', '--ignore-scripts'], root)
   }
-  await command(process.execPath, [pnpm, '--dir', runtime, 'install', '--offline', '--frozen-lockfile', '--prod', '--node-linker=hoisted', '--store-dir', store], root)
+  await command(process.execPath, [pnpm, '--dir', runtime, 'install', '--prefer-offline', '--frozen-lockfile', '--prod', '--node-linker=hoisted', '--store-dir', store], root)
   await command(process.execPath, ['scripts/assets.mjs'], application)
   await command(process.execPath, ['scripts/bundle-desktop.mjs'], root)
   copyFileSync(resolve(application, 'lib/launch.js'), resolve(runtime, 'launch.js'))

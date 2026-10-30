@@ -1,4 +1,5 @@
 import { cssText } from './ExperimentsPage.module.css'
+import { cssText as serviceCssText } from './InferenceServices.module.css'
 /** Register the experiment list and detail panel in the shipped Web composition. */
 import type { Context } from '@deepseek-ai/cordis'
 import { TYPERT_REMOTE } from '@aspera/dispatch/remote'
@@ -26,7 +27,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const unmount = await ctx.remote.$mount(TYPERT_REMOTE)
   ctx.effect(() => unmount, 'Aspera: Remote descriptors')
   ctx.inject(['remote.aspera', 'slots', 'locale', 'remote'], (scope) => {
-    scope.effect(() => { const tag = document.createElement('style'); tag.dataset.aspera = 'console'; tag.textContent = cssText; document.head.appendChild(tag); return () => { tag.remove() } }, 'Aspera: styles')
+    scope.effect(() => { const tag = document.createElement('style'); tag.dataset.aspera = 'console'; tag.textContent = cssText + '\n' + serviceCssText; document.head.appendChild(tag); return () => { tag.remove() } }, 'Aspera: styles')
     const controller = new ExperimentsController(scope.remote.aspera, config)
     scope.effect(() => scope.locale.register('experiments', { en, zh }), 'experiments: dictionaries')
     const t = scope.locale.bind('experiments')
@@ -51,7 +52,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const stream = scope.remote.$stream({ name: 'aspera-watch', open: signal => scope.remote.aspera.watch(signal),
         ended: accepted => new Error(accepted ? 'Aspera watch disconnected' : 'Aspera watch ended before the initial snapshot') })
       const watch = (async () => { for await (const item of stream) { controller.receive(item.value); item.accept(); controller.tick() } })()
-      void watch.catch((error: unknown) => { controller.report(error) })
+      void watch.catch((error: unknown) => { controller.readFailed(error) })
       return async () => { await stream.dispose(); await watch }
     }, 'Aspera: reconnecting state stream')
     const panel = 'experiments' as MainPanelId

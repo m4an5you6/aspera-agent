@@ -46,6 +46,10 @@ pnpm run start:desktop
 
 桌面验证默认使用最近的构建，也可通过 `ASPERA_DESKTOP_BUILD_ID` 指定构建目录。
 
+更新资源时，`pnpm -C extensions/aspera run update:desktop:resources --prepare` 会在生成部署快照前构建 Host 代码、生成类型及 Web 资源。构建失败时不打包过期编译文件。完全退出 Aspera 后，用 `--apply <directory>` 应用已准备目录；更新器备份资源，并核对原可执行文件和桌面程序的摘要保持不变。
+
+更新桌面 Cookie 路由与权限时，`pnpm run update:desktop:shell -- --prepare` 仅编译并暂存主模块、Cookie 路由模块及协议策略。完全退出 Aspera 后，用 `-- --apply <directory>` 备份并替换这些模块。更新器核对原可执行文件和运行时归档保持不变；模块自准备后发生变化时拒绝更新。
+
 DeepSeek 回归使用原执行文件，在本机 Messages 测试接口上回放标准 Agent，以及使用新建和旧模型快照的全部三个阶段。它核对新建及已有 profile 的插件身份、已记录的 Session 交付和快照内容保持不变，不使用真实模型密钥。
 
 构建中断后，设置 `ASPERA_DESKTOP_STAGE=.artifacts/desktop-build-<id>` 可复用该暂存目录，前提是其冻结发布摘要仍与当前构建相同。构建会重新检查生产锁文件并封装运行时，已完成的输出目录各自独立。
@@ -60,6 +64,10 @@ DeepSeek 回归使用原执行文件，在本机 Messages 测试接口上回放�
 Electron 管理窗口和托盘，其 Node 模式子进程通过已发布的 DSH profile runner 启动 `aspera-desktop`，不导入上游 Desktop 源码。浏览器认证将私有启动 token 换为 cookie。隔离的渲染器没有 Node 集成；适配器提供外观、应用／编辑菜单和已发布的 Desktop 快捷键协议，设备偏好通过原子文件写入保存。引导只通过已认证 RPC 查询模型凭据的存在状态。原生操作校验获准的顶层页面。页面停留在本机回环来源，通过系统浏览器打开无凭据的 HTTPS 链接，浏览器权限默认拒绝。
 
 `runtime.asar` 保存冻结的生产依赖和 pnpm，原生二进制及 pnpm 位于解包目录。可写 profile 保存外部插件依赖和启用选择。DSH 共享解析器使用同时声明 Aspera 包和官方可选 DSH 插件的运行时清单；打包时从固定版本的 DSH 安装中读取可选插件名称和版本。用户目录不需要源码仓库或第二份核心依赖。插件使用内置 pnpm 安装，启用变更在重启后生效；文件监听 HMR 关闭。应用补丁与用户补丁分开。升级先备份旧配置，再移除经验证的运行时链接和应用生成的管理限制，见[升级说明](../../docs/desktop-upgrade.zh.md)。框架环境仍在远端节点，已发布的浏览目录选择器提供目录选择。
+
+私有浏览器会话只发送与当前 Host 地址匹配的 DSH 认证 Cookie。旧回环端口的 Cookie 保持存储，不再扩大当前 HTTP 或 WebSocket 请求头。其他 Cookie 和 Host 签名校验保持不变。
+
+处于焦点的应用主页面可以通过复制控件写入剪贴板文本。Electron 的两个权限处理器均核对自有窗口、当前 Host 来源及请求的顶层页面。剪贴板读取、嵌入页面、其他窗口及其他浏览器权限仍被拒绝。`pnpm run test:desktop -- --case=clipboard` 使用隔离 profile 检查已打包桌面程序的写入与读取策略。
 
 [架构图](../../docs/architecture.zh.md#architecture-diagrams)展示模块归属及接管。策略及 profile 测试拒绝非法 IPC 地址、不安全导航、带凭据的链接及被修改的归属。私有 IPC 在 Windows 中调用 CLI 的正常退出信号处理，桌面壳等待 Host 结束。
 

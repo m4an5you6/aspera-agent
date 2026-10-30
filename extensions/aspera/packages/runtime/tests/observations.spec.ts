@@ -66,6 +66,18 @@ it('pages backwards without overlaps and reports rotation, missing files and inc
   rmSync(file)
   expect(readObservation(root, request).missing).toBe(true)
 })
+it('bounds serialized multibyte output and preserves its incomplete status after both streams close', () => {
+  const { root, source, request } = fixture(), limit = 512
+  const writer = new ObservationWriter(root, source, [], limit)
+  writer.append('stdout', 'start\n')
+  writer.append('stdout', '🙂'.repeat(300) + '\n')
+  writer.append('stderr', 'later output\n')
+  writer.close()
+  expect(writer.limited).toBe(true)
+  expect(readFileSync(resolve(root, 'observations-v1/process-a.jsonl')).byteLength).toBeLessThanOrEqual(limit)
+  expect(readObservation(root, { ...request, fromStart: true }).lines.map(line => line.text).join('')).toBe('start\n')
+  expect(observationSources(root)[0]?.complete).toBe(false)
+})
 
 it('retains measured values and gaps without inventing missing GPU or training fields', () => {
   const { root, request } = fixture()

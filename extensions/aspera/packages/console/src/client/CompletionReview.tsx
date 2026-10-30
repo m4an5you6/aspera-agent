@@ -10,9 +10,11 @@ import css from './ExperimentsPage.module.css'
 export function CompletionReview({ row, controller, t, onRecords }: { row: FleetExperiment; controller: ExperimentsController;
   t: TranslateNS<'experiments'>; onRecords: () => void }) {
   const review = row.completionReview
+  const recovery = row.acceptanceRecovery
   const [requesting, setRequesting] = useState(false)
   if (!row.completionReviewAvailable && review === undefined) return null
-  const busy = review?.phase === 'collecting' || review?.phase === 'verifying'
+  const recoveryBusy = recovery !== undefined && ['recovering', 'verifying', 'reviewing'].includes(recovery.phase)
+  const busy = recoveryBusy || review?.phase === 'collecting' || review?.phase === 'verifying'
   const invoke = (operation: () => Promise<void>) => {
     setRequesting(true)
     void operation().catch(error => { controller.report(error, { experimentId: row.request.experimentId, operation: 'completion-review' }) }).finally(() => { setRequesting(false) })
@@ -22,6 +24,15 @@ export function CompletionReview({ row, controller, t, onRecords }: { row: Fleet
     <div className={css.sectionHeading}><h3 className={css.pipelineLabel}>{t('completionReview')}</h3>{busy && <StateDot state="ongoing" />}</div>
     <p className={css.hint}>{t('reviewReadOnlyHint')}</p>
     <p>{t((row.latest ?? row.receipt)?.state === 'blocked' ? 'reviewOriginalBlocked' : 'reviewOriginalFailure', { time: new Date(review?.originalUpdatedAt ?? (row.latest ?? row.receipt)!.updatedAt).toLocaleString() })}</p>
+    {recovery !== undefined && <div data-acceptance-recovery={recovery.phase}>
+      <p role="status">{t(recovery.phase === 'recovering' ? 'recoveringInference' : recovery.phase === 'verifying' ? 'verifyingRecoveredInference' : recovery.phase === 'passed' ? 'revalidated' : recovery.phase === 'blocked' ? 'review-blocked' : 'reviewCollecting')}</p>
+      <p className={css.hint}>{t('acceptanceRecoveryHint')}</p>
+      <time>{t('stageUpdatedAt', { time: new Date(recovery.updatedAt).toLocaleString() })}</time>
+      {recovery.detail !== undefined && <details><summary>{t('reviewDiagnostics')}</summary><pre className={css.log}>{recovery.detail}</pre></details>}
+      <div className={css.workActions}><Button variant="ghost" size="sm" onClick={onRecords}>{t('inferenceRecoveryTrace')}</Button>
+        <Button variant="ghost" size="sm" onClick={() => { controller.select(recovery.pendingRuntimeId ?? recovery.recoveryExperimentId) }}>{t('openAssociatedRecovery')}</Button>
+        {recoveryBusy && <Button variant="outline" size="sm" disabled={requesting} onClick={() => { invoke(async () => { await controller.interrupt(recovery.pendingRuntimeId ?? recovery.recoveryExperimentId) }) }}>{t('interruptExperiment')}</Button>}</div>
+    </div>}
     {review !== undefined && <>
       <p role="status">{t(review.phase === 'collecting' ? 'reviewCollecting' : review.phase === 'verifying' ? 'reviewVerifying' : review.phase === 'passed' ? 'revalidated' : review.phase === 'cancelled' ? 'reviewCancelled' : 'review-blocked')}</p>
       {busy && review.currentServerId !== undefined && <p>{row.servers.find(server => server.id === review.currentServerId)?.name}</p>}
@@ -43,6 +54,8 @@ export function CompletionReview({ row, controller, t, onRecords }: { row: Fleet
       </details>}
     </>}
     <div className={css.workActions}>
+      {!busy && recovery?.phase !== 'passed' && <Button size="sm" variant="primary" disabled={requesting} icon={requesting ? <StateDot state="ongoing" /> : undefined}
+        onClick={() => { invoke(() => controller.recoverAcceptance(row.request.experimentId)) }}>{t('recoverOriginalAcceptance')}</Button>}
       {!busy && review?.phase !== 'passed' && row.completionReviewAvailable && <Button size="sm" variant="primary" disabled={requesting} icon={requesting ? <StateDot state="ongoing" /> : undefined} onClick={() => { invoke(() => controller.reviewCompletion(row.request.experimentId)) }}>{t(review === undefined ? 'startCompletionReview' : 'retryCompletionReview')}</Button>}
       {busy && <Button size="sm" variant="outline" disabled={requesting} icon={requesting ? <StateDot state="ongoing" /> : undefined} onClick={() => { invoke(() => controller.cancelCompletionReview(row.request.experimentId)) }}>{t('cancelCompletionReview')}</Button>}
       {review !== undefined && <Button size="sm" variant="ghost" onClick={onRecords}>{t('reviewTrace')}</Button>}

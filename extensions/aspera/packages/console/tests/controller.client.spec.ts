@@ -493,6 +493,14 @@ it('projects revalidation only from a committed assessment of the current origin
   expect(experimentProgress({ ...failed, completionReview: { ...review, phase: 'collecting' } })).toMatchObject({ busy: true, status: 'reviewing' })
   expect(experimentProgress({ ...failed, completionReview: { ...review, phase: 'blocked' } })).toMatchObject({ busy: false, attention: true, status: 'review-blocked' })
 })
+it('shows associated inference recovery on the original task without changing its retained result or training measurements', () => {
+  const row = record('first'), original = JSON.stringify(row.latest)
+  row.acceptanceRecovery = fromAny<NonNullable<FleetExperiment['acceptanceRecovery']>, object>({ phase: 'recovering' })
+  expect(experimentProgress(row)).toMatchObject({ status: 'reviewing', busy: true, phase: 3 })
+  row.acceptanceRecovery.phase = 'blocked'
+  expect(experimentProgress(row)).toMatchObject({ status: 'review-blocked', busy: false, issue: true })
+  expect(JSON.stringify(row.latest)).toBe(original)
+})
 
 it('shares supplementary requests across navigation and ignores acknowledgements after deletion', async () => {
   const { controller, remote, rows } = fixture()

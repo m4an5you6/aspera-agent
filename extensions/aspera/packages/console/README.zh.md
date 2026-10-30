@@ -11,6 +11,10 @@ kind: "package-reference"
 
 在独立页面管理远端实验，同时保持普通对话可用。添加密码服务器、连续提交 Goal、确认计划，并查看进度、回执、消息、节点日志和输出。通过私有连接访问及停止推理服务，显示其阻塞的排队实验。Host 管理任务状态，浏览器卸载只结束页面效果。
 
+[原任务恢复](../../docs/completion-review.zh.md#recover-acceptance-on-the-original-experiment)在原详情页保留恢复进度、Agent 轨迹和关联推理服务。服务操作使用关联执行身份；原受阻结果继续展示。
+
+推理页面优先展示接入信息，并分别保留进程与外部状态的原时间。原实验与恢复任务的同一服务只展示一次；未释放异常保留在当前区域，已释放服务收起为历史。每服务的请求输入和结果在客户端内存中跨页面保留；密钥不进入该状态，切换服务或页面后清除。[调用示例与受管请求](../../docs/public-inference.zh.md#use-the-inference-page)说明默认 PowerShell 示例、可选的含密钥复制、cURL 和确认停服。
+
 ## 目录
 
 - [使用本包](#use-this-package)

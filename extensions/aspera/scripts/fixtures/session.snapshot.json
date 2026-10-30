@@ -142,7 +142,10 @@
     "fullStepSearch": true,
     "readingStateRestored": true,
     "storageModalViewport": true,
-    "systemFallbackAndShortfall": true
+    "systemFallbackAndShortfall": true,
+    "agentRepairChoice": true,
+    "referenceOnlyConfirmation": true,
+    "partialBudgetNotTrainingReady": true
   },
   "experimentInterruption": {
     "confirmedNodes": 1,

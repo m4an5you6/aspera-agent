@@ -1,3 +1,4 @@
+import { z as storageZ } from 'zod'
 import type { ServerConnectionCheck, ExperimentDeletionPreview, ExperimentDeletion, DeleteExperimentsRequest, ServerDeletionPreview } from './types.ts'
 /** Aspera's DSH adapter: public Remote methods and effect-owned dispatch tools. */
 import type { Context } from '@deepseek-ai/cordis'
@@ -31,11 +32,13 @@ import { experimentCacheCleanupSchema } from '@aspera/experiments'
 import type { ExperimentStorageUsage, ExperimentStoragePlan, ExperimentCachePreview, ExperimentCacheCleanup, ExperimentCacheResult } from '@aspera/experiments/types'
 import type { PhaseContextPolicy } from '@aspera/runtime'
 import { environmentRequirements } from './environment.ts'
+import type { PublicServiceVerificationRoute } from './service-verification.ts'
 import type { ExperimentPasswordStatus, ExperimentSshAccount, FleetCreateRequest, FleetExperiment, FleetRegistry, FleetServerInput, FleetSnapshot } from './types.ts'
 export type * from './types.ts'
 
 /** Host policy; the profile owns directories and operation limits. */
 export interface Config extends RunArchivePolicy {
+  publicServiceVerificationRoute: PublicServiceVerificationRoute
   finalization: FinalizationPolicy
   agentContext: PhaseContextPolicy
   managedEnvironments: ManagedEnvironmentPolicy
@@ -47,6 +50,8 @@ export interface Config extends RunArchivePolicy {
   preparationCommandStopGraceMs: number
   agentCredentialRefs: string[]
   toolTimeoutMs: number
+  documentationReadTimeoutMs: number
+  documentationPageBytes: number
   connectionCheckTimeoutMs: number
   sshHandshakeTimeoutMs: number
   sshHandshakeMaxRetries: number
@@ -62,9 +67,12 @@ export interface Config extends RunArchivePolicy {
   sandboxRepairCleanupTimeoutMs: number
   sandboxRepairPollIntervalMs: number
   sandboxRepairMaxAttempts: number
+  sandboxNativeBuildTimeoutMs: number
+  sandboxNativeBuildBytes: number
 }
 /** Validated Host policy supplied by the independent profile. */
 export const Config: z<Config> = z.object({
+  publicServiceVerificationRoute: z.union(['direct', 'inherit']).default('direct'),
   finalization: FinalizationPolicyConfig.default({}),
   agentContext: PhaseContextPolicyConfig.default({}),
   managedEnvironments: ManagedEnvironmentPolicyConfig.default({}),
@@ -75,6 +83,8 @@ export const Config: z<Config> = z.object({
   preparationCommandStopGraceMs: z.number().step(1).min(1).max(60000).default(5000),
   agentCredentialRefs: z.array(z.string()).default(['DEEPSEEK_API_KEY']),
   toolTimeoutMs: z.number().step(1).min(1000).default(300000),
+  documentationReadTimeoutMs: z.number().step(1).min(1).max(2_147_483_647).default(30000),
+  documentationPageBytes: z.number().step(1).min(1024).max(65536).default(8192),
   connectionCheckTimeoutMs: z.number().step(1).min(1000).default(20000),
   sshHandshakeTimeoutMs: z.number().step(1).min(1).max(2_147_483_647).default(15000),
   sshHandshakeMaxRetries: z.number().step(1).min(0).max(Number.MAX_SAFE_INTEGER).default(2),
@@ -90,6 +100,8 @@ export const Config: z<Config> = z.object({
   sandboxRepairCleanupTimeoutMs: z.number().step(1).min(100).max(10000).default(1000),
   sandboxRepairPollIntervalMs: z.number().step(1).min(1).max(1000).default(20),
   sandboxRepairMaxAttempts: z.number().step(1).min(0).max(10).default(2),
+  sandboxNativeBuildTimeoutMs: z.number().step(1).min(1000).max(1800000).default(300000),
+  sandboxNativeBuildBytes: z.number().step(1).min(1048576).max(1073741824).default(67108864),
   archiveEnabled: z.boolean().default(true), archiveIntervalMs: z.number().step(1).min(500).default(15000),
   archiveBacklogIntervalMs: z.number().step(1).min(500).default(5000),
   archiveWaitingIntervalMs: z.number().step(1).min(500).default(30000),
@@ -207,6 +219,24 @@ export class AsperaRemote extends TypertRemoteService {
   /** @param id - retained experiment. @returns measured space, environment sharing and offline observations. */
   @Remote
   experimentStorageUsage(id: string): Promise<ExperimentStorageUsage> { return this.fleet.storageUsage(experimentIdSchema.parse(id)) }
+  /** @param id - retained experiment. @returns current policy and revisions proposed by its Agent. */
+  @Remote
+  experimentStoragePolicies(id: string): Promise<import('@aspera/experiments/types').ExperimentStoragePolicies> { return this.fleet.storagePolicies(experimentIdSchema.parse(id)) }
+  /** @param id - retained experiment. @param proposalId - saved proposal. @param expectedRevision - original revision. @returns approved policy without changing execution steps. */
+  @Remote
+  approveExperimentStoragePolicy(id: string, proposalId: string, expectedRevision: number): Promise<import('@aspera/experiments/types').StoragePolicyRecord> {
+    return this.fleet.decideStoragePolicy(experimentIdSchema.parse(id), storageZ.uuid().parse(proposalId), storageZ.number().int().nonnegative().parse(expectedRevision), true)
+  }
+  /** @param id - retained experiment. @param proposalId - saved proposal. @param expectedRevision - original revision. @returns rejected proposal and retained approved policy. */
+  @Remote
+  rejectExperimentStoragePolicy(id: string, proposalId: string, expectedRevision: number): Promise<import('@aspera/experiments/types').StoragePolicyRecord> {
+    return this.fleet.decideStoragePolicy(experimentIdSchema.parse(id), storageZ.uuid().parse(proposalId), storageZ.number().int().nonnegative().parse(expectedRevision), false)
+  }
+  /** @param id - retained task. @param proposalId - rejected Agent proposal. @param expectedRevision - current approved revision. @returns a new explicit Host approval without replacing the original rejection or Agent-selected contents. */
+  @Remote
+  reconsiderExperimentStoragePolicy(id: string, proposalId: string, expectedRevision: number): Promise<import('@aspera/experiments/types').StoragePolicyRecord> {
+    return this.fleet.reconsiderStoragePolicy(experimentIdSchema.parse(id), storageZ.uuid().parse(proposalId), storageZ.number().int().nonnegative().parse(expectedRevision))
+  }
   /** @param id - retained experiment. @returns measured per-volume capacity plans, retaining offline timestamps. */
   @Remote
   experimentStoragePlan(id: string): Promise<ExperimentStoragePlan[]> { return this.fleet.storagePlan(experimentIdSchema.parse(id)) }
@@ -247,6 +277,14 @@ export class AsperaRemote extends TypertRemoteService {
   /** @param id - released completion-evidence failure. @returns a background review acknowledgement without retraining. */
   @Remote
   reviewExperimentCompletion(id: string): import('@aspera/experiments').CompletionReview { return this.fleet.reviewCompletion(experimentIdSchema.parse(id)) }
+  /** @param id - original trained experiment. @param recoveryId - optional existing inference task. @returns recovery progress without copying or retraining the original task. */
+  @Remote
+  recoverExperimentAcceptance(id: string, recoveryId?: string): Promise<import('@aspera/experiments').AcceptanceRecovery> {
+    return this.fleet.recoverAcceptance(experimentIdSchema.parse(id), recoveryId === undefined ? undefined : experimentIdSchema.parse(recoveryId))
+  }
+  /** @param id - original experiment. @returns saved checkpoint-bound inference recovery, including the original observation time. */
+  @Remote
+  experimentAcceptanceRecoveryStatus(id: string): import('@aspera/experiments').AcceptanceRecovery | undefined { return this.fleet.acceptanceRecoveryStatus(experimentIdSchema.parse(id)) }
   /** @param id - original experiment. @returns the saved independent assessment. */
   @Remote
   experimentCompletionReviewStatus(id: string): import('@aspera/experiments').CompletionReview | undefined { return this.fleet.completionReviewStatus(experimentIdSchema.parse(id)) }
@@ -346,14 +384,16 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const fleet = await ExperimentFleet.open(ctx, (server: ServerSettings) => ({ ...server,
     localRepo: config.extensionRoot, dataRoots: config.dataRoots, preparationOutputChars: config.preparationOutputChars,
     agentCredentialRefs: config.agentCredentialRefs, tokenRef: 'ASPERA_COORDINATOR', toolTimeoutMs: config.toolTimeoutMs,
+    documentationReadTimeoutMs: config.documentationReadTimeoutMs, documentationPageBytes: config.documentationPageBytes,
     controlPollIntervalMs: config.pollIntervalMs, minimumFreeBytes: config.minimumFreeBytes }), config.connectionCheckTimeoutMs,
     undefined, installationPolicySchema.parse(config), { maxAttempts: config.controllerRepairMaxAttempts }, resolveSshConnectionPolicy(config), {
       probeTimeoutMs: config.sandboxRepairProbeTimeoutMs, cleanupTimeoutMs: config.sandboxRepairCleanupTimeoutMs,
       pollIntervalMs: config.sandboxRepairPollIntervalMs, maxAttempts: config.sandboxRepairMaxAttempts,
+      nativeBuildTimeoutMs: config.sandboxNativeBuildTimeoutMs, nativeBuildBytes: config.sandboxNativeBuildBytes,
     }, runArchivePolicySchema.parse(config), config.agentContext, managedEnvironmentPolicySchema.parse(config.managedEnvironments), {
       pollIntervalMs: Math.min(config.pollIntervalMs, 10000), readTimeoutMs: config.preparationCommandReadTimeoutMs,
       recoveryTimeoutMs: config.preparationCommandRecoveryTimeoutMs, stopGraceMs: config.preparationCommandStopGraceMs,
-    }, finalizationPolicySchema.parse(config.finalization))
+    }, finalizationPolicySchema.parse(config.finalization), config.publicServiceVerificationRoute)
   new AsperaRemote(ctx, fleet, new ExperimentDownloads(ctx, fleet, config.downloadTtlMs), config)
   const output = { schema: { type: 'string' as const }, render: (_args: object, value: string) => [{ type: 'text' as const, text: value }] }
   const presentCall = (args: object) => ({ card: 'generic' as const, title: 'Aspera experiment', kind: 'other' as const, rawInput: args })

@@ -32,7 +32,10 @@ it('clears ambient credentials and uses POSIX cache paths on every construction 
   expect(argv).toContain('--clearenv')
   expect(argv.slice(argv.indexOf('HOME'), argv.indexOf('HOME') + 2)).toEqual(['HOME', spec.workspaceRoot])
   expect(argv.slice(argv.indexOf('HF_HOME'), argv.indexOf('HF_HOME') + 2)).toEqual(['HF_HOME', spec.workspaceRoot + '/cache/huggingface'])
-  expect(argv.slice(argv.indexOf('TMPDIR'), argv.indexOf('TMPDIR') + 2)).toEqual(['TMPDIR', spec.workspaceRoot + '/tmp'])
+  expect(argv.slice(argv.indexOf('TMPDIR'), argv.indexOf('TMPDIR') + 2)).toEqual(['TMPDIR', '/tmp/aspera'])
+  expect(argv.slice(argv.indexOf('--symlink'), argv.indexOf('--symlink') + 3)).toEqual(['--symlink', spec.workspaceRoot + '/tmp', '/tmp/aspera'])
+  expect(argv.slice(argv.indexOf('--dir'), argv.indexOf('--dir') + 2)).toEqual(['--dir', spec.workspaceRoot + '/tmp'])
+  expect(argv.indexOf('--dir')).toBeGreaterThan(argv.indexOf('--bind'))
 })
 
 it('mounts managed packages read-only and permits only individually detached files to be writable', () => {
@@ -52,4 +55,34 @@ it('defaults registered model and dataset commands to offline loading without ch
     expect(argv.slice(argv.indexOf(name) - 1, argv.indexOf(name) + 2)).toEqual(['--setenv', name, '1'])
     expect(experimentSandboxArgv(spec, ['true'])).not.toContain(name)
   }
+})
+
+it('applies checkpoint protection after every writable environment mount', () => {
+  const checkpoint = spec.workspaceRoot + '/checkpoints/retained'
+  const argv = experimentSandboxArgv({ ...spec, protectedPaths: [checkpoint],
+    environment: { readonlyPaths: [], writablePaths: [checkpoint] } }, ['true'])
+  const last = argv.lastIndexOf(checkpoint)
+  expect(argv.slice(last - 2, last + 1)).toEqual(['--ro-bind', checkpoint, checkpoint])
+})
+
+it('limits diagnostic temporary storage and removes persistent write mounts', () => {
+  const path = spec.workspaceRoot + '/env/module.py'
+  const argv = experimentSandboxArgv({ ...spec, devicePaths: [], diagnosticTemporaryBytes: 67108864,
+    environment: { readonlyPaths: [], writablePaths: [path] } }, ['bash', '-c', 'df -h'])
+  expect(argv).not.toContain('--bind'); expect(argv).not.toContain('--dev-bind')
+  expect(argv.slice(argv.indexOf('--size'), argv.indexOf('--size') + 4)).toEqual(['--size', '67108864', '--tmpfs', '/tmp'])
+  expect(argv.slice(argv.indexOf(path) - 1, argv.indexOf(path) + 2)).toEqual(['--ro-bind', path, path])
+  expect(argv.slice(argv.lastIndexOf('TMPDIR'), argv.lastIndexOf('TMPDIR') + 2)).toEqual(['TMPDIR', '/tmp'])
+  expect(argv).not.toContain('--symlink'); expect(argv).not.toContain('--dir')
+})
+
+it('creates workspace and environment mount targets before freezing their hidden ancestors', () => {
+  const environment = '/data/.aspera/node/packages/object'
+  const argv = experimentSandboxArgv({ ...spec, devicePaths: [], diagnosticTemporaryBytes: 67108864,
+    environment: { readonlyPaths: [environment], writablePaths: [], hiddenPaths: ['/data/.aspera/node/packages'] } }, ['true'])
+  const frozen = argv.findIndex((value, index) => value === '--remount-ro' && argv[index + 1] === '/data/.aspera/node')
+  expect(frozen).toBeGreaterThan(argv.lastIndexOf(spec.workspaceRoot, argv.indexOf('--chdir') - 1))
+  expect(frozen).toBeGreaterThan(argv.lastIndexOf(environment))
+  expect(frozen).toBeLessThan(argv.indexOf('--chdir'))
+  expect(argv.findIndex((value, index) => value === '--remount-ro' && argv[index + 1] === '/data/.aspera/node/packages')).toBeGreaterThan(argv.lastIndexOf(environment))
 })

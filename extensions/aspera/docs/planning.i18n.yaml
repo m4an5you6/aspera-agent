@@ -1,0 +1,28 @@
+# Bilingual-pair consistency record for planning.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write extensions/aspera/docs/planning.md
+/:
+  en: fdd8e12803f8d268
+  zh: bd49771b25021eb1
+/planning-tools:
+  en: b94f8c033786522e
+  zh: a870bd26df967d38
+/planning-tools/summary:
+  en: a1539703f24be6c6
+  zh: 17068a8edfa30823
+/planning-tools/table-of-contents:
+  en: 3e5b0a6fab2451c9
+  zh: 512fda4bece9f77d
+/planning-tools/documentation:
+  en: 800ca0790f076d8e
+  zh: 2bda136f3a0a0c8c
+/planning-tools/drafts-and-submission:
+  en: 320753a217b3da80
+  zh: 753cec22e2ed0fb1
+/planning-tools/persistence-and-compatibility:
+  en: 7506f4a4bbf863f9
+  zh: 6ea26cc85999316c
+/planning-tools/dev-note:
+  en: b75c8458928b72b9
+  zh: a1f8a33fb09d661a

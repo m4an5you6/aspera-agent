@@ -1,5 +1,5 @@
 import type { ExperimentDeletion, ExperimentDeletionPreview, ServerDeletionPreview, UnconfirmedWorkNotice } from '@aspera/dispatch/types'
-type ManagementMessage = 'experimentsDeleted' | 'deletionIncomplete' | 'serverDeleted' | 'serverDeleteFailed' | 'installationSourceChanged' | 'cacheCleanupComplete' | 'cacheCleanupBlocked' | 'storageFallbackApplied'
+type ManagementMessage = 'experimentsDeleted' | 'deletionIncomplete' | 'serverDeleted' | 'serverDeleteFailed' | 'installationSourceChanged' | 'cacheCleanupComplete' | 'cacheCleanupBlocked' | 'storageFallbackApplied' | 'serviceCopied' | 'serviceRequestDone' | 'serviceStopConfirmed' | 'serviceStopUnconfirmed'
 import type {} from '@aspera/dispatch/remote'
 import type {} from '@deepseek-ai/dsh-api-gateway/client'
 /** Independent experiment selection, incremental reads, and browser actions. */
@@ -22,6 +22,8 @@ import type { ObservationSource, ObservationRead, ObservationPage, MetricRead, M
 import type { ExecutionProgressRead } from '@aspera/experiments/types'
 import type { ExperimentInterruptionStatus } from '@aspera/experiments/types'
 import type { ExperimentStorageUsage, ExperimentCachePreview, ExperimentCacheResult } from '@aspera/experiments/types'
+import { collectServices } from './inference-services.ts'
+import { ServiceInteractions } from './service-interactions.ts'
 
 /** A failed refresh retains the last exact-plan snapshot and its arrival time. */
 export interface ExecutionProgressView { value?: ExecutionProgressRead; error?: string; receivedAt?: number }
@@ -70,6 +72,7 @@ export interface ExperimentsSnapshot {
   toast: { key: ManagementMessage; sequence: number; failed: boolean; detail?: string; peakBytes?: number; storage?: { experimentId: string; serverId: string } } | null
   storageFocus: { experimentId: string; serverId: string; sequence: number } | null
   error: string | null
+  serviceReadError: string | null
   sourceErrors: Record<string, string>
   errorNotice: { message: string; identity: string; sequence: number } | null
 }
@@ -79,9 +82,17 @@ export class ExperimentsController {
   /** Observable page data; execution ownership remains on the Host. */
   readonly store = createSnapshotStore<ExperimentsSnapshot>({ view: 'list', preferences: readPreferences(), modelDirectory: null, modelsLoading: false, modelsError: null, settingsOpen: false,
     registry: { servers: [] }, experiments: [], selectedId: null, storageFocus: null,
-    probes: {}, probeErrors: {}, streams: {}, files: [], filesTruncated: false, retrying: [], probing: [], removingServers: [], deletedIds: [], deletions: [], unconfirmedWork: [], installations: [], executionReads: {}, interruptions: [], interrupting: [], settlingTasks: [], toast: null, error: null, sourceErrors: {}, errorNotice: null })
+    probes: {}, probeErrors: {}, streams: {}, files: [], filesTruncated: false, retrying: [], probing: [], removingServers: [], deletedIds: [], deletions: [], unconfirmedWork: [], installations: [], executionReads: {}, interruptions: [], interrupting: [], settlingTasks: [], toast: null, error: null, serviceReadError: null, sourceErrors: {}, errorNotice: null })
   /** List reading state survives opening details within this panel. */
   readonly listReading = { search: '', filter: 'all' as 'all' | 'pending' | 'attention' | 'active' | 'ended', scrollTop: 0 }
+  /** Non-secret forms and pending service operations have controller-owned lifetimes. */
+  readonly services = new ServiceInteractions({
+    items: () => this.disposed ? [] : collectServices(this.store.getSnapshot().experiments, undefined, this.store.getSnapshot().deletedIds),
+    request: (item, path, method, body) => this.accessService(item.service.experimentId, item.service.id, path, method, body),
+    stop: item => this.stopService(item.service.experimentId, item.service.id),
+    report: (error, item, operation) => { this.report(error, { experimentId: item.service.experimentId, serverId: item.service.serverId, operation }) },
+    notify: key => { this.notify(key) },
+  })
   private readonly announcedErrors = new Set<string>()
   private readonly errorQueue: NonNullable<ExperimentsSnapshot['errorNotice']>[] = []
   private errorSequence = 0
@@ -140,6 +151,19 @@ export class ExperimentsController {
     return this.remote.experimentCompletionReviewTrace(id, operationId, request).then(unwrap)
   }
   private readonly reviewRequests = new Map<string, Promise<void>>()
+  private readonly acceptanceRequests = new Map<string, Promise<void>>()
+  /** @param id - original trained task. @returns acknowledgement of existing inference recovery without another training run. */
+  recoverAcceptance(id: string): Promise<void> {
+    const pending = this.acceptanceRequests.get(id)
+    if (pending !== undefined) return pending
+    const operation = this.remote.recoverExperimentAcceptance(id).then(unwrap).then(recovery => {
+      if (this.disposed || this.deleted.has(id) || recovery.experimentId !== id) return
+      const row = this.store.getSnapshot().experiments.find(value => value.request.experimentId === id)
+      if (row !== undefined && recovery.source.resultRevision === (row.latest ?? row.receipt)?.revision
+        && (row.acceptanceRecovery?.revision ?? -1) <= recovery.revision) this.replace({ ...row, acceptanceRecovery: recovery })
+    }).finally(() => { this.acceptanceRequests.delete(id) })
+    this.acceptanceRequests.set(id, operation); return operation
+  }
   /** @param id - released evidence-only failure. @returns acknowledgement of Host-owned supplementation without retraining. */
   reviewCompletion(id: string): Promise<void> {
     const pending = this.reviewRequests.get(id)
@@ -195,6 +219,14 @@ export class ExperimentsController {
     if (this.deleted.has(id) || result.experimentId !== id) throw new Error('Finalization observation belongs to a deleted or different experiment')
     return result
   }
+  /** @param id - retained experiment. @returns assigned-node retention policies. */
+  storagePolicies(id: string) { return this.remote.experimentStoragePolicies(id).then(unwrap) }
+  /** @param id - retained experiment. @param proposalId - original proposal. @param revision - expected policy revision. @param approve - operator choice. @returns the confirmed decision. */
+  decideStoragePolicy(id: string, proposalId: string, revision: number, approve: boolean) {
+    return (approve ? this.remote.approveExperimentStoragePolicy(id, proposalId, revision) : this.remote.rejectExperimentStoragePolicy(id, proposalId, revision)).then(unwrap)
+  }
+  /** @param id - retained task. @param proposalId - rejected Agent request. @param revision - approved policy revision. @returns an explicit approval successor preserving the earlier rejection. */
+  reconsiderStoragePolicy(id: string, proposalId: string, revision: number) { return this.remote.reconsiderExperimentStoragePolicy(id, proposalId, revision).then(unwrap) }
   /** @param id - retained experiment. @returns actual storage observations or an explicitly offline copy. */
   storageUsage(id: string): Promise<ExperimentStorageUsage> {
     return this.remote.experimentStorageUsage(id).then(unwrap).then(value => {
@@ -227,8 +259,13 @@ export class ExperimentsController {
   /** @param preview - candidate identities. @param operationId - stable retry identity. @returns per-node cleanup results. */
   async cleanupCache(preview: ExperimentCachePreview, operationId: string, selection?: Record<string, string[]>): Promise<ExperimentCacheResult> {
     const result = unwrap(await this.remote.cleanupExperimentCache({ experimentId: preview.experimentId, operationId: brandString<EnvironmentOperationId>(operationId),
-      nodes: preview.nodes.filter(node => node.eligible && node.candidates.length > 0 && (selection === undefined || (selection[node.serverId]?.length ?? 0) > 0))
-        .map(node => ({ serverId: node.serverId, fingerprint: node.fingerprint, ...(selection === undefined ? {} : { candidateIds: selection[node.serverId] }) })) }))
+      nodes: preview.nodes.filter(node => node.eligible && (node.candidates.length > 0 || node.referenceRepairs?.some(row => row.eligible)) && (selection === undefined || (selection[node.serverId]?.length ?? 0) > 0))
+        .map(node => ({ serverId: node.serverId, fingerprint: node.fingerprint, ...(selection === undefined ? {} : {
+          candidateIds: (selection[node.serverId] ?? []).filter(id => !id.startsWith('reference:')),
+          ...((selection[node.serverId] ?? []).some(id => id.startsWith('reference:')) ? {
+            referenceRepairIds: (selection[node.serverId] ?? []).filter(id => id.startsWith('reference:')).map(id => id.slice('reference:'.length)),
+          } : {}),
+        }) })) }))
     if (!this.deleted.has(preview.experimentId)) this.notify(result.nodes.every(node => node.state === 'completed') ? 'cacheCleanupComplete' : 'cacheCleanupBlocked', result.nodes.some(node => node.state !== 'completed'))
     return result
   }
@@ -243,6 +280,7 @@ export class ExperimentsController {
 
   /** Apply a validated reconnect snapshot without moving local log cursors. @param snapshot - current durable records. */
   receive(snapshot: import('@aspera/dispatch/types').FleetSnapshot): void {
+    this.patch({ serviceReadError: null })
     for (const id of snapshot.deletedIds) this.deleted.add(id)
     for (const id of snapshot.removedServerIds) this.removedServers.add(id)
     const selectedId = this.store.getSnapshot().selectedId
@@ -264,6 +302,7 @@ export class ExperimentsController {
       executionReads: Object.fromEntries(Object.entries(this.store.getSnapshot().executionReads).filter(([id]) => !this.deleted.has(id))),
       ...(selectedId !== null && this.deleted.has(selectedId) ? { selectedId: null, files: [], filesTruncated: false } : {}) })
     for (const record of snapshot.experiments) this.replace(record)
+    this.services.reconcile()
     for (const installation of snapshot.installations) for (const change of installation.round.changes) {
       if (!change.applied || this.deleted.has(installation.experimentId) || this.announcedSources.has(change.id)) continue
       this.announcedSources.add(change.id)
@@ -280,6 +319,9 @@ export class ExperimentsController {
   }
 
   private isDisposed(): boolean { return this.disposed }
+
+  /** @param error - Host snapshot or watch failure; retained service times remain unchanged. */
+  readFailed(error: unknown): void { this.patch({ serviceReadError: String(error) }); this.report(error, { operation: 'snapshot' }) }
 
   private patch(patch: Partial<ExperimentsSnapshot>): void {
     if (!this.disposed) this.store.update((value) => { Object.assign(value, patch) })
@@ -331,7 +373,7 @@ export class ExperimentsController {
   refresh(): Promise<void> {
     if (this.isDisposed()) return Promise.resolve()
     if (this.loading !== undefined) return this.loading
-    const work = this.load().catch((error: unknown) => { this.report(error) }).finally(() => { this.loading = undefined })
+    const work = this.load().catch((error: unknown) => { this.readFailed(error) }).finally(() => { this.loading = undefined })
     this.loading = work
     return work
   }
@@ -391,6 +433,8 @@ export class ExperimentsController {
     const current = this.store.getSnapshot().experiments
     const previous = current.find(value => value.request.experimentId === row.request.experimentId)
     if ((previous?.latest?.revision ?? 0) > (row.latest?.revision ?? 0)) return
+    if (previous?.acceptanceRecovery !== undefined && previous.acceptanceRecovery.source.resultRevision === (row.latest ?? row.receipt)?.revision
+      && previous.acceptanceRecovery.revision > (row.acceptanceRecovery?.revision ?? -1)) row = { ...row, acceptanceRecovery: previous.acceptanceRecovery }
     if (previous?.completionReview !== undefined && previous.completionReview.originalRevision === (row.latest ?? row.receipt)?.revision
       && previous.completionReview.revision > (row.completionReview?.revision ?? -1)) row = { ...row, completionReview: previous.completionReview }
     if (previous?.completionAssessment !== undefined && previous.completionAssessment.originalRevision === (row.latest ?? row.receipt)?.revision
@@ -660,5 +704,5 @@ export class ExperimentsController {
   tick(): void { void this.refresh() }
 
   /** Stop applying late replies after the plugin is unloaded. */
-  dispose(): void { this.disposed = true; this.visible = false; this.decoders.clear() }
+  dispose(): void { this.disposed = true; this.visible = false; this.decoders.clear(); this.services.reconcile() }
 }

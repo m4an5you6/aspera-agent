@@ -13,6 +13,8 @@ The management profile's `archiveIntervalMs` default changes from 2000 to 15000 
 
 `lastSyncedAt` records the last successful round, including checks without new bytes. Background checks keep the previous result instead of publishing `syncing` at their start. Existing status fields and saved index version remain readable; `incomplete` still identifies historical gaps. The console presents those gaps separately in Overview's right-side Record saving card.
 
+An active phase can archive its events before the queue saves its Session id. The reader uses a single experiment/node-owned Agent source declaration; missing declarations remain unavailable and ambiguous declarations are diagnosed. Existing queue identities remain authoritative. No Session, remote release or archive generation changes.
+
 ## Migration
 
 1. Rebuild and restart the management profile. Review any explicit archive interval overrides in its `aspera-dispatch` configuration; existing values still take precedence. Custom fleet callers that supply a resolved archive policy must include `archiveBacklogIntervalMs` and `archiveWaitingIntervalMs`.

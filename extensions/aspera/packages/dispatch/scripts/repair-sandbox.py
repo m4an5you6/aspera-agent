@@ -182,15 +182,17 @@ def native_programs(request, root):
         descriptor = json.loads((backend.parent.parent / "launcher.json").read_text())
         if descriptor["version"] != 1 or descriptor["serverId"] != request["serverId"]:
             raise RuntimeError("Existing launcher belongs to a different server or format")
-        native = descriptor["native"]
+        native = dict(descriptor["native"])
         if descriptor["launcher"]["path"] != str(backend) or digest(backend) != descriptor["launcher"]["digest"]:
             raise RuntimeError("Existing launcher content differs from its saved identity")
         for item in native.values():
             if digest(item["path"]) != item["digest"]:
                 raise RuntimeError("A launcher's native executable changed: " + item["path"])
-        return native
-    native = {}
-    for name in ("bwrap", "unshare", "setpriv", "sha256sum"):
+    else:
+        native = {}
+    for name in ("bwrap", "unshare", "setpriv", "sha256sum", "env"):
+        if name in native:
+            continue
         path = str(backend) if name == "bwrap" else shutil.which(name)
         if path is None:
             raise FileNotFoundError("Required compatibility utility is missing: " + name)
@@ -209,7 +211,7 @@ def launcher_source(native):
     source = ["#!/bin/sh", "set -eu", 'root=${0%/bin/bwrap}', 'identity=${root##*/}',
               'actual=$(' + checksum + ' -- "$0")',
               '[ "${actual%% *}" = "$identity" ] || { printf \'Aspera launcher identity mismatch\\n\' >&2; exit 125; }']
-    for name in ("bwrap", "unshare", "setpriv"):
+    for name in ("bwrap", "unshare", "setpriv", "env"):
         item = native[name]
         source.extend(["actual=$(" + checksum + " -- " + quote(item["path"]) + ")",
                        '[ "${actual%% *}" = ' + quote(item["digest"]) +
@@ -218,6 +220,7 @@ def launcher_source(native):
                    '  1:--version|1:--help) exec ' + quote(native["bwrap"]["path"]) + ' "$@" ;;', 'esac',
                    "exec " + quote(native["setpriv"]["path"]) + " --no-new-privs --pdeathsig KILL " +
                    quote(native["unshare"]["path"]) + " --pid --fork --kill-child=SIGKILL --mount-proc -- " +
+                   quote(native["env"]["path"]) + " --default-signal=TERM,INT -- " +
                    quote(native["bwrap"]["path"]) + ' --cap-drop ALL "$@"'])
     return "\n".join(source) + "\n"
 
@@ -227,6 +230,10 @@ def inspect_or_repair(request, result):
     if not root.is_absolute() or request["mode"] not in ("inspect", "repair"):
         raise RuntimeError("Invalid program-owned compatibility location")
     native = native_programs(request, root)
+    if 'nativeRecipe' in request:
+        native = ensure_native_sandbox(request, native, result)
+        if native is None:
+            return
     source = launcher_source(native)
     identity = hashlib.sha256(source.encode()).hexdigest()
     directory = root / identity
@@ -253,18 +260,30 @@ def inspect_or_repair(request, result):
                       reason="The selected account lacks CAP_SYS_ADMIN for creating a private PID/proc parent. The cloud platform must supply compatible namespace/proc permissions; keep all inner isolation flags.")
         return
     namespaces = {name: os.readlink("/proc/self/ns/" + name) for name in ("user", "pid", "mnt", "ipc", "uts")}
-    probe = """import json,os,pathlib
+    probe = """import json,os,pathlib,signal,subprocess,sys
 expected=json.loads(os.environ['ASPERA_PARENT_NAMESPACES'])
 assert all(os.readlink('/proc/self/ns/'+name) != value for name,value in expected.items()), 'Namespaces were not isolated'
 status=dict(line.split(':',1) for line in pathlib.Path('/proc/self/status').read_text().splitlines() if ':' in line)
 assert all(int(status[name].strip(),16)==0 for name in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb')), 'Capabilities were retained'
 assert status['NoNewPrivs'].strip() == '1', 'Privilege gain is not disabled'
 assert len([name for name in os.listdir('/proc') if name.isdigit()]) <= 3, 'proc exposes unrelated processes'
+assert all(signal.getsignal(number) != signal.SIG_IGN for number in (signal.SIGTERM,signal.SIGINT)), 'Command termination signals are ignored'
+child=subprocess.Popen([sys.executable,'-c',"import time;print('ready',flush=True);time.sleep(60)"],stdout=subprocess.PIPE,text=True)
+try:
+    assert child.stdout.readline().strip() == 'ready', 'Signal probe child did not start'
+    child.terminate()
+    assert child.wait(timeout=ASPERA_SIGNAL_CHECK_TIMEOUT_SECONDS) == -signal.SIGTERM, 'Signal probe child did not terminate normally'
+finally:
+    if child.poll() is None:child.kill();child.wait()
+    child.stdout.close()
 print('Private user/PID/mount/IPC/UTS namespaces, private proc, zero capabilities and no_new_privs verified')
+print('Default SIGTERM/SIGINT and child termination verified')
 print('ASPERA_PROBE_PID_NS='+os.readlink('/proc/self/ns/pid'))
 """
+    probe = probe.replace("ASPERA_SIGNAL_CHECK_TIMEOUT_SECONDS", repr(request["cleanupTimeoutMs"] / 1000))
     argv = [native["setpriv"]["path"], "--no-new-privs", "--pdeathsig", "KILL", native["unshare"]["path"],
-            "--pid", "--fork", "--kill-child=SIGKILL", "--mount-proc", "--", native["bwrap"]["path"],
+            "--pid", "--fork", "--kill-child=SIGKILL", "--mount-proc", "--", native["env"]["path"],
+            "--default-signal=TERM,INT", "--", native["bwrap"]["path"],
             "--cap-drop", "ALL", *request["isolationArgs"], "--clearenv", "--setenv", "ASPERA_PARENT_NAMESPACES",
             json.dumps(namespaces), "--", request["python"], "-c", probe]
     code, stdout, stderr = run_probe(argv, request)

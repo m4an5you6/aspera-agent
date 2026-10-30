@@ -246,3 +246,176 @@ export function inspectExperimentFinalization(request) {
   return { version: 1, experimentId: request.experimentId, supported: waits.length > 0 || stages.length > 0 || decision !== undefined,
     waits, stages, ...(decision === undefined ? {} : { decision }), observedAt: Date.now(), offline: false, truncated }
 }
+
+function ownedJournals(request, folder, suffix) {
+  const directory = join(request.runRoot, folder)
+  if (!existsSync(directory)) return []
+  return opened(request.runRoot, directory, fd => {
+    const names = readdirSync(process.platform === 'linux' ? `/proc/self/fd/${fd}` : directory).filter(name => name.endsWith(suffix)).sort()
+    if (names.length > request.maxEntries) throw new Error('Acceptance recovery journal exceeds the configured entry limit')
+    return names.map(name => {
+      const row = JSON.parse(read(request.runRoot, join(directory, name), request.maxBytes).toString('utf8'))
+      if (row.experimentId !== request.experimentId || row.serverId !== request.serverId) throw new Error('Acceptance journal belongs to another experiment or node')
+      return row
+    })
+  })
+}
+function runtimeIdentity(request) {
+  own(request.runRoot, request.experimentId, request.serverId, request.maxBytes)
+  const control = JSON.parse(read(request.controlRoot, join(request.controlRoot, '.aspera-owner.json'), request.maxBytes))
+  const release = JSON.parse(read(request.releaseRoot, join(request.releaseRoot, 'aspera-release.json'), request.maxBytes))
+  const allocation = JSON.parse(read(request.controlRoot, join(request.controlRoot, 'state/node-home/storages/aspera_node/allocations', request.experimentId + '.json'), request.maxBytes)).record
+  if (control.kind !== 'control' || control.serverId !== request.serverId || release.deploymentId !== request.deploymentId
+    || allocation.deploymentId !== request.deploymentId || JSON.stringify(canonical(allocation.node)) !== JSON.stringify(canonical(request.node))) throw new Error('Acceptance recovery allocation or fixed release differs')
+  read(request.releaseRoot, join(request.releaseRoot, '.ready'), request.maxBytes)
+  return allocation
+}
+function checkpointFiles(request, directory, hashes) {
+  if (isAbsolute(directory) || directory.split(/[\\/]/).some(part => part === '..' || part === '.')) throw new Error('Recovery checkpoint path is not relative')
+  const workspace = join(request.runRoot, 'workspace')
+  return ['adapter_config.json', 'adapter_model.safetensors', 'trainer_state.json'].map(name => opened(workspace, join(workspace, directory, name), fd => {
+    const before = fstatSync(fd)
+    if (!before.isFile() || before.size <= 0) throw new Error('Retained adapter has missing or empty files')
+    const result = { name, device: String(before.dev), inode: String(before.ino), bytes: before.size, modified: before.mtimeMs }
+    if (hashes) {
+      const hash = createHash('sha256'), buffer = Buffer.alloc(65536)
+      let count
+      while ((count = readSync(fd, buffer, 0, buffer.length, null)) > 0) hash.update(buffer.subarray(0, count))
+      result.sha256 = hash.digest('hex')
+    }
+    if (identity(before) !== identity(fstatSync(fd))) throw new Error('Retained adapter changed during recovery inspection')
+    return result
+  }))
+}
+/** @param request - original and program-selected inference allocations. @returns a released native endpoint matched to an existing protected snapshot and original public check. */
+export function inspectAcceptanceSource(request) {
+  inspectCompletionIdentity(request)
+  const recovery = { ...request.recovery, maxBytes: request.maxBytes, maxEntries: request.maxEntries }
+  if (recovery.experimentId === request.experimentId || recovery.serverId !== request.serverId) throw new Error('Acceptance recovery must use the same selected node and another execution identity')
+  runtimeIdentity(recovery)
+  const snapshots = ownedJournals(recovery, 'inference-checkpoints-v1', '.json').filter(row => row.state === 'ready'
+    && row.source.sourceExperimentId === request.experimentId && row.source.step === request.expectedStep)
+  if (snapshots.length !== 1) throw new Error('A unique protected recovery snapshot of the original endpoint is required')
+  const snapshot = snapshots[0], source = snapshot.source
+  if (!/^[a-zA-Z0-9_-]{1,80}$/.test(source.commandId)) throw new Error('Original training command identity is invalid')
+  const command = JSON.parse(read(request.controlRoot, join(request.controlRoot, 'state/node-home/storages/aspera_node/commands', request.experimentId + '_' + source.commandId + '.json'), request.maxBytes)).record
+  if (command.experimentId !== request.experimentId || command.commandId !== source.commandId || command.state !== 'completed' || command.exitCode !== 0 || !command.released) throw new Error('Original endpoint command has not confirmed successful release')
+  const stages = ownedJournals(request, 'stage-acceptance-v1', '.verification.json')
+  const registrations = ownedJournals(request, 'stage-acceptance-v1', '.registration.json')
+  if (!registrations.some(registration => registration.commandId === source.commandId && stages.some(row => row.stageId === registration.stageId
+    && row.attemptId === registration.attemptId && row.sessionId === registration.sessionId && row.planRevision === registration.planRevision
+    && row.ready && row.endStep === request.expectedStep))) throw new Error('Original endpoint lacks independent stage verification')
+  const files = checkpointFiles(request, source.directory, true)
+  const actual = { sourceExperimentId: request.experimentId, serverId: request.serverId, commandId: source.commandId,
+    directory: source.directory, step: request.expectedStep, files: files.map(({ sha256: _hash, ...file }) => file) }
+  if (source.checkpointId !== digest(JSON.stringify(actual)) || JSON.stringify(actual.files) !== JSON.stringify(source.files)
+    || files.some(file => !snapshot.files.some(proof => JSON.stringify(file) === JSON.stringify(proof)))) throw new Error('Recovery snapshot does not match the original native files')
+  const state = JSON.parse(read(join(request.runRoot, 'workspace'), join(request.runRoot, 'workspace', source.directory, 'trainer_state.json'), request.maxBytes))
+  if (state.global_step !== request.expectedStep) throw new Error('Original native step changed')
+  const checks = ownedJournals(request, 'service-verifications-v1', '.json')
+  const requirements = [...new Map(checks.map(row => [row.url + '\n' + row.modelName, row])).values()]
+  if (requirements.length !== 1 || request.node.server.inferenceMapping?.url !== requirements[0].url) throw new Error('Original public inference requirements are missing or ambiguous')
+  return { serverId: request.serverId, step: request.expectedStep, commandId: source.commandId, checkpointId: source.checkpointId,
+    directory: source.directory, files, publicUrl: requirements[0].url, modelName: requirements[0].modelName }
+}
+/** @param request - fixed inference allocation. @returns current program journals and Goal outcome without launching any work. */
+export function inspectAcceptanceRuntime(request) {
+  runtimeIdentity(request)
+  const snapshots = ownedJournals(request, 'inference-checkpoints-v1', '.json')
+  for (const row of snapshots) {
+    const files = checkpointFiles(request, row.destination, false)
+    if (files.some(file => !row.files.some(proof => file.name === proof.name && file.device === proof.device && file.inode === proof.inode && file.bytes === proof.bytes && file.modified === proof.modified))) throw new Error('Protected recovery checkpoint changed')
+  }
+  const verifications = ownedJournals(request, 'service-verifications-v1', '.json')
+  const directory = join(request.controlRoot, 'state/node-home/storages/aspera_node/services')
+  const services = existsSync(directory) ? opened(request.controlRoot, directory, fd => {
+    const names = readdirSync(process.platform === 'linux' ? '/proc/self/fd/' + fd : directory).filter(name => name.endsWith('.json'))
+    if (names.length > request.maxEntries) throw new Error('Service history exceeds the configured acceptance limit')
+    return names.map(name => JSON.parse(read(request.controlRoot, join(directory, name), request.maxBytes)).record).filter(row => row.experimentId === request.experimentId)
+  }) : []
+  let record, goalFinished = false
+  if (request.coordinator) {
+    record = JSON.parse(read(request.controlRoot, join(request.controlRoot, 'state/coordinator-home/storages/aspera_queue/experiments', request.experimentId + '.json'), request.maxBytes)).record
+    if (record.submission.experimentId !== request.experimentId || record.submission.deploymentId !== request.deploymentId) throw new Error('Recovery coordinator identity differs')
+    if (['serving', 'completed'].includes(record.state)) {
+      const goal = inspectCompletionSession({ ...request, sessionId: record.sessionId })
+      goalFinished = goal.finished && goal.finishStatus === 'completed'
+    }
+  }
+  return { snapshots, services, verifications, ...(record === undefined ? {} : { record }), goalFinished }
+}
+/** @param request - released original node. @returns whether original program-owned checks establish a public-serving obligation. */
+export function inspectCompletionServiceRequirements(request) {
+  inspectCompletionIdentity(request)
+  return { required: ownedJournals(request, 'service-verifications-v1', '.json').length > 0 }
+}
+/** @param request - released inference recovery. @returns retained program hints for another recovery, without installing or approving its requirements. */
+export function inspectAcceptanceReferences(request) {
+  inspectCompletionIdentity(request)
+  const preflights = [], environmentIssues = [], directory = join(request.runRoot, 'environment-operations-v1')
+  if (existsSync(directory)) opened(request.runRoot, directory, fd => {
+    const held = process.platform === 'linux' ? '/proc/self/fd/' + fd : directory
+    const operations = readdirSync(held).filter(name => /^[a-f0-9-]{36}$/.test(name)).sort()
+    if (operations.length > request.maxEntries) throw new Error('Environment operation references exceed the configured limit')
+    for (const name of operations) {
+      const path = join(directory, name, 'receipt.v1.json')
+      if (!existsSync(path)) { environmentIssues.push({ operationId: name, detail: 'Receipt is unavailable; this source remains unconfirmed' }); continue }
+      const row = opened(request.runRoot, path, file => {
+        const before = fstatSync(file)
+        if (!before.isFile()) throw new Error('Environment operation receipt is not a regular file')
+        if (before.size > request.maxBytes) { environmentIssues.push({ operationId: name, detail: 'Receipt exceeds the configured read limit; inspect this operation with its detail interface' }); return undefined }
+        const bytes = readFileSync(file)
+        if (bytes.length !== before.size || identity(before) !== identity(fstatSync(file))) throw new Error('Environment operation receipt changed during inspection')
+        return JSON.parse(bytes.toString('utf8'))
+      })
+      if (row === undefined) continue
+      if (row.experimentId !== request.experimentId || row.serverId !== request.serverId) throw new Error('Environment operation reference belongs to another experiment')
+      if (row.preflight?.status === 'reusable' && row.exitConfirmed && row.exitCode === 0) preflights.push(row.preflight)
+    }
+  })
+  const proposals = ownedJournals(request, 'storage-preflight-v2/proposals', '.json')
+  return { preflights, environmentIssues, proposals }
+}
+/** @param request - original owned source paths selected from its saved file catalog. @returns bounded script/configuration text, never executed or modified. */
+export function inspectAcceptanceScripts(request) {
+  inspectCompletionIdentity(request)
+  if (request.paths.length > request.maxEntries) throw new Error('Recovery source list exceeds its configured limit')
+  let bytes = 0
+  return request.paths.map(path => {
+    if (!/^(?:configs|scripts)\/.+\.(?:py|sh|json)$/.test(path)) throw new Error('Recovery source is outside original scripts and configurations')
+    const file = inspectCompletionFile({ ...request, path, maxBytes: request.readBytes })
+    if (file.truncated) throw new Error('Original recovery source is truncated: ' + path)
+    bytes += file.bytes
+    if (bytes > request.maxBytes) throw new Error('Recovery source text exceeds the configured total limit')
+    return { serverId: request.serverId, path, sha256: file.sha256, text: file.text }
+  })
+}
+/** @param request - validated Host operation and accepted observations. @returns a new immutable original-relative proof, retaining every original result and log. */
+export function saveAcceptanceEvidence(request) {
+  inspectCompletionIdentity(request)
+  const operation = request.operation
+  if (operation.experimentId !== request.experimentId || operation.source.experimentId !== request.experimentId
+    || operation.recoveryExperimentId !== request.observation.experimentId || !/^[a-f0-9-]{36}$/.test(operation.operationId)) throw new Error('Acceptance evidence ownership differs')
+  const relativePath = 'reports/acceptance-recovery/' + operation.operationId + '.json'
+  const workspace = join(request.runRoot, 'workspace'), directory = join(workspace, 'reports/acceptance-recovery')
+  for (const [parent, name] of [[workspace, 'reports'], [join(workspace, 'reports'), 'acceptance-recovery']]) opened(workspace, parent, fd => {
+    const path = join(process.platform === 'linux' ? '/proc/self/fd/' + fd : parent, name)
+    if (!existsSync(path)) mkdirSync(path, { mode: 0o700 })
+  })
+  return opened(workspace, directory, fd => {
+    const held = process.platform === 'linux' ? '/proc/self/fd/' + fd : directory, path = join(held, operation.operationId + '.json')
+    const bytes = JSON.stringify({ version: 1, experimentId: request.experimentId, operationId: operation.operationId,
+      source: operation.source, recovery: request.observation, checkedAt: Date.now() }) + '\n'
+    if (existsSync(path)) {
+      const saved = read(workspace, join(workspace, relativePath), request.maxBytes)
+      const original = JSON.parse(saved)
+      if (original.operationId !== operation.operationId || JSON.stringify(original.source) !== JSON.stringify(operation.source)
+        || JSON.stringify(original.recovery) !== JSON.stringify(request.observation)) throw new Error('Acceptance evidence is immutable')
+      return { path: relativePath, sha256: digest(saved) }
+    }
+    const temporary = join(held, randomUUID() + '.incoming'), output = openSync(temporary, 'wx', 0o600)
+    try { writeFileSync(output, bytes); fsyncSync(output) } finally { closeSync(output) }
+    renameSync(temporary, path)
+    return { path: relativePath, sha256: digest(bytes) }
+  })
+}

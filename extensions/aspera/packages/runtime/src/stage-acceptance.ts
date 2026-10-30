@@ -1,7 +1,9 @@
 /** Program-owned Transformers evidence checks use approved stage arithmetic and scheduler semantics. */
 import { z } from 'zod'
+import { stageRegistrationSchema } from '@aspera/experiments'
 import type { ClusterCommandResult, CompletionSource, StageRegistration, StageVerification } from '@aspera/experiments'
 import type { FinalizationPolicy } from './finalization-policy.ts'
+import { stageCheckpointFiles, verifyCheckpointSaving } from './stage-checkpoints.ts'
 
 /** The trusted reader supplies stable hashes and the complete bounded source, never a model summary. */
 export interface StageDocument { source: CompletionSource; text: string; truncated: boolean }
@@ -17,6 +19,12 @@ function parseRows(text: string): Record<string, unknown>[] {
   const row = object.parse(value)
   return Array.isArray(row.log_history) ? row.log_history.map(item => object.parse(item)) : [row]
 }
+function resultGroups(text: string): { body: Record<string, unknown>; rows: Record<string, unknown>[] }[] {
+  return parseRows(text).map(body => {
+    const values = body.results ?? body.outputs ?? body.generations ?? body.rows
+    return { body, rows: values === undefined ? [body] : z.array(object).parse(values) }
+  })
+}
 function optimizerStep(row: Record<string, unknown>): number | undefined {
   const step = row.global_step ?? row.step
   if (typeof step === 'number' && Number.isSafeInteger(step) && step >= 0) return step
@@ -29,6 +37,13 @@ function number(row: Record<string, unknown>, key: string): number {
   if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error(`Missing finite numeric ${key}`)
   return value
 }
+function verifyAttemptLabel(registration: StageRegistration, actual: unknown, path: string, detail: string): void {
+  const expected = registration.attemptLabel
+  if (expected === undefined || actual === expected) return
+  const parsed = stageRegistrationSchema.shape.attemptLabel.safeParse(actual)
+  const observed = parsed.success ? JSON.stringify(parsed.data) : `invalid ${typeof actual}`
+  throw new Error(`${detail}: ${path}; expected attemptLabel=${JSON.stringify(expected)} in attempt_id/phase, observed=${observed}. Registered attemptId=${JSON.stringify(registration.attemptId)} is a separate identifier. Preserve original logs and numerical results; correct the structured evidence without retraining.`)
+}
 function schedulerRate(spec: StageRegistration['requirement'], step: number): number {
   const scheduler = spec.scheduler, position = scheduler.mode === 'continue' ? step : step - spec.startStep
   if (position < scheduler.warmupSteps) return scheduler.learningRate * position / Math.max(1, scheduler.warmupSteps)
@@ -37,10 +52,10 @@ function schedulerRate(spec: StageRegistration['requirement'], step: number): nu
   return scheduler.learningRate * (scheduler.type === 'linear' ? Math.max(0, 1 - progress) : Math.max(0, 0.5 * (1 + Math.cos(Math.PI * progress))))
 }
 
-/** @param spec - approved requirements. @param text - complete effective parameter JSON.
+/** @param spec - approved requirements. @param text - complete effective parameter JSON. @param trainerState - registered final native state or its complete log snapshot. @param resumeState - original native state for continuation.
  * @returns a diagnostic after checking launch parameters; throws when the approved values differ.
  */
-export function verifyStageParameters(spec: StageRegistration['requirement'], text: string): string {
+export function verifyStageParameters(spec: StageRegistration['requirement'], text: string, trainerState: string, resumeState?: Record<string, unknown>): string {
   const args = object.parse(JSON.parse(text)), scheduler = spec.scheduler
   if (scheduler.mode === 'restart') {
     if (number(args, 'max_steps') < spec.endStep || number(args, 'scheduler_total_steps') !== scheduler.totalSteps) throw new Error('Restart requires an explicit effective local scheduler horizon and the approved cumulative endpoint')
@@ -52,6 +67,7 @@ export function verifyStageParameters(spec: StageRegistration['requirement'], te
   if (spec.samples !== undefined && (number(args, 'per_device_train_batch_size') !== spec.samples.perDeviceBatchSize
     || number(args, 'gradient_accumulation_steps') !== spec.samples.gradientAccumulationSteps
     || number(args, 'world_size') !== spec.samples.worldSize)) throw new Error('Effective batch, accumulation or world size differs from the sample-count basis')
+  verifyCheckpointSaving(spec, args, trainerState, resumeState)
   return 'Effective training parameters match the approved stage'
 }
 
@@ -79,7 +95,7 @@ export function verifyTrainingStage(registration: StageRegistration, documents: 
     return 'Approved cumulative and additional optimizer steps are separate'
   })
   check('command', () => {
-    if (command?.commandId !== registration.commandId || command.state !== 'completed' || command.exitCode !== 0 || !command.released) throw new Error('Original training command has not succeeded with confirmed release')
+    if (command?.commandId !== registration.commandId || command.purpose === 'diagnostic' || command.state !== 'completed' || command.exitCode !== 0 || !command.released) throw new Error('Original training command has not succeeded with confirmed release')
     return 'Original command exit 0 and cleanup confirmed; numerical checks remain independent'
   })
   check('checkpoint', () => {
@@ -88,7 +104,13 @@ export function verifyTrainingStage(registration: StageRegistration, documents: 
     return `${spec.startStep} + ${spec.additionalSteps} = ${spec.endStep}`
   })
   check('parameters', () => {
-    return verifyStageParameters(spec, read(registration.parameters).text)
+    return verifyStageParameters(spec, read(registration.parameters).text, registration.trainerState,
+      registration.resumeState === undefined ? undefined : json(registration.resumeState))
+  })
+  for (const point of stageCheckpointFiles(spec)) check('recovery-checkpoint:' + point.path, () => {
+    const actual = number(json(point.path), 'global_step')
+    if (actual !== point.step) throw new Error(`Recovery checkpoint ${point.path} declares cumulative step ${point.step}, but native global_step=${actual}; renaming another checkpoint cannot establish the approved recovery point`)
+    return 'Native recovery state confirms cumulative optimizer step ' + point.step
   })
   if (spec.scheduler.mode === 'continue') check('resume-state', () => {
     if (registration.resumeState === undefined) throw new Error('Original resume checkpoint is missing')
@@ -109,7 +131,7 @@ export function verifyTrainingStage(registration: StageRegistration, documents: 
     for (const row of rows) {
       const step = optimizerStep(row)
       if (step === undefined) throw new Error('Training metric has no valid optimizer step')
-      if (registration.attemptLabel !== undefined && (row.attempt_id ?? row.phase) !== registration.attemptLabel) throw new Error('Metric attempt identity differs from the registered attempt')
+      verifyAttemptLabel(registration, row.attempt_id ?? row.phase, registration.metrics, 'Metric attempt identity differs from the registered attempt')
       if (step > spec.endStep || step <= (spec.metricScope === 'stage' ? spec.startStep : 0)) throw new Error('Metric belongs outside the declared stage scope: ' + step)
       number(row, 'loss'); number(row, 'learning_rate')
       const prior = byStep.get(step)
@@ -143,7 +165,7 @@ export function verifyTrainingStage(registration: StageRegistration, documents: 
     for (const row of rows) {
       const seq = number(row, 'seq'), step = number(row, samples.meaning === 'fetched' ? 'global_step_at_fetch' : 'global_step')
       if (!Number.isSafeInteger(seq) || sequences.has(seq) || step < spec.startStep || step > spec.endStep) throw new Error('Sample sequence is duplicated or outside the registered stage')
-      if (registration.attemptLabel !== undefined && (row.attempt_id ?? row.phase) !== registration.attemptLabel) throw new Error('Sample evidence belongs to another attempt')
+      verifyAttemptLabel(registration, row.attempt_id ?? row.phase, registration.samples, 'Sample evidence belongs to another attempt')
       sequences.add(seq)
       if (samples.datasetSize !== undefined && samples.firstIndex !== undefined && number(row, 'index') !== (samples.firstIndex + seq) % samples.datasetSize) throw new Error('Sample order does not continue the approved dataset sequence')
     }
@@ -152,16 +174,16 @@ export function verifyTrainingStage(registration: StageRegistration, documents: 
   if (spec.results?.evaluationSamples !== undefined) check('evaluation', () => {
     if (registration.evaluation === undefined) throw new Error('Evaluation evidence path is missing')
     const evaluation = json(registration.evaluation), count = evaluation.n ?? evaluation.eval_samples ?? evaluation.num_samples
+      ?? (evaluation.mode === 'eval' ? evaluation.evaluatedSamples : undefined)
     if (count !== spec.results!.evaluationSamples) throw new Error('Evaluation sample count does not match the approved stage')
-    number(evaluation, 'eval_loss')
+    if (evaluation.lossIsFinite === false) throw new Error('Original evaluation explicitly reports nonfinite loss')
+    if (evaluation.eval_loss !== undefined) number(evaluation, 'eval_loss')
+    else if (evaluation.mode === 'eval') number(evaluation, 'meanLossPerSupervisedToken')
+    else throw new Error('Missing finite numeric eval_loss')
     return 'Finite evaluation loss and the approved sample count are recorded'
   })
   const responses = (path: string): Record<string, unknown>[] => {
-    const value: unknown = JSON.parse(read(path).text)
-    if (Array.isArray(value)) return value.map(row => object.parse(row))
-    const body = object.parse(value), values = body.results ?? body.outputs ?? body.generations
-    if (!Array.isArray(values)) throw new Error('Inference evidence requires actual structured prompt responses')
-    return values.map(row => object.parse(row))
+    return resultGroups(read(path).text).flatMap(group => group.rows)
   }
   const nonempty = (row: Record<string, unknown>) => typeof (row.response ?? row.output ?? row.generated_text) === 'string'
     && String(row.response ?? row.output ?? row.generated_text).trim().length > 0
@@ -177,13 +199,28 @@ export function verifyTrainingStage(registration: StageRegistration, documents: 
   })
   const requiredResults = spec.results
   if (requiredResults !== undefined) check('result-identity', () => {
-    const checkpoint = registration.trainerState.replace(/\/[^/]+$/, '')
-    const matches = (path: unknown) => typeof path === 'string' && (path.replace(/\/$/, '') === checkpoint
-      || path.includes(`/runs/${registration.experimentId}/workspace/`) && path.replace(/\/$/, '').endsWith('/' + checkpoint))
+    const snapshot = read(registration.trainerState)
+    const nativeFiles = stageCheckpointFiles(spec).filter(file => file.step === spec.endStep)
+    const checkpoints = new Set(nativeFiles.length === 0 ? [registration.trainerState.replace(/\/[^/]+$/, '')] : [])
+    for (const file of nativeFiles) {
+      const native = read(file.path)
+      if (native.source.sha256 === snapshot.source.sha256 && native.source.bytes === snapshot.source.bytes
+        && native.text === snapshot.text && number(object.parse(JSON.parse(native.text)), 'global_step') === spec.endStep) {
+        checkpoints.add(file.path.replace(/\/[^/]+$/, ''))
+      }
+    }
+    const matches = (path: unknown) => typeof path === 'string' && !path.split('/').some(part => part === '..' || part === '.')
+      && [...checkpoints].some(checkpoint => path.replace(/\/$/, '') === checkpoint
+        || path.includes(`/runs/${registration.experimentId}/workspace/`) && path.replace(/\/$/, '').endsWith('/' + checkpoint))
     const confirm = (path: string) => {
-      const raw: unknown = JSON.parse(read(path).text), rows = Array.isArray(raw) ? raw.map(row => object.parse(row)) : [object.parse(raw)]
-      if (!rows.every(row => matches(row.adapter_path ?? row.checkpoint ?? row.model_checkpoint))) throw new Error('Result does not identify the registered training checkpoint: ' + path)
-      if (registration.attemptLabel !== undefined && !rows.every(row => (row.attempt_id ?? row.phase) === registration.attemptLabel)) throw new Error('Result belongs to a different training attempt')
+      const checkpoint = (row: Record<string, unknown>) => row.adapter_path ?? row.checkpoint ?? row.model_checkpoint ?? row.adapterPath ?? row.adapter
+      const attempt = (row: Record<string, unknown>) => row.attempt_id ?? row.phase
+      for (const { body, rows } of resultGroups(read(path).text)) {
+        if (checkpoint(body) !== undefined && !matches(checkpoint(body))) throw new Error('Result does not identify the registered training checkpoint: ' + path)
+        if (attempt(body) !== undefined) verifyAttemptLabel(registration, attempt(body), path, 'Result belongs to a different training attempt')
+        if (!rows.every(row => matches(checkpoint(row) ?? checkpoint(body)))) throw new Error('Result does not identify the registered training checkpoint: ' + path)
+        for (const row of rows) verifyAttemptLabel(registration, attempt(row) ?? attempt(body), path, 'Result belongs to a different training attempt')
+      }
     }
     if (requiredResults.evaluationSamples !== undefined && registration.evaluation !== undefined) confirm(registration.evaluation)
     if (requiredResults.inferencePrompts !== undefined && registration.inference !== undefined) confirm(registration.inference)

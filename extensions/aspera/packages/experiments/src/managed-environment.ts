@@ -2,6 +2,7 @@
 import { z } from 'zod'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import type { Branded } from '@deepseek-ai/dsh-brand'
+import { environmentPreflightSchema } from './storage-preflight.ts'
 import { experimentIdSchema, serverIdSchema, deploymentIdSchema } from './cluster-protocol.ts'
 import { borrowedEnvironmentSummarySchema, serverStorageCatalogSchema, experimentStoragePlanSchema, experimentMaterialSummarySchema, materialOperationSchema, storageArrangementSchema } from './storage-governance.ts'
 
@@ -19,21 +20,33 @@ const relativePath = z.string().min(1).max(2048).refine(value => !value.startsWi
 /** Model requests select dependencies and registered environments, never controller paths or PIDs. */
 export const prepareExperimentEnvironmentSchema = z.object({
   environmentId: experimentEnvironmentIdSchema, operationId: environmentOperationIdSchema,
-  action: z.enum(['create', 'install', 'verify', 'make-writable']),
+  action: z.enum(['create', 'install', 'verify', 'verify-reuse', 'make-writable', 'repair']),
   purpose: z.string().min(1).max(1000).optional(),
   directory: relativePath.optional(), requirements: z.array(z.string().min(1).max(4096)).max(512).default([]),
   modules: z.array(z.string().regex(/^[a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*$/)).max(64).default([]),
   files: z.array(relativePath).max(128).default([]), requireCuda: z.boolean().default(false),
   reuseCandidateId: z.string().regex(/^[a-f0-9]{64}$/).optional(),
-}).strict()
+  recheckSource: z.boolean().optional(),
+  repairPlanId: deploymentIdSchema.optional(),
+  repairWheelMetadata: z.boolean().optional(),
+}).strict().refine(value => value.action === 'repair' ? value.repairPlanId !== undefined : value.repairPlanId === undefined,
+  'Only repair selects a program-issued repair plan').refine(value => !value.repairWheelMetadata || value.action === 'repair',
+  'Wheel metadata rebuilding requires an explicitly selected repair plan')
 /** A checked model operation, without account credentials. */
 export type PrepareExperimentEnvironment = z.infer<typeof prepareExperimentEnvironmentSchema>
+
+/** Independent input proof written only after authenticated node digest verification. */
+export const environmentInputVerificationSchema = z.object({ version: z.literal(1), experimentId: experimentIdSchema,
+  serverId: serverIdSchema, name: z.string().min(1).max(255), sha256: deploymentIdSchema,
+  checkedAt: z.number().int().nonnegative() }).strict()
+/** A verified submitted wheel retains its original experiment and content identity. */
+export type EnvironmentInputVerification = z.infer<typeof environmentInputVerificationSchema>
 
 /** Persisted reuse decisions precede dependency acquisition and retain measured results. */
 export const environmentReusePlanSchema = z.object({ version: z.literal(1), experimentId: experimentIdSchema, serverId: serverIdSchema,
   operationId: environmentOperationIdSchema, environmentId: experimentEnvironmentIdSchema, requirementsHash: deploymentIdSchema,
   pythonAbi: z.string(), uvVersion: z.string(), lockHash: deploymentIdSchema.optional(),
-  stage: z.enum(['checking', 'reusing', 'downloading', 'installing', 'verifying', 'completed', 'blocked', 'recovering']),
+  stage: z.enum(['checking', 'checking-reuse', 'reusing', 'downloading', 'installing', 'verifying', 'completed', 'blocked', 'recovering']),
   packages: z.array(z.object({ name: z.string(), version: z.string(), wheelHash: deploymentIdSchema.optional(),
     decision: z.enum(['current', 'shared', 'material', 'legacy', 'download']), reason: z.string().optional(), bytes: z.number().int().nonnegative().optional(),
   }).strict()), downloadBytes: z.number().int().nonnegative(), reusedBytes: z.number().int().nonnegative(),
@@ -104,6 +117,25 @@ export const environmentRecoverySchema = z.object({ version: z.literal(1), exper
 }).strict()
 /** Independent version-1 recovery result preserves the failed receipt and its original times. */
 export type EnvironmentRecovery = z.infer<typeof environmentRecoverySchema>
+/** A failed source retains measured differences without authorizing changes to that source. */
+export const environmentDiagnosticSchema = z.object({ version: z.literal(1), experimentId: experimentIdSchema, serverId: serverIdSchema,
+  operationId: environmentOperationIdSchema, environmentId: experimentEnvironmentIdSchema, id: deploymentIdSchema,
+  code: z.enum(['content-mismatch', 'dependency-mismatch', 'unreadable', 'verification-timeout', 'reference-pending', 'installation-failed']),
+  detail: z.string(), candidateId: deploymentIdSchema.optional(), path: z.string().optional(), package: z.string().optional(),
+  expectedHash: z.string().optional(), actualHash: z.string().optional(), expectedBytes: z.number().int().nonnegative().optional(),
+  actualBytes: z.number().int().nonnegative().optional(), sourceFingerprint: deploymentIdSchema, checkedAt: z.number().int().nonnegative(),
+}).strict()
+/** A model selects an immutable, allocation-owned repair proposal rather than filesystem paths. */
+export const environmentRepairPlanSchema = z.object({ version: z.literal(1), id: deploymentIdSchema, experimentId: experimentIdSchema,
+  serverId: serverIdSchema, environmentId: experimentEnvironmentIdSchema, sourceOperationId: environmentOperationIdSchema,
+  requestHash: deploymentIdSchema, sourceFingerprint: deploymentIdSchema, diagnosticIds: z.array(deploymentIdSchema),
+  strategy: z.enum(['rebuild-from-materials', 'reinstall-affected']), requirements: z.array(z.string()), modules: z.array(z.string()),
+  requireCuda: z.boolean(), packages: z.array(z.string()), checkedAt: z.number().int().nonnegative(),
+  downloadBytes: z.number().int().nonnegative().nullable(), copyBytes: z.number().int().nonnegative().nullable(),
+  peakBytes: z.number().int().nonnegative().nullable(), detail: z.string(),
+}).strict()
+/** Program-issued environment repair proposal saved independently of the original failure. */
+export type EnvironmentRepairPlan = z.infer<typeof environmentRepairPlanSchema>
 /** Structured package collisions bind retry admission to their original program-owned inputs. */
 export const environmentFailureSchema = z.object({ version: z.literal(1), experimentId: experimentIdSchema, serverId: serverIdSchema,
   operationId: environmentOperationIdSchema, environmentId: experimentEnvironmentIdSchema, requestHash: deploymentIdSchema,
@@ -124,6 +156,8 @@ export const environmentOperationSchema = z.object({ version: z.literal(1), expe
   exitConfirmed: z.boolean(), exitCode: z.number().int().nullable(), detail: z.string().optional(), environment: experimentEnvironmentSchema.optional(),
   cleanup: environmentCleanupSchema.optional(), recovery: environmentRecoverySchema.optional(),
   failure: environmentFailureSchema.optional(),
+  preflight: environmentPreflightSchema.optional(),
+  diagnostics: z.array(environmentDiagnosticSchema).optional(), repairPlans: z.array(environmentRepairPlanSchema).optional(),
   borrowed: borrowedEnvironmentSummarySchema.optional(),
 }).strict().refine(value => value.failure === undefined || value.failure.experimentId === value.experimentId
   && value.failure.serverId === value.serverId && value.failure.operationId === value.operationId
@@ -176,9 +210,22 @@ export const environmentStorageNodeSchema = z.object({ serverId: serverIdSchema,
   storagePlan: experimentStoragePlanSchema.optional(),
   arrangement: storageArrangementSchema.optional(),
   assets: z.array(experimentMaterialSummarySchema).optional(), materialOperations: z.array(materialOperationSchema).optional(),
+  diagnostics: z.array(environmentDiagnosticSchema).optional(), repairPlans: z.array(environmentRepairPlanSchema).optional(),
 }).strict()
 /** Read-only per-node space observations; local copies retain the original check time. */
 export type EnvironmentStorageNode = z.infer<typeof environmentStorageNodeSchema>
+/** Authenticated node response preserves process observations when the environment scan fails. */
+export const environmentInspectionResponseSchema = z.object({ version: z.literal(1), experimentId: experimentIdSchema,
+  serverId: serverIdSchema, checkedAt: z.number().int().nonnegative(), operations: z.array(environmentOperationStatusSchema),
+  launches: z.array(environmentLaunchSchema), storage: environmentStorageNodeSchema.optional(), error: z.string().optional(),
+}).strict().refine(value => value.storage !== undefined || value.error !== undefined, 'Inspection requires an observation or error')
+/** Environment inspection is independent of successful dependency discovery. */
+export type EnvironmentInspectionResponse = z.infer<typeof environmentInspectionResponseSchema>
+/** A missing environment remains referenced until its original deletion and process exit are confirmed. */
+export const environmentReferenceRepairSchema = z.object({ id: deploymentIdSchema, sourceExperimentId: experimentIdSchema,
+  environmentId: experimentEnvironmentIdSchema, eligible: z.boolean(), detail: z.string(), checkedAt: z.number().int().nonnegative(),
+  evidenceHash: deploymentIdSchema.optional(),
+}).strict()
 /** Version-1 Host copy does not modify fleet generation 6 or the submitted experiment. */
 export const experimentStorageUsageSchema = z.object({ version: z.literal(1), experimentId: experimentIdSchema,
   nodes: z.array(environmentStorageNodeSchema), updatedAt: z.number().int().nonnegative(),
@@ -186,7 +233,7 @@ export const experimentStorageUsageSchema = z.object({ version: z.literal(1), ex
 /** Experiment-wide storage observations and environment status. */
 export type ExperimentStorageUsage = z.infer<typeof experimentStorageUsageSchema>
 /** Program-generated cleanup entries never expose an arbitrary deletion path input. */
-export const environmentCacheCandidateSchema = z.object({ id: z.string(), kind: z.enum(['package', 'temporary', 'material', 'historical-temporary', 'historical-material']),
+export const environmentCacheCandidateSchema = z.object({ id: z.string(), kind: z.enum(['package', 'temporary', 'material', 'historical-temporary', 'historical-material', 'manager-cache', 'input-duplicate', 'release-asset-duplicate']),
   bytes: z.number().int().nonnegative(), reason: z.string(),
   sourceExperimentId: experimentIdSchema.optional(),
 }).strict()
@@ -194,19 +241,21 @@ export const environmentCacheCandidateSchema = z.object({ id: z.string(), kind: 
 export const experimentCachePreviewSchema = z.object({ experimentId: experimentIdSchema, nodes: z.array(z.object({ serverId: serverIdSchema,
   checkedAt: z.number().int().nonnegative(), fingerprint: deploymentIdSchema, candidates: z.array(environmentCacheCandidateSchema),
   eligible: z.boolean(), detail: z.string().optional(),
+  referenceRepairs: z.array(environmentReferenceRepairSchema).optional(),
 }).strict()) }).strict()
 /** Read-only preview of safe, owned cleanup candidates. */
 export type ExperimentCachePreview = z.infer<typeof experimentCachePreviewSchema>
 /** Only previewed nodes and fingerprints are accepted for cleanup. */
 export const experimentCacheCleanupSchema = z.object({ experimentId: experimentIdSchema, operationId: environmentOperationIdSchema,
-  nodes: z.array(z.object({ serverId: serverIdSchema, fingerprint: deploymentIdSchema, candidateIds: z.array(z.string()).min(1).optional() }).strict()).min(1).max(128),
+    nodes: z.array(z.object({ serverId: serverIdSchema, fingerprint: deploymentIdSchema, candidateIds: z.array(z.string()).optional(),
+      referenceRepairIds: z.array(deploymentIdSchema).min(1).optional() }).strict()).min(1).max(128),
 }).strict()
 /** Explicit cleanup request using registered candidate snapshots. */
 export type ExperimentCacheCleanup = z.infer<typeof experimentCacheCleanupSchema>
 /** Partial cleanup results retain errors without changing training outcomes. */
 export const experimentCacheResultSchema = z.object({ experimentId: experimentIdSchema, operationId: environmentOperationIdSchema,
   nodes: z.array(z.object({ serverId: serverIdSchema, state: z.enum(['completed', 'blocked']), reclaimedBytes: z.number().int().nonnegative(),
-  checkedAt: z.number().int().nonnegative(), detail: z.string().optional() }).strict()),
+  checkedAt: z.number().int().nonnegative(), detail: z.string().optional(), repairedReferences: z.array(deploymentIdSchema).optional() }).strict()),
 }).strict()
 /** Per-node cleanup results, independently retriable. */
 export type ExperimentCacheResult = z.infer<typeof experimentCacheResultSchema>

@@ -37,3 +37,18 @@ export function isExternalLink(candidate: string): boolean {
   try { const url = new URL(candidate); return url.protocol === 'https:' && !url.username && !url.password }
   catch (error) { void error; return false }
 }
+
+/**
+ * Permit clipboard writes only from the focused, owned top-level document; reads and other permissions remain denied.
+ * @param request - observed caller, frame and current Host identity from Electron's permission handlers.
+ * @returns whether the browser may write clipboard text.
+ */
+export function allowClipboardWrite(request: {
+  permission: string; owned: boolean; focused: boolean; mainFrame: boolean
+  origin: string | undefined; currentUrl: string; requestingUrl: string | undefined; requestingOrigin?: string
+}): boolean {
+  return request.permission === 'clipboard-sanitized-write' && request.owned && request.focused && request.mainFrame
+    && request.origin !== undefined && request.requestingUrl !== undefined
+    && isOwnedNavigation(request.currentUrl, request.origin) && isOwnedNavigation(request.requestingUrl, request.origin)
+    && (request.requestingOrigin === undefined || isOwnedNavigation(request.requestingOrigin, request.origin))
+}

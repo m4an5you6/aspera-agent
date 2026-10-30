@@ -1,5 +1,6 @@
 /** Durable preparation command supervision and SSH-independent log recovery. */
 import { readFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { setTimeout as delay } from 'node:timers/promises'
 import { z } from 'zod'
 import { importObservation, observationSources } from '@aspera/runtime'
@@ -76,6 +77,34 @@ mkdir -p ${shellQuote(input.directory.slice(0, input.directory.lastIndexOf('/'))
 mkdir ${directory} || exit 1
 printf '%s\\n' ${shellQuote(JSON.stringify(request))} > ${directory}/request.v1.json
 ${execute}`
+}
+
+/**
+ * Stream a complete supervised launcher without placing its source in SSH arguments.
+ * @param input - original invocation and a verified Python path when available.
+ * @returns short command plus UTF-8 input, or the shell-only bootstrap before Python exists.
+ */
+export function preparationCommandTransfer(input: PreparationInvocation): { script: string; input?: string } {
+  const payload = preparationCommandScript(input)
+  if (input.python === undefined) return { script: payload }
+  const loader = `import hashlib,os,pathlib,subprocess,sys,tempfile
+data=sys.stdin.buffer.read(int(sys.argv[1])+1)
+if len(data)!=int(sys.argv[1]) or hashlib.sha256(data).hexdigest()!=sys.argv[2]:
+ raise RuntimeError('Preparation launcher input is incomplete or changed; no command was started')
+parent=pathlib.Path(sys.argv[3])
+if not parent.is_absolute() or any(item.is_symlink() for item in (parent,*parent.parents)):
+ raise RuntimeError('Preparation launcher directory is outside its owned path')
+parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+status=parent.stat()
+if status.st_uid!=os.geteuid() or status.st_mode&0o022:
+ raise RuntimeError('Preparation launcher directory is not private to the SSH account')
+with tempfile.TemporaryFile(dir=parent) as source:
+ source.write(data);source.flush();source.seek(0)
+ environment=dict(os.environ);environment.pop('BASH_ENV',None);environment.pop('ENV',None)
+ result=subprocess.run(['/bin/bash','/proc/self/fd/'+str(source.fileno())],stdin=subprocess.DEVNULL,pass_fds=(source.fileno(),),env=environment)
+sys.exit(result.returncode)`
+  return { script: `${shellQuote(input.python)} -B -I -c ${shellQuote(loader)} ${Buffer.byteLength(payload)} ${shellQuote(createHash('sha256').update(payload).digest('hex'))} ${shellQuote(input.directory.slice(0, input.directory.lastIndexOf('/')))}`,
+    input: payload }
 }
 
 /**

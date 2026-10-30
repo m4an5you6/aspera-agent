@@ -1,6 +1,6 @@
 /** Command groups submit participants before waiting and retain unresolved launch identities. */
-import { randomUUID } from 'node:crypto'
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs'
+import { randomUUID, createHash } from 'node:crypto'
+import { mkdtempSync, mkdirSync, rmSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
@@ -9,6 +9,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { experimentIdSchema, serverIdSchema } from '@aspera/experiments'
 import { installExecutionCommands } from '../src/execution-commands.ts'
 import { clusterNodeRequest, ClusterNodeOperationError } from '../src/cluster-runtime.ts'
+import { CommandAdmissionRejected } from '../src/command-admission.ts'
 import type { ClusterPrivate, ClusterRuntimeConfig } from '../src/cluster-runtime.ts'
 
 vi.mock('../src/cluster-runtime.ts', async original => ({ ...await original<typeof import('../src/cluster-runtime.ts')>(), clusterNodeRequest: vi.fn() }))
@@ -28,9 +29,9 @@ function fixture() {
     const input = raw as { commandId: string }
     observations.push(operation + ':' + input.commandId)
     if (operation === 'run') return { state: 'running' }
-    return { experimentId: id, serverId, result: { commandId: input.commandId, state: 'completed', exitCode: 0, released: true }, checkedAt: 1 }
+    return { experimentId: id, serverId, requestHash: createHash('sha256').update('true').digest('hex'), result: { commandId: input.commandId, state: 'completed', exitCode: 0, released: true }, checkedAt: 1 }
   })
-  return { id, serverId, group, call, observations, execution, tools }
+  return { id, serverId, group, call, observations, execution, tools, root }
 }
 it('starts all rendezvous members before the first status read and rejects altered duplicate requests', async () => {
   const f = fixture(); await f.call()
@@ -47,20 +48,44 @@ it('refuses an ordinary command impersonating a managed service before launch', 
   await expect(f.tools.get('run_experiment_command')!.execute({ server_id: f.serverId, run_id: 'service-fake', command: 'true' }, f.execution)).rejects.toThrow('reserved')
   expect(f.observations).toEqual([])
 })
+it('returns readable stream references after diagnostic exit without resubmitting it', async () => {
+  const f = fixture(), original = vi.mocked(clusterNodeRequest).getMockImplementation()!
+  vi.mocked(clusterNodeRequest).mockImplementation(async (...args) => args[2] === 'diagnostic' ? { state: 'running' }
+    : { ...await original(...args) as object, experimentId: f.id, serverId: f.serverId, requestHash: createHash('sha256').update('true').digest('hex'),
+      result: { commandId: 'readonly', state: 'completed', exitCode: 0, released: true, purpose: 'diagnostic' }, checkedAt: 1 })
+  const result = JSON.parse(String(await f.tools.get('run_experiment_diagnostic')!.execute({ server_id: f.serverId, run_id: 'readonly', command: 'true' }, f.execution)))
+  expect(result).toMatchObject({ state: 'settled', result: { released: true }, logs: {
+    stdout: { tool: 'read_experiment_file', server_id: f.serverId, command_id: 'readonly', stream: 'stdout', offset: 0 },
+    stderr: { command_id: 'readonly', stream: 'stderr' },
+  } })
+  expect(vi.mocked(clusterNodeRequest).mock.calls.filter(call => call[2] === 'diagnostic')).toHaveLength(1)
+})
+
+it('does not submit changed ordinary command contents or overwrite the successful original wait', async () => {
+  const f = fixture(), tool = f.tools.get('run_experiment_command')!
+  const args = { server_id: f.serverId, run_id: 'first', command: 'true' }
+  expect(JSON.parse(String(await tool.execute(args, f.execution)))).toMatchObject({ state: 'completed' })
+  const path = resolve(f.root, 'runs', f.id, 'command-waits-v1', f.serverId + '_first.json')
+  const before = readFileSync(path, 'utf8'), calls = f.observations.length
+  await expect(tool.execute({ ...args, command: 'printf changed' }, f.execution)).rejects.toThrow('different content')
+  expect(f.observations).toHaveLength(calls); expect(readFileSync(path, 'utf8')).toBe(before)
+})
 it('stops matching members after a confirmed launch rejection, with content hashes', async () => {
   const f = fixture(), original = vi.mocked(clusterNodeRequest).getMockImplementation()!
   vi.mocked(clusterNodeRequest).mockImplementation(async (...args) => {
-    if (args[2] === 'run' && (args[3] as { commandId: string }).commandId === 'two') throw new ClusterNodeOperationError(409, 'admission refused')
+    if (args[2] === 'run' && (args[3] as { commandId: string }).commandId === 'two') throw new CommandAdmissionRejected({ version: 1, formatVersion: '0.1.3',
+      experimentId: f.id, serverId: f.serverId, commandId: 'two', requestHash: createHash('sha256').update('true').digest('hex'),
+      state: 'rejected', processState: 'not-started', checkedAt: Date.now(), detail: 'admission refused' })
     return original(...args)
   })
   expect(JSON.parse(String(await f.call()))).toMatchObject({ state: 'startup-failed' })
-  expect(vi.mocked(clusterNodeRequest).mock.calls.filter(call => call[2] === 'stop-command')).toHaveLength(2)
+  expect(vi.mocked(clusterNodeRequest).mock.calls.filter(call => call[2] === 'stop-command')).toHaveLength(1)
   for (const call of vi.mocked(clusterNodeRequest).mock.calls.filter(call => call[2] === 'stop-command')) expect(call[3]).toMatchObject({ commandHash: expect.stringMatching(/^[a-f0-9]{64}$/) })
 })
 it('reconciles a lost launch response without stopping or resubmitting the original group', async () => {
   const f = fixture(), original = vi.mocked(clusterNodeRequest).getMockImplementation()!
   vi.mocked(clusterNodeRequest).mockImplementation(async (...args) => {
-    if (args[2] === 'run' && (args[3] as { commandId: string }).commandId === 'two') throw new Error('connection reset after acceptance')
+    if (args[2] === 'run' && (args[3] as { commandId: string }).commandId === 'two') throw new ClusterNodeOperationError(400, 'unstructured rejection cannot establish process absence')
     return original(...args)
   })
   expect(JSON.parse(String(await f.call()))).toMatchObject({ state: 'unknown', waits: [{ state: 'settled' }, { state: 'settled' }] })

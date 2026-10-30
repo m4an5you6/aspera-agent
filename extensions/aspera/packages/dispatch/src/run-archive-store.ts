@@ -1,6 +1,6 @@
 /** Durable local copies use immutable blocks and an atomically replaced version-1 index. */
 import { createHash, randomUUID } from 'node:crypto'
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, statfsSync, unlinkSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, statfsSync, unlinkSync, writeFileSync } from 'node:fs'
 import { resolve, sep } from 'node:path'
 import { z } from 'zod'
 import { agentRecordSchema, agentRecordRequestSchema, observationLineSchema, observationReadSchema, observationSourceSchema,
@@ -115,15 +115,29 @@ export class RunArchiveStore {
     return value
   }
   private verifyIndex(): void {
+    const blocks = new Set(this.manifest.metricFrames.map(frame => frame.hash + '.json'))
     for (const stream of this.manifest.streams) {
       if (stream.key !== archiveHash([stream.serverId, stream.id, stream.generation, stream.phase, stream.sessionId])) throw new Error('Local archive source identity differs')
       let offset = 0
       for (const frame of stream.frames) {
-        if (frame.start !== offset || frame.end < frame.start || !existsSync(this.path(frame.hash + '.json'))) throw new Error('Local archive has a missing committed interval')
+        if (frame.start !== offset || frame.end < frame.start) throw new Error('Local archive has a missing committed interval')
+        blocks.add(frame.hash + '.json')
         offset = frame.end
       }
       if (offset !== stream.bytes) throw new Error('Local archive index does not match its committed bytes')
     }
+    const before = lstatSync(this.directory), canonical = realpathSync(this.directory)
+    if (before.isSymbolicLink() || !before.isDirectory()) throw new Error('Local archive directory changed')
+    // Blocks are direct children; one directory listing verifies their type without resolving every ancestor per frame.
+    const entries = new Map(readdirSync(this.directory, { withFileTypes: true }).map(entry => [entry.name, entry]))
+    for (const name of blocks) {
+      const entry = entries.get(name)
+      if (entry === undefined) throw new Error('Local archive has a missing committed interval')
+      if (entry.isSymbolicLink() || !entry.isFile()) throw new Error('Local archive block must be a regular file without symbolic links')
+    }
+    const after = lstatSync(this.directory)
+    if (after.isSymbolicLink() || !after.isDirectory() || before.dev !== after.dev || before.ino !== after.ino
+      || before.birthtimeMs !== after.birthtimeMs || realpathSync(this.directory) !== canonical) throw new Error('Local archive directory changed during index verification')
   }
 
   /** @param serverId - owned node. @param source - physical source declaration. @returns durable source generation. */

@@ -10,6 +10,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { experimentIdSchema } from '@aspera/experiments'
 import type { ClusterNode } from '@aspera/experiments'
 import { fromAny } from '@total-typescript/shoehorn'
+import { z } from 'zod'
 
 const base = resolve('.artifacts'); mkdirSync(base, { recursive: true })
 const roots: string[] = []
@@ -17,9 +18,10 @@ it('projects installer pip settings only to capable fixed releases', () => {
   const current = managedEnvironmentPolicySchema.parse({})
   const { pipVersion, ...previous } = current
   expect(managedEnvironmentPolicyForRelease(current, false)).toEqual(previous)
-  expect(managedEnvironmentPolicySchema.omit({ pipVersion: true }).safeParse(managedEnvironmentPolicyForRelease(current, false)).success).toBe(true)
+  const legacy = z.object(managedEnvironmentPolicySchema.shape).omit({ pipVersion: true }).strict()
+  expect(legacy.safeParse(managedEnvironmentPolicyForRelease(current, false)).success).toBe(true)
   expect(managedEnvironmentPolicyForRelease(current, true)).toEqual({ ...previous, pipVersion })
-  expect(managedEnvironmentPolicySchema.omit({ pipVersion: true }).safeParse(managedEnvironmentPolicyForRelease(current, true)).success).toBe(false)
+  expect(legacy.safeParse(managedEnvironmentPolicyForRelease(current, true)).success).toBe(false)
 })
 it('retains merged direct requirements beyond one request while enforcing the per-request limit', () => {
   const requirements = Array.from({ length: 513 }, (_, index) => `fixture-${index}==1`)
@@ -71,7 +73,10 @@ it('masks pending hard-link aliases after binding the workspace and permits the 
   expect(mounts.hiddenPaths).toEqual([f.residue]); expect(mounts.readonlyPaths).toEqual([f.directory])
   const argv = experimentSandboxArgv({ backendPath: '/usr/bin/bwrap', workspaceRoot: f.workspace, devicePaths: [], hiddenPaths: [], environment: mounts }, ['true'])
   const hidden = argv.indexOf(f.residue)
-  expect(argv[hidden - 1]).toBe('--tmpfs'); expect(argv.slice(hidden + 1, hidden + 3)).toEqual(['--remount-ro', f.residue])
+  expect(argv[hidden - 1]).toBe('--tmpfs')
+  const protectedAt = argv.findIndex((value, index) => value === '--remount-ro' && argv[index + 1] === f.residue)
+  expect(protectedAt).toBeGreaterThan(hidden)
+  expect(protectedAt).toBeGreaterThan(argv.lastIndexOf('--ro-bind'))
   expect(hidden).toBeGreaterThan(argv.indexOf('--bind'))
 })
 it('refuses cleanup safety errors and mismatched experiment or cleanup paths', () => {

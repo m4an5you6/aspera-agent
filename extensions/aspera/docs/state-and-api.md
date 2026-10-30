@@ -90,7 +90,7 @@ A semi-mode question binds its experiment, Session, tool call and immutable ques
 <a id="controller-readiness"></a>
 ## Controller readiness and recovery
 
-The preparation Agent calls environment inspection, `repair_preparation_controller` and verification in its original Session. Program checks compare actual GPU UUIDs, accessible character devices and the controller's startup authorization; sorted sets avoid order-dependent differences. Handover rechecks every accepted controller identity and policy digest, and new node allocation independently probes hardware again. A changed submitted GPU requirement requires a copied experiment rather than rewritten records.
+The preparation Agent calls environment inspection, `repair_preparation_controller` and verification in its original Session. Program checks require the controller's fixed release to match the selected experiment, then compare actual GPU UUIDs, accessible character devices and startup authorization; sorted sets avoid order-dependent differences. Matching features alone do not permit another release. Handover rechecks every accepted controller identity and policy digest, and new node allocation independently probes hardware again. A changed submitted GPU requirement requires a copied experiment rather than rewritten records.
 
 Authenticated health advertises `controller-readiness-v1` and `controller-maintenance-v1`. Maintenance checks queued and active coordinator tasks, node allocations, commands and inference services, then atomically fences admission. The repair tool derives the PID, Linux start identity, host boot identity, paths and fixed release itself. It waits for identity-bound process exit and port release before starting that release. Busy, unknown and legacy maintenance cases retain concrete blockers. Whitelisted legacy process settings allow read-only reuse only when startup GPU evidence and the original release match; missing evidence never counts as compatibility.
 
@@ -104,6 +104,12 @@ Controller repair persistence acknowledgment: version-2 receipts under `$DSH_HOM
 
 <a id="api-consumers"></a>
 ## API consumers
+
+Independent version-1 `input-sharing-v1` receipts bind released input compaction to the current experiment/node, authenticated content, original identities and completed replacements. Cleanup adds `input-duplicate`, enabled by `inputSharingVersion: 1` and `managed-input-sharing-v1`. Independent `release-asset-sharing-v1` records and `release-asset-duplicate` cover known immutable idle release resources, requiring `releaseAssetSharingVersion: 1`/`managed-release-asset-sharing-v1`. Paths/bytes remain; original file times are retained in the receipt. No Session or protocol generation changes.
+
+Wheel/cache persistence acknowledgment: independent version-1 `input-verifications-v1`, `wheel-derivations-v1` and `cache-maintenance-v1` records bind input digests, derived builds, unchanged payloads and manager exits to their owning node/operation. Operation-local proofs and manager receipts enter the archive. Optional `PrepareExperimentEnvironment.repairWheelMetadata` requires an explicit repair plan; cleanup adds `manager-cache`. Older records remain readable. Manifest `wheelMetadataRepairVersion: 2` and `managerCacheVersion: 1` require `managed-wheel-metadata-v1`/`managed-wheel-metadata-v2` and `managed-manager-cache-v1` before reuse/handover. Protocol 4, fleet 6 and Session formats remain fixed.
+
+Tool-snapshot persistence acknowledgment: `storage-tool-observations-v1/<serverId>/<snapshotId>.json` accepts existing node inspections plus complete `EnvironmentOperationStatus` and `EnvironmentOperation` values. Readers distinguish operation identities, retain old inspection reads, verify allocation ownership and page the saved original without changing receipts. The version-1 envelope and prior files remain intact; protocol 4, fleet 6 and Session formats are unchanged.
 
 Persistence acknowledgment: optional `EnvironmentOperation.cleanup`/`recovery` and `EnvironmentStorageNode.cleanups`/`recoveries` reference independent version-1 cleanup and recovery files. Prior records without these fields remain readable; original failed receipts and times are retained. Current mount IDs appear only in diagnostics. Manifest `asperaEnvironmentTools.cleanupVersion: 1` requires `managed-environment-cleanup-v1` before controller reuse. All schema and generated Remote consumers update together; protocol 4, fleet generation 6 and Session formats remain unchanged.
 
@@ -125,6 +131,8 @@ Control APIs require private bearer credentials and listen on loopback. The Host
 
 <a id="execution-step-progress"></a>
 ## Execution step progress
+
+Checkpoint persistence acknowledgment: [retention records](../packages/runtime/src/checkpoint-protection.ts) add private version-1 `checkpoint-protection-v1/registrations` and `sealed` files in each node run. They bind the original experiment/node, approved stage, attempt, command, required recovery directory and observed file identities. Read-only archive discovery includes both record kinds; experiment-owned deletion removes them with the run. Mount IDs are checked live and never retained as restart authorization. Protocol 4, fleet 6, Session formats and original stage records remain unchanged; older fixed releases have no implied checkpoint protection.
 
 Persistence type acknowledgment: [execution progress schemas](../packages/experiments/src/execution-progress.ts) add an independent version-1 file in the coordinator's owned experiment run directory. Reports bind experiment ID, approved plan revision, one-based step and execution Session. The file stores its own revision, per-step state, short detail, call ID and program timestamp. Existing plans, `progress.json`, fleet generation `6`, remote protocol/storage `4` and Session events remain unchanged. Experiment-owned cleanup removes this file with its run directory.
 

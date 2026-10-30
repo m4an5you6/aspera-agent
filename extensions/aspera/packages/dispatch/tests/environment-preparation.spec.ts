@@ -180,7 +180,8 @@ it('reconciles the original timed-out command and returns its persisted download
 it('gives downloads the same command budget and retains output independently of the SSH reader', async () => {
   const f = fixture(); let installed = false
   f.input.directories = { workspace: '/hidden-namespace/runs/experiment/workspace', release: '/hidden-namespace/releases/fixed', control: '/hidden-namespace/control' }
-  vi.mocked(f.driver.remoteResult).mockImplementation(async (_target, command) => {
+  vi.mocked(f.driver.remoteResult).mockImplementation(async (_target, wire, _signal, _password, _output, input) => {
+    const command = input ?? wire
     expect(command).toContain('request.v1.json')
     expect(command).toContain('ASPERA_PREPARATION_REMAINING_MS')
     expect(command).not.toContain('mkfifo')
@@ -194,7 +195,8 @@ it('gives downloads the same command budget and retains output independently of 
 
 it('scopes fixed uv acquisition to the selected node and still requires independent verification', async () => {
   const f = fixture(); f.input.requirements.uv = '0.13.0'; let installed = false
-  vi.mocked(f.driver.remoteResult).mockImplementation(async (_target, command) => {
+  vi.mocked(f.driver.remoteResult).mockImplementation(async (_target, wire, _signal, _password, _output, input) => {
+    const command = input ?? wire
     expect(command).toContain('ASPERA_PREPARATION_COMMAND_DIRECTORY/command.py')
     expect(command).toContain('0.13.0')
     installed = true
@@ -350,12 +352,13 @@ it('records the dedicated immutable install while leaving active controllers and
     reason: 'Measured private-proc fixture', stdout: '', stderr: '', exitCode: 0, requiresPlatformAction: false,
     ...(installed ? { launcher, pathEntries: [launcher.path.slice(0, -6)] } : {}) })
   vi.mocked(f.driver.remote).mockImplementation(async (_target, script) => script.includes('/exited') ? '0\n' : 'active')
-  vi.mocked(f.driver.remoteResult).mockImplementation(async (_target, script) => {
+  vi.mocked(f.driver.remoteResult).mockImplementation(async (_target, wire, _signal, _password, _output, input) => {
+    const script = input ?? wire
     if (script.replaceAll('\\"', '"').includes('"mode":"repair"')) installed = true
     return { ...f.result, stdout: JSON.stringify(diagnostic()) }
   })
   f.input.sandbox = new SandboxRepair({ experimentId: f.input.experimentId, serverId: f.input.serverId,
-    policy: sandboxRepairPolicySchema.parse({}) }, f.driver)
+    policy: sandboxRepairPolicySchema.parse({}), minimumFreeBytes: 0 }, f.driver)
   f.loop(async () => {
     await f.call('repair_preparation_sandbox')
     expect(f.progress.some(value => value.pendingCommand !== undefined)).toBe(true)
@@ -364,7 +367,7 @@ it('records the dedicated immutable install while leaving active controllers and
   await f.ensure(async () => { if (!installed) throw new SandboxVerificationError('sandbox-launch', '/usr/bin/bwrap', {
     exitCode: 1, stdout: '', stderr: 'proc mount refused' }); return 'verified without stopping active controllers' })
   expect(f.progress.at(-1)?.pendingCommand).toBeUndefined()
-  const commands = vi.mocked(f.driver.remoteResult).mock.calls.map(call => call[1])
+  const commands = vi.mocked(f.driver.remoteResult).mock.calls.map(call => call[5] ?? call[1])
   expect(commands.filter(script => script.replaceAll('\\"', '"').includes('"mode":"repair"'))).toHaveLength(1)
   expect(commands.some(script => script.includes('ASPERA_PREPARATION_COMMAND_DIRECTORY'))).toBe(true)
   expect(commands.some(script => script.includes('kill -9'))).toBe(false)
@@ -375,10 +378,13 @@ it('retains a sandbox install with a lost command channel until the original rec
   vi.mocked(f.driver.remote).mockImplementation(async (_target, command) => command.includes('/exited') ? 'unknown' : '')
   const diagnostic = { version: 1, strategy: 'private-proc', state: 'available', reason: 'Compatible private proc',
     stdout: '', stderr: '', exitCode: 0, requiresPlatformAction: false }
-  vi.mocked(f.driver.remoteResult).mockImplementation(async (_target, script) => script.replaceAll('\\"', '"').includes('"mode":"repair"')
-    ? { ...f.result, stdout: '', exitConfirmed: false, timedOut: true } : { ...f.result, stdout: JSON.stringify(diagnostic) })
+  vi.mocked(f.driver.remoteResult).mockImplementation(async (_target, wire, _signal, _password, _output, input) => {
+    const script = input ?? wire
+    return script.replaceAll('\\"', '"').includes('"mode":"repair"')
+      ? { ...f.result, stdout: '', exitConfirmed: false, timedOut: true } : { ...f.result, stdout: JSON.stringify(diagnostic) }
+  })
   f.input.sandbox = new SandboxRepair({ experimentId: f.input.experimentId, serverId: f.input.serverId,
-    policy: sandboxRepairPolicySchema.parse({}) }, f.driver)
+    policy: sandboxRepairPolicySchema.parse({}), minimumFreeBytes: 0 }, f.driver)
   f.loop(async () => { await f.call('repair_preparation_sandbox') })
   await expect(f.ensure(async () => { throw new SandboxVerificationError('sandbox-launch', '/usr/bin/bwrap', {
     exitCode: 1, stdout: '', stderr: 'proc mount refused' }) })).rejects.toBeInstanceOf(UnconfirmedPreparationCommand)
@@ -386,7 +392,7 @@ it('retains a sandbox install with a lost command channel until the original rec
   expect(f.input.pendingCommand).toBeDefined()
   vi.mocked(f.driver.remote).mockResolvedValue('unknown')
   await expect(f.ensure(async () => 'ready')).rejects.toThrow('no confirmed exit')
-  expect(vi.mocked(f.driver.remoteResult).mock.calls.filter(call => call[1].replaceAll('\\"', '"').includes('"mode":"repair"'))).toHaveLength(1)
+  expect(vi.mocked(f.driver.remoteResult).mock.calls.filter(call => (call[5] ?? call[1]).replaceAll('\\"', '"').includes('"mode":"repair"'))).toHaveLength(1)
 })
 
 it('retains an unconfirmed mutation and refuses to repeat it on retry', async () => {

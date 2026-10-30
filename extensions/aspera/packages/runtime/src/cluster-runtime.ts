@@ -18,9 +18,15 @@ import { request } from './transport.ts'
 import { readClusterChunk } from '@aspera/experiments'
 import { observationSourceIdSchema } from '@aspera/experiments'
 import { ObservationWriter } from './observations.ts'
+import { observeServingServices, readServingServiceKeys } from './service-monitor.ts'
+import type { ServingServiceKey } from './service-monitor.ts'
 import type { PhaseContextPolicy } from './phase-context.ts'
 import { managedEnvironmentPolicyForRelease, managedEnvironmentPolicySchema } from './managed-environment.ts'
 import type { FinalizationPolicy } from './finalization-policy.ts'
+import { commandAdmissionRejectionSchema } from '@aspera/experiments'
+import { planningPolicySchema } from '@aspera/experiments'
+import { resolveDocumentationPolicy } from './framework-documentation.ts'
+import { CommandAdmissionRejected } from './command-admission.ts'
 
 /** Complete model selection captured before dispatch, including provider-owned reasoning effort. */
 export const clusterAgentModelSchema = z.object({ provider: z.string(), model: z.string(),
@@ -34,6 +40,7 @@ export const clusterPrivateSchema = z.object({
     knownHostsFile: z.string(), identityFile: z.string().optional(),
   }).strict()),
   modelCredentialFile: z.string(), toolTimeoutMs: z.number().int().positive(),
+  documentationPolicy: planningPolicySchema.optional(),
   agentModel: clusterAgentModelSchema,
 }).strict()
 /** Host-only settings kept outside Agent workspaces. */
@@ -49,10 +56,13 @@ export interface ClusterRuntimeConfig {
   root: string
   chunkBytes: number
   fileLimit: number
+  storageToolResultBytes?: number
   cleanupTimeoutMs: number
   pollIntervalMs: number
   documentationHosts: string[]
   documentationBytes: number
+  documentationReadTimeoutMs?: number
+  documentationPageBytes?: number
   goalContinuationWindow: number
   agentContext?: PhaseContextPolicy
   observations?: import('@aspera/experiments').ObservationPolicy
@@ -101,6 +111,8 @@ export async function clusterNodeRequest(runtime: ClusterPrivate, serverId: Expe
     ...(connection.identityFile === undefined ? {} : { identityFile: connection.identityFile }),
     toolTimeoutMs: runtime.toolTimeoutMs }, connection.token, path, 'POST', payload, signal, connection.password)
   if (result.status !== 200) {
+    const refusal = z.object({ admission: commandAdmissionRejectionSchema }).safeParse(result.value)
+    if (refusal.success) throw new CommandAdmissionRejected(refusal.data.admission)
     const error = z.object({ error: z.string() }).safeParse(result.value)
     throw new ClusterNodeOperationError(result.status, error.success ? error.data.error : `node ${node.server.name} returned HTTP ${result.status}`)
   }
@@ -281,14 +293,19 @@ export class RemoteClusterExecutor implements ClusterExecutor {
   }
 
   private async monitorServices(record: ClusterRecord, signal: AbortSignal, update: Update): Promise<ClusterOutcome> {
+    let admitted: ServingServiceKey[]
+    try {
+      admitted = readServingServiceKeys(serverRunRoot(record.submission.coordinator, record.submission.experimentId))
+      if (admitted.some(key => !record.submission.nodes.some(node => node.server.id === key.serverId))) throw new Error('Serving admission references an unassigned node')
+    } catch (error) {
+      return { state: 'interrupted', detail: 'Serving admission could not be confirmed; allocation is retained and no service was restarted: ' + String(error), resourcesReleased: false }
+    }
     try {
       while (!signal.aborted) {
         const services = await this.services(record)
         await update({ state: 'serving', services })
-        const failed = services.find(service => ['failed', 'interrupted'].includes(service.state))
-        if (failed !== undefined) return { state: failed.state === 'interrupted' ? 'interrupted' : 'failed', detail: failed.detail ?? 'Inference service failed.', resourcesReleased: await this.reconcile(record) }
-        if (services.length === 0) return { state: 'interrupted', detail: 'Registered service identities are missing; execution was not restarted.', resourcesReleased: await this.reconcile(record) }
-        if (services.every(service => service.released)) return { state: 'completed', resourcesReleased: await this.reconcile(record) }
+        const observed = observeServingServices(admitted, services)
+        if (observed.state !== 'serving') return { ...observed, resourcesReleased: await this.reconcile(record) }
         await delay(this.config.pollIntervalMs, undefined, { signal })
       }
     } catch (error) {
@@ -312,12 +329,18 @@ export class RemoteClusterExecutor implements ClusterExecutor {
     const release = serverReleaseRoot(submission.coordinator, submission.deploymentId)
     // Profiles are installed before launching; no mutable checkout or CLI argv escape is used.
     await setupWorkerProfile(home, release)
-    const manifest = z.object({ asperaEnvironmentTools: z.object({ installVersion: z.union([z.literal(2), z.literal(3)]).optional(), storageVersion: z.literal(1).optional(), storageFormat: z.literal('0.1.0').optional() }).optional() })
+    const manifest = z.object({ asperaAgentRecoveryVersion: z.literal(1).optional(), asperaEnvironmentTools: z.object({ installVersion: z.union([z.literal(2), z.literal(3)]).optional(), storageVersion: z.literal(1).optional(), storageFormat: z.literal('0.1.0').optional(), materialFormat: z.enum(['0.1.1', '0.1.2']).optional(), registrationFormat: z.literal('0.1.3').optional(), reuseVerificationVersion: z.literal(1).optional() }).optional() })
       .parse(JSON.parse(readFileSync(resolve(release, 'package.json'), 'utf8')))
     const environmentPolicy = managedEnvironmentPolicyForRelease(managedEnvironmentPolicySchema.parse(this.config.managedEnvironments ?? {}),
-      manifest.asperaEnvironmentTools?.installVersion === 3, manifest.asperaEnvironmentTools?.storageVersion === 1, manifest.asperaEnvironmentTools?.storageFormat === '0.1.0')
+      manifest.asperaEnvironmentTools?.installVersion === 3, manifest.asperaEnvironmentTools?.storageVersion === 1, manifest.asperaEnvironmentTools?.storageFormat === '0.1.0', manifest.asperaEnvironmentTools?.materialFormat !== undefined)
+    const originalFinalization: Partial<FinalizationPolicy> = this.config.finalization ?? {}
+    const { outputTokenCorrections: _outputTokenCorrections, ...beforeRecovery } = originalFinalization
+    const releaseFinalization = manifest.asperaAgentRecoveryVersion === 1 ? originalFinalization : beforeRecovery
+    const { diagnostics: _diagnostics, ...legacyFinalization } = releaseFinalization ?? {}
+    const finalization = manifest.asperaEnvironmentTools?.registrationFormat === '0.1.3' ? releaseFinalization : legacyFinalization
     if (!planning) writeClusterReceipt(this.config.root, submission.experimentId, { cleanupConfirmed: false }, 'execution.json')
     const credentials = z.object({ refs: z.record(z.string(), z.string()) }).parse(JSON.parse(readFileSync(runtime.modelCredentialFile, 'utf8')))
+    const documentationPolicy = resolveDocumentationPolicy(runtime.documentationPolicy, this.config)
     const logObservation = new ObservationWriter(runRoot, { version: 1, experimentId: submission.experimentId, serverId: submission.coordinator.id,
       id: observationSourceIdSchema.parse(planning ? 'agent-planning' : 'agent-execution'), kind: 'agent', phase: planning ? 'planning' : 'execution',
       sessionId: `aspera-${planning ? 'plan' : 'execution'}-${submission.experimentId}`, label: planning ? 'planning' : 'execution',
@@ -330,11 +353,14 @@ export class RemoteClusterExecutor implements ClusterExecutor {
       env: { DSH_HOME: home, DSH_EXPERIMENT_ROLE: planning ? 'planner' : 'agent', DSH_CLUSTER_ROOT: this.config.root,
         DSH_CLUSTER_EXPERIMENT: submission.experimentId, DSH_CLUSTER_GENERATION: readFileSync(resolve(this.config.root, 'state', 'coordinator.generation'), 'utf8'),
         DSH_CLUSTER_CHUNK_BYTES: String(this.config.chunkBytes), DSH_CLUSTER_FILE_LIMIT: String(this.config.fileLimit),
+        ...(this.config.storageToolResultBytes === undefined ? {} : { DSH_CLUSTER_STORAGE_TOOL_BYTES: String(this.config.storageToolResultBytes) }),
         DSH_CLUSTER_CLEANUP_MS: String(this.config.cleanupTimeoutMs), DSH_CLUSTER_POLL_MS: String(this.config.pollIntervalMs),
         DSH_CLUSTER_DOCUMENTATION_HOSTS: JSON.stringify(this.config.documentationHosts), DSH_CLUSTER_DOCUMENTATION_BYTES: String(this.config.documentationBytes),
+        DSH_CLUSTER_DOCUMENTATION_TIMEOUT_MS: String(documentationPolicy.documentationReadTimeoutMs),
+        DSH_CLUSTER_DOCUMENTATION_PAGE_BYTES: String(documentationPolicy.documentationPageBytes),
         DSH_CLUSTER_GOAL_WINDOW: String(this.config.goalContinuationWindow),
         DSH_CLUSTER_CONTEXT_POLICY_JSON: JSON.stringify(this.config.agentContext ?? {}),
-        DSH_CLUSTER_FINALIZATION_POLICY_JSON: JSON.stringify(this.config.finalization ?? {}),
+        DSH_CLUSTER_FINALIZATION_POLICY_JSON: JSON.stringify(finalization ?? {}),
         DSH_CLUSTER_ENVIRONMENT_POLICY_JSON: JSON.stringify(environmentPolicy),
         DSH_EXPERIMENT_TOKEN_FILE: resolve(this.config.root, 'secrets/coordinator.token'),
         DSH_EXPERIMENT_MODEL_CREDENTIAL_FILE: runtime.modelCredentialFile, DSH_EXPERIMENT_DEPLOYMENT_ID: submission.deploymentId,

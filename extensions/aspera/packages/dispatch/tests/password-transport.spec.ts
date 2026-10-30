@@ -13,7 +13,7 @@ import { expect, it, onTestFinished } from 'vitest'
 import { copy, remote, remoteResult, request, prepareSshHostKey } from '../src/transport.ts'
 import type { Target } from '../src/transport.ts'
 
-async function fixture() {
+async function fixture(holdUploads = false) {
   const root = await mkdtemp(join(tmpdir(), 'dsh-password-ssh-'))
   const password = '  p a$$\\"word\'密碼  '
   const privateKey = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ type: 'pkcs1', format: 'pem' })
@@ -29,6 +29,7 @@ async function fixture() {
   let connections = 0
   let notifyCommand = () => {}
   const commandStarted = new Promise<void>((resolve) => { notifyCommand = resolve })
+  const uploadStarted = Promise.withResolvers<void>()
   const receiver = httpServer((req, res) => {
     let body = ''
     req.setEncoding('utf8')
@@ -66,11 +67,13 @@ async function fixture() {
         })
         session.on('sftp', (accept) => {
           const sftp = accept()
+          let uploadMode = 0
           sftp.on('OPEN', (id, _path, _flags, attrs) => {
-            expect(attrs.mode & 0o777).toBe(0o600)
+            uploadMode = attrs.mode & 0o777
             sftp.handle(id, Buffer.from('file'))
           })
-          sftp.on('WRITE', (id, _handle, _offset, data) => { uploaded.push(Buffer.from(data)); sftp.status(id, 0) })
+          sftp.on('FSETSTAT', (id, _handle, attrs) => { uploadMode = attrs.mode & 0o777; expect(uploadMode).toBe(0o600); sftp.status(id, 0) })
+          sftp.on('WRITE', (id, _handle, _offset, data) => { expect(uploadMode).toBe(0o600); uploaded.push(Buffer.from(data)); uploadStarted.resolve(); if (!holdUploads) sftp.status(id, 0) })
           sftp.on('CLOSE', (id) => { sftp.status(id, 0) })
         })
       })
@@ -107,7 +110,7 @@ async function fixture() {
     host: '127.0.0.1', username: 'ubuntu', sshPort: sshAddress.port, remotePort: httpAddress.port,
     authMode: 'password', identityFile: join(root, 'unused-key'), knownHostsFile, toolTimeoutMs: 10_000,
   }
-  return { root, target, password, methods, commands, uploaded, requests, commandStarted, connections: () => connections }
+  return { root, target, password, methods, commands, uploaded, requests, commandStarted, uploadStarted: uploadStarted.promise, connections: () => connections }
 }
 
 async function handshakeProxy(f: Awaited<ReturnType<typeof fixture>>, blocked: number, reset: boolean) {
@@ -161,6 +164,18 @@ it('uploads private files over password-authenticated SFTP', async () => {
   await copy(f.target, file, '/worker/source.tar', undefined, f.password)
   expect(Buffer.concat(f.uploaded).toString()).toBe('private upload')
   expect(f.methods).toEqual(['password'])
+})
+
+it('cancels an active parallel upload without replaying its authenticated operation', async () => {
+  const f = await fixture(true)
+  const file = join(f.root, 'source.tar')
+  await writeFile(file, Buffer.alloc(1024 * 1024, 7))
+  const abort = new AbortController()
+  const copying = copy(f.target, file, '/worker/source.tar', abort.signal, f.password)
+  await f.uploadStarted
+  abort.abort(new Error('stop active upload'))
+  await expect(copying).rejects.toThrow('stop active upload')
+  expect(f.connections()).toBe(1)
 })
 
 it('sends authenticated JSON directly through the SSH receiver channel', async () => {

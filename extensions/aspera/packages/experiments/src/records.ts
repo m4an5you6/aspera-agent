@@ -39,7 +39,8 @@ export type ExperimentProcess = z.infer<typeof experimentProcessSchema>
 export const processLogCursorSchema = z.object({ experimentId: experimentIdSchema, serverId: serverIdSchema,
   commandId: z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/), stream: z.enum(['stdout', 'stderr']), generation: z.string(), offset: z.number().int().nonnegative() }).strict()
 /** Process log source and optional continuation. */
-export const processLogRequestSchema = processLogCursorSchema.omit({ generation: true, offset: true }).extend({ cursor: processLogCursorSchema.optional() }).strict()
+export const processLogRequestSchema = processLogCursorSchema.omit({ generation: true, offset: true }).extend({ cursor: processLogCursorSchema.optional(),
+  limit: z.number().int().positive().max(262144).optional() }).strict()
 /** Bounded log bytes plus an identity-bound continuation. */
 export const processLogPageSchema = z.object({ chunk: clusterChunkSchema, cursor: processLogCursorSchema, missing: z.boolean() }).strict()
 /** Process log request. */

@@ -40,15 +40,40 @@ try {
   const manifest = JSON.parse(readFileSync(resolve(installRoot, 'package.json'), 'utf8'))
   assert.equal(manifest.asperaEnvironmentTools.storageVersion, 1, 'Fixed releases require account storage, historical loans and managed materials')
   assert.equal(manifest.asperaEnvironmentTools.storageFormat, '0.1.0')
+  assert.equal(manifest.asperaEnvironmentTools.materialFormat, '0.1.2', 'Fixed releases require independent material source and verification bindings')
+  assert.equal(manifest.asperaEnvironmentTools.registrationFormat, '0.1.3', 'Fixed releases require copied-root registration and bounded diagnostics')
+  assert.equal(manifest.asperaEnvironmentTools.reuseVerificationVersion, 1, 'Fixed releases require automatic historical source verification')
+  assert.equal(manifest.asperaEnvironmentTools.repairVersion, 1, 'Fixed releases expose Agent-selected repair and reference confirmation')
+  assert.equal(manifest.asperaEnvironmentTools.sandboxVersion, 1, 'Fixed releases require bounded diagnostic launch ordering')
+  assert.equal(manifest.asperaEnvironmentTools.sandboxIpcVersion, 1, 'Fixed releases require short private IPC paths')
+  assert.equal(manifest.asperaEnvironmentTools.reusePrecheckVersion, 1, 'Fixed releases require historical eligibility checks before content verification')
+  assert.equal(manifest.asperaEnvironmentTools.wheelMetadataRepairVersion, 2, 'Fixed releases require explicit input metadata rebuilding')
+  assert.equal(manifest.asperaEnvironmentTools.managerCacheVersion, 1, 'Fixed releases require owned manager-cache previews')
+  assert.equal(manifest.asperaEnvironmentTools.inputSharingVersion, 1, 'Fixed releases require released input snapshot compaction')
+  assert.equal(manifest.asperaEnvironmentTools.releaseAssetSharingVersion, 1, 'Fixed releases require immutable release asset compaction')
+  assert.equal(manifest.asperaStageAttemptVersion, 1, 'Fixed releases require confirmed stage-attempt recovery')
+  assert.equal(manifest.asperaStageEvidenceVersion, 4, 'Fixed releases require verified native checkpoint identity and pre-launch save-policy validation')
+  assert.equal(manifest.asperaCheckpointProtectionVersion, 1, 'Fixed releases protect approved successful recovery checkpoints')
+  assert.equal(manifest.asperaAgentRecoveryVersion, 1, 'Fixed releases retain bounded Agent correction before terminal settlement')
+  assert.equal(manifest.asperaServiceVerificationVersion, 1, 'Fixed releases require Agent-requested public inference verification')
+  assert.equal(manifest.asperaServiceLifecycleVersion, 1, 'Fixed releases require Agent-controlled service replacement')
+  assert.equal(manifest.asperaInferenceCheckpointVersion, 1, 'Fixed releases require protected retained-adapter snapshots')
+  assert.equal(manifest.asperaEnvironmentTools.readonlyConsumerVersion, 2, 'Fixed releases verify readonly child ancestry across private sessions')
+  assert.ok(existsSync(resolve(installRoot, 'node_modules/@aspera/runtime/scripts/environment-repair.py')))
+  for (const file of ['command-admission.js', 'diagnostic-policy.js']) assert.ok(existsSync(resolve(installRoot, 'node_modules/@aspera/runtime/lib', file)))
   assert.equal(manifest.asperaFinalizationVersion, 2, 'Installed releases require unified stage acceptance and command waiting')
   assert.equal(manifest.asperaCompletionVersion, 1, 'Source snapshots retain completion acceptance requirements')
   assert.ok(existsSync(resolve(installRoot, 'node_modules/@aspera/runtime/lib/stage-acceptance.js')))
   assert.ok(existsSync(resolve(installRoot, 'node_modules/@aspera/runtime/lib/command-wait.js')))
+  assert.deepEqual(manifest.asperaPlanningTools, { version: 1, formatVersion: '0.1.0', requirementsVersion: 1, inferenceVersion: 1 })
+  for (const file of ['plan-draft.js', 'plan-tools.js', 'plan-requirements.js', 'framework-documentation.js', 'planning-store.js']) {
+    assert.ok(existsSync(resolve(installRoot, 'node_modules/@aspera/runtime/lib', file)), 'Independent planning tools must ship: ' + file)
+  }
   assert.ok(existsSync(resolve(installRoot, 'node_modules/@aspera/runtime/scripts/storage-placement.py')), 'Purpose placement must ship in the installed runtime')
   assert.equal(manifest.dependencies['@deepseek-ai/dsh'], '0.2.0-rc.2')
   assert.equal(JSON.parse(readFileSync(resolve(installRoot, 'aspera-release.json'), 'utf8')).extension, '0.1.1')
   assert.equal(existsSync(resolve(installRoot, 'packages')), false)
-  for (const file of ['lib/preparation-command.js', 'scripts/preparation-command.py']) {
+  for (const file of ['lib/preparation-command.js', 'scripts/preparation-command.py', 'scripts/build-sandbox-native.py', 'scripts/sandbox-native.json']) {
     assert.ok(existsSync(resolve(installRoot, 'node_modules/@aspera/dispatch', file)), 'The installed preparation supervisor is present: ' + file)
   }
   assert.ok(existsSync(resolve(installRoot, 'node_modules/@aspera/console/lib/client/index.d.ts')))
@@ -68,6 +93,7 @@ try {
   const sandboxArgs = experimentSandboxArgv({ backendPath: '/usr/bin/bwrap', workspaceRoot: '/fixture/workspace',
     devicePaths: ['/dev/nvidia3'], hiddenPaths: ['/fixture/control'] }, ['true'])
   for (const flag of ['--unshare-user', '--unshare-pid', '--unshare-ipc', '--unshare-uts', '--clearenv', '--cap-drop']) assert.ok(sandboxArgs.includes(flag))
+  assert.equal(sandboxArgs[sandboxArgs.lastIndexOf('TMPDIR') + 1], '/tmp/aspera'); assert.ok(sandboxArgs.includes('--symlink'))
   assert.equal(sandboxArgs[sandboxArgs.indexOf('--cap-drop') + 1], 'ALL')
   assert.ok(existsSync(resolve(installRoot, 'node_modules/@aspera/dispatch/scripts/repair-sandbox.py')))
   for (const file of ['lib/controller-recovery.js', 'scripts/controller-recovery.py', 'scripts/controller-profile.mjs']) {
@@ -77,6 +103,10 @@ try {
     assert.ok(existsSync(resolve(installRoot, 'node_modules/@aspera/dispatch', file)), `Installed archive entry is missing ${file}`)
   }
   const { experimentArchiveStatusSchema } = await import(pathToFileURL(resolve(installRoot, 'node_modules/@aspera/experiments/lib/index.js')).href)
+  const { assessExperimentStorageSchema } = await import(pathToFileURL(resolve(installRoot, 'node_modules/@aspera/experiments/lib/index.js')).href)
+  const source = { materialId: 'a'.repeat(64), verificationOperationId: '11111111-1111-4111-8111-111111111111', mode: 'readonly' }
+  assert.deepEqual(assessExperimentStorageSchema.parse({ operationId: '22222222-2222-4222-8222-222222222222',
+    materialIds: [source.materialId], materialSources: [source], outputBytes: 0, checkpointBytes: 0 }).materialSources, [source])
   assert.equal(experimentArchiveStatusSchema.parse({ version: 1, experimentId: '11111111-1111-4111-8111-111111111111', state: 'idle',
     runtimeAvailable: false, savedBytes: 0, complete: false, sources: [], gaps: [] }).version, 1)
   const remoteDeclarations = readFileSync(resolve(installRoot, 'node_modules/@aspera/dispatch/lib/typert.remote-client.d.ts'), 'utf8')

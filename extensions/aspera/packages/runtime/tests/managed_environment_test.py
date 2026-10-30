@@ -1,6 +1,7 @@
 """Linux filesystem regressions exercise package publication, confined requests and durable recovery."""
 import base64
 import csv
+import email
 import errno
 import hashlib
 import importlib.util
@@ -465,15 +466,22 @@ class EnvironmentCase(unittest.TestCase):
 
     def test_missing_environment_reference_is_not_silently_released(self):
         environment, _ = self.environment(); module.remove_private(pathlib.Path(environment["directory"]), self.workspace)
+        self.assertEqual(self.owner.preview()["candidates"], [])
+        self.assertTrue(self.owner.reference_path(environment["environmentId"]).exists())
         with self.assertRaisesRegex(RuntimeError, "confirmed environment deletion"):
-            self.owner.preview()
+            self.owner.refs()
 
     def test_cleanup_refuses_stale_snapshot_and_duplicate_id_reuses_result(self):
         self.package(self.root / "unlinked")
         module.remove_private(self.root / "unlinked", self.root)
         preview = self.owner.preview(); operation = str(uuid.uuid4())
-        with self.assertRaisesRegex(RuntimeError, "changed"):
-            self.owner.cleanup(operation, "a" * 64)
+        refused = self.owner.cleanup(operation, "a" * 64)
+        self.assertEqual(refused["state"], "blocked")
+        self.assertIn("cleanup candidates changed", refused["detail"])
+        self.assertEqual(self.owner.cleanup(operation, "a" * 64), refused)
+        with self.assertRaisesRegex(RuntimeError, "another preview"):
+            self.owner.cleanup(operation, preview["fingerprint"])
+        operation = str(uuid.uuid4())
         first = self.owner.cleanup(operation, preview["fingerprint"])
         self.assertEqual(self.owner.cleanup(operation, preview["fingerprint"]), first)
         self.assertEqual(self.owner.records(), [])
@@ -597,6 +605,46 @@ class EnvironmentCase(unittest.TestCase):
                 with module.Environments(self.config).locked(write=True):
                     self.fail("Concurrent lock should not be granted")
 
+    def test_package_lock_rejection_retains_a_terminal_receipt_without_installing(self):
+        request = self.request("create")
+        config = {**self.config, "action": "prepare", "request": request}
+        command = [sys.executable, "-B", str(spec.origin)]
+        with self.owner.locked(write=True):
+            rejected = subprocess.run(command, input=json.dumps(config), capture_output=True, text=True, timeout=30)
+        self.assertEqual(rejected.returncode, 1, rejected.stderr)
+        result = json.loads(rejected.stdout)
+        self.assertEqual(result.get("state"), "blocked", result)
+        self.assertTrue(result["exitConfirmed"])
+        self.assertIn("holds the server package lock", result["detail"])
+        receipt = self.owner.operations / request["operationId"] / "receipt.v1.json"
+        self.assertEqual(module.load(receipt), result)
+        self.assertFalse((self.workspace / "tmp" / ("environment-" + request["operationId"])).exists())
+        self.assertEqual(list(self.owner.manifests.iterdir()), [])
+        repeated = subprocess.run(command, input=json.dumps(config), capture_output=True, text=True, timeout=30)
+        self.assertEqual(repeated.returncode, 1, repeated.stderr)
+        self.assertEqual(json.loads(repeated.stdout), result)
+        config["request"] = {**request, "requirements": ["different-fixture==1"]}
+        with self.owner.locked(write=True):
+            conflicting = subprocess.run(command, input=json.dumps(config), capture_output=True, text=True, timeout=30)
+        self.assertEqual(conflicting.returncode, 1)
+        self.assertIn("bound to different content", json.loads(conflicting.stdout)["error"])
+        self.assertEqual(module.load(receipt), result)
+
+    def test_package_lock_rejection_does_not_close_an_unresolved_original_operation(self):
+        request = self.request("create")
+        receipt = {"version": 1, "experimentId": self.id, "serverId": self.server, "operationId": request["operationId"],
+            "environmentId": request["environmentId"], "requestHash": module.digest(request), "action": request["action"],
+            "commandId": "environment-" + request["operationId"], "state": "running", "startedAt": 1, "updatedAt": 1,
+            "exitConfirmed": False, "exitCode": None}
+        path = self.owner.operations / request["operationId"] / "receipt.v1.json"
+        module.save(path, receipt)
+        with self.owner.locked(write=True):
+            rejected = subprocess.run([sys.executable, "-B", str(spec.origin)],
+                input=json.dumps({**self.config, "action": "prepare", "request": request}), capture_output=True, text=True, timeout=30)
+        self.assertEqual(rejected.returncode, 1, rejected.stderr)
+        self.assertIn("original process", json.loads(rejected.stdout)["error"])
+        self.assertEqual(module.load(path), receipt)
+
     def test_no_user_site_prefix_fallback_is_accepted(self):
         environment, _ = self.environment(); work = self.workspace / "tmp"; work.mkdir()
         with patch.object(self.owner, "command", return_value=json.dumps({"python": "/usr/bin/python3", "prefix": str(self.workspace / ".local"), "userSiteEnabled": True, "modules": []})):
@@ -665,6 +713,10 @@ class EnvironmentCase(unittest.TestCase):
     def test_cleanup_recovery_does_not_blindly_repeat_an_unconfirmed_deletion(self):
         operation_id = str(uuid.uuid4()); fingerprint = "d" * 64
         module.save(self.owner.operations / ("cleanup-" + operation_id + ".json"), {"version": 1, "fingerprint": fingerprint, "state": "running"})
+        original = (self.owner.operations / ("cleanup-" + operation_id + ".json")).read_bytes()
+        with self.assertRaisesRegex(RuntimeError, "original process"):
+            self.owner.cleanup(operation_id, fingerprint)
+        self.assertEqual((self.owner.operations / ("cleanup-" + operation_id + ".json")).read_bytes(), original)
         with self.assertRaisesRegex(RuntimeError, "identity is missing"):
             self.owner.recover_cleanup(operation_id, fingerprint)
         self.owner.config["launchFailureConfirmed"] = True
@@ -728,17 +780,20 @@ class NativeInstallerCase(unittest.TestCase):
             import ensurepip
             self.bootstrap = pathlib.Path(ensurepip.__file__).parent / "_bundled"
         self.owner.policy["pipVersion"] = next(self.bootstrap.glob("pip-*.whl")).name.split("-")[1]
+        copy_config["policy"]["pipVersion"] = self.owner.policy["pipVersion"]
 
     def native_command(self, owner, args, work, **_kwargs):
         self.commands.append(args[:])
         if "download" in args:
             self.fail("Verified fixture materials must prevent a dependency download")
         actual = list(args)
-        if actual[1:3] == ["pip", "compile"] and "--no-index" not in actual:
-            actual.append("--no-index")
+        if actual[1:3] == ["pip", "compile"] and "--offline" not in actual:
+            actual.append("--offline")
         if actual[1:3] == ["pip", "install"] and any(str(part).endswith("installer/bin/python") for part in actual):
             actual += ["--no-index", "--find-links", str(self.bootstrap)]
         environment = {**os.environ, "PYTHONNOUSERSITE": "1", "PYTHONDONTWRITEBYTECODE": "1"}
+        if getattr(owner, "test_confined_inputs", False):
+            actual = owner.sandbox(actual, [work], _kwargs.get("readonly"), _kwargs.get("environment"))
         result = subprocess.run(actual, cwd=owner.workspace, env=environment, capture_output=True, text=True, timeout=120)
         if result.returncode:
             raise RuntimeError(result.stderr)
@@ -757,6 +812,68 @@ class NativeInstallerCase(unittest.TestCase):
             "tiny_fixture-1.0.dist-info/entry_points.txt": b"[console_scripts]\ntiny-fixture = tiny_fixture:main\n"})
         self.owner.retain_material(path)
 
+    def test_agent_selected_input_metadata_repair_uses_native_installer_and_reuses_the_verified_generation(self):
+        self.owner.config["repairVersion"] = 1
+        if os.environ.get("ASPERA_TEST_SANDBOX"):
+            observed = json.loads(os.environ["ASPERA_TEST_SANDBOX"])
+            self.owner.config["backendPath"] = observed["backendPath"]
+            self.owner.config["sandboxBase"] = [observed["backendPath"], "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-net",
+                "--die-with-parent", "--cap-drop", "ALL", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", str(self.owner.store),
+                "--tmpfs", observed["namespaceRoot"], "--tmpfs", observed["controlRoot"] + "/secrets", "--tmpfs", "/root/.ssh"]
+            self.owner.test_confined_inputs = True
+            (self.owner.store / "unselected-secret").write_text("not visible to an installer")
+        inputs = self.owner.workspace / "inputs"; inputs.mkdir()
+        original = inputs / "tiny_fixture-1.0-py3-none-any.whl"
+        entries = wheel(original, extra={"tiny_fixture-1.0.dist-info/top_level.txt": b"tiny_fixture\n"})
+        entries["tiny_fixture-1.0.dist-info/top_level.txt"] = b"different_metadata\n"
+        with zipfile.ZipFile(original, "w") as archive:
+            for name, body in entries.items():
+                archive.writestr(name, body)
+        before = original.read_bytes()
+        module.save(self.owner.run / "input-verifications-v1" / (hashlib.sha256(original.name.encode()).hexdigest() + ".json"),
+            {"version": 1, "experimentId": self.owner.id, "serverId": self.owner.server, "name": original.name,
+                "sha256": module.file_hash(original), "checkedAt": 1})
+        request = self.fixture.request("create")
+        request.update(requirements=["tiny-fixture @ " + original.as_uri()], modules=["tiny_fixture"])
+        rejected = self.owner.prepare(request)
+        self.assertEqual(rejected["state"], "blocked")
+        repair = {**request, "operationId": str(uuid.uuid4()), "action": "repair",
+            "repairPlanId": rejected["repairPlans"][0]["id"], "repairWheelMetadata": True}
+        with patch.object(self.owner, "assert_exited"), patch.object(self.owner, "command",
+                side_effect=lambda args, work, **kwargs: self.native_command(self.owner, args, work, **kwargs)):
+            result = self.owner.prepare(repair)
+        self.assertEqual(result["state"], "completed", result.get("detail"))
+        if getattr(self.owner, "test_confined_inputs", False):
+            code = "from pathlib import Path; assert not Path(" + repr(str(self.owner.store / "unselected-secret")) + ").exists()"
+            sandboxed = self.owner.sandbox([sys.executable, "-I", "-c", code])
+            subprocess.run(sandboxed, check=True, capture_output=True)
+        self.assertEqual(original.read_bytes(), before)
+        subprocess.run([result["environment"]["python"], "-I", "-c", "import tiny_fixture; assert tiny_fixture.value == 17"], check=True)
+        generation = result["environment"]["generation"]
+        again = {**request, "operationId": str(uuid.uuid4())}
+        with patch.object(self.owner, "command", side_effect=lambda args, work, **kwargs: self.native_command(self.owner, args, work, **kwargs)):
+            repeated = self.owner.prepare(again)
+        self.assertEqual(repeated["state"], "completed", repeated.get("detail"))
+        self.assertEqual(repeated["environment"]["generation"], generation)
+        self.assertEqual(module.load(self.owner.operations / again["operationId"] / "reuse-plan.v1.json")["downloadBytes"], 0)
+
+    def test_readonly_preflight_verifies_native_environment_without_republishing_or_installing(self):
+        self.seed_material()
+        installed, _ = self.install(self.owner)
+        self.owner.config.update(storagePreflightVersion=2, governancePolicy={"verificationTimeoutMs": 300000})
+        manifest = self.owner.manifests / "training.json"
+        original = manifest.read_bytes()
+        request = self.fixture.request("verify-reuse")
+        request.update(requirements=["tiny-fixture==1.0"], modules=["tiny_fixture"])
+        commands_before = len(self.commands)
+        with patch.object(self.owner, "command", side_effect=lambda args, work, **kwargs: self.native_command(self.owner, args, work, **kwargs)):
+            checked = self.owner.prepare(request)
+        self.assertEqual(checked["preflight"]["status"], "reusable", checked)
+        self.assertEqual(manifest.read_bytes(), original)
+        self.assertNotIn("environment", checked)
+        self.assertFalse(any("download" in args or "venv" in args for args in self.commands[commands_before:]))
+        self.assertEqual(self.owner.environment("training")["generation"], installed["environment"]["generation"])
+
     def test_base_training_interpreter_has_no_implicit_installer_distributions(self):
         request = self.fixture.request("create")
         with patch.object(self.owner, "command", side_effect=lambda args, work, **kwargs: self.native_command(self.owner, args, work, **kwargs)):
@@ -765,6 +882,24 @@ class NativeInstallerCase(unittest.TestCase):
         code = "import importlib.metadata,json; print(json.dumps([d.metadata['Name'] for d in importlib.metadata.distributions()]))"
         installed = json.loads(subprocess.check_output([result["environment"]["python"], "-I", "-c", code], text=True))
         self.assertEqual(installed, [], "Training must not inherit the installer's pip, packaging or setuptools")
+
+    def test_fixed_uv_checks_constraints_when_the_training_interpreter_has_no_packaging(self):
+        self.seed_material()
+        installed, _ = self.install(self.owner)
+        interpreter = installed["environment"]["python"]
+        subprocess.run([interpreter, "-I", "-c", "import importlib.util; assert importlib.util.find_spec('packaging') is None"], check=True)
+        command = [self.config["uvPath"], "pip", "check", "--python", interpreter, "--offline", "--no-cache", "--no-config"]
+        good = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        self.assertEqual(good.returncode, 0, good.stderr)
+        metadata = self.owner.site(pathlib.Path(installed["environment"]["directory"])) / "tiny_fixture-1.0.dist-info/METADATA"
+        self.assertEqual(metadata.stat().st_nlink, 1, "Only the independently owned test metadata may be changed")
+        document = email.message_from_bytes(metadata.read_bytes())
+        document["Requires-Dist"] = "tiny-fixture==2.0"
+        metadata.write_bytes(document.as_bytes())
+        incompatible = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(incompatible.returncode, 0)
+        self.assertIn("tiny-fixture", incompatible.stderr)
+        self.assertIn("2.0", incompatible.stderr)
 
     def test_workspace_modules_cannot_replace_private_installation_parsers(self):
         self.seed_material()
@@ -897,6 +1032,37 @@ class NativeInstallerCase(unittest.TestCase):
         self.assertEqual(self.owner.environment("training")["generation"], first["environment"]["generation"])
         self.assertEqual(plan["downloadBytes"], 0)
 
+    def test_agent_selected_repair_reinstalls_metadata_without_redownloading_or_copying_payload(self):
+        self.seed_material()
+        first, _ = self.install(self.owner)
+        self.owner.config["repairVersion"] = 1
+        directory = pathlib.Path(first["environment"]["directory"])
+        payload = directory / "lib" / ("python" + ".".join(sys.version.split(".")[:2])) / "site-packages/tiny_fixture/payload.bin"
+        original_inode = payload.stat().st_ino
+        metadata = payload.parent.parent / "tiny_fixture-1.0.dist-info/METADATA"
+        metadata.write_text(metadata.read_text().replace("Version: 1.0", "Version: 9.0"))
+        failed_request = self.fixture.request("verify")
+        failed_request["requirements"] = ["tiny-fixture==1.0"]; failed_request["modules"] = ["tiny_fixture"]
+        with patch.object(self.owner, "command", side_effect=lambda args, work, **kwargs: self.native_command(self.owner, args, work, **kwargs)):
+            failure = self.owner.prepare(failed_request)
+        self.assertEqual(failure["state"], "blocked", failure.get("detail"))
+        self.assertTrue(failure["repairPlans"])
+        self.assertEqual(self.owner.environment("training")["state"], "blocked")
+        with patch.object(self.owner, "assert_exited"):
+            recovered = self.owner.recover(failed_request)
+        request = self.fixture.request("repair"); request["repairPlanId"] = recovered["repairPlans"][0]["id"]
+        with patch.object(self.owner, "assert_exited") as exited, patch.object(self.owner, "command",
+                side_effect=lambda args, work, **kwargs: self.native_command(self.owner, args, work, **kwargs)):
+            repaired = self.owner.prepare(request)
+        self.assertEqual(repaired["state"], "completed", repaired.get("detail"))
+        exited.assert_called_once()
+        self.assertNotEqual(first["environment"]["generation"], repaired["environment"]["generation"])
+        self.assertEqual(payload.stat().st_ino, original_inode)
+        self.assertIn("Version: 1.0", metadata.read_text())
+        plan = module.load(self.owner.operations / request["operationId"] / "reuse-plan.v1.json")
+        self.assertEqual(plan["downloadBytes"], 0)
+        self.assertGreaterEqual(plan["reusedBytes"], 2 * 1024 ** 2)
+
     def test_standard_parser_keeps_build_and_compressed_tags_and_rejects_incompatible_or_invented_tags(self):
         request = self.fixture.request("create")
         with patch.object(self.owner, "command", side_effect=lambda args, work, **kwargs: self.native_command(self.owner, args, work, **kwargs)):
@@ -926,10 +1092,33 @@ class NativeInstallerCase(unittest.TestCase):
         self.assertEqual(plan["downloadBytes"], 0); self.assertEqual(module.file_hash(path), original)
         self.assertEqual(len(self.owner.material_records()), 1)
         compile_commands = [args for args in self.commands if args[1:3] == ["pip", "compile"]]
-        self.assertEqual(len(compile_commands), 1); self.assertIn("--no-index", compile_commands[0])
+        self.assertEqual(len(compile_commands), 1); self.assertIn("--offline", compile_commands[0])
         self.assertTrue(result["environment"]["verification"]["verified"])
         print("NATIVE_HISTORY_EVIDENCE " + json.dumps({"wheelHash": original, "downloadBytes": plan["downloadBytes"],
             "offlineResolution": True, "originalWheelUnchanged": True, "materials": 1, "verified": True}), flush=True)
+
+    def test_resolution_metadata_preserves_wheel_hash_without_extracting_cached_payload(self):
+        self.seed_material()
+        catalog = self.fixture.workspace / "resolution-catalog"; catalog.mkdir()
+        material = self.owner.material_records()[0]
+        source = self.owner.materials / material["hash"] / material["filename"]
+        os.link(source, catalog / source.name)
+        index = self.owner.resolution_catalog(catalog)
+        request = self.fixture.workspace / "resolve.in"; request.write_text("tiny-fixture==1.0\n")
+        lock = self.fixture.workspace / "resolve.lock"; cache = self.fixture.workspace / "resolve-cache"
+        command = [self.config["uvPath"], "pip", "compile", str(request), "--python", sys.executable,
+            "--generate-hashes", "--offline", "--index", index, "--cache-dir", str(cache), "--output-file", str(lock)]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(module.locked_requirements(lock.read_text())[0]["hashes"], [material["hash"]])
+        allocated = sum(path.stat().st_blocks * 512 for path in cache.rglob("*") if path.is_file() and not path.is_symlink())
+        self.assertLess(allocated, 256 * 1024, "Resolution must not unpack the existing 2 MiB payload")
+        self.assertEqual(module.file_hash(source), material["hash"])
+        request.write_text("tiny-fixture==1.0\nmissing-fixture==1.0\n")
+        rejected = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("missing-fixture", rejected.stderr)
+        self.assertFalse(any(path.name == "payload.bin" for path in cache.rglob("*")))
 
 
 if __name__ == "__main__":

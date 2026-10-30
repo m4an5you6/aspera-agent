@@ -11,6 +11,10 @@ kind: "package-bundle"
 
 使实验控制、执行 Agent 及受管训练和推理进程具有独立生命周期。节点归属单个实验，命令受文件系统及 GPU 权限限制，并保存进程清理证据。只读工具准备计划，再由单 Agent 执行批准的要求。框架技能指导版本选择和短验证，不包含各框架的参数适配器。
 
+[服务生命周期工具](src/inference-service-tools.ts)让执行 Agent 在加载修正代码前停止自己的已登记后端。[公网推理](../../docs/public-inference.zh.md)定义归属、确认释放和替换服务 ID 的要求。
+
+全自动与手动模式中的保留策略缩减均等待 Host 明确确认。[存储策略](../../docs/storage-governance.zh.md#storage-preflight)保留 Agent 提议的内容及独立决定历史。
+
 ## 目录
 
 - [使用本包](#use-this-package)
@@ -23,6 +27,10 @@ kind: "package-bundle"
 
 <a id="use-this-package"></a>
 ## 使用本包
+
+[定向材料核验](../../docs/storage-governance.zh.md#targeted-material-verification) 提供可独立调用的发现、规范清单、只读核验和容量工具。Agent 自主选择顺序，程序保留归属、内容与写入准入检查。[结束判定](../../docs/finalization.zh.md#finish-decisions) 区分有引用的程序观察和未核验的受阻报告。
+
+环境解析通过 PEP 503/658 元数据索引提供已验证的本地 wheel。固定 uv 解析器读取依赖元数据，不展开已有包内容，锁定摘要仍指向完整原包。本地解析缺少依赖时使用配置的在线来源，安装继续复用共享内容链接。
 
 派发提供方安装固定发布版本，通过 `setupWorkerProfile` 和封存的 setup 入口初始化 profile。常驻控制进程在稳定角色运行目录中使用 `aspera-worker-<deploymentId>`，实验 Agent 在私有运行目录中使用 `aspera-worker`。[控制进程恢复](../../docs/state-and-api.zh.md#controller-readiness)跨发布保留原任务和 Session 存储。bundle 为已发布 DSH base 之上的 [worker.patch.yml](worker.patch.yml)。[正式 worker 检查](../../scripts/test-worker.mjs)无需模型密钥即可验证 worker 入口，Linux 节点执行需要完成 [GPU 验收](../../docs/verification.zh.md#gpu-acceptance)。
 
@@ -54,9 +62,13 @@ kind: "package-bundle"
 <details>
 <summary>实现细节</summary>
 
-[experiment-sandbox.ts](src/experiment-sandbox.ts)管理准备与正式命令共用的 Linux 启动参数：用户／PID／IPC／UTS 命名空间、私有 `/proc`、移除全部能力、限定设备授权、隐藏的控制／存储目录、清空的环境及工作目录内缓存。发布目录在沙箱内不可见，因此准备探测以内联程序执行。命名空间或 proc 挂载被拒绝时，以原始诊断阻止接入；[专用兼容修复](../dispatch/README.zh.md#sandbox-compatibility-repair)保留这些隔离。受控进程清理在需要时从 TERM 升级到 KILL，包括命名空间监督进程忽略 TERM 的启动器。
+[command-output.ts](src/command-output.ts) 核对命令输出读取的身份和字节游标，涵盖工作区之外的诊断输出。[命令等待](../../docs/finalization.zh.md#command-waiting) 统一说明工具参数及输出上限。
 
-[transport.ts](src/transport.ts) 为密码和密钥 SSH 命令提供独立 stdout/stderr、退出状态、超时／取消信息及退出确认证据。`remote` 保留成功返回 stdout 的接口；`remoteResult` 返回非零命令结果供诊断，连接失败仍报告错误。已验证程序目录应用于后续所有命令。SSH 断开不能证明远端进程已经结束。
+[experiment-sandbox.ts](src/experiment-sandbox.ts)管理准备与正式命令共用的 Linux 启动参数：用户／PID／IPC／UTS 命名空间、私有 `/proc`、移除全部能力、限定设备授权、隐藏的控制／存储目录、清空的环境及工作目录内缓存。普通命令的 `TMPDIR=/tmp/aspera` 通过命令私有链接指向 `workspace/tmp`，临时内容仍保存在选中磁盘；只读诊断继续使用限额的私有 tmpfs。发布目录在沙箱内不可见，因此准备探测以内联程序执行。命名空间或 proc 挂载被拒绝时，以原始诊断阻止接入；[专用兼容修复](../dispatch/README.zh.md#sandbox-compatibility-repair)保留这些隔离。受控进程清理在需要时从 TERM 升级到 KILL，包括命名空间监督进程忽略 TERM 的启动器。
+
+`pnpm run test:sandbox:linux` 先构建运行包，再在 Linux 上验证真实 Python 本地进程通信。`ASPERA_TEST_BACKEND` 指定节点上已验证的启动器。测试使用私有临时工作目录，不请求 GPU 设备。
+
+[transport.ts](src/transport.ts) 为密码和密钥 SSH 命令提供独立 stdout/stderr、退出状态、超时／取消信息及退出确认证据。`remote` 保留成功返回 stdout 的接口；`remoteResult` 返回非零命令结果供诊断。两者接受可选 UTF-8 标准输入，写入后关闭输入，不将输入内容拼入命令参数。连接失败仍报告错误。已验证程序目录应用于后续所有命令。SSH 断开不能证明远端进程已经结束。
 
 密码命令、上传和接收端请求可按已解析的[连接策略](src/ssh-connection.ts)在认证前重连。每个失败客户端关闭后才建立下一个连接；尝试和等待共用一次操作的截止时间及取消信号。主机密钥和认证失败直接结束。认证后发生命令通道或接收端错误时，不自动重试，缺少远端退出证据的结果仍为未确认。密钥 OpenSSH 操作保留原退出回执行为。
 
@@ -80,25 +92,37 @@ kind: "package-bundle"
 <a id="model-experience"></a>
 ## 模型体验
 
-环境恢复保留原回执，返回独立代次及清理诊断；Agent 恢复后必须请求程序重新验收。普通临时删除失败保留已验收环境，挂载或身份错误仍阻塞；命令和服务沙箱隐藏待清理操作目录。
+[checkpoint 保留](../../docs/finalization.zh.md#command-waiting)保护批准且成功生成的恢复文件，使后续命令和服务只能读取。Agent 根据原始日志和 checkpoint 修正证据；格式错误不授权重新执行已成功的训练。
+
+环境安装、操作查询和恢复提供有界 JSON 与已保存的详情分页；[受管环境读取](../../docs/managed-environments.zh.md#create-and-verify)保留完整包清单及诊断记录。
+
+[账号工具传输](src/python-input.ts) 用固定短入口，经 SSH 输入流传递受管 Python 定义及结构化请求。准备、离线观察、存储登记及已确认删除后的引用释放共用该方式；完整输入解析成功后才执行。
+
+环境恢复保留原回执，返回独立代次及清理诊断；Agent 恢复后必须请求程序重新验收。`managed-environment-lock-receipt-v1` 在包锁拒绝时保存失败回执且不安装依赖，节点仍需确认进程退出后才释放准入；新的包锁拒绝不能结束已有的未决操作。普通临时删除失败保留已验收环境，挂载或身份错误仍阻塞；命令和服务沙箱隐藏待清理操作目录。
 
 `inspect_experiment_environment` 读取分配节点限定的环境及复用记录；`prepare_experiment_environment` 在固定 uv 安装、验收或文件分离前强制核对复用和空间。`recover_experiment_environment` 核对原启动/进程证据，`preview_experiment_cache_cleanup` 与 `cleanup_experiment_cache` 共用程序管理的清理服务。普通命令和服务通过只读挂载加载已验证内容。[受管环境](../../docs/managed-environments.zh.md)说明材料保留、专属入口、链接、恢复及空间统计，`managedEnvironments` 配置安装与观察上限。
 
-[environment-operation.ts](src/environment-operation.ts) 通过认证的轻量状态读取，让现有串行安装工具持续等待。节点保存原期限，独立核验退出和准入释放。`create` 合并直接依赖要求，`install` 明确替换要求。专属固定 pip 工具环境负责解析及下载依赖，不向训练环境填入种子包。结构化文件冲突阻止更换操作 ID 后无条件重试。固定发布声明 `managed-environment-install-v3`，Agent 主循环保持不变。
+[environment-operation.ts](src/environment-operation.ts) 通过认证的轻量状态读取，让现有串行安装工具持续等待。节点保存原期限，独立核验退出和准入释放。环境请求文件还保存可选的 `evidenceContext`，绑定批准计划及执行 Session，原样传给子核验进程；重试拒绝不同身份，旧请求文件继续可读。`create` 合并直接依赖要求，`install` 明确替换要求。专属固定 pip 工具环境负责解析及下载依赖，不向训练环境填入种子包。结构化文件冲突阻止更换操作 ID 后无条件重试。固定发布声明 `managed-environment-install-v3`，Agent 主循环保持不变。
 
-Agent 接收已记入日志的固定要求和批准计划。两种角色都能读取随包发布的技能、允许的 HTTPS 文档和声明的输入字节。规划增加计划保存；执行增加受限命令、日志及文件、实测进度、版本及脚本及环境及参数记录、登记服务管理。完成要求具有执行记录、已完成的步骤上报，以及每个节点上成功结束的命令或健康的所属服务。无法满足要求时持久保存被阻塞的 Goal。
+Agent 接收已记入日志的固定要求和批准计划。两种角色都能读取随包发布的技能、允许的 HTTPS 文档分页和声明的输入字节。[计划工具](../../docs/planning.zh.md)在不可变提交前提供准确类型、持久草稿和局部修正。执行增加受限命令、日志及文件、实测进度、版本及脚本及环境及参数记录、登记服务管理。完成要求具有执行记录、已完成的步骤上报，以及每个节点上成功结束的命令或健康的所属服务。无法满足要求时持久保存被阻塞的 Goal。
 
 执行通过 `get_experiment_execution_progress` 和 `report_experiment_step` 将批准的步骤上报为进行中、已完成或受阻。程序记录执行身份及调用时间。记录版本冲突返回诊断和最新记录，Agent 修正上报而不重跑已结束命令；遗漏步骤上报时，Goal 保持活动直至补齐。上报不能代替命令、节点或结果的独立验收。[步骤持久化](../../docs/state-and-api.zh.md#execution-step-progress)定义归属和迟到消息的拒绝规则。
 
+`stage-evidence-reading-v1` 要求[阶段验收](../../docs/finalization.zh.md#approved-stages)完整读取结构化来源并核对逐回答身份，包括同时声明为必需产物的文件。`stage-checkpoint-evidence-v4` 在登记的状态副本位于日志目录时核验原生 checkpoint 身份，并在启动前检查声明的原生保存目录。
+
 Agent 范围屏蔽全局工具并禁用插件管理层。全自动在提问服务层拒绝人工等待，包括直接请求；半自动通过持久化远端应答提供方接入已有提问服务。无法解决的选择暂停新的 Agent 工具，节点上的受管进程仍可取消。模型提供方的暂时故障重新激活同一 Goal；明确阻塞和不可恢复故障保存终态原因。回复不能修改提交要求或授予权限。[Megatron](skills/megatron/SKILL.md)、[MS-SWIFT](skills/swift/SKILL.md) 和 [Unsloth](skills/unsloth/SKILL.md) 技能要求明确文档版本、独立环境、短运行和实测评估，不承诺参数最优。
 
-规划或执行回合在完成前以 `max-tokens` 结束时，将 Goal 以 `aspera-model-token-limit` 标记受阻，落盘 Session 并写入 worker 终态结果。调度端沿用已有释放检查核对所属命令及服务；该结果不重跑命令。[正式 worker 回放](../../scripts/test-worker.mjs)覆盖真实压缩后继续调用工具，以及已结束命令仅启动一次时的 token 上限退出。
+规划或执行回合以 `max-tokens` 结束时，在原 Goal 和 Session 中记录纠正信息并继续。`finalization.outputTokenCorrections` 默认允许连续恢复两次，收到工具结果后重新计数；用尽后以 `aspera-model-token-limit` 标记受阻，保留实际输出上限事件。恢复不重放命令。未核实的受阻上报先获得 `finalization.reasonCorrections` 次纠正机会，之后记录为 Agent 工作未完成。[正式 worker 回放](../../scripts/test-worker.mjs)覆盖成功续行、有限恢复用尽及已结束命令仅启动一次。发布声明 `asperaAgentRecoveryVersion: 1`，控制进程复用前要求 `agent-recovery-v1`。
 
-[完成验收](../../docs/completion-review.zh.md) 说明检查工具、完成工具和 worker 最终收尾共用的检查。缺少节点证据时，原 Goal 保持活动以补录已有结果，不重复训练。
+[完成验收](../../docs/completion-review.zh.md) 说明检查工具、完成工具和 worker 最终收尾共用的检查。恢复观察核对协调记录中固定提交的实验及发布身份。缺少节点证据时，原 Goal 保持活动以补录已有结果，不重复训练。
 
-[阶段验收与实验收尾](../../docs/finalization.zh.md) 定义批准的优化器步数口径、独占命令／命令组等待、来源绑定检查与预算证据。`finalization` 配置负责轮询、读取／重连限制、证据大小及纠正次数，不增加训练总时限。这些工具使用已有 DSH 注册及生命周期扩展点。
+[阶段验收与实验收尾](../../docs/finalization.zh.md) 定义批准的优化器步数口径、独占命令／命令组等待、来源绑定检查与预算证据。`finalization` 配置负责轮询、读取／重连限制、证据大小及纠正次数，不增加训练总时限。这些工具使用已有 DSH 注册及生命周期扩展点。[stage-attempts.ts](src/stage-attempts.ts) 追加失败尝试的后继，不替换原登记；Agent 通过现有阶段工具选择重试。
 
-[存储治理](../../docs/storage-governance.zh.md) 提供共用的账号视角盘点、历史环境借用、逐卷预留及不可变模型／数据获取。限定范围的工具使用程序生成的候选及原操作；命令、服务与完成验收消费者核验只读授权。文件内容锁协调跨版本获取。运行时保留原环境和失败证据。
+[环境预核验与保留策略](../../docs/storage-governance.zh.md#storage-preflight)将只读来源核验、可纠正的字节估算和批准的保存内容分开。Agent 选择修复或补齐部分材料，程序准入与完整清单发布仍然必需。
+
+[存储治理](../../docs/storage-governance.zh.md) 提供共用的账号视角盘点、历史环境借用、逐卷预留及不可变模型／数据获取。限定范围的工具使用程序生成的候选及原操作；命令、服务与完成验收消费者核验只读授权。每个校验操作固定明确的候选，容量通过 `materialSources` 选择其回执。各实验发布保留独立来源。文件内容锁协调跨版本获取。运行时保留原环境和失败证据。
+
+复制的容器通过[存储登记](../../docs/storage-governance.zh.md#storage-registration)保留旧挂载观察并重新核验当前归属。[有限诊断](../../docs/finalization.zh.md#bounded-diagnostics)允许不经过训练容量准入的只读调查；身份匹配的明确命令拒绝立即返回。这些能力属于新固定发布，不会重启已有实验。
 
 <a id="known-limitations-and-deferred-work"></a>
 ## 已知限制和后续工作
@@ -111,3 +135,13 @@ Agent 范围屏蔽全局工具并禁用插件管理层。全自动在提问服�
 ### 开发备注
 
 无。
+
+[历史来源自动复用](../../docs/storage-governance.zh.md#automatic-history-reuse)优先读取归属已确认的就绪环境清单，使用持久节点核验与已保存的来源选择。容量消费已确认回执，发现不完整时保持待确认。[存储工具结果](src/storage-tool-result.ts)提供有界的保存分页，读取超时保留诊断并继续原核验。
+
+`historical-environment-precheck-v1` 要求在深度核验来源前执行[历史候选初步检查](../../docs/storage-governance.zh.md#historical-environments)。
+
+`storage-requirement-ledger-v1` 使用已发布环境要求进行[容量重算](../../docs/storage-governance.zh.md#storage-preflight)，失败的依赖试算不会变成安装要求。
+
+`managed-environment-repair-v1` 提供 [Agent 选择修复](../../docs/storage-governance.zh.md#agent-selected-environment-repair)、来源诊断及环境引用删除确认。存储发现失败时，检查响应仍保留进程记录。
+
+[公网推理验收](../../docs/public-inference.zh.md)允许执行 Agent 请求真实的 Host 侧认证和固定提示生成检查。凭据保持私密；操作认领与保存结果防止自动重复发送生成请求。公网服务完成检查消费这些观察。

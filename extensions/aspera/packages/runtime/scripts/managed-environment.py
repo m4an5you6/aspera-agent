@@ -7,6 +7,7 @@ import email
 import errno
 import fcntl
 import hashlib
+import html
 import io
 import json
 import os
@@ -21,15 +22,60 @@ import sys
 import tempfile
 import time
 import uuid
+import urllib.parse
 import zipfile
 
 
+def environment_repair(owner):
+    if "StorageGovernance" not in globals():
+        source = pathlib.Path(__file__).with_name("storage-governance.py")
+        exec(compile(source.read_text(), str(source), "exec"), globals())
+    if "EnvironmentRepair" not in globals():
+        source = pathlib.Path(__file__).with_name("environment-repair.py")
+        exec(compile(source.read_text(), str(source), "exec"), globals())
+    return EnvironmentRepair(owner)
+
+
+def wheel_metadata(owner):
+    environment_repair(owner)
+    if "WheelMetadataRepair" not in globals():
+        source = pathlib.Path(__file__).with_name("wheel-metadata.py")
+        exec(compile(source.read_text(), str(source), "exec"), globals())
+    return WheelMetadataRepair(owner)
+
+
+def manager_caches(owner):
+    if "ManagerCaches" not in globals():
+        source = pathlib.Path(__file__).with_name("manager-cache.py")
+        exec(compile(source.read_text(), str(source), "exec"), globals())
+    return ManagerCaches(owner)
+
+
+def input_sharing(owner):
+    if "InputSharing" not in globals():
+        source = pathlib.Path(__file__).with_name("input-sharing.py")
+        exec(compile(source.read_text(), str(source), "exec"), globals())
+    return InputSharing(owner)
+
+
+def release_assets(owner):
+    input_sharing(owner)
+    return ReleasedAssets(owner)
+
+
 def storage_governance(owner):
+    environment_repair(owner)
     if "environment_arrangement" not in globals():
         source = pathlib.Path(__file__).with_name("storage-placement.py")
         exec(compile(source.read_text(), str(source), "exec"), globals())
     if "StorageGovernance" not in globals():
         source = pathlib.Path(__file__).with_name("storage-governance.py")
+        exec(compile(source.read_text(), str(source), "exec"), globals())
+    if "StorageReuse" not in globals():
+        source = pathlib.Path(__file__).with_name("storage-reuse.py")
+        exec(compile(source.read_text(), str(source), "exec"), globals())
+    if "StoragePreflight" not in globals():
+        source = pathlib.Path(__file__).with_name("storage-preflight.py")
         exec(compile(source.read_text(), str(source), "exec"), globals())
     if not hasattr(owner, "_storage_governance"):
         owner._storage_governance = StorageGovernance(owner)
@@ -379,6 +425,10 @@ def package_name(value):
     return re.sub(r"[-_.]+", "-", value).lower()
 
 
+class PackageStoreBusy(RuntimeError):
+    """A package-store operation was refused before it acquired the shared lock."""
+
+
 class Environments:
     def __init__(self, config):
         self.config = config
@@ -402,6 +452,7 @@ class Environments:
         self.material_references = self.store / "material-references"
         self.cleanups = self.run / "environment-cleanups-v1"
         self.recoveries = self.run / "environment-recoveries-v1"
+        self.input_wheel_paths = []
         self.policy = {**config["policy"], "legacyEntryLimit": config["policy"].get("legacyEntryLimit", config["policy"]["maxPackageFiles"])}
         self.expanded_limit = self.policy.get("maxPackageBytes")
         if (self.run / "storage-arrangement.v1.json").exists():
@@ -462,7 +513,7 @@ class Environments:
                 fcntl.flock(handle, (fcntl.LOCK_EX if write else fcntl.LOCK_SH) | fcntl.LOCK_NB)
             except BlockingIOError:
                 if write or self.config.get("action") != "inspect":
-                    raise RuntimeError("Another environment operation holds the server package lock; inspect its receipt")
+                    raise PackageStoreBusy("Another environment operation holds the server package lock; inspect its receipt")
                 self.inspection_busy = True
             yield
 
@@ -514,7 +565,7 @@ class Environments:
             values.append(value)
         return values
 
-    def refs(self):
+    def refs(self, allow_missing=False):
         if not self.references.exists():
             return []
         values = []
@@ -535,8 +586,13 @@ class Environments:
                 allowed = expected / "workspace"
             if allowed not in directory.parents or manifest.parent != expected / "environments-v1":
                 raise RuntimeError("Package reference escaped its original experiment")
-            if not directory.exists() or not manifest.exists():
+            if (not directory.exists() or not manifest.exists()) and not allow_missing:
                 raise RuntimeError("Package reference requires confirmed environment deletion: " + item["experimentId"])
+            if not manifest.exists():
+                if any(not re.fullmatch(r"[a-f0-9]{64}", package) for package in item["packages"]):
+                    raise RuntimeError("Unknown package references prevent cleanup")
+                values.append(item)
+                continue
             declared = load(manifest)
             if declared["experimentId"] != item["experimentId"] or declared["serverId"] != self.server or declared["environmentId"] != item["environmentId"] or declared["directory"] != str(directory):
                 raise RuntimeError("Package reference differs from its environment manifest")
@@ -602,7 +658,7 @@ class Environments:
         return record
 
     def candidates(self):
-        refs = self.refs()
+        refs = self.refs(allow_missing=True)
         held = {package for row in refs for package in row["packages"]}
         rows = []
         for package in self.records():
@@ -644,11 +700,31 @@ class Environments:
 
     def preview(self):
         rows = self.candidates()
+        detail = None
         if self.config.get("governancePolicy"):
             rows.extend({key: value for key, value in row.items() if key in ("id", "kind", "bytes", "reason", "sourceExperimentId")}
                 for row in storage_governance(self).historical_cleanup())
-        signature = digest({"references": self.refs(), "candidates": rows, "packages": self.records(), "materials": self.material_records(), "cleanups": self.cleanup_records()})
-        return {"serverId": self.server, "checkedAt": now(), "fingerprint": signature, "candidates": rows, "eligible": True}
+            if self.config.get("managerCacheVersion") == 1:
+                caches = manager_caches(self)
+                rows.extend({key: row[key] for key in ("id", "kind", "bytes", "reason")} for row in caches.discover())
+                if caches.diagnostics:
+                    detail = "Manager caches excluded by identity/activity checks: " + "; ".join(caches.diagnostics)[:16384]
+            if self.config.get("inputSharingVersion") == 1:
+                sharing = input_sharing(self)
+                rows.extend({key: row[key] for key in ("id", "kind", "bytes", "reason")} for row in sharing.discover())
+                if sharing.diagnostics:
+                    detail = ((detail + "; ") if detail else "") + "; ".join(sharing.diagnostics)
+            if self.config.get("releaseAssetSharingVersion") == 1:
+                assets = release_assets(self)
+                rows.extend({key: row[key] for key in ("id", "kind", "bytes", "reason")} for row in assets.discover())
+                if assets.diagnostics:
+                    detail = ((detail + "; ") if detail else "") + "; ".join(assets.diagnostics)
+        repairs = environment_repair(self).reference_candidates() if self.config.get("governancePolicy") else []
+        signature = digest({"references": self.refs(allow_missing=True), "candidates": rows, "packages": self.records(),
+            "materials": self.material_records(), "cleanups": self.cleanup_records(),
+            "referenceRepairs": [{key: value for key, value in row.items() if key != "checkedAt"} for row in repairs]})
+        return {"serverId": self.server, "checkedAt": now(), "fingerprint": signature, "candidates": rows, "eligible": True,
+            "referenceRepairs": repairs, **({"detail": detail} if detail else {})}
 
     def legacy(self, wheels_only=False, verify=True):
         rows = []; scanned = 0; self.legacy_truncated = False
@@ -734,10 +810,15 @@ class Environments:
                 for row in self.material_records()]}
         if self.config.get("governancePolicy"):
             governance = storage_governance(self)
+            result["diagnostics"], result["repairPlans"] = environment_repair(self).observations()
             result["catalog"] = governance.catalog()
             result["borrowings"] = [{**{key: value for key, value in row.items() if key != "files"}, "fileCount": len(row["files"])}
-                for row in governance.validate_borrowings()]
+                for row in governance.borrowing_observations()]
             budget = self.run / "storage-plan.v1.json"
+            if self.config.get("storagePreflightVersion") == 2:
+                candidates = list((self.run / "storage-plans-v1").glob("*.json"))
+                if candidates:
+                    budget = max(candidates, key=lambda path: load(path)["checkedAt"])
             if budget.exists():
                 result["storagePlan"] = load(budget)
             arrangement = environment_arrangement(self)
@@ -838,9 +919,9 @@ class Environments:
                         for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
                             value.update(block); length += len(block)
                     if base64.urlsafe_b64encode(value.digest()).rstrip(b"=").decode() != encoded:
-                        raise RuntimeError("Wheel RECORD content digest differs")
+                        raise RuntimeError("Wheel RECORD content digest differs: " + path.name + ": " + filename)
                     if size != str(length):
-                        raise RuntimeError("Wheel RECORD size differs")
+                        raise RuntimeError("Wheel RECORD size differs: " + path.name + ": " + filename + ": expected " + size + ", observed " + str(length))
                 elif filename != prefix + "/RECORD":
                     raise RuntimeError("Wheel entry has no content digest")
             if set(name for name in names if not name.endswith("/")) != checked:
@@ -961,6 +1042,30 @@ class Environments:
             writer.writerows(rows); writer.writerow([info["distInfo"] + "/RECORD", "", ""])
             output.writestr(info["distInfo"] + "/RECORD", record.getvalue())
         return info
+
+    def resolution_catalog(self, catalog):
+        """Expose verified wheels through PEP 503/658 without unpacking their payloads."""
+        entries = {}
+        for path in sorted(catalog.glob("*.whl")):
+            reject_links(path)
+            with zipfile.ZipFile(path) as archive:
+                names = [name for name in archive.namelist() if re.fullmatch(r"[^/]+\.dist-info/METADATA", name)]
+                if len(names) != 1:
+                    raise RuntimeError("Resolution wheel metadata is ambiguous")
+                metadata = archive.read(names[0])
+            name = package_name(email.message_from_bytes(metadata)["Name"])
+            path.with_name(path.name + ".metadata").write_bytes(metadata)
+            checksum = hashlib.sha256(metadata).hexdigest()
+            address = "../../" + urllib.parse.quote(path.name, safe="") + "#sha256=" + file_hash(path)
+            entries.setdefault(name, []).append('<a href="' + html.escape(address, quote=True) + '" data-core-metadata="sha256=' + checksum
+                + '" data-dist-info-metadata="sha256=' + checksum + '">' + html.escape(path.name) + '</a>')
+        index = catalog / "simple"
+        index.mkdir(mode=0o700)
+        for name, links in entries.items():
+            directory = index / name
+            directory.mkdir(mode=0o700)
+            (directory / "index.html").write_text("<!DOCTYPE html>\n" + "\n".join(links) + "\n", encoding="utf-8")
+        return index.as_uri()
 
     def shared_copy_budget(self, records, work):
         if not records:
@@ -1218,7 +1323,7 @@ class Environments:
             argv += ["--setenv", "TMPDIR", str(work / "tmp"), "--setenv", "HOME", str(work / "home"),
                 "--setenv", "XDG_CACHE_HOME", str(work / "cache"), "--setenv", "UV_CACHE_DIR", str(work / "uv"),
                 "--setenv", "PIP_CACHE_DIR", str(work / "pip")]
-        for path in readonly or []:
+        for path in list(readonly or []) + self.input_wheel_paths:
             reject_links(path)
             argv += ["--ro-bind", str(path), str(path)]
         if environment:
@@ -1261,18 +1366,38 @@ class Environments:
     def verify(self, environment, request, work):
         directory = pathlib.Path(environment["directory"])
         site = self.site(directory)
+        metadata = {}
+        known_hashes = {}
+        for path in site.glob("*.dist-info/METADATA"):
+            reject_links(path)
+            declared = email.message_from_string(path.read_text())
+            metadata[package_name(declared["Name"])] = (declared["Version"], path)
+        if request["action"] in ("verify", "verify-reuse") and not set(request["requirements"]).issubset(environment["requirements"]):
+            raise RuntimeError("Verification requirements differ from the registered dependency set; select create or install to resolve them")
         for package in environment["packages"]:
+            actual = metadata.get(package_name(package["name"]))
+            if actual is None or actual[0] != package["version"]:
+                environment_repair(self)
+                path = actual[1] if actual else site / (package["name"] + ".dist-info/METADATA")
+                raise EnvironmentSourceError("Installed dependency metadata differs: " + package["name"] + " expected "
+                    + package["version"] + ", observed " + (actual[0] if actual else "missing"),
+                    {"code": "dependency-mismatch", "package": package["name"], "path": str(path.relative_to(site))}, [str(path)])
             record = load(self.objects / package["id"] / "record.v1.json")
             observed = []
             for name in package["files"]:
                 path = site / relative(name)
                 reject_links(path)
                 checksum = file_hash(path)
+                known_hashes[str(path)] = checksum
                 if name not in environment["privateFiles"] and checksum != record["hashes"][name]:
                     raise RuntimeError("Shared dependency content changed: " + name)
                 observed.append((name, checksum))
             if package["modified"]:
                 package["contentHash"] = digest(sorted(observed))
+        environment_repair(self)
+        verify_distribution_records(directory, site, known_hashes, environment["privateFiles"])
+        if environment["privateFiles"] and request["action"] != "verify-reuse":
+            self.refresh_installation_records(environment["packages"], directory)
         code = "import json,sys,site,importlib,sysconfig; modules=json.loads(sys.argv[1]); [importlib.import_module(m) for m in modules]; assert sysconfig.get_config_var('SOABI')==sys.argv[2], 'Python ABI changed'; out={'python':sys.executable,'prefix':sys.prefix,'userSiteEnabled':bool(site.ENABLE_USER_SITE),'modules':modules}; "
         require_cuda = request["requireCuda"] or any(re.fullmatch(r"/dev/nvidia\d+", path) for path in self.config.get("devicePaths", [])) and any(package["name"].lower() == "torch" for package in environment["packages"])
         if require_cuda:
@@ -1285,6 +1410,31 @@ class Environments:
             raise RuntimeError("Interpreter prefix or user-site isolation differs from its registered environment")
         self.command([environment["uv"], "pip", "check", "--python", environment["python"]], work, readonly=[directory], environment=directory)
         return {"verified": True, "checkedAt": now(), **observed, "dependenciesValid": True}
+
+    def reject_prepare(self, request, detail):
+        """Retain a pre-install refusal without changing an existing operation or package content."""
+        operation_id = request["operationId"]
+        if not re.fullmatch(r"[a-f0-9-]{36}", operation_id):
+            raise RuntimeError("Invalid environment operation identity")
+        op = self.operations / operation_id
+        reject_links(op)
+        receipt_path = op / "receipt.v1.json"
+        expected = {"version": 1, "experimentId": self.id, "serverId": self.server, "operationId": operation_id,
+            "environmentId": request["environmentId"], "requestHash": digest(request), "action": request["action"],
+            "commandId": "environment-" + operation_id}
+        if op.exists():
+            previous = load(receipt_path)
+            if any(previous.get(key) != value for key, value in expected.items()):
+                raise RuntimeError("Environment operation identity is bound to different content")
+            if not previous["exitConfirmed"]:
+                raise RuntimeError("Environment operation outcome is unknown; inspect its original process before retrying")
+            return previous
+        op.mkdir(mode=0o700)
+        timestamp = now()
+        receipt = {**expected, "state": "blocked", "startedAt": timestamp, "updatedAt": timestamp,
+            "exitConfirmed": True, "exitCode": 1, "detail": detail + "; dependency installation did not start"}
+        save(receipt_path, receipt)
+        return receipt
 
     def prepare(self, request):
         operation_id = request["operationId"]
@@ -1332,11 +1482,31 @@ class Environments:
         before = shutil.disk_usage(self.workspace).free
         try:
             self.plan_stage("checking")
+            if request["action"] == "verify-reuse":
+                governance = storage_governance(self)
+                preflight, plans = storage_preflight(governance).preflight_environment(request, work)
+                receipt.update(state="completed", preflight=preflight, repairPlans=plans, exitConfirmed=True, exitCode=0, updatedAt=now())
+                save(op / "receipt.v1.json", receipt)
+                self.plan_stage("completed")
+                try:
+                    remove_private(work, self.workspace, self.owner)
+                except CleanupIoError as error:
+                    receipt["detail"] = "Read-only verification completed; temporary cleanup pending: " + str(error)
+                    save(op / "receipt.v1.json", receipt)
+                return receipt
+            if request["action"] == "repair":
+                request = environment_repair(self).resolve(request)
+                self.repair_wheel_metadata = request.get("repairWheelMetadata", False)
+                self.effective_requirements = sorted(set(request["requirements"]))
+                save(op / "requirements.v1.json", {"version": 1, "requestHash": signature, "requirements": request["requirements"]})
+                self.reuse_plan["requirementsHash"] = digest(request["requirements"])
+            elif request["action"] in ("create", "install"):
+                wheel_metadata(self).check(request)
             if self.config.get("governancePolicy"):
                 governance = storage_governance(self)
                 with governance.locked():
                     governance.protect_source(self.id)
-                    borrowed = governance.borrowing(request) if environment is None else None
+                borrowed = governance.borrowing(request) if environment is None and request["action"] != "repair" else None
                 if borrowed is not None:
                     summary = {**{key: value for key, value in borrowed.items() if key != "files"}, "fileCount": len(borrowed["files"])}
                     receipt.update(state="completed", exitConfirmed=True, exitCode=0, borrowed=summary, updatedAt=now())
@@ -1348,7 +1518,7 @@ class Environments:
                         receipt["detail"] = "Historical environment verified; private verification files pending cleanup: " + str(error)
                         save(op / "receipt.v1.json", receipt)
                     return receipt
-            if request["action"] in ("create", "install", "make-writable"):
+            if request["action"] in ("create", "install", "make-writable", "repair"):
                 self.free()
             if request["action"] == "make-writable":
                 if not environment:
@@ -1377,7 +1547,7 @@ class Environments:
             previous_path = pathlib.Path(previous["directory"]) if previous else None
             previous_restored = previous_path is not None and previous_path.exists() and load(previous_path / ".aspera-environment.json")["generation"] == previous["generation"]
             if previous_restored:
-                if isinstance(error, CleanupSafetyError) or self.commit_started:
+                if isinstance(error, CleanupSafetyError) or self.commit_started or getattr(error, "facts", {}).get("code") in ("content-mismatch", "dependency-mismatch"):
                     previous.update(state="blocked", detail=str(error), updatedAt=now())
                 save(self.manifests / (previous["environmentId"] + ".json"), previous)
                 if not self.commit_started:
@@ -1390,6 +1560,13 @@ class Environments:
                         manifest.unlink(); self.reference_path(request["environmentId"]).unlink(missing_ok=True)
                     else:
                         failed.update(state="blocked", detail=str(error), updatedAt=now()); save(manifest, failed)
+            if (self.config.get("governancePolicy") or self.config.get("repairVersion") == 1) and (request["action"] != "repair" or getattr(self, "repairing", False)):
+                repair = environment_repair(self)
+                diagnostics = [row for row in repair.observations()[0] if row["operationId"] == operation_id]
+                if not diagnostics:
+                    diagnostics = [repair.diagnose(request, error)]
+                receipt["diagnostics"] = diagnostics
+                receipt["repairPlans"] = [] if isinstance(error, (DependencyConflict, UnchangedInstallationFailure)) else [repair.propose(request, diagnostics)]
             receipt.update(state="blocked", exitConfirmed=True, exitCode=1, detail=str(error), updatedAt=now())
             if isinstance(error, DependencyConflict):
                 failure = {"version": 1, "experimentId": self.id, "serverId": self.server, "operationId": operation_id,
@@ -1431,7 +1608,11 @@ class Environments:
         if not receipt_path.exists():
             op.mkdir(parents=True, mode=0o700, exist_ok=True)
             save(receipt_path, receipt)
-        return self.recover_publication(op, receipt, receipt_path)
+        result = self.recover_publication(op, receipt, receipt_path)
+        if (self.config.get("governancePolicy") or self.config.get("repairVersion") == 1) and receipt.get("diagnostics") and receipt.get("repairPlans"):
+            effective = load(op / "requirements.v1.json")["requirements"]
+            result["repairPlans"] = [environment_repair(self).propose({**request, "requirements": effective}, receipt["diagnostics"])]
+        return result
 
     def assert_exited(self, command_id, launch_failure=False):
         identity = self.run / "process-identities" / (command_id + ".v1.json")
@@ -1601,7 +1782,7 @@ class Environments:
             raise RuntimeError("Published environment cannot occupy a private operation directory")
         if not previous and directory.exists() and list(directory.iterdir()):
             raise RuntimeError("Refusing to overwrite an unregistered or legacy environment")
-        satisfied = previous and request["requirements"] == previous["requirements"]
+        satisfied = previous and request["requirements"] == previous["requirements"] and request["action"] != "repair"
         if not satisfied:
             code = "import json,sys,sysconfig; print(json.dumps({'version':sys.version.split()[0],'abi':sysconfig.get_config_var('SOABI')}))"
             target = json.loads(self.command([self.config["pythonPath"], "-I", "-c", code], work))
@@ -1697,6 +1878,7 @@ class Environments:
     def install_dependencies(self, requirements, facts, stage, work, before):
         uv, interpreter = self.config["uvPath"], stage / "bin/python"
         self.reuse_plan["pythonAbi"] = facts["abi"]
+        requirements = wheel_metadata(self).install_requirements(requirements, stage, work)
         requirements_file = work / "requirements.in"
         for requirement in requirements:
             if "\n" in requirement or "\r" in requirement or requirement.lstrip().startswith("-") or re.search(r"https?://[^/\s]*@", requirement):
@@ -1743,7 +1925,7 @@ class Environments:
                 lock.write_text(saved["text"])
             else:
                 compile_args = [uv, "pip", "compile", str(requirements_file), "--python", str(interpreter), "--generate-hashes", "--output-file", str(lock),
-                    "--cache-dir", str(work / "uv"), "--find-links", str(catalog)]
+                    "--cache-dir", str(work / "uv"), "--index", str(catalog)]
                 for candidate in self.legacy(wheels_only=True, verify=False):
                     source = pathlib.Path(candidate["directory"])
                     if candidate["kind"] != "wheel" or (catalog / source.name).exists():
@@ -1759,9 +1941,10 @@ class Environments:
                     target = catalog / identity["filename"]
                     if not target.exists():
                         self.link_file(source, target, empty_sharing())
+                compile_args[-1] = self.resolution_catalog(catalog)
                 if any(catalog.glob("*.whl")):
                     try:
-                        self.command(compile_args + ["--no-index"], work, readonly=[catalog], environment=stage)
+                        self.command(compile_args + ["--offline"], work, readonly=[catalog], environment=stage)
                     except RuntimeError as error:
                         if "No solution found" not in str(error) and "not found in the provided package locations" not in str(error):
                             raise
@@ -1927,6 +2110,23 @@ class Environments:
     def cleanup(self, operation_id, fingerprint):
         path = self.operations / ("cleanup-" + operation_id + ".json")
         if path.exists():
+            previous = load(path)
+            if previous["fingerprint"] != fingerprint:
+                raise RuntimeError("Cleanup identity is bound to another preview")
+            if previous["state"] != "completed":
+                raise RuntimeError("Cleanup outcome is unknown; inspect its original process before retrying")
+        try:
+            return self.perform_cleanup(operation_id, fingerprint)
+        except (OSError, RuntimeError, ValueError) as error:
+            saved = load(path) if path.exists() else {"version": 1, "fingerprint": fingerprint}
+            result = {"serverId": self.server, "state": "blocked", "reclaimedBytes": 0, "checkedAt": now(),
+                "detail": str(error) + "; cleanup did not finish. Read a fresh preview before selecting another operation; previous deletion results are not inferred."}
+            save(path, {**saved, "state": "completed", "result": result})
+            return result
+
+    def perform_cleanup(self, operation_id, fingerprint):
+        path = self.operations / ("cleanup-" + operation_id + ".json")
+        if path.exists():
             saved = load(path)
             if saved["fingerprint"] != fingerprint:
                 raise RuntimeError("Cleanup identity is bound to another preview")
@@ -1937,13 +2137,26 @@ class Environments:
         if preview["fingerprint"] != fingerprint:
             raise RuntimeError("Package references or cleanup candidates changed; refresh the preview")
         selected = self.config.get("candidateIds")
-        if selected is not None and (not selected or not set(selected).issubset({row["id"] for row in preview["candidates"]})):
+        reference_ids = self.config.get("referenceRepairIds", [])
+        if reference_ids and selected is None:
+            selected = []
+        if selected is not None and (not selected and not reference_ids or not set(selected).issubset({row["id"] for row in preview["candidates"]})):
             raise RuntimeError("Cleanup selection differs from its preview")
-        preview["candidates"] = [row for row in preview["candidates"] if (not row["kind"].startswith("historical-") and selected is None) or (selected is not None and row["id"] in selected)]
-        save(path, {"version": 1, "fingerprint": fingerprint, "state": "running", "candidates": preview["candidates"]})
+        preview["candidates"] = [row for row in preview["candidates"] if (not row["kind"].startswith("historical-") and row["kind"] not in ("manager-cache", "input-duplicate", "release-asset-duplicate") and selected is None) or (selected is not None and row["id"] in selected)]
+        if reference_ids and not set(reference_ids).issubset({row["id"] for row in preview.get("referenceRepairs", []) if row["eligible"]}):
+            raise RuntimeError("Reference repair selection differs from its eligible preview")
+        save(path, {"version": 1, "fingerprint": fingerprint, "state": "running", "candidates": preview["candidates"],
+            "referenceRepairIds": reference_ids})
+        repaired = environment_repair(self).release_references(reference_ids) if reference_ids else []
         before = shutil.disk_usage(self.namespace).free
         for row in preview["candidates"]:
-            if row["kind"].startswith("historical-") and self.config.get("governancePolicy"):
+            if row["kind"] == "release-asset-duplicate" and self.config.get("releaseAssetSharingVersion") == 1:
+                release_assets(self).compact(row["id"])
+            elif row["kind"] == "input-duplicate" and self.config.get("inputSharingVersion") == 1:
+                input_sharing(self).compact(row["id"])
+            elif row["kind"] == "manager-cache" and self.config.get("managerCacheVersion") == 1:
+                manager_caches(self).clean(row["id"])
+            elif row["kind"].startswith("historical-") and self.config.get("governancePolicy"):
                 governance = storage_governance(self)
                 with governance.locked():
                     expected = next((item for item in governance.historical_cleanup() if item["id"] == row["id"]), None)
@@ -1974,7 +2187,8 @@ class Environments:
                 remove_private(self.materials / row["id"][9:], self.store)
             else:
                 raise RuntimeError("Unknown cleanup candidate kind")
-        result = {"serverId": self.server, "state": "completed", "reclaimedBytes": max(0, shutil.disk_usage(self.namespace).free - before), "checkedAt": now()}
+        result = {"serverId": self.server, "state": "completed", "reclaimedBytes": max(0, shutil.disk_usage(self.namespace).free - before),
+            "checkedAt": now(), "repairedReferences": repaired}
         save(path, {"version": 1, "fingerprint": fingerprint, "state": "completed", "result": result})
         return result
 
@@ -1985,6 +2199,8 @@ def release_references(config):
         raise RuntimeError("Environment references cannot be released before confirmed remote deletion")
     if config.get("governancePolicy"):
         governance = storage_governance(owner)
+        if action == "history-register":
+            return governance.verify_root(config["request"])
         with governance.locked():
             governance.release()
     if (owner.control / "training-storage-v1/runs" / owner.id).exists():
@@ -2021,9 +2237,20 @@ def main(config):
         if config.get("storageLocation"):
             owner.workspace = pathlib.Path(config["storageLocation"])
         governance = storage_governance(owner)
+        if action == "history-material-verify":
+            request = config["request"]
+            if request["action"] not in ("verify", "recover"):
+                raise RuntimeError("Preparation history access only permits read-only material verification")
+            if request["action"] == "recover":
+                original = governance_row(owner.run / "material-operations-v1" / request["operationId"] / "request.v1.json")
+                if original["request"]["action"] != "verify":
+                    raise RuntimeError("Historical verification cannot recover an acquisition")
+            with governance.locked():
+                governance.register_material(request)
+            return governance.prepare_material(request)
         with governance.locked():
             if action == "history-inspect":
-                return governance.catalog(config.get("refresh", True), config.get("cursor"))
+                return governance.catalog(config.get("refresh", True), config.get("cursor"), config.get("scope"))
             if action == "history-preview":
                 return governance.history_preview()
             if action == "history-cleanup":
@@ -2036,6 +2263,21 @@ def main(config):
     if action.startswith("storage-") or action.startswith("material-"):
         owner.owner()
         governance = storage_governance(owner)
+        if action == "storage-register":
+            return governance.verify_root(config["request"])
+        if action == "storage-register-placement":
+            result = []
+            roots, _ = governance.roots()
+            for root in roots:
+                if root["directory"] not in (str(owner.control), str(owner.namespace)):
+                    continue
+                if root.get("registrationId") and root["confirmed"]:
+                    continue
+                if "observationId" not in root:
+                    raise RuntimeError(root.get("detail", "Storage ownership is unconfirmed"))
+                operation = str(uuid.uuid5(uuid.NAMESPACE_URL, owner.id + ":" + root["observationId"]))
+                result.append(governance.verify_root({"operationId": operation, "rootId": root["id"], "observationId": root["observationId"]}))
+            return {"verified": True, "registrations": result}
         if action == "material-prepare":
             try:
                 return governance.prepare_material(config["request"])
@@ -2044,9 +2286,18 @@ def main(config):
                 value.update(state="blocked", stage="blocked", detail=str(error), updatedAt=now(), exitConfirmed=True, admissionReleased=False)
                 save(owner.run / "material-operations-v1" / config["request"]["operationId"] / "receipt.v1.json", value)
                 return value
+        if action in ("storage-policy-status", "storage-policy-propose", "storage-policy-decide"):
+            preflight = storage_preflight(governance)
+            if action == "storage-policy-status":
+                return preflight.observations()
+            with preflight.locked():
+                preflight.approved_plan_policy()
+                return preflight.propose(config["request"]) if action == "storage-policy-propose" else preflight.decide(config["request"])
         with governance.locked():
             if action == "storage-inspect":
-                return governance.catalog(config.get("refresh", False), config.get("cursor"))
+                return governance.catalog(config.get("refresh", False), config.get("cursor"), config.get("scope"))
+            if action == "storage-write-evidence":
+                return governance.write_evidence(config["request"], config["diagnosticPolicy"])
             if action == "storage-assess":
                 return governance.assess(config["request"])
             if action == "storage-plan":
@@ -2054,6 +2305,9 @@ def main(config):
                 return load(path) if path.exists() else None
             if action == "storage-command-reserve":
                 return governance.reserve_command(config["commandId"])
+            if action == "storage-admission":
+                plan = governance.admitted_plan()
+                return {"verified": plan is not None}
             if action == "storage-command-settle":
                 return governance.settle_capacity(config["commandId"], config.get("launchFailureConfirmed", False))
             if action == "storage-release":
@@ -2068,12 +2322,20 @@ def main(config):
                 return governance.pending_metadata()
             if action == "material-metadata-error":
                 return governance.metadata_error(config["requestId"], config["detail"])
+            if action == "storage-requirement-evidence":
+                return governance.requirement_evidence(config["reference"])
             if action == "material-settle":
                 return governance.settle_material(config["operationId"])
             if action == "material-stop":
                 return governance.stop_material(config["operationId"], config["reason"])
             raise RuntimeError("Unknown storage governance operation")
-    with owner.locked(write=action in ("prepare", "cleanup", "recover", "recover-cleanup")):
+    if action == "prepare":
+        try:
+            with owner.locked(write=True):
+                return owner.prepare(config["request"])
+        except PackageStoreBusy as error:
+            return owner.reject_prepare(config["request"], str(error))
+    with owner.locked(write=action in ("cleanup", "recover", "recover-cleanup")):
         if action == "inspect":
             return owner.inspect()
         if action == "acceptance":
@@ -2082,8 +2344,6 @@ def main(config):
             return owner.preview()
         if action == "cleanup":
             return owner.cleanup(config["operationId"], config["fingerprint"])
-        if action == "prepare":
-            return owner.prepare(config["request"])
         if action == "recover":
             return owner.recover(config["request"])
         if action == "recover-cleanup":
@@ -2093,8 +2353,16 @@ def main(config):
 
 if __name__ == "__main__":
     try:
-        config = json.loads(sys.stdin.read(1048577)) if len(sys.argv) == 1 else load(sys.argv[1])
-        signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt("Environment operation cancelled")))
+        if len(sys.argv) == 1:
+            incoming = sys.stdin.read(128 * 1024 * 1024 + 1)
+            if len(incoming) > 128 * 1024 * 1024:
+                raise RuntimeError("Managed request exceeds the IPC limit")
+            config = json.loads(incoming)
+        else:
+            config = load(sys.argv[1])
+        def interrupted(number, _frame):
+            raise KeyboardInterrupt("Environment process received " + signal.Signals(number).name + " (" + str(number) + "); inspect the recorded stop reason and exit")
+        signal.signal(signal.SIGTERM, interrupted)
         result = main(config)
         print(json.dumps(result))
         if config["action"] in ("prepare", "material-prepare") and result.get("state") == "blocked":

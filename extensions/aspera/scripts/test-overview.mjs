@@ -20,6 +20,8 @@ export async function checkExecutionOverview(page, control, create, browser, url
   const setMode = async name => { await control('overview-' + name, id); await page.locator('header').getByRole('button', { name: /^(刷新|Refresh)$/ }).click() }
   await setMode('running')
   const storageSummary = page.getByRole('region', { name: /^(训练环境与空间|Training environment and storage)$/ })
+  await expect(storageSummary).toContainText(/发现历史来源|Discovering historical sources/)
+  await expect(storageSummary).toContainText(/复用已确认|Reuse verified/)
   await expect(page.getByRole('region', { name: /^(节点网络|Node network)$/ })).toContainText('CPU A')
   await expect(page.getByRole('region', { name: /^(实际存储与网络|Resolved storage and network)$/ })).toHaveCount(0)
   await storageSummary.getByRole('button', { name: /^(存储详情|Storage details)$/ }).first().click()
@@ -27,7 +29,7 @@ export async function checkExecutionOverview(page, control, create, browser, url
   await expect(storage.getByRole('columnheader')).toHaveCount(5)
   const allocations = storage.getByRole('table')
   await expect(allocations).toContainText(/依赖环境已验收|Dependencies verified/)
-  await expect(allocations).toContainText(/固定材料已核验|Fixed material verified/)
+  await expect(allocations).toContainText(/发现历史来源|Discovering historical sources/)
   await expect(allocations).toContainText(/已安排|Arranged/)
   await expect(allocations).not.toContainText('unrelated-node-cache')
   await expect(storage).toContainText(/硬链接|Hard links/)
@@ -219,10 +221,59 @@ export async function checkExecutionOverview(page, control, create, browser, url
   await expect(storage).toContainText(/查看占用、预览可清理缓存|Inspect usage, preview/)
   await storage.screenshot({ path: resolve(output, 'storage-capacity-shortfall.png'), animations: 'disabled' })
   await page.keyboard.press('Escape')
+  await setMode('storage-repair')
+  await expect(storageSummary).toContainText(/预算试算|Budget preview/)
+  await storageSummary.getByRole('button', { name: /^(存储详情|Storage details)$/ }).first().click()
+  await expect(storage).toContainText(/供 Agent 选择的修复方案|Repair choice for Agent/)
+  await expect(storage).toContainText(/Agent 正在修复环境|Agent is repairing the environment/)
+  await expect(storage).toContainText(/已声明范围通过，完整训练预算待确认|Declared scope fits · full training budget pending/)
+  await storage.getByText(/^(修复方案与实测差异|Repair proposal and measured differences)$/).click()
+  await expect(storage).toContainText('decord-0.6.0.dist-info/top_level.txt')
+  await expect(storage).toContainText('"actualBytes": 7')
+  await expect(storage).toContainText(/保留策略修订待确认|Retention revision awaits confirmation/)
+  await expect(storage).toContainText('2 → 1')
+  await storage.getByRole('button', { name: /^(预览缓存清理|Preview cache cleanup)$/ }).click()
+  const confirmedReference = storage.getByRole('checkbox', { name: /确认解除环境 removed-training 的引用|Confirm reference removal for removed-training/ })
+  await expect(confirmedReference).toBeEnabled()
+  await expect(storage.getByRole('checkbox', { name: /确认解除环境 unconfirmed-training 的引用|Confirm reference removal for unconfirmed-training/ })).toBeDisabled()
+  await confirmedReference.focus(); await page.keyboard.press('Space')
+  const confirmReference = storage.getByRole('button', { name: /^(处理所选项目|Process selected items)$/ })
+  await expect(confirmReference).toBeEnabled()
+  await expect(storage).toContainText(/仅确认已删除环境的引用，保留已有模型和日志|Confirms the removed environment reference/)
+  for (const dark of [false, true]) {
+    await page.evaluate(value => { if (value) document.body.dataset.dsDarkTheme = ''; else delete document.body.dataset.dsDarkTheme }, dark)
+    await page.setViewportSize({ width: 620, height: 900 })
+    await confirmReference.scrollIntoViewIfNeeded()
+    await expect(confirmReference).toBeInViewport()
+    await storage.screenshot({ path: resolve(output, `environment-repair-reference-${dark ? 'dark' : 'light'}.png`), animations: 'disabled' })
+  }
+  await page.evaluate(() => { delete document.body.dataset.dsDarkTheme })
+  await page.setViewportSize({ width: 1440, height: 1100 })
+  await confirmReference.click()
+  await expect(storage.getByRole('checkbox')).toHaveCount(0)
+  const approvePolicy = storage.getByRole('button', { name: /^(批准修订|Approve revision)$/ })
+  await approvePolicy.focus(); await page.keyboard.press('Enter')
+  await expect(approvePolicy).toHaveCount(0)
+  await storage.getByText(/^(已批准的保留策略|Approved retention strategy)$/).click()
+  await expect(storage).toContainText('"checkpointCount": 1')
+  await expect(storage).toContainText('fixture/cpu-model')
+  await page.keyboard.press('Escape')
+  const repairLocale = await browser.newContext({ locale: 'en-US' })
+  try {
+    const translated = await repairLocale.newPage()
+    await openAspera(translated, url)
+    await translated.getByRole('button', { name: 'CPU overview review', exact: true }).click()
+    await translated.getByRole('region', { name: 'Training environment and storage', exact: true }).getByRole('button', { name: 'Storage details', exact: true }).first().click()
+    const dialog = translated.getByRole('dialog', { name: 'Storage details', exact: true })
+    await expect(dialog).toContainText('Repair choice for Agent')
+    await expect(dialog).toContainText('Declared scope fits · full training budget pending')
+    await dialog.screenshot({ path: resolve(output, 'environment-repair-production-en.png'), animations: 'disabled' })
+  } finally { await repairLocale.close() }
   await setMode('blocked')
   return { id, facts: { actualPlanSteps: row.latest.plan.steps.length, savedNodes: 2, coreMetrics: 3, missingMetricsAbsent: true,
     reportedTrainingPercentage: 27, invalidTotalHidden: true, readFailureRetainsReports: true, offlineInitialReadRetainsCopy: true, internalFieldsCollapsed: true,
     stoppedAnimations: true, oldReleaseUnrecorded: true, localizedLabels: true, responsiveColumns: true, keyboardDisclosure: true,
     managedEnvironmentMeasured: true, mandatoryReusePlanDisplayed: true, retainedMaterialsDisplayed: true, managedCachePreviewAndCleanup: true,
-    completedStepsCollapsed: true, fullStepSearch: true, readingStateRestored: true, storageModalViewport: true, systemFallbackAndShortfall: true } }
+    completedStepsCollapsed: true, fullStepSearch: true, readingStateRestored: true, storageModalViewport: true, systemFallbackAndShortfall: true,
+    agentRepairChoice: true, referenceOnlyConfirmation: true, partialBudgetNotTrainingReady: true, policyRevisionKeyboardApproval: true } }
 }

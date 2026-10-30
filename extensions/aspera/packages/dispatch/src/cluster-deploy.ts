@@ -31,16 +31,37 @@ export class ControllerDiagnostic extends Error {
   }
 }
 
-/** @param controller - authenticated status. @param target - selected server. @param prepared - accepted device inventory.
+/** @param controller - authenticated status. @param target - selected server. @param prepared - verified fixed release and device inventory.
  * @param role - expected resident role. @returns validated status or a specific repair diagnostic.
  */
 export function verifyController(controller: ControllerStatus, target: DeploymentConfig, prepared: PreparedEnvironment,
   role: 'node' | 'coordinator'): ControllerStatus {
-  const expected = { backendPath: prepared.backendPath, devicePaths: normalizedSet(prepared.devicePaths), hiddenPaths: normalizedSet(prepared.hiddenPaths), gpu: prepared.gpu }
+  const expected = { deploymentId: prepared.deploymentId, backendPath: prepared.backendPath, devicePaths: normalizedSet(prepared.devicePaths), hiddenPaths: normalizedSet(prepared.hiddenPaths), gpu: prepared.gpu }
   const fail = (code: ControllerDiagnostic['diagnostic']['code'], detail: string): never => { throw new ControllerDiagnostic({ code, role, detail, controller, expected }) }
   if (controller.role !== role || controller.root !== target.remoteRoot) fail('unknown', 'Control process role or directory differs from this server')
   const missing = prepared.requiredFeatures?.filter(feature => !controller.features?.includes(feature)) ?? []
+  if (controller.features?.includes('bounded-sandbox-launch-v1') && !prepared.requiredFeatures?.includes('bounded-sandbox-launch-v1')) missing.push('selected release must retain bounded-sandbox-launch-v1')
+  if (controller.features?.includes('short-temporary-paths-v1') && !prepared.requiredFeatures?.includes('short-temporary-paths-v1')) missing.push('selected release must retain short-temporary-paths-v1')
+  if (controller.features?.includes('stage-attempt-recovery-v1') && !prepared.requiredFeatures?.includes('stage-attempt-recovery-v1')) missing.push('selected release must retain stage-attempt-recovery-v1')
+  if (controller.features?.includes('stage-evidence-reading-v1') && !prepared.requiredFeatures?.includes('stage-evidence-reading-v1')) missing.push('selected release must retain stage-evidence-reading-v1')
+  for (const feature of ['managed-wheel-metadata-v1', 'managed-wheel-metadata-v2', 'managed-manager-cache-v1', 'managed-input-sharing-v1', 'managed-release-asset-sharing-v1', 'stage-evidence-reading-v2', 'stage-checkpoint-evidence-v3', 'stage-checkpoint-evidence-v4', 'checkpoint-protection-v1', 'agent-recovery-v1', 'public-inference-verification-v1', 'inference-service-lifecycle-v1', 'inference-checkpoint-snapshots-v1', 'readonly-source-consumers-v1', 'readonly-source-consumers-v2']) {
+    if (controller.features?.includes(feature) && !prepared.requiredFeatures?.includes(feature)) missing.push('selected release must retain ' + feature)
+  }
+  if (controller.features?.includes('historical-environment-precheck-v1') && !prepared.requiredFeatures?.includes('historical-environment-precheck-v1')) missing.push('selected release must retain historical-environment-precheck-v1')
+  if (controller.features?.includes('storage-preflight-v2') && !prepared.requiredFeatures?.includes('storage-preflight-v2')) missing.push('selected release must retain storage-preflight-v2')
+  if (controller.features?.includes('managed-environment-repair-v1') && !prepared.requiredFeatures?.includes('managed-environment-repair-v1')) {
+    missing.push('selected release must retain managed-environment-repair-v1')
+  }
+  if (controller.features?.includes('managed-environment-lock-receipt-v1') && !prepared.requiredFeatures?.includes('managed-environment-lock-receipt-v1')) {
+    missing.push('selected release must retain managed-environment-lock-receipt-v1')
+  }
+  if (controller.features?.includes('storage-requirement-ledger-v1') && !prepared.requiredFeatures?.includes('storage-requirement-ledger-v1')) {
+    missing.push('selected release must retain storage-requirement-ledger-v1')
+  }
   if (missing.length > 0) fail('configuration-outdated', 'Control process lacks selected-release capabilities: ' + missing.join(', ') + '; request controlled repair before reuse')
+  if (controller.features?.includes('storage-reuse-verification-v1') && !prepared.requiredFeatures?.includes('storage-reuse-verification-v1')) {
+    fail('configuration-outdated', 'Automatic source selection cannot substitute for an older fixed storage implementation; retain the original release')
+  }
   if (controller.features?.includes('managed-environment-install-v3') && !prepared.requiredFeatures?.includes('managed-environment-install-v3')) {
     fail('configuration-outdated', 'Control process installer v3 cannot substitute for the original release installer; retain the old release and use controlled idle repair')
   }
@@ -50,7 +71,17 @@ export function verifyController(controller: ControllerStatus, target: Deploymen
   if (controller.features?.includes('purpose-storage-0.1.0') && !prepared.requiredFeatures?.includes('purpose-storage-0.1.0')) {
     fail('configuration-outdated', 'Purpose-storage controller cannot replace an older fixed storage implementation')
   }
+  if (controller.features?.includes('targeted-materials-0.1.1') && !prepared.requiredFeatures?.includes('targeted-materials-0.1.1')) {
+    fail('configuration-outdated', 'Targeted-material controller cannot replace an older fixed material implementation')
+  }
+  if (controller.features?.includes('storage-registration-0.1.3') && !prepared.requiredFeatures?.includes('storage-registration-0.1.3')) {
+    throw new Error('Original release cannot consume current storage registrations; keep its fixed release and use an isolated controller root')
+  }
+  if (controller.features?.includes('material-source-bindings-0.1.2') && !prepared.requiredFeatures?.includes('material-source-bindings-0.1.2')) {
+    fail('configuration-outdated', 'Material-source controller cannot replace an older fixed source implementation')
+  }
   if (controller.legacy && controller.deploymentId !== prepared.deploymentId) fail('unknown', 'A legacy controller can only serve its verified original release; release its tasks before starting the selected release')
+  if (controller.deploymentId !== prepared.deploymentId) fail('configuration-outdated', 'Control process fixed-release identity differs from the selected experiment release; request controlled repair before reuse')
   if (controller.maintenance !== undefined) fail('occupied', `Control process is held by maintenance ${controller.maintenance}`)
   if (controller.policy.backendPath !== expected.backendPath || JSON.stringify(normalizedSet(controller.policy.devicePaths)) !== JSON.stringify(expected.devicePaths)
     || JSON.stringify(normalizedSet(controller.policy.hiddenPaths)) !== JSON.stringify(expected.hiddenPaths)) {
@@ -223,13 +254,15 @@ ln ${shellQuote(incomingToken)} ${shellQuote(root + '/secrets/' + role + '.token
     DSH_EXPERIMENT_DEVICES: prepared.devicePaths.join(','), DSH_EXPERIMENT_BWRAP: prepared.backendPath,
     DSH_EXPERIMENT_GPU_SNAPSHOT: JSON.stringify(prepared.gpu),
     DSH_EXPERIMENT_HIDDEN_PATHS_JSON: JSON.stringify(prepared.hiddenPaths), DSH_EXPERIMENT_PORT: String(control.remotePort),
+    ...(prepared.requiredFeatures?.includes('documentation-pages-0.1.0') && target.documentationReadTimeoutMs !== undefined ? { DSH_CLUSTER_DOCUMENTATION_TIMEOUT_MS: String(target.documentationReadTimeoutMs) } : {}),
+    ...(prepared.requiredFeatures?.includes('documentation-pages-0.1.0') && target.documentationPageBytes !== undefined ? { DSH_CLUSTER_DOCUMENTATION_PAGE_BYTES: String(target.documentationPageBytes) } : {}),
     ...(recoveryId === undefined ? {} : { ASPERA_CONTROLLER_RECOVERY_ID: recoveryId }),
   }
   if (target.managedEnvironments !== undefined) {
     const uvPath = (await remote(target, 'command -v uv || true', signal, password)).trim()
     const pythonPath = (await remote(target, 'command -v python3', signal, password)).trim()
     env.DSH_CLUSTER_ENVIRONMENT_POLICY_JSON = JSON.stringify({ ...managedEnvironmentPolicyForRelease(target.managedEnvironments,
-      prepared.requiredFeatures?.includes('managed-environment-install-v3') === true, prepared.requiredFeatures?.includes('storage-governance-v1') === true, prepared.requiredFeatures?.includes('purpose-storage-0.1.0') === true),
+      prepared.requiredFeatures?.includes('managed-environment-install-v3') === true, prepared.requiredFeatures?.includes('storage-governance-v1') === true, prepared.requiredFeatures?.includes('purpose-storage-0.1.0') === true, prepared.requiredFeatures?.includes('targeted-materials-0.1.1') === true),
       uvPath: uvPath.startsWith('/') ? uvPath : target.managedEnvironments.uvPath, pythonPath })
   }
   const executablePath = target.pathEntries?.length ? `export PATH=${shellQuote(target.pathEntries.join(':'))}:"$PATH"\n` : ''

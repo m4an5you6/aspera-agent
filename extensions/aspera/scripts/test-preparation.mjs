@@ -68,8 +68,15 @@ try {
   assert.ok(calls.some(call => call.name === 'verify_preparation_environment' && call.timeoutRecovered))
   assert.equal(state.preparationCommands.filter(call => call.host === account.host && !call.exitConfirmed).length, 1)
   assert.ok(record.preparation.environments.every(node => node.phase === 'environment-ready' && node.pendingCommand === undefined))
+  const selectedStorage = record.preparation.placements[0]
+  const selectedInventory = record.preparation.inventories.find(row => row.serverId === selectedStorage.serverId).inventory
+  assert.equal(selectedStorage.candidate.availableBytes, 3_285_319_680)
+  assert.equal(selectedInventory.observedAt, 2)
+  assert.deepEqual(selectedInventory.candidates.find(candidate => candidate.id === selectedStorage.candidate.id), selectedStorage.candidate)
+  assert.deepEqual(record.submission.inventories, record.preparation.inventories)
   const snapshot = { role: 'preparation', calls: calls.map(call => call.name), timeoutRecovered: true,
-    originalCommandSubmissions: 1, independentVerification: true }
+    originalCommandSubmissions: 1, independentVerification: true,
+    storageSelection: { changedFreeSpace: true, matchingObservationSaved: true, submissionConsistent: true } }
   browser = await chromium.launch({ ...(process.env.ASPERA_BROWSER_EXECUTABLE ? { executablePath: process.env.ASPERA_BROWSER_EXECUTABLE }
     : { channel: process.env.ASPERA_BROWSER_CHANNEL || 'chrome' }), headless: true })
   const context = await browser.newContext({ viewport: { width: 1440, height: 1050 } })

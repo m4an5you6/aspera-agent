@@ -18,6 +18,7 @@ afterEach(async () => {
     if (dirname(f.root) !== base) throw new Error('Fixture deletion escaped its owned directory')
     rmSync(f.root, { recursive: true, force: true })
   }
+  vi.unstubAllGlobals()
 })
 function fixture() {
   const root = mkdtempSync(resolve(base, 'managed-environments-'))
@@ -48,6 +49,97 @@ it('coalesces page refreshes and reuses unchanged checked time within the measur
   expect(f.owner.node).toHaveBeenCalledTimes(1)
 })
 
+it('checks policy ownership before exposing or approving a proposal', async () => {
+  const f = fixture()
+  const proposal = { version: 1, experimentId: f.id, serverId: f.serverId, proposalId: randomUUID(), planRevision: 1,
+    expectedRevision: 0, revision: 0, state: 'pending', createdAt: 1, updatedAt: 1, requestHash: 'a'.repeat(64), reason: 'Keep one recovery file',
+    policy: { artifact: 'adapter', checkpointCount: 1, optimizerState: true, schedulerState: true, recoveryPoints: [], outputMinimumBytes: 10, checkpointMinimumBytes: 20, basis: 'Approved retained content' } }
+  vi.mocked(f.owner.node).mockResolvedValue({ current: null, proposals: [{ ...proposal, serverId: randomUUID() }] })
+  await expect(f.service.storagePolicies(f.id)).rejects.toThrow('another allocation')
+  vi.mocked(f.owner.node).mockResolvedValue({ current: null, proposals: [proposal] })
+  await expect(f.service.decideStoragePolicy(f.id, randomUUID(), 0, true)).rejects.toThrow('one assigned node')
+  expect(vi.mocked(f.owner.node).mock.calls.some(call => call[2] === 'storage-policy-decide')).toBe(false)
+  vi.mocked(f.owner.node).mockImplementation(async (_record, _server, action) => action === 'storage-policy-status'
+    ? { current: null, proposals: [proposal] } : { ...proposal, state: 'approved', revision: 1 })
+  expect((await f.service.decideStoragePolicy(f.id, proposal.proposalId, 0, true)).state).toBe('approved')
+})
+
+it('waits for cancelled policy reads before deletion and rejects a late reply', async () => {
+  const f = fixture()
+  let resolveRead: ((value: object) => void) | undefined
+  let readSignal: AbortSignal | undefined
+  vi.mocked(f.owner.node).mockImplementation((_record, _server, _action, _body, signal) => {
+    readSignal = signal
+    return new Promise<object>(done => { resolveRead = done })
+  })
+  const reading = f.service.storagePolicies(f.id)
+  const outcome = reading.then(() => 'accepted', () => 'rejected')
+  await Promise.resolve()
+  let removed = false
+  const removal = f.service.remove(f.id).then(() => { removed = true })
+  await Promise.resolve()
+  expect(readSignal?.aborted).toBe(true)
+  expect(removed).toBe(false)
+  if (resolveRead === undefined) throw new Error('Policy read did not start')
+  resolveRead({ current: null, proposals: [] })
+  await removal
+  expect(await outcome).toBe('rejected')
+})
+
+it('creates an explicit approval successor for a rejected Agent proposal without rewriting its decision or amounts', async () => {
+  const f = fixture(), id: string = randomUUID()
+  f.record.latest = fromAny<NonNullable<FleetExperiment['latest']>, object>({ sessionId: 'execution', plan: { revision: 1 } })
+  const proposal = { version: 1, experimentId: f.id, serverId: f.serverId, proposalId: id, planRevision: 1,
+    expectedRevision: 1, revision: 1, state: 'rejected', createdAt: 1, updatedAt: 1, requestHash: 'a'.repeat(64), reason: 'Inference logs need fewer bytes',
+    policy: { artifact: 'other', checkpointCount: 0, optimizerState: false, schedulerState: false, recoveryPoints: [], outputMinimumBytes: 64, checkpointMinimumBytes: 0, basis: 'Observed inference only' } }
+  const before = JSON.stringify(proposal), rows = [proposal]
+  vi.mocked(f.owner.node).mockImplementation(async (_record, _server, action, input) => {
+    if (action === 'storage-policy-status') return { current: { ...proposal, proposalId: randomUUID(), state: 'approved' }, proposals: rows }
+    const request = fromAny<{ operationId: string; proposalId: string; policy: typeof proposal.policy; reason: string }, object>(input)
+    if (action === 'storage-policy-propose') { const successor = { ...proposal, proposalId: request.operationId, state: 'pending', reason: request.reason }; rows.push(successor); return successor }
+    const current = rows.find(row => row.proposalId === request.proposalId)!
+    return { ...current, revision: 2, state: 'approved' }
+  })
+  const first = f.service.reconsiderStoragePolicy(f.id, id, 1), duplicate = f.service.reconsiderStoragePolicy(f.id, id, 1)
+  expect(first).toBe(duplicate)
+  const accepted = await first
+  expect(accepted).toMatchObject({ state: 'approved', policy: proposal.policy }); expect(accepted.proposalId).not.toBe(id)
+  expect(JSON.stringify(proposal)).toBe(before)
+  expect(vi.mocked(f.owner.node).mock.calls.filter(call => call[2] === 'storage-policy-propose')).toHaveLength(1)
+})
+
+it('bridges a durable fixed-revision request and imports under the same request identity', async () => {
+  const f = fixture(), requestId = 'd'.repeat(64)
+  const request = { kind: 'model', provider: 'huggingface', repository: 'fixture/model', revision: 'a'.repeat(40), metadataSource: 'host', reuseCandidateId: 'b'.repeat(64) }
+  const canonical = { id: request.repository, sha: request.revision, siblings: [] }
+  const fetcher = vi.fn<typeof fetch>(async () => Response.json(canonical)); vi.stubGlobal('fetch', fetcher)
+  let imported: () => void = () => { throw new Error('Import barrier was not installed') }
+  const done = new Promise<void>(resolve => { imported = resolve })
+  f.owner.list = () => [f.record]
+  vi.mocked(f.owner.node).mockImplementation(async (_record, _server, operation, body) => {
+    if (operation === 'material-metadata-pending') return [{ requestId, request, deadline: Date.now() + 30000 }]
+    if (operation === 'material-manifest-import') {
+      expect(body).toEqual({ experimentId: f.id, ...request, canonical }); imported(); return {}
+    }
+    throw new Error('Unexpected bridge operation: ' + operation)
+  })
+  f.service.start(); await done; await f.service.close()
+  expect(fetcher).toHaveBeenCalledTimes(1)
+  expect(JSON.parse(readFileSync(resolve(f.root, f.id, 'canonical-manifests-v1', requestId + '.json'), 'utf8'))).toEqual(canonical)
+})
+
+it('honors an explicit node-only metadata choice without a Host request', async () => {
+  const f = fixture(), fetcher = vi.fn<typeof fetch>(); vi.stubGlobal('fetch', fetcher)
+  let observed: () => void = () => { throw new Error('Read barrier was not installed') }
+  const done = new Promise<void>(resolve => { observed = resolve })
+  f.owner.list = () => [f.record]
+  vi.mocked(f.owner.node).mockImplementation(async () => {
+    observed(); return [{ requestId: 'a'.repeat(64), request: { kind: 'model', provider: 'huggingface', repository: 'fixture/model', revision: 'a'.repeat(40), metadataSource: 'node' } }]
+  })
+  f.service.start(); await done; await f.service.close()
+  expect(fetcher).not.toHaveBeenCalled()
+})
+
 it('performs an explicitly requested inventory after a concurrent saved-state read and coalesces matching scans', async () => {
   const f = fixture()
   let release: () => void = () => { throw new Error('Observation gate was not installed') }
@@ -71,7 +163,10 @@ it('uses read-only SSH when the fixed controller is unavailable and retains that
   const result = await f.service.usage(f.id)
   expect(result.nodes[0]).toMatchObject({ source: 'ssh', checkedAt: 123, error: 'Error: offline [redacted]' })
   const command = vi.mocked(f.owner.ssh).mock.calls[0]?.[2]
-  expect(command).toContain('python3 -c'); expect(command).not.toContain('ssh-private')
+  expect(command).toContain('python3 -B -c'); expect(Buffer.byteLength(command!)).toBeLessThan(4096); expect(command).not.toContain('ssh-private')
+  const payload = JSON.parse(vi.mocked(f.owner.ssh).mock.calls[0]![4]!)
+  expect(payload.program).toContain('class ReleasedAssets')
+  expect(payload.request.action).toBe('inspect')
   expect(readFileSync(resolve(f.root, f.id, 'storage.v1.json'), 'utf8')).not.toContain('ssh-private')
 })
 

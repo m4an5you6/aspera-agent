@@ -51,6 +51,38 @@ export function archiveCatalog(request) {
       sessionId: request.sessions[phase], format: 'events' })
     add(join(root, 'agent.log'), { id: 'legacy-agent', kind: 'log', format: 'text', stream: 'mixed', label: 'agent.log' })
     result.progress = json(root, join(root, 'execution-progress.v1.json'))
+    const attempts = join(root, 'stage-attempts-v1')
+    if (existsSync(attempts)) {
+      contained(root, attempts)
+      for (const name of readdirSync(attempts).sort()) {
+        if (result.sources.length >= max) { result.truncated = true; break }
+        const directory = contained(root, join(attempts, name))
+        if (!statSync(directory).isDirectory()) throw new Error('Archive stage attempt directory is unavailable')
+        for (const file of readdirSync(directory).filter(value => /^[a-zA-Z0-9_-]+\.json$/.test(value)).sort()) {
+          if (result.sources.length >= max) { result.truncated = true; break }
+          const path = join(directory, file), row = json(root, path), registration = row?.registration
+          if (row?.version !== 1 || registration?.experimentId !== request.experimentId || registration.sessionId !== request.sessions.execution
+            || name !== registration.serverId + '_' + registration.stageId || file !== row.previousAttemptId + '.json'
+            || row.previousCommand?.state !== 'failed' || row.previousCommand.released !== true) throw new Error('Archive stage attempt ownership or release differs')
+          const label = relative(root, path).split(sep).join('/')
+          add(path, { id: 'stage-attempt-' + createHash('sha256').update(label).digest('hex').slice(0, 32), kind: 'log', format: 'text', stream: 'mixed', phase: 'execution', label })
+        }
+      }
+    }
+  }
+  const checkpoints = join(root, 'checkpoint-protection-v1')
+  for (const kind of ['registrations', 'sealed']) {
+    const directory = join(checkpoints, kind)
+    if (!existsSync(directory)) continue
+    contained(root, directory)
+    for (const name of readdirSync(directory).filter(value => /^[a-zA-Z0-9_-]+\.json$/.test(value)).sort()) {
+      if (result.sources.length >= max) { result.truncated = true; break }
+      const path = join(directory, name), row = json(root, path), owner = kind === 'registrations' ? row?.registration : row
+      if (row?.version !== 1 || owner?.experimentId !== request.experimentId || owner.serverId !== request.serverId) throw new Error('Archive checkpoint retention ownership differs')
+      const label = relative(root, path).split(sep).join('/')
+      add(path, { id: 'checkpoint-retention-' + createHash('sha256').update(label).digest('hex').slice(0, 32),
+        kind: 'log', format: 'text', stream: 'mixed', phase: 'execution', label })
+    }
   }
   const observations = join(root, 'observations-v1')
   if (existsSync(observations)) {
@@ -93,31 +125,36 @@ export function archiveCatalog(request) {
     }
   }
   add(join(root, 'node.log'), { id: 'legacy-node', kind: 'log', format: 'text', stream: 'mixed', label: 'node.log' })
-  for (const folder of ['environment-runtime-v1', 'environment-launches-v1', 'environment-operations-v1', 'material-operations-v1']) {
+  for (const folder of ['environment-runtime-v1', 'environment-launches-v1', 'environment-operations-v1', 'material-operations-v1',
+    'environment-diagnostics-v1', 'environment-repair-plans-v1', 'environment-reference-releases-v1']) {
     const directory = join(root, folder)
     if (!existsSync(directory)) continue
     contained(root, directory)
     for (const name of readdirSync(directory)) {
       if (result.sources.length >= max) { result.truncated = true; break }
       const nested = folder.endsWith('operations-v1')
-      if (!(nested ? /^[a-f0-9-]{36}$/ : /^[a-f0-9-]{36}\.json$/).test(name)) continue
+      const independent = ['environment-diagnostics-v1', 'environment-repair-plans-v1', 'environment-reference-releases-v1'].includes(folder)
+      if (!(nested ? /^[a-f0-9-]{36}$/ : independent ? /^[a-f0-9]{64}\.json$/ : /^[a-f0-9-]{36}\.json$/).test(name)) continue
       const operationId = nested ? name : name.slice(0, -5)
       const paths = [join(directory, name)]
       if (nested) {
         contained(root, paths[0])
-        paths.splice(0, 1, ...readdirSync(join(directory, name)).filter(file => /^(?:receipt(?:-[\w-]+)?|reuse-plan|runtime|cache-import|copy-plan|failure)\.v1\.json$/.test(file)).map(file => join(directory, name, file)))
+        paths.splice(0, 1, ...readdirSync(join(directory, name)).filter(file => file === 'source-0.1.2.json' || /^(?:receipt(?:-[\w-]+)?|reuse-plan|runtime|cache-import|copy-plan|failure|selection|process|wheel-derivations)\.v1\.json$/.test(file)).map(file => join(directory, name, file)))
       }
       for (const path of paths) {
         if (result.sources.length >= max) { result.truncated = true; break }
-        const record = json(root, path)
-        if (record === undefined) continue
-        if (record.version !== 1 || record.experimentId !== request.experimentId || record.serverId !== request.serverId || record.operationId !== operationId) throw new Error('Archive managed operation ownership differs')
+        const saved = json(root, path)
+        if (saved === undefined) continue
+        const record = independent ? saved.diagnostic ?? saved.plan ?? saved : saved
+        if (path.endsWith('process.v1.json') && record.experimentId === undefined && record.serverId === undefined) continue
+        if (record.version !== 1 || record.experimentId !== request.experimentId || record.serverId !== request.serverId
+          || (independent ? record.id !== operationId : record.operationId !== operationId)) throw new Error('Archive managed operation ownership differs')
         const label = relative(root, path).split(sep).join('/')
         add(path, { id: 'environment-' + createHash('sha256').update(label).digest('hex').slice(0, 32), kind: 'log', format: 'text', stream: 'mixed', phase: 'execution', label })
       }
     }
   }
-  for (const folder of ['environment-borrowings-v1', 'storage-plans-v1', 'material-bindings-v1']) {
+  for (const folder of ['environment-borrowings-v1', 'storage-plans-v1', 'material-bindings-v1', 'material-publications-0.1.2', 'service-verifications-v1', 'inference-checkpoints-v1', 'input-verifications-v1', 'cache-maintenance-v1', 'input-sharing-v1', 'release-asset-sharing-v1']) {
     const directory = join(root, folder)
     if (!existsSync(directory)) continue
     contained(root, directory)
@@ -126,11 +163,35 @@ export function archiveCatalog(request) {
       if (!/^[a-zA-Z0-9_-]+\.json$/.test(name)) continue
       const path = join(directory, name), record = json(root, path)
       if (record?.version !== 1 || record.experimentId !== request.experimentId || record.serverId !== request.serverId) throw new Error('Archive storage record ownership differs')
+      if (folder === 'service-verifications-v1' && record.input?.operationId + '.json' !== name) throw new Error('Archive service verification identity differs')
+      if (folder === 'inference-checkpoints-v1' && record.request?.operationId + '.json' !== name) throw new Error('Archive inference snapshot identity differs')
       const label = relative(root, path).split(sep).join('/')
       add(path, { id: 'storage-' + createHash('sha256').update(label).digest('hex').slice(0, 32), kind: 'log', format: 'text', stream: 'mixed', phase: 'execution', label })
     }
   }
   const workspace = join(root, 'workspace')
+  for (const folder of ['reuse-verifications-v1', 'storage-tool-observations-v1', 'environment-read-diagnostics-v1', 'storage-reuse-requirements-v1']) {
+    const directory = join(root, folder)
+    if (!existsSync(directory)) continue
+    const walkRecords = (current, depth) => {
+      contained(root, current)
+      for (const entry of readdirSync(current, { withFileTypes: true })) {
+        if (result.sources.length >= max) { result.truncated = true; return }
+        if (entry.isSymbolicLink()) throw new Error('Archive reuse record contains a symbolic link')
+        const path = join(current, entry.name)
+        if (entry.isDirectory() && depth < 3) { walkRecords(path, depth + 1); continue }
+        if (!entry.isFile() || !entry.name.endsWith('.json')) continue
+        const record = json(root, path)
+        if (record?.version !== 1 || record.experimentId !== request.experimentId || record.serverId !== request.serverId) throw new Error('Archive reuse record ownership differs')
+        const label = relative(root, path).split(sep).join('/')
+        add(path, { id: 'reuse-' + createHash('sha256').update(label).digest('hex').slice(0, 32), kind: 'log', format: 'text', stream: 'mixed', phase: 'execution', label })
+        if (folder === 'environment-read-diagnostics-v1' && entry.name === 'result.v1.json') {
+          add(join(current, 'stderr.log'), { id: 'reuse-error-' + createHash('sha256').update(label).digest('hex').slice(0, 32), kind: 'log', format: 'text', stream: 'stderr', phase: 'execution', label: label.replace('result.v1.json', 'stderr.log') })
+        }
+      }
+    }
+    walkRecords(directory, 0)
+  }
   let inspected = 0
   function walk(directory) {
     contained(root, directory)

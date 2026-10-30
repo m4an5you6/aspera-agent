@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 import { copyFileSync, existsSync, readFileSync, readdirSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import { create, extract } from 'tar'
 import { z } from 'zod'
 import { run } from './transport.ts'
@@ -29,6 +30,18 @@ export async function snapshotSource(root: string, timeoutMs: number, signal?: A
   const source = join(directory, 'release'); const archive = join(directory, 'release.tar')
   mkdirSync(source)
   try {
+    if (existsSync(join(root, 'aspera-release.tar'))) {
+      signal?.throwIfAborted()
+      const release = z.object({ version: z.literal(1), deploymentId: z.string().regex(/^[a-f0-9]{64}$/) })
+        .parse(JSON.parse(readFileSync(join(root, 'aspera-release.json'), 'utf8')))
+      copyFileSync(join(root, 'aspera-release.tar'), archive)
+      await verifySourceArchive(archive, release.deploymentId, root)
+      await extract({ file: archive, cwd: source, strict: true })
+      signal?.throwIfAborted()
+      return { directory, archive, digest: release.deploymentId,
+        archiveHash: createHash('sha256').update(readFileSync(archive)).digest('hex'),
+        dispose: () => { rmSync(directory, { recursive: true, force: true }) } }
+    }
     const dependencies: Record<string, string> = { '@deepseek-ai/dsh': '0.2.0-rc.2' }
     const overrides: Record<string, string> = {}
     const digest = createHash('sha256')
@@ -73,7 +86,15 @@ export async function snapshotSource(root: string, timeoutMs: number, signal?: A
     const application = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8'))
     const releaseManifest = { name: 'aspera-installed-release', private: true, type: 'module',
       packageManager: application.packageManager, engines: application.engines, asperaEnvironmentTools: application.asperaEnvironmentTools,
-      asperaCompletionVersion: application.asperaCompletionVersion, asperaFinalizationVersion: application.asperaFinalizationVersion, dependencies }
+      asperaCompletionVersion: application.asperaCompletionVersion, asperaFinalizationVersion: application.asperaFinalizationVersion,
+      asperaStageAttemptVersion: application.asperaStageAttemptVersion,
+      asperaStageEvidenceVersion: application.asperaStageEvidenceVersion,
+      asperaCheckpointProtectionVersion: application.asperaCheckpointProtectionVersion,
+      asperaAgentRecoveryVersion: application.asperaAgentRecoveryVersion,
+      asperaServiceVerificationVersion: application.asperaServiceVerificationVersion,
+      asperaServiceLifecycleVersion: application.asperaServiceLifecycleVersion,
+      asperaInferenceCheckpointVersion: application.asperaInferenceCheckpointVersion,
+      asperaPlanningTools: application.asperaPlanningTools, dependencies }
     writeFileSync(join(source, 'package.json'), JSON.stringify(releaseManifest, null, 2) + '\n')
     copyFileSync(resolve(root, 'pnpm-workspace.yaml'), join(source, 'pnpm-workspace.yaml'))
     const patchRoot = resolve(root, 'patches')
@@ -90,7 +111,7 @@ export async function snapshotSource(root: string, timeoutMs: number, signal?: A
     copyFileSync(resolve(root, 'LICENSE'), join(source, 'LICENSE'))
     const pnpmCli = process.env.npm_execpath
     if (pnpmCli === undefined || !existsSync(pnpmCli)) throw new Error('launch Aspera through pnpm so its pinned package manager can produce the deployment lockfile')
-    await run(process.execPath, [pnpmCli, '--dir', source, 'install', '--lockfile-only', '--offline', '--ignore-scripts'], timeoutMs, signal)
+    await run(process.execPath, [pnpmCli, '--dir', source, 'install', '--lockfile-only', '--prefer-offline', '--ignore-scripts'], timeoutMs, signal)
     for (const file of ['pnpm-lock.yaml', 'package.json', 'pnpm-workspace.yaml', 'setup.mjs', 'LICENSE']) { digest.update(file + '\0'); digest.update(readFileSync(join(source, file))) }
     const identity = digest.digest('hex')
     writeFileSync(join(source, 'aspera-release.json'), JSON.stringify({ version: 1, deploymentId: identity, dsh: '0.2.0-rc.2', extension: '0.1.1' }) + '\n')
@@ -98,6 +119,24 @@ export async function snapshotSource(root: string, timeoutMs: number, signal?: A
     const archiveHash = createHash('sha256').update(readFileSync(archive)).digest('hex')
     return { directory, archive, digest: identity, archiveHash, dispose: () => { rmSync(directory, { recursive: true, force: true }) } }
   } catch (error) { rmSync(directory, { recursive: true, force: true }); throw error }
+}
+
+function installedPackageFiles(root: string): string[] {
+  const files: string[] = []
+  const walk = (relative: string): void => {
+    if (!existsSync(join(root, relative))) return
+    for (const entry of readdirSync(join(root, relative), { withFileTypes: true })) {
+      const path = `${relative}/${entry.name}`
+      if (entry.isDirectory()) walk(path)
+      else if (entry.isFile() && !entry.name.endsWith('.tsbuildinfo')) files.push(path)
+      else if (!entry.isFile()) throw new Error(`Installed release contains an unsupported package entry: ${path}`)
+    }
+  }
+  for (const relative of ['lib', 'scripts', 'skills']) walk(relative)
+  for (const relative of ['worker.patch.yml', 'cordis.patch.yml', 'README.md', 'README.zh.md', 'LICENSE', 'package.json']) {
+    if (existsSync(join(root, relative))) files.push(relative)
+  }
+  return files.sort()
 }
 
 function appendOverrides(source: string, overrides: Record<string, string>): void {
@@ -108,9 +147,10 @@ function appendOverrides(source: string, overrides: Record<string, string>): voi
 
 /** Verify a recovered archive against the original content identity, including packaged extension files.
  * @param archive - retained or recovered original archive. @param expected - frozen deployment identity.
+ * @param installedRoot - desktop installation whose published package files must match the archive; desktop-only dependencies may differ.
  * @returns original runtime requirements; a self-declared manifest alone is insufficient.
  */
-export async function verifySourceArchive(archive: string, expected: string): Promise<EnvironmentRequirements> {
+export async function verifySourceArchive(archive: string, expected: string, installedRoot?: string): Promise<EnvironmentRequirements> {
   const directory = mkdtempSync(join(tmpdir(), 'aspera-verify-'))
   const unpack = async (file: string, cwd: string) => {
     mkdirSync(cwd, { recursive: true })
@@ -143,11 +183,31 @@ export async function verifySourceArchive(archive: string, expected: string): Pr
         }
       }
       walk('')
+      if (installedRoot !== undefined) {
+        const installed = join(installedRoot, 'node_modules', '@aspera', name)
+        if (!isDeepStrictEqual(files.toSorted(), installedPackageFiles(installed))) throw new Error(`Installed @aspera/${name} file list differs from the sealed release`)
+        for (const file of files) {
+          const sealed = readFileSync(join(contents, 'package', file))
+          const current = readFileSync(join(installed, file))
+          if (!sealed.equals(current)) throw new Error(`Installed @aspera/${name}/${file} differs from the sealed release`)
+        }
+      }
       for (const file of files.sort()) { digest.update(`${name}/${file}\0`); digest.update(readFileSync(join(contents, 'package', file))); digest.update('\0') }
     }
     for (const patch of readdirSync(join(root, 'patches')).sort()) { digest.update(`patches/${patch}\0`); digest.update(readFileSync(join(root, 'patches', patch))) }
     for (const file of ['pnpm-lock.yaml', 'package.json', 'pnpm-workspace.yaml', 'setup.mjs', 'LICENSE']) { digest.update(`${file}\0`); digest.update(readFileSync(join(root, file))) }
     if (digest.digest('hex') !== expected) throw new Error('Recovered material digest differs from the submitted release')
+    if (installedRoot !== undefined) {
+      const sealed = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+      const current = JSON.parse(readFileSync(join(installedRoot, 'package.json'), 'utf8'))
+      for (const key of ['packageManager', 'engines', 'asperaEnvironmentTools', 'asperaCompletionVersion', 'asperaFinalizationVersion', 'asperaStageAttemptVersion', 'asperaStageEvidenceVersion', 'asperaCheckpointProtectionVersion', 'asperaAgentRecoveryVersion', 'asperaServiceVerificationVersion', 'asperaServiceLifecycleVersion', 'asperaInferenceCheckpointVersion', 'asperaPlanningTools']) {
+        if (!isDeepStrictEqual(sealed[key], current[key])) throw new Error(`Installed ${key} differs from the sealed release`)
+      }
+      for (const file of ['pnpm-workspace.yaml', 'setup.mjs', 'LICENSE', ...readdirSync(join(root, 'patches')).map(name => `patches/${name}`)]) {
+        if (!readFileSync(join(root, file)).equals(readFileSync(join(installedRoot, file)))) throw new Error(`Installed ${file} differs from the sealed release`)
+      }
+      if (!isDeepStrictEqual(readdirSync(join(root, 'patches')).sort(), readdirSync(join(installedRoot, 'patches')).sort())) throw new Error('Installed patch list differs from the sealed release')
+    }
     const application = z.object({ dependencies: z.object({ '@deepseek-ai/dsh': z.literal(release.dsh) }) }).parse(JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')))
     return environmentRequirements(root, { extension: release.extension, dsh: application.dependencies['@deepseek-ai/dsh'] })
   } finally { rmSync(directory, { recursive: true, force: true }) }

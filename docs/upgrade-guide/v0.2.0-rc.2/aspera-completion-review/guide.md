@@ -13,7 +13,11 @@ Completion tools and final settlement now share per-node checks. An execution Ag
 
 Released failures caused specifically by missing completion evidence expose Supplement and verify. A restricted standard DSH Agent uses the original execution model in a separate Session; it cannot train, install or start services. A program-verified receipt displays Revalidation passed while preserving the original failure and timestamp. Existing `pyenv` metadata can be registered read-only for this retrospective assessment.
 
-Supplementary JSON/JSONL evidence and embedded events retain valid structure when credentials are removed. Recording diagnostics list all mismatches together. Review trajectory reads are asynchronous and use the original local DSH Session, so a damaged redacted companion file does not hide intact history or require another review.
+Supplementary JSON/JSONL evidence and embedded events retain valid structure during credential removal. Recording diagnostics list mismatches together. Trajectory pages use the original local DSH Session and locate its latest events when count metadata is absent; damaged companion files do not hide intact history.
+
+Historical stage file references can be corrected before successful verification. The Agent reads `assessment.revision` and supplies it as the tool's `expected_revision`; command, attempt and approved requirements cannot change. Corrected references require fresh verification. Unused paths are omitted; passed bindings remain fixed. Retained invalid registrations need no manual ledger edit, retraining or new review identity.
+
+Review tools distinguish current acceptance from retained historical failure. An associated exact-checkpoint serving proof may satisfy the original public-serving step after independent verification, without changing the old blocked report. Unresolved step indices appear first; completed reports need no repetition. Refresh the application and resume the same review Session to use these explanations; no original training or inference needs repeating. Blocked retries resume the same Goal with its remaining round budget.
 
 ## Migration
 

@@ -2,17 +2,17 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { Button, Tag, StateDot, Modal, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
-import type { ExperimentStorageUsage, ExperimentCachePreview, EnvironmentReusePlan, MaterialOperation, StoragePlacement } from '@aspera/experiments/types'
+import type { ExperimentStorageUsage, ExperimentCachePreview, EnvironmentReusePlan, MaterialOperation, StoragePlacement, ExperimentStoragePolicies } from '@aspera/experiments/types'
 import type { ExperimentsController } from './controller.ts'
 import css from './ExperimentsPage.module.css'
 
-const reuseStageLabels = { checking: 'environmentCheckingReuse', reusing: 'environmentReusingPackages', downloading: 'environmentDownloadingMissing',
+const reuseStageLabels = { checking: 'environmentCheckingReuse', 'checking-reuse': 'storageDiscoveringHistory', reusing: 'environmentReusingPackages', downloading: 'environmentDownloadingMissing',
   installing: 'environmentInstallingMissing', verifying: 'environmentProgramVerification', recovering: 'environmentRecoveringOperation',
   completed: 'environmentReady', blocked: 'environmentBlocked' } as const satisfies Record<EnvironmentReusePlan['stage'], string>
 const categoryLabels = { release: 'storageCategoryRelease', environment: 'storageCategoryEnvironment', package: 'storageCategoryPackage',
   model: 'storageCategoryModel', dataset: 'storageCategoryDataset', temporary: 'storageCategoryTemporary', checkpoint: 'storageCategoryCheckpoint',
   result: 'storageCategoryResult', log: 'storageCategoryLog', other: 'storageCategoryOther' } as const
-const materialStageLabels = { checking: 'environmentCheckingReuse', 'waiting-transfer': 'storageWaitingTransfer', reusing: 'environmentReusingPackages',
+const materialStageLabels = { checking: 'environmentCheckingReuse', discovering: 'storageDiscoveringHistory', 'waiting-transfer': 'storageWaitingTransfer', reusing: 'environmentReusingPackages',
   downloading: 'storageMaterialDownloading', verifying: 'environmentProgramVerification', publishing: 'storagePublishingMaterial',
   'waiting-exit': 'environmentWaitingExit', completed: 'storageMaterialReady', blocked: 'environmentBlocked' } as const satisfies Record<NonNullable<MaterialOperation['stage']>, string>
 
@@ -20,6 +20,9 @@ const materialStageLabels = { checking: 'environmentCheckingReuse', 'waiting-tra
 export function EnvironmentStorage({ id, controller, t, active, placements = [] }: { id: string; controller: ExperimentsController; t: TranslateNS<'experiments'>; active: boolean; placements?: StoragePlacement[] }) {
   const [usage, setUsage] = useState<ExperimentStorageUsage>()
   const [error, setError] = useState<string>()
+  const [policies, setPolicies] = useState<ExperimentStoragePolicies>([])
+  const [policyError, setPolicyError] = useState(false)
+  const [policyBusy, setPolicyBusy] = useState<string>()
   const [preview, setPreview] = useState<ExperimentCachePreview>()
   const [busy, setBusy] = useState<'preview' | 'cleanup' | 'scan'>()
   const [selection, setSelection] = useState<Record<string, string[]>>({})
@@ -40,12 +43,16 @@ export function EnvironmentStorage({ id, controller, t, active, placements = [] 
       if (!current.active || pending) return
       pending = true
       try {
+        try {
+          const observed = await controller.storagePolicies(id)
+          if (current.active) { setPolicies(observed); setPolicyError(false) }
+        } catch (failure) { if (current.active) setPolicyError(true); void failure }
         const next = await controller.storageUsage(id)
         if (current.active && next.experimentId === id) { setUsage(next); setError(undefined) }
       } catch (failure) { if (current.active) setError(String(failure)) }
       finally { pending = false }
     }
-    setUsage(undefined); setPreview(undefined); setError(undefined); setBusy(undefined); setSelection({}); setSelectedNode(undefined); operation.current = undefined
+    setPolicies([]); setPolicyError(false); setPolicyBusy(undefined); setUsage(undefined); setPreview(undefined); setError(undefined); setBusy(undefined); setSelection({}); setSelectedNode(undefined); operation.current = undefined
     void load(); const timer = setInterval(() => { void load() }, controller.displayLimits().pollIntervalMs)
     return () => { current.active = false; clearInterval(timer) }
   }, [id, controller])
@@ -84,7 +91,7 @@ export function EnvironmentStorage({ id, controller, t, active, placements = [] 
     <h3>{t('environmentStorage')}</h3>
     {usage === undefined && error === undefined && <StateDot state="ongoing" />}
     {usage?.nodes.map(node => <div className={css.storageSummary} key={node.serverId}>
-      <div className={css.sectionHeading}><strong>{node.name}</strong><Tag tone={node.storagePlan?.state === 'insufficient' ? 'warning' : 'neutral'}>{t(node.source === 'local' ? 'environmentOffline' : node.storagePlan?.state === 'insufficient' ? 'storageBudgetInsufficient' : node.storagePlan?.state === 'ready' ? 'storageBudgetReady' : 'storageBudgetPending')}</Tag></div>
+      <div className={css.sectionHeading}><strong>{node.name}</strong><Tag tone={node.storagePlan?.state === 'insufficient' ? 'warning' : 'neutral'}>{t(node.source === 'local' ? 'environmentOffline' : node.storagePlan?.mode === 'preview' ? 'storageBudgetPreview' : node.storagePlan?.state === 'insufficient' ? 'storageBudgetInsufficient' : node.storagePlan?.state === 'ready' ? node.storagePlan.coverage?.complete === false ? 'storageBudgetDeclared' : 'storageBudgetReady' : 'storageBudgetPending')}</Tag></div>
       <StorageAllocations node={node} placement={placements.find(value => value.serverId === node.serverId)} t={t} gib={gib} compact />
       {node.arrangement !== undefined && <Tag tone="warning">{t('storageSystemFallback')}</Tag>}
       {node.storagePlan?.volumes.filter(volume => (volume.shortfallBytes ?? 0) > 0).map(volume => <p className={css.issueSummary} key={volume.directory}>{t('storageGapSummary', { volume: volume.directory, size: gib(volume.shortfallBytes!) })}</p>)}
@@ -97,6 +104,30 @@ export function EnvironmentStorage({ id, controller, t, active, placements = [] 
     {usage?.nodes.filter(node => node.serverId === selectedNode).map(node => <div className={css.environmentNode} key={node.serverId}>
       <div className={css.sectionHeading}><strong>{node.name}</strong><Tag>{t(node.source === 'local' ? 'environmentOffline' : node.source === 'ssh' ? 'environmentSshRead' : 'environmentMeasured')}</Tag></div>
       <StorageAllocations node={node} placement={placements.find(value => value.serverId === node.serverId)} t={t} gib={gib} />
+      {policies.filter(value => value.serverId === node.serverId).map(value => <div className={css.environmentRow} key={value.serverId}>
+        <span>{t('storageRetentionPolicy')}</span>
+        {value.current && <details className={css.infoDisclosure}><summary>{t('storageApprovedPolicy')}</summary><pre className={css.log}>{JSON.stringify(value.current.policy, null, 2)}</pre></details>}
+        {value.proposals.filter(proposal => proposal.state === 'pending' || proposal.state === 'rejected' && proposal.expectedRevision === value.current?.revision).map(proposal => <div key={proposal.proposalId}>
+          <Tag tone="warning">{t(proposal.state === 'pending' ? 'storagePolicyPending' : 'storagePolicyRejected')}</Tag><p>{proposal.reason}</p>
+          <dl className={css.infoFacts}>
+            <div><dt>{t('storageSavedArtifact')}</dt><dd>{proposal.policy.artifact}</dd></div>
+            <div><dt>{t('storageCheckpointCount')}</dt><dd>{value.current?.policy.checkpointCount ?? '—'} → {proposal.policy.checkpointCount}</dd></div>
+            <div><dt>{t('storageOptimizerState')}</dt><dd>{t(proposal.policy.optimizerState ? 'storageRetentionRequired' : 'storageNotRequired')}</dd></div>
+            <div><dt>{t('storageSchedulerState')}</dt><dd>{t(proposal.policy.schedulerState ? 'storageRequired' : 'storageNotRequired')}</dd></div>
+          </dl>
+          <details className={css.infoDisclosure}><summary>{t('storagePolicyChanges')}</summary><pre className={css.log}>{JSON.stringify({ previous: value.current?.policy, proposed: proposal.policy }, null, 2)}</pre></details>
+          {(proposal.state === 'rejected' ? [true] : [true, false]).map(approve => <Button key={String(approve)} variant="ghost" disabled={!active || policyBusy !== undefined} onClick={() => {
+            const lifetimeAtRequest = lifetime.current
+            setPolicyBusy(proposal.proposalId + ':' + String(approve))
+            void (proposal.state === 'rejected' ? controller.reconsiderStoragePolicy(id, proposal.proposalId, proposal.expectedRevision)
+              : controller.decideStoragePolicy(id, proposal.proposalId, proposal.expectedRevision, approve)).then(() => controller.storagePolicies(id)).then(next => {
+              if (lifetimeAtRequest.active) { setPolicies(next); setPolicyError(false) }
+            }).catch((failure: unknown) => { if (lifetimeAtRequest.active) { setPolicyError(true); setError(String(failure)) } })
+              .finally(() => { if (lifetimeAtRequest.active) setPolicyBusy(undefined) })
+          }}>{policyBusy === proposal.proposalId + ':' + String(approve) && <StateDot state="ongoing" />}{t(proposal.state === 'rejected' ? 'storageReconsiderPolicy' : approve ? 'storageApprovePolicy' : 'storageRejectPolicy')}</Button>)}
+        </div>)}
+      </div>)}
+      {policyError && <p className={css.hint}>{t('storagePolicyReadIssue')}</p>}
       {node.arrangement !== undefined && <details className={css.infoDisclosure}><summary>{t('storageHistory')}</summary><p>{node.arrangement.reason}</p><pre className={css.log}>{JSON.stringify(node.arrangement, null, 2)}</pre></details>}
       {placements.find(value => value.serverId === node.serverId) !== undefined && <details className={css.infoDisclosure}><summary>{t('selectionReason')}</summary><p>{placements.find(value => value.serverId === node.serverId)?.reason}</p></details>}
       {node.checkedAt > 0 && <p className={css.hint}>{t('environmentCheckedAt', { time: new Date(node.checkedAt).toLocaleString() })}</p>}
@@ -122,7 +153,7 @@ export function EnvironmentStorage({ id, controller, t, active, placements = [] 
         <details className={css.infoDisclosure}><summary>{t('storageInventoryDetails')}</summary><pre className={css.log}>{JSON.stringify(node.catalog, null, 2)}</pre></details>
       </div>}
       {node.storagePlan && <div className={css.environmentRow}>
-        <div className={css.sectionHeading}><span>{t('storageCapacityPlan')}</span><Tag>{t(node.storagePlan.state === 'ready' ? 'storageBudgetReady' : node.storagePlan.state === 'insufficient' ? 'storageBudgetInsufficient' : 'storageBudgetPending')}</Tag></div>
+        <div className={css.sectionHeading}><span>{t('storageCapacityPlan')}</span>{node.storagePlan.mode === 'preview' && <Tag>{t('storageBudgetPreview')}</Tag>}<Tag>{t(node.storagePlan.state === 'ready' ? node.storagePlan.coverage?.complete === false ? 'storageBudgetDeclared' : 'storageBudgetReady' : node.storagePlan.state === 'insufficient' ? 'storageBudgetInsufficient' : 'storageBudgetPending')}</Tag></div>
         {node.storagePlan.volumes.map(volume => <dl className={css.infoFacts} key={volume.directory}>
           <div><dt>{t('storageVolume')}</dt><dd><code>{volume.directory}</code></dd></div>
           <div><dt>{t('storageRequired')}</dt><dd>{volume.requiredBytes === null ? t('storageUnconfirmed') : gib(volume.requiredBytes)}</dd></div>
@@ -137,6 +168,13 @@ export function EnvironmentStorage({ id, controller, t, active, placements = [] 
         {node.storagePlan.state === 'insufficient' && <p className={css.hint}>{t('storageCapacityActions')}</p>}
         <details className={css.infoDisclosure}><summary>{t('technicalDetails')}</summary><pre className={css.log}>{JSON.stringify(node.storagePlan, null, 2)}</pre></details>
       </div>}
+      {node.repairPlans?.map(plan => <div className={css.environmentRow} key={plan.id}>
+        <div className={css.sectionHeading}><span>{plan.environmentId}</span><Tag tone="warning">{t('environmentRepairChoice')}</Tag></div>
+        <p className={css.hint}>{t(plan.strategy === 'reinstall-affected' ? 'environmentRepairAffected' : 'environmentRepairRebuild')}</p>
+        <p className={css.hint}>{t('environmentCheckedAt', { time: new Date(plan.checkedAt).toLocaleString() })}</p>
+        <details className={css.infoDisclosure}><summary>{t('environmentRepairDiagnostics')}</summary><pre className={css.log}>{JSON.stringify({ plan,
+          diagnostics: node.diagnostics?.filter(row => plan.diagnosticIds.includes(row.id)) }, null, 2)}</pre></details>
+      </div>)}
       {node.borrowings?.map(binding => <div className={css.environmentRow} key={binding.environmentId}>
         <div className={css.sectionHeading}><span>{binding.environmentId}</span><Tag>{t('storageBorrowedReadonly')}</Tag></div>
         <dl className={css.infoFacts}><div><dt>{t('storageSourceExperiment')}</dt><dd>{binding.sourceExperimentId}</dd></div>
@@ -151,10 +189,11 @@ export function EnvironmentStorage({ id, controller, t, active, placements = [] 
         <code className={css.storagePath}>{material.revision}</code>
       </div>)}
       {node.materialOperations?.map(operation => <div className={css.environmentRow} key={operation.operationId}>
-        <div className={css.sectionHeading}><span>{t(operation.stage === undefined ? 'storageMaterialOperation' : materialStageLabels[operation.stage])}</span>
-          <StateDot state={operation.state === 'completed' && operation.admissionReleased ? 'done' : operation.state === 'blocked' || operation.state === 'unknown' ? 'warning' : active && node.source !== 'local' ? 'ongoing' : 'idle'} /></div>
+        <div className={css.sectionHeading}><span>{t(operation.verificationStatus === 'partial' ? 'storageMaterialPartial' : operation.verificationStatus === 'none' ? 'storageMaterialNoMatch' : operation.verificationStatus === 'unknown' ? 'storageUnconfirmed' : operation.stage === undefined ? 'storageMaterialOperation' : materialStageLabels[operation.stage])}</span>
+          <StateDot state={operation.state === 'completed' && operation.admissionReleased && operation.materialReady !== false ? 'done' : operation.state === 'blocked' || operation.state === 'unknown' || operation.materialReady === false ? 'warning' : active && node.source !== 'local' ? 'ongoing' : 'idle'} /></div>
         <dl className={css.infoFacts}><div><dt>{t('environmentDownloaded')}</dt><dd>{gib(operation.downloadedBytes)}</dd></div>
           <div><dt>{t('environmentReusedBytes')}</dt><dd>{gib(operation.reusedBytes)}</dd></div></dl>
+        {operation.reuse && <p className={css.hint}>{t(operation.reuse.state === 'verified' && operation.exitConfirmed && operation.admissionReleased ? 'storageReuseVerified' : operation.reuse.state === 'discovering' ? 'storageDiscoveringHistory' : 'storageReusePending')}</p>}
         <p className={css.hint}>{t('environmentElapsed', { seconds: Math.floor(Math.max(0, operation.updatedAt - operation.startedAt) / 1000) })} · {t('environmentCheckedAt', { time: new Date(operation.updatedAt).toLocaleString() })}</p>
         <details className={css.infoDisclosure}><summary>{t('technicalDetails')}</summary><pre className={css.log}>{JSON.stringify(operation, null, 2)}</pre></details>
       </div>)}
@@ -162,8 +201,9 @@ export function EnvironmentStorage({ id, controller, t, active, placements = [] 
         .map(operation => [operation.operation?.environmentId ?? operation.operationId, operation]))).map(operation => <div className={css.environmentRow} key={operation.operationId}>
         <div className={css.sectionHeading}><span>{operation.operation?.environmentId}</span><span className={css.nodeStatus}>
           <StateDot state={operation.state === 'completed' ? 'done' : operation.state === 'failed' || operation.state === 'unknown' ? 'warning' : active && node.source === 'remote' ? 'ongoing' : 'idle'} />
-          <span>{t(operation.state === 'unknown' ? 'environmentOutcomeUnknown' : operation.state === 'failed' ? 'environmentBlocked'
+          <span>{t(operation.state === 'running' && operation.operation?.action === 'repair' ? 'environmentRepairing' : operation.state === 'unknown' ? 'environmentOutcomeUnknown' : operation.state === 'failed' ? 'environmentBlocked'
             : operation.state === 'running' && operation.operation?.exitConfirmed ? 'environmentWaitingExit'
+            : operation.operation?.preflight !== undefined ? operation.operation.preflight.status === 'reusable' ? 'environmentSourceVerified' : operation.operation.preflight.status === 'repair-required' ? 'environmentSourceRepair' : 'storageUnconfirmed'
             : operation.state === 'completed' ? operation.operation?.environment?.requirements.length === 0 ? 'environmentInterpreterReady' : 'environmentReady'
             : operation.reusePlan === undefined ? 'environmentConfiguring' : reuseStageLabels[operation.reusePlan.stage])}</span>
         </span></div>
@@ -208,6 +248,16 @@ export function EnvironmentStorage({ id, controller, t, active, placements = [] 
     {preview && <div className={css.environmentPreview}><p className={css.hint}>{t('environmentCleanupHint')}</p>{preview.nodes.filter(node => node.serverId === selectedNode).map(node => <div key={node.serverId}>
       <p>{t(node.eligible ? 'environmentCleanupCandidate' : 'environmentCleanupUnavailable', { size: gib(node.candidates.reduce((sum, value) => sum + value.bytes, 0)) })}</p>
       {node.detail && <details><summary>{t('technicalDetails')}</summary><pre className={css.log}>{node.detail}</pre></details>}
+      {node.referenceRepairs?.map(row => <div className={css.environmentRow} key={row.id}><label>
+        <input type="checkbox" checked={selection[node.serverId]?.includes('reference:' + row.id) ?? false} disabled={busy !== undefined || !node.eligible || !row.eligible}
+          aria-label={t('environmentSelectReference', { id: row.environmentId })}
+          onChange={event => { const checked = event.currentTarget.checked; operation.current = undefined; setSelection(previous => ({ ...previous,
+            [node.serverId]: checked ? [...(previous[node.serverId] ?? []), 'reference:' + row.id] : (previous[node.serverId] ?? []).filter(id => id !== 'reference:' + row.id) })) }} />
+        <span>{t('environmentReferencePending')} · {row.environmentId}</span></label>
+        <code className={css.storagePath}>{row.sourceExperimentId}</code>
+        <p className={css.hint}>{t('environmentReferencePreservesFiles')}</p>
+        <details className={css.infoDisclosure}><summary>{t('technicalDetails')}</summary><pre className={css.log}>{row.detail}</pre></details>
+      </div>)}
       {node.eligible && node.candidates.map(candidate => <div className={css.environmentRow} key={candidate.id}><label>
         <input type="checkbox" checked={selection[node.serverId]?.includes(candidate.id) ?? false} disabled={busy !== undefined}
           aria-label={t('storageSelectCleanup', { id: candidate.id })}
@@ -219,8 +269,8 @@ export function EnvironmentStorage({ id, controller, t, active, placements = [] 
         <details className={css.infoDisclosure}><summary>{t('technicalDetails')}</summary><pre className={css.log}>{candidate.reason}</pre></details>
       </div>)}
     </div>)}
-      {preview.nodes.some(node => node.serverId === selectedNode && node.eligible && node.candidates.length > 0) && <Button disabled={busy !== undefined || !Object.values(selection).some(ids => ids.length > 0)} aria-busy={busy === 'cleanup'} onClick={() => { void cleanup() }}>
-        {busy === 'cleanup' && <StateDot state="ongoing" />}{t('environmentCleanupAction')}
+      {preview.nodes.some(node => node.serverId === selectedNode && node.eligible && (node.candidates.length > 0 || node.referenceRepairs?.some(row => row.eligible))) && <Button disabled={busy !== undefined || !Object.values(selection).some(ids => ids.length > 0)} aria-busy={busy === 'cleanup'} onClick={() => { void cleanup() }}>
+        {busy === 'cleanup' && <StateDot state="ongoing" />}{t(Object.values(selection).some(ids => ids.some(id => id.startsWith('reference:'))) ? 'environmentProcessSelection' : 'environmentCleanupAction')}
       </Button>}
     </div>}
     </Modal>
@@ -234,20 +284,25 @@ function StorageAllocations({ node, placement, t, gib, compact = false }: { node
   const borrowed = node.borrowings?.find(value => value.environmentId === plan?.environmentId) ?? node.borrowings?.[0]
   const materialIds = new Set(plan?.materialIds ?? node.materialOperations?.map(operation => operation.materialId) ?? [])
   const assets = node.assets?.filter(material => materialIds.has(material.id)) ?? []
+  const materialOperation = node.materialOperations?.filter(value => materialIds.size === 0 || materialIds.has(value.materialId)).sort((a, b) => a.updatedAt - b.updatedAt).at(-1)
   const operation = node.operations?.filter(value => (value.operation?.environmentId ?? value.reusePlan?.environmentId) === (plan?.environmentId ?? 'training')).sort((a, b) => a.checkedAt - b.checkedAt).at(-1)
-  const environmentState = env?.state === 'ready' && env.verification?.verified === true || borrowed !== undefined ? 'environmentReady'
+  const preflight = operation?.operation?.preflight
+  const environmentState = env?.state === 'ready' && env.verification?.verified === true || borrowed !== undefined ? 'environmentReady' : preflight?.status === 'reusable' ? 'environmentSourceVerified' : preflight?.status === 'repair-required' ? 'environmentSourceRepair'
     : env?.state === 'blocked' || operation?.state === 'failed' ? 'environmentBlocked'
-    : operation?.state === 'unknown' ? 'environmentOutcomeUnknown' : operation?.state === 'running' ? 'environmentConfiguring'
+    : operation?.state === 'unknown' ? 'environmentOutcomeUnknown' : operation?.state === 'running' ? operation.reusePlan?.stage === 'verifying' ? 'environmentProgramVerification' : 'environmentCheckingReuse'
     : node.arrangement !== undefined ? 'storageArranged' : 'storageUnconfirmed'
-  const materialState = assets.length === 0 ? 'storageUnconfirmed' : assets.some(value => value.state === 'blocked') ? 'environmentBlocked'
+  const materialState = materialOperation?.verificationStatus === 'partial' ? 'storageMaterialPartial' : materialOperation?.verificationStatus === 'none' ? 'storageMaterialNoMatch' : materialOperation?.state === 'running' || materialOperation?.state === 'requested' ? materialStageLabels[materialOperation.stage ?? 'checking']
+    : materialOperation?.state === 'unknown' ? 'environmentOutcomeUnknown' : materialOperation?.state === 'blocked' ? 'environmentBlocked'
+    : materialOperation?.reuse?.state === 'verified' && materialOperation.admissionReleased ? 'storageReuseVerified'
+    : assets.length === 0 ? 'storageUnconfirmed' : assets.some(value => value.state === 'blocked') ? 'environmentBlocked'
     : assets.some(value => value.state === 'downloading') ? 'storageMaterialDownloading' : assets.every(value => value.state === 'ready') ? 'storageMaterialReady' : 'storageMaterialPending'
   const rows = [
     { key: 'storageTrainingEnvironment', state: environmentState, directory: env?.directory ?? borrowed?.directory ?? node.arrangement?.environmentWorkspace, reuse: borrowed !== undefined || (env?.sharing.hardlinkBytes ?? 0) > 0, bytes: plan?.volumes.reduce<number | null>((sum, value) => sum === null || value.environmentBytes === null ? null : sum + value.environmentBytes, 0) },
-    { key: 'storageModelsData', state: materialState, directory: [...new Set(assets.map(value => value.directory))].join('\n') || undefined, reuse: assets.some(value => value.verifiedBytes > 0), bytes: plan?.volumes.reduce((sum, value) => sum + value.missingBytes, 0) },
-    { key: 'storageOutputs', state: plan?.state === 'ready' ? 'storageArranged' : plan?.state === 'insufficient' ? 'storageBudgetInsufficient' : 'storageUnconfirmed', directory: placement?.workspaceRoot, reuse: false, bytes: plan?.volumes.reduce((sum, value) => sum + value.outputBytes + value.checkpointBytes, 0) },
+    { key: 'storageModelsData', state: materialState, directory: materialOperation?.material?.directory ?? ([...new Set(assets.map(value => value.directory))].join('\n') || undefined), reuse: materialOperation?.reuse?.state === 'verified' || assets.some(value => value.verifiedBytes > 0), bytes: plan?.volumes.reduce((sum, value) => sum + value.missingBytes, 0) },
+    { key: 'storageOutputs', state: plan?.mode === 'preview' ? 'storageBudgetPreview' : plan?.state === 'ready' ? 'storageArranged' : plan?.state === 'insufficient' ? 'storageBudgetInsufficient' : 'storageUnconfirmed', directory: placement?.workspaceRoot, reuse: false, bytes: plan?.volumes.reduce((sum, value) => sum + value.outputBytes + value.checkpointBytes, 0) },
   ] as const
-  if (compact) return <dl className={css.storageSummaryRows}>{rows.map(row => <div key={row.key}><dt>{t(row.key)}</dt><dd>{row.directory === undefined ? t('storageUnconfirmed') : <Tooltip label={row.directory} portal><button type="button" className={css.storageOneLine}>{row.directory}</button></Tooltip>}{row.reuse && <small>{t('storageReused')}</small>}</dd></div>)}</dl>
+  if (compact) return <dl className={css.storageSummaryRows}>{rows.map(row => <div key={row.key}><dt>{t(row.key)}</dt><dd>{row.directory === undefined ? t('storageUnconfirmed') : <Tooltip label={row.directory} portal><button type="button" className={css.storageOneLine}>{row.directory}</button></Tooltip>}{row.reuse && <small>{t('storageReused')}</small>}{row.state !== 'storageUnconfirmed' && <small>{t(row.state)}</small>}</dd></div>)}</dl>
   return <div className={css.storageTableScroll}><table className={css.storageAllocationTable}><thead><tr>{(['storageContent', 'storageActualDirectory', 'environmentReuse', 'storageEstimatedPeak', 'status'] as const).map(key => <th key={key}>{t(key)}</th>)}</tr></thead><tbody>{rows.map(row => <tr key={row.key}>
-    <td>{t(row.key)}</td><td><code>{row.directory ?? t('storageUnconfirmed')}</code></td><td>{t(row.reuse ? 'storageReused' : row.key === 'storageOutputs' ? 'storageNotApplicable' : 'storageUnconfirmed')}</td><td>{row.bytes == null ? t('storageUnconfirmed') : t('storageEstimate', { size: gib(Math.ceil(row.bytes * (plan?.peakSafetyFactor ?? 1))) })}</td><td><Tag tone={row.state === 'environmentBlocked' || row.state === 'storageBudgetInsufficient' || row.state === 'environmentOutcomeUnknown' ? 'warning' : row.state === 'environmentReady' || row.state === 'storageMaterialReady' ? 'success' : row.state === 'environmentConfiguring' || row.state === 'storageMaterialDownloading' ? 'info' : 'neutral'}>{t(row.state)}</Tag></td>
+    <td>{t(row.key)}</td><td><code>{row.directory ?? t('storageUnconfirmed')}</code></td><td>{t(row.reuse ? 'storageReused' : row.key === 'storageOutputs' ? 'storageNotApplicable' : 'storageUnconfirmed')}</td><td>{row.bytes == null ? t('storageUnconfirmed') : t('storageEstimate', { size: gib(Math.ceil(row.bytes * (plan?.peakSafetyFactor ?? 1))) })}</td><td><Tag tone={row.state === 'environmentBlocked' || row.state === 'storageBudgetInsufficient' || row.state === 'environmentOutcomeUnknown' ? 'warning' : row.state === 'environmentReady' || row.state === 'storageMaterialReady' || row.state === 'storageReuseVerified' ? 'success' : row.state === 'storageDiscoveringHistory' || row.state === 'environmentProgramVerification' || row.state === 'environmentCheckingReuse' || row.state === 'storageMaterialDownloading' ? 'info' : 'neutral'}>{t(row.state)}</Tag></td>
   </tr>)}</tbody></table></div>
 }

@@ -51,14 +51,17 @@ export function shellQuote(value: string): string {
 export async function run(program: string, args: readonly string[], timeoutMs: number, signal?: AbortSignal): Promise<string> {
   const result = await runResult(program, args, timeoutMs, signal)
   if (result.exitCode !== 0 || result.timedOut || result.cancelled) {
-    throw new Error(`${program} ${result.timedOut ? 'timed out' : result.cancelled ? 'was cancelled' : `exited ${result.exitCode}`}: ${result.stderr.slice(-4000)}`)
+    throw new Error(`${program} ${result.timedOut ? 'timed out' : result.cancelled ? 'was cancelled' : `exited ${result.exitCode}`}: ${(result.stderr || result.stdout).slice(-4000)}`)
   }
   return result.stdout
 }
 
-async function runResult(program: string, args: readonly string[], timeoutMs: number, signal?: AbortSignal, output?: CommandOutputSink): Promise<CommandResult> {
+async function runResult(program: string, args: readonly string[], timeoutMs: number, signal?: AbortSignal, output?: CommandOutputSink,
+  input?: string): Promise<CommandResult & { inputFailure?: string }> {
   signal?.throwIfAborted()
-  const child = spawn(program, [...args], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+  const child = input === undefined
+    ? spawn(program, [...args], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    : spawn(program, [...args], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
   let stdout = ''
   let errorOutput = ''
   let captureError: unknown
@@ -72,6 +75,7 @@ async function runResult(program: string, args: readonly string[], timeoutMs: nu
   child.stderr.on('data', (part: string) => { errorOutput = (errorOutput + part).slice(-limit); capture('stderr', part) })
   let timedOut = false
   let cancelled = false
+  let inputFailure: string | undefined
   const abort = () => { cancelled = true; child.kill() }
   signal?.addEventListener('abort', abort, { once: true })
   const timer = setTimeout(() => { timedOut = true; child.kill() }, timeoutMs)
@@ -79,9 +83,13 @@ async function runResult(program: string, args: readonly string[], timeoutMs: nu
     const exit = await new Promise<{ exitCode: number | null; signal: string | null }>((resolve, reject) => {
       child.once('error', reject)
       child.once('close', (exitCode, exitSignal) => { resolve({ exitCode, signal: exitSignal ?? null }) })
+      if (input !== undefined && child.stdin !== null) {
+        child.stdin.once('error', () => { inputFailure = 'SSH input transfer failed; reconcile the original operation before retrying' })
+        child.stdin.end(input, 'utf8')
+      }
     })
     if (captureError !== undefined) throw captureError
-    return { stdout, stderr: errorOutput, ...exit, timedOut, cancelled }
+    return { stdout, stderr: errorOutput, ...exit, timedOut, cancelled, ...(inputFailure === undefined ? {} : { inputFailure }) }
   } finally {
     clearTimeout(timer)
     signal?.removeEventListener('abort', abort)
@@ -109,10 +117,11 @@ export function sshOptions(target: Target): string[] {
  * @param script - remote shell program.
  * @param signal - aborts the SSH process.
  * @param password - operation-scoped password, resolved outside persisted target settings.
+ * @param input - optional UTF-8 standard input, closed after all bytes have been written.
  * @returns remote stdout after successful exit.
  */
-export async function remote(target: Target, script: string, signal?: AbortSignal, password?: string): Promise<string> {
-  const result = await remoteResult(target, script, signal, password)
+export async function remote(target: Target, script: string, signal?: AbortSignal, password?: string, input?: string): Promise<string> {
+  const result = await remoteResult(target, script, signal, password, undefined, input)
   signal?.throwIfAborted()
   if (result.exitCode !== 0 || result.timedOut || result.cancelled || !result.exitConfirmed) throw new RemoteCommandError(result)
   return result.stdout
@@ -125,17 +134,25 @@ export async function remote(target: Target, script: string, signal?: AbortSigna
  * @param signal - operation cancellation.
  * @param password - private operation credential.
  * @param output - optional complete pipe capture; capture failure stops the command channel.
+ * @param input - optional UTF-8 standard input; a channel failure never replays a started command.
  * @returns captured outcome; connection and authentication failures reject.
  */
-export async function remoteResult(target: Target, script: string, signal?: AbortSignal, password?: string, output?: CommandOutputSink): Promise<RemoteCommandResult> {
+export async function remoteResult(target: Target, script: string, signal?: AbortSignal, password?: string, output?: CommandOutputSink,
+  input?: string): Promise<RemoteCommandResult> {
   const prefix = target.pathEntries?.length ? `export PATH=${shellQuote(target.pathEntries.join(':'))}:"$PATH"\n` : ''
   const command = `sh -c ${shellQuote(prefix + script)}`
-  if (target.authMode === 'password') return passwordResult(target, password, command, signal, output)
+  if (target.authMode === 'password') return passwordResult(target, password, command, signal, output, input)
   const marker = `ASPERA_EXIT_${randomUUID()}=`
   const checked = `${command}; status=$?; printf '\\n${marker}%s\\n' "$status" >&2`
-  const result = await runResult('ssh', [...sshOptions(target), destination(target), checked], target.toolTimeoutMs, signal, output)
+  const { inputFailure, ...result } = await runResult('ssh', [...sshOptions(target), destination(target), checked], target.toolTimeoutMs, signal, output, input)
   const receipt = new RegExp(`\\n${marker}(\\d+)\\r?\\n$`).exec(result.stderr)
-  if (receipt !== null) return { ...result, exitCode: Number(receipt[1]), stderr: result.stderr.slice(0, receipt.index), exitConfirmed: true }
+  if (receipt !== null) {
+    const confirmed = { ...result, exitCode: Number(receipt[1]), stderr: result.stderr.slice(0, receipt.index), exitConfirmed: true }
+    if (inputFailure !== undefined && confirmed.exitCode === 0 && !result.timedOut && !result.cancelled) {
+      throw new SshConnectionError({ ...confirmed, stderr: confirmed.stderr + '\n' + inputFailure })
+    }
+    return confirmed
+  }
   const unconfirmed = { ...result, exitCode: null, exitConfirmed: false }
   if (!result.timedOut && !result.cancelled) throw new SshConnectionError(unconfirmed)
   return unconfirmed

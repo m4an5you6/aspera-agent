@@ -28,6 +28,9 @@ import type { ControllerStatus, GpuInventory } from '@aspera/experiments'
 import { controllerPolicyDigest, controllerProcessIdentity } from './controller.ts'
 import { inspectExperimentFinalization } from '../scripts/completion-files.mjs'
 import { finalizationPolicySchema } from './finalization-policy.ts'
+import { serviceVerificationSchema } from '@aspera/experiments'
+import { CommandAdmissionRejected } from './command-admission.ts'
+import { assertSubmittedPlanRequirements } from './plan-requirements.ts'
 
 const storeSpec = defineDomain({ name: 'aspera_queue', version: 4, compatibleVersions: [1, 2, 3], layout: 'per-record',
   tables: { experiments: domainTable<ExperimentId, ClusterRecord>(clusterRecordSchema) } })
@@ -108,7 +111,7 @@ export async function applyClusterRole(ctx: Context, config: ClusterRoleConfig):
           occupied: { experiments: queue?.maintenanceOccupancy() ?? [], allocations: [], commands: [], services: [] },
           ...(queue?.maintenanceOperation === undefined ? {} : { maintenance: queue.maintenanceOperation }) }
         respond(200, { protocol: 4, role: config.role, deploymentId: config.deploymentId,
-          features: ['public-inference-v1', 'controller-readiness-v1', 'controller-maintenance-v1', 'managed-environments-v1', 'managed-environment-reuse-v1', 'managed-environment-cleanup-v1', 'managed-environment-install-v2', 'managed-environment-install-v3', 'completion-evidence-v1', 'experiment-finalization-v2', 'storage-governance-v1', 'historical-environment-borrow-v1', 'managed-materials-v1', 'purpose-storage-0.1.0'], controller,
+          features: ['public-inference-v1', 'controller-readiness-v1', 'controller-maintenance-v1', 'managed-environments-v1', 'managed-environment-reuse-v1', 'managed-environment-cleanup-v1', 'managed-environment-install-v2', 'managed-environment-install-v3', 'managed-environment-lock-receipt-v1', 'completion-evidence-v1', 'experiment-finalization-v2', 'stage-attempt-recovery-v1', 'stage-evidence-reading-v1', 'stage-evidence-reading-v2', 'stage-checkpoint-evidence-v3', 'stage-checkpoint-evidence-v4', 'checkpoint-protection-v1', 'agent-recovery-v1', 'public-inference-verification-v1', 'inference-service-lifecycle-v1', 'inference-checkpoint-snapshots-v1', 'readonly-source-consumers-v1', 'readonly-source-consumers-v2', 'storage-governance-v1', 'historical-environment-borrow-v1', 'managed-materials-v1', 'purpose-storage-0.1.0', 'targeted-materials-0.1.1', 'material-source-bindings-0.1.2', 'storage-registration-0.1.3', 'bounded-diagnostics-0.1.3', 'command-admission-0.1.3', 'storage-reuse-verification-v1', 'historical-environment-precheck-v1', 'managed-environment-repair-v1', 'managed-wheel-metadata-v1', 'managed-wheel-metadata-v2', 'managed-manager-cache-v1', 'managed-input-sharing-v1', 'managed-release-asset-sharing-v1', 'storage-preflight-v2', 'storage-requirement-ledger-v1', 'canonical-modelscope-dataset-v1', 'bounded-sandbox-launch-v1', 'short-temporary-paths-v1', 'command-output-v1', 'command-wait-identity-v1', 'managed-material-recovery-v1', 'inference-plan-v1', 'planning-requirements-v1', 'planning-drafts-0.1.0', 'documentation-pages-0.1.0'], controller,
           ...(nodeHealth === undefined ? {} : { node: { allocations: nodeHealth.allocations } }) })
         return
       }
@@ -178,6 +181,7 @@ export async function applyClusterRole(ctx: Context, config: ClusterRoleConfig):
       }
       if (path === '/aspera/v1/approve') {
         const approved = z.object({ revision: z.number().int().positive() }).parse(body)
+        if (record.plan !== undefined) assertSubmittedPlanRequirements(record.submission, serverRunRoot(record.submission.coordinator, input.experimentId), record.plan)
         respond(200, await queue.approve(input.experimentId, approved.revision)); return
       }
       if (path === '/aspera/v1/stop-service' || path === '/aspera/v1/access-service' || path === '/aspera/v1/service-access-info') {
@@ -186,6 +190,15 @@ export async function applyClusterRole(ctx: Context, config: ClusterRoleConfig):
         if (service === undefined) throw new Error('service does not belong to this experiment')
         respond(200, await clusterNodeRequest(readClusterPrivate(config.root, input.experimentId), service.serverId,
           path.slice('/aspera/v1/'.length), input)); return
+      }
+      if (path === '/aspera/v1/service-verification-pending') {
+        const runtime = readClusterPrivate(config.root, input.experimentId)
+        const nodes = await Promise.all(record.submission.nodes.map(node => clusterNodeRequest(runtime, node.server.id, 'service-verification-pending')))
+        respond(200, { supported: true, operations: nodes.flatMap(value => z.object({ operations: z.array(serviceVerificationSchema) }).parse(value).operations) }); return
+      }
+      if (path === '/aspera/v1/service-verification-claim' || path === '/aspera/v1/service-verification-result') {
+        const target = z.object({ serverId: serverIdSchema }).parse(body)
+        respond(200, await clusterNodeRequest(readClusterPrivate(config.root, input.experimentId), target.serverId, path.slice('/aspera/v1/'.length), input)); return
       }
       if (path === '/aspera/v1/status') { respond(200, { record, waitingFor: queue.waitingFor(input.experimentId) }); return }
       if (path === '/aspera/v1/finalization-status') {
@@ -267,6 +280,7 @@ export async function applyClusterRole(ctx: Context, config: ClusterRoleConfig):
         return
       }
       respond(404, { error: 'cluster route not found' })
-    } catch (error) { respond(400, { error: error instanceof Error ? error.message : String(error) }) }
+    } catch (error) { respond(400, { error: error instanceof Error ? error.message : String(error),
+      ...(error instanceof CommandAdmissionRejected ? { admission: error.receipt } : {}) }) }
   } }), 'experiment cluster: authenticated control routes')
 }

@@ -1,5 +1,38 @@
-/** Supplementary evidence keeps JSON framing while removing credentials from structured and embedded data. */
+/** Original-result review views and credential-safe structured evidence. */
 import { redactObservation } from '@aspera/runtime'
+import { createHash } from 'node:crypto'
+import type { ExperimentServerId, ExecutionProgress, CompletionAssessment, CompletionReview, CompletionCheck, AcceptanceRecovery } from '@aspera/experiments'
+
+/** @param check - fresh complete inspection, including associated serving checks. @param recovery - program-owned association.
+ * @returns separate serving and overall conclusions; historical reports and the completion decision are unchanged.
+ */
+export function reviewCompletionSummary(check: CompletionCheck,
+  recovery?: Pick<AcceptanceRecovery, 'experimentId' | 'recoveryExperimentId' | 'evidencePath' | 'evidenceHash'>) {
+  return { assessmentScope: 'current retrospective acceptance; original outcome remains unchanged',
+    associatedServing: recovery?.evidencePath === undefined ? undefined : { originalExperimentId: recovery.experimentId,
+      recoveryExperimentId: recovery.recoveryExperimentId, evidencePath: recovery.evidencePath, evidenceHash: recovery.evidenceHash,
+      verified: !check.issues.some(issue => issue.code === 'results'),
+      permittedUse: 'Use this independently verified original-checkpoint proof for the current public-serving step assessment. It does not rewrite the old blocked report and does not require another generation.' },
+    ...check }
+}
+
+/** @param progress - original reports and the separate assessment. @param review - original result identity.
+ * @param stepCount - approved original plan length. @returns unresolved effective reports before the retained historical data.
+ */
+export function reviewProgressSummary(progress: { original?: ExecutionProgress; assessment?: CompletionAssessment },
+  review: Pick<CompletionReview, 'experimentId' | 'planRevision' | 'executionSessionId'>, stepCount: number) {
+  const original = progress.original, assessment = progress.assessment
+  const matches = original !== undefined && original.experimentId === review.experimentId && original.planRevision === review.planRevision
+    && original.sessionId === review.executionSessionId
+  const states = new Map((matches ? original.steps : []).map(step => [step.step, step.state]))
+  if (matches && assessment?.experimentId === review.experimentId && assessment.planRevision === review.planRevision
+    && assessment.executionSessionId === review.executionSessionId) {
+    for (const step of assessment.steps) if (step.state !== 'blocked') states.set(step.step, 'completed')
+  }
+  return { progressIdentity: matches ? 'confirmed' : 'unconfirmed',
+    unresolvedSteps: Array.from({ length: stepCount }, (_value, index) => index + 1).filter(step => states.get(step) !== 'completed'),
+    originalReportsPreserved: true, ...progress }
+}
 
 function structured(text: string): { value: unknown } | undefined {
   if (!/^\s*[[{]/.test(text)) return undefined
@@ -30,4 +63,13 @@ export function redactCompletionData(value: unknown, secrets: readonly string[])
       : /(?:authorization|api[_-]?key|password|(?:access[_-]?)?token|secret)$/i.test(key) && entry !== null
         ? '[redacted]' : redactCompletionData(entry, secrets)]))
   return value
+}
+
+/** @param file - bounded retained source and its original byte digest. @param secrets - account-owned credentials.
+ * @returns masked text, its supplied digest and masking status, with the original file identity retained.
+ */
+export function redactCompletionScript(file: { serverId: ExperimentServerId; path: string; sha256: string; text: string }, secrets: readonly string[]) {
+  const text = redactCompletionText(file.text, secrets)
+  return { ...file, path: redactCompletionText(file.path, secrets), text,
+    textSha256: createHash('sha256').update(text).digest('hex'), textRedacted: text !== file.text }
 }

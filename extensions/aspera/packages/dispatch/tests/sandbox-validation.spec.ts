@@ -19,8 +19,13 @@ it('checks workspace, credential and CUDA access through the same complete launc
   await expect(validateEnvironment(target, 'a'.repeat(64))).resolves.toMatchObject({ sandboxWriteProbe: 'passed', cudaProbe: 'passed' })
   const script = vi.mocked(remote).mock.calls[1]![1]
   const probes = script.split('\n').filter(line => line.startsWith("'/usr/bin/bwrap'"))
-  expect(probes).toHaveLength(6)
-  for (const probe of probes) {
+  expect(probes).toHaveLength(7)
+  const diagnostics = probes.filter(line => line.includes("'--size'"))
+  expect(diagnostics).toHaveLength(1)
+  expect(diagnostics[0]).toContain("'--ro-bind' '/controls/node/workspace' '/controls/node/workspace'")
+  expect(script).toContain('ASPERA_VERIFY_STAGE=diagnostic-isolation')
+  expect(script).toContain('Sandbox command ignores SIGTERM/SIGINT')
+  for (const probe of probes.filter(line => !line.includes("'--size'"))) {
     for (const flag of ['--unshare-user', '--unshare-pid', '--unshare-ipc', '--unshare-uts', '--clearenv', '--dev-bind', '--chdir']) expect(probe).toContain(flag)
     expect(probe).toContain("'--tmpfs' '/controls/node'")
     expect(probe).toContain("'--bind' '/controls/node/workspace' '/controls/node/workspace'")
@@ -41,7 +46,16 @@ it('returns the actual proc mount refusal instead of passing a weaker deployment
       requiresPlatformAction: true } })
 })
 
-it.each(['workspace-isolation', 'credential-isolation', 'gpu-access'])('retains the independent %s failure', async stage => {
+it('rejects ignored command signals as a repairable launcher failure', async () => {
+  const error = new RemoteCommandError({ exitCode: 1, exitConfirmed: true, signal: null, timedOut: false, cancelled: false,
+    stdout: '', stderr: 'ASPERA_VERIFY_STAGE=sandbox-launch\nAssertionError: Sandbox command ignores SIGTERM/SIGINT; repair its private launcher\n' })
+  vi.mocked(remote).mockResolvedValueOnce(JSON.stringify(discovery)).mockRejectedValueOnce(error)
+  await expect(validateEnvironment(target, 'a'.repeat(64))).rejects.toMatchObject({ diagnostic: {
+    stage: 'sandbox-launch', stderr: error.result.stderr, requiresPlatformAction: false,
+  } })
+})
+
+it.each(['workspace-isolation', 'credential-isolation', 'gpu-access', 'diagnostic-isolation'])('retains the independent %s failure', async stage => {
   const error = new RemoteCommandError({ exitCode: 1, exitConfirmed: true, signal: null, timedOut: false, cancelled: false,
     stdout: 'Probe output', stderr: `ASPERA_VERIFY_STAGE=sandbox-launch\nASPERA_VERIFY_STAGE=${stage}\nProbe refused\n` })
   vi.mocked(remote).mockResolvedValueOnce(JSON.stringify(discovery)).mockRejectedValueOnce(error)

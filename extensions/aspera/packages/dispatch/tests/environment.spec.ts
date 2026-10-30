@@ -92,11 +92,11 @@ it('uses the saved application engines without consulting the local or installed
   expect(remote).toHaveBeenCalledTimes(2)
 })
 
-it.each([2, 3])('reads installer version %s without changing a saved release requirement', async installVersion => {
+it.each([2, 3])('reads installer version %s and repair capability without changing a saved release requirement', async installVersion => {
   vi.mocked(remote).mockResolvedValueOnce(JSON.stringify({ version: 1, deploymentId: digest, dsh: '0.2.0-rc.2', extension: '0.1.1' }))
     .mockResolvedValueOnce(JSON.stringify({ packageManager: 'pnpm@11.7.0', engines: { node: '>=22.19.0' },
-      dependencies: { '@deepseek-ai/dsh': '0.2.0-rc.2' }, asperaEnvironmentTools: { uvVersion: '0.13.0', installVersion,
-        ...(installVersion === 3 ? { pipVersion: '26.2.1' } : {}) } }))
+      dependencies: { '@deepseek-ai/dsh': '0.2.0-rc.2' }, asperaEnvironmentTools: { uvVersion: '0.13.0', installVersion, repairVersion: 1,
+        ...(installVersion === 3 ? { pipVersion: '26.2.1', lockReceiptVersion: 1, requirementLedgerVersion: 1, sandboxIpcVersion: 1 } : {}) } }))
   expect(await installedEnvironmentRequirements(target, '/original/release', digest)).toEqual({ node: '>=22.19.0', pnpm: '11.7.0', uv: '0.13.0',
     ...(installVersion === 3 ? { pip: '26.2.1' } : {}) })
 })

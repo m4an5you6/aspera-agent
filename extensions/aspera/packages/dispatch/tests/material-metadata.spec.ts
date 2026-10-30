@@ -6,7 +6,7 @@ import { fetchCanonicalMaterialMetadata } from '../src/material-metadata.ts'
 function fixture() {
   const request = inspectExperimentMaterialsSchema.parse({ kind: 'model', provider: 'huggingface', repository: 'fixture/model', revision: 'a'.repeat(40), mirror: 'https://modelscope.cn' })
   const fetcher = vi.fn<typeof fetch>(async () => Response.json({ id: request.repository, sha: request.revision, siblings: [] }))
-  return { request, readBytes: 1024, readTimeoutMs: 1000, signal: new AbortController().signal, fetcher }
+  return { request, readBytes: 1024, readTimeoutMs: 1000, pollIntervalMs: 10, signal: new AbortController().signal, fetcher }
 }
 it('contacts the canonical commit endpoint even when a mirror is selected', async () => {
   const f = fixture(); await fetchCanonicalMaterialMetadata(f)
@@ -21,8 +21,13 @@ it('rejects a floating or foreign repository response and oversized metadata', a
   f.fetcher.mockResolvedValueOnce(new Response('x'.repeat(2048)))
   await expect(fetchCanonicalMaterialMetadata(f)).rejects.toThrow(/configured read bytes/)
 })
-it('does not treat a mirror revision parameter as provider attestation', async () => {
+it('uses official Git evidence for a ModelScope dataset rather than a mirror revision parameter', async () => {
   const f = fixture(); f.request.provider = 'modelscope'
-  await expect(fetchCanonicalMaterialMetadata(f)).rejects.toThrow(/provider-attested/)
+  f.request.kind = 'dataset'
+  const gitReader = vi.fn(async () => ({ id: f.request.repository, sha: f.request.revision, siblings: [] }))
+  await expect(fetchCanonicalMaterialMetadata({ ...f, gitReader })).resolves.toMatchObject({ sha: f.request.revision })
+  expect(gitReader).toHaveBeenCalledWith(expect.objectContaining({ request: f.request, readBytes: f.readBytes }))
   expect(f.fetcher).not.toHaveBeenCalled()
+  gitReader.mockResolvedValueOnce({ id: f.request.repository, sha: 'b'.repeat(40), siblings: [] })
+  await expect(fetchCanonicalMaterialMetadata({ ...f, gitReader })).rejects.toThrow()
 })

@@ -1,13 +1,13 @@
 /** Storage preparation shared by SSH dispatch and the installed node controller. */
 import { readFileSync } from 'node:fs'
 import { posix, resolve } from 'node:path'
-import { gzipSync } from 'node:zlib'
 import { serverInventorySchema, storageCandidateSchema, storagePlacementSchema } from '@aspera/experiments'
 import type { ClusterServer, ExperimentId, ServerInventory, ServerSettings, StorageCandidateId, StoragePlacement } from '@aspera/experiments'
 import { remote, shellQuote } from './transport.ts'
 import type { Target } from './transport.ts'
 import { managedEnvironmentProgram, managedEnvironmentPolicySchema } from './managed-environment.ts'
 import { storageGovernancePolicySchema } from './storage-governance.ts'
+import { pythonMainInput } from './python-input.ts'
 
 /** Read-only SSH inventory works before any Aspera installation exists.
  * @param target - pinned SSH account. @param directory - explicit storage directory. @param password - private credential.
@@ -45,19 +45,25 @@ export async function cleanupServerStorage(target: Target, placement: StoragePla
   const result = await storageRequest(target, 'cleanupStorage', { placement: storagePlacementSchema.parse(placement), privateNames }, password, signal)
   if (typeof result !== 'object' || result === null || !('cleaned' in result) || result.cleaned !== true) throw new Error('Remote cleanup was not confirmed')
   const program = managedEnvironmentProgram().split('if __name__ == "__main__":')[0]!
-  const config = Buffer.from(JSON.stringify({ action: 'release-references', placement, policy: managedEnvironmentPolicySchema.parse({}), governancePolicy: storageGovernancePolicySchema.parse({}) })).toString('base64')
-  const releaseProgram = 'import base64,gzip,json;exec(gzip.decompress(base64.b64decode("' + gzipSync(program).toString('base64')
-    + '")));print(json.dumps(main(json.loads(base64.b64decode("' + config + '")))))'
-  const released = JSON.parse(await remote(target, 'python3 -c ' + shellQuote(releaseProgram), signal, password))
+  const invocation = pythonMainInput(program, { action: 'release-references', placement, policy: managedEnvironmentPolicySchema.parse({}), governancePolicy: storageGovernancePolicySchema.parse({}) })
+  const released = JSON.parse(await remote(target, invocation.command, signal, password, invocation.input))
   if (typeof released !== 'object' || released === null || !('released' in released) || released.released !== true) throw new Error('Environment references were not released after remote deletion')
 }
 
 /** Materialize a saved assignment without reselecting a disk.
  * @param target - pinned SSH account. @param placement - durable selection. @param password - credential.
- * @param signal - cancellation. @param requiredBytes - additional transfer size. @returns actual capacity after verification.
+ * @param signal - cancellation. @param requiredBytes - additional transfer size. @param registerCurrent - pinned release supports storage registration. @returns actual capacity after verification.
  */
-export async function prepareServerStorage(target: Target, placement: StoragePlacement, password?: string, signal?: AbortSignal, requiredBytes = 0) {
-  return storageCandidateSchema.parse(await storageRequest(target, 'prepareStorage', placement, password, signal, requiredBytes))
+export async function prepareServerStorage(target: Target, placement: StoragePlacement, password?: string, signal?: AbortSignal, requiredBytes = 0, registerCurrent = false) {
+  const observed = storageCandidateSchema.parse(await storageRequest(target, 'prepareStorage', placement, password, signal, requiredBytes))
+  if (!registerCurrent) return observed
+  const program = managedEnvironmentProgram().split('if __name__ == "__main__":')[0]!
+  const fields = { action: 'storage-register-placement', placement, deploymentId: placement.releaseRoot.split('/').at(-1),
+    policy: managedEnvironmentPolicySchema.parse({}), governancePolicy: storageGovernancePolicySchema.parse({}) }
+  const invocation = pythonMainInput(program, fields)
+  const result: unknown = JSON.parse(await remote(target, invocation.command, signal, password, invocation.input))
+  if (typeof result !== 'object' || result === null || !('verified' in result) || result.verified !== true) throw new Error('Current storage registration was not confirmed')
+  return observed
 }
 
 /** Recheck a selected mount immediately before transferring data.

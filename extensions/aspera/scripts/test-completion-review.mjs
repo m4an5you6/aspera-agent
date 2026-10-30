@@ -109,12 +109,16 @@ try {
     return value?.phase
   }).toBe('passed')
   const assessment = await rpc('experimentCompletionAssessment', { id: continuationId })
+  assert.equal(assessment.stages[0].baseControl, undefined, 'The Agent must correct the invalid evidence path before acceptance')
   assert.deepEqual(assessment.verifications.map(stage => [stage.startStep, stage.additionalSteps, stage.endStep, stage.ready]), [[30, 200, 230, true]])
   assert.equal(assessment.steps[0].step, 2); assert.equal(assessment.steps[0].state, 'completed')
   assert.deepEqual((await rpc('experiments', {})).find(row => row.request.experimentId === continuationId).latest, originalContinuation)
   const continuationReview = await rpc('experimentCompletionReviewStatus', { id: continuationId })
   const continuationTrace = await rpc('experimentCompletionReviewTrace', { id: continuationId, operationId: continuationReview.operationId, request: { limit: 100 } })
   const continuationCalls = continuationTrace.records.filter(event => event.type === 'tool/call').map(event => JSON.parse(event.data).name)
+  const correction = continuationTrace.records.filter(event => event.type === 'tool/call').map(event => JSON.parse(event.data))
+    .find(event => event.name === 'register_experiment_stage' && Number.isInteger(JSON.parse(event.arguments).expected_revision))
+  assert.ok(correction, 'The formal Agent must submit a revision-checked evidence correction')
   for (const name of ['register_experiment_stage', 'verify_experiment_stage', 'report_experiment_step']) assert.ok(continuationCalls.includes(name))
   assert.ok(!continuationCalls.some(name => /run_experiment|prepare_experiment|start_inference/.test(name)))
   await page.getByRole('button', { name: '返回实验', exact: true }).click()
@@ -140,6 +144,40 @@ try {
   await page.getByRole('button', { name: 'CPU missing artifact', exact: true }).click()
   await expect(page.getByRole('region', { name: '完成证据复验', exact: true }).getByRole('button', { name: '重试补录验收', exact: true })).toBeVisible()
   await page.screenshot({ path: resolve(artifacts, 'completion-production-blocked.png'), fullPage: true })
+  const blockedReview = await rpc('experimentCompletionReviewStatus', { id: blockedId })
+  const blockedOriginal = (await rpc('experiments', {})).find(row => row.request.experimentId === blockedId).latest
+  assert.match(blockedReview.detail, /Original adapter evidence is unavailable/)
+  let blockedGoal
+  await expect.poll(async () => {
+    const blockedTrace = await rpc('experimentCompletionReviewTrace', { id: blockedId, operationId: blockedReview.operationId, request: { limit: 100 } })
+    const event = blockedTrace.records.filter(event => event.type === 'goal/change').at(-1)
+    blockedGoal = event === undefined ? undefined : JSON.parse(event.data).goal
+    return blockedGoal?.phase === 'blocked' && blockedTrace.records.some(row => row.type === 'turn/end' && row.seq > event.seq)
+  }).toBe(true)
+  await control('completion-retry', blockedId)
+  await rpc('reviewExperimentCompletion', { id: blockedId })
+  await expect.poll(async () => {
+    const value = await rpc('experimentCompletionReviewStatus', { id: blockedId })
+    if (value?.phase === 'blocked') throw new Error('Resumed review blocked: ' + JSON.stringify(value))
+    return value?.phase
+  }).toBe('passed')
+  const resumedReview = await rpc('experimentCompletionReviewStatus', { id: blockedId })
+  assert.equal(resumedReview.operationId, blockedReview.operationId); assert.equal(resumedReview.sessionId, blockedReview.sessionId)
+  assert.deepEqual((await rpc('experiments', {})).find(row => row.request.experimentId === blockedId).latest, blockedOriginal)
+  let resumedGoal
+  let resumedGoalTrace
+  await expect.poll(async () => {
+    const resumedTrace = await rpc('experimentCompletionReviewTrace', { id: blockedId, operationId: resumedReview.operationId, request: { limit: 100 } })
+    resumedGoalTrace = resumedTrace
+    resumedGoal = resumedTrace.records.filter(event => event.type === 'goal/change').map(event => JSON.parse(event.data).goal).at(-1)
+    return resumedGoal?.phase
+  }).toBe('complete').catch(error => {
+    writeFileSync(resolve(artifacts, 'completion-retry-goal-debug.json'), JSON.stringify(resumedGoalTrace, null, 2) + '\n')
+    throw error
+  })
+  assert.equal(resumedGoal.id, blockedGoal.id)
+  assert.equal(resumedGoal.maxGoalRounds, blockedGoal.maxGoalRounds)
+  assert.ok(resumedGoal.revision > blockedGoal.revision)
   const holdId = await create('CPU cancel review', 'hold')
   await rpc('reviewExperimentCompletion', { id: holdId })
   await expect.poll(async () => (await rpc('experimentCompletionReviewStatus', { id: holdId }))?.phase).toBe('collecting')
@@ -153,7 +191,7 @@ try {
     historicalEnvironmentReadOnly: true, restrictedStandardAgent: true, retrainingToolsAbsent: true, passed: true, missingArtifactBlocked: true,
     cancelled: true, traceRecorded: true, structuredJsonRedaction: true, aggregateDiagnostics: true, originalSessionTraceRecovery: true,
     localized: true, responsive: true, blockedContinuationSupplemented: true, cumulativeAndAdditionalStepsSeparated: true,
-    stageToolsCalledByRestrictedAgent: true, originalStepReportsRetained: true, gpuAcceptance: 'not run' }
+    stageToolsCalledByRestrictedAgent: true, originalStepReportsRetained: true, blockedReviewGoalResumedWithSameIdentity: true, gpuAcceptance: 'not run' }
   const snapshot = resolve(root, 'scripts/fixtures/completion.snapshot.json')
   if (process.argv.includes('--record')) writeFileSync(snapshot, JSON.stringify(expected, null, 2) + '\n')
   assert.deepEqual(expected, JSON.parse(readFileSync(snapshot, 'utf8')))

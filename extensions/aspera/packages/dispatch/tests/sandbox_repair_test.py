@@ -19,6 +19,7 @@ class OwnershipTests(unittest.TestCase):
     def request(self, root):
         return {"version": 1, "serverId": "selected-server", "experimentId": "experiment", "controlRoot": str(root),
                 "adoptLegacyControlRoot": False, "mode": "repair", "maxAttempts": 2,
+                "probeTimeoutMs": 15000, "cleanupTimeoutMs": 1000, "pollIntervalMs": 20,
                 "python": "/usr/bin/python3", "bwrap": "/usr/bin/true", "isolationArgs": ["--unshare-user", "--cap-drop", "ALL"]}
 
     def test_bootstrap_control_marker_matches_storage_encoding(self):
@@ -81,6 +82,26 @@ class OwnershipTests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("ASPERA_TEST_SANDBOX_ARGV"), "Requires an actual compatible Linux sandbox")
+    def test_private_proc_children_preserve_graceful_termination(self):
+        argv = json.loads(os.environ["ASPERA_TEST_SANDBOX_ARGV"])
+        program = """import signal,subprocess,sys
+assert not any(signal.getsignal(s)==signal.SIG_IGN for s in (signal.SIGTERM,signal.SIGINT))
+child=subprocess.Popen([sys.executable,'-c',"import time;print('ready',flush=True);time.sleep(60)"],stdout=subprocess.PIPE,text=True)
+try:
+    assert child.stdout.readline().strip()=='ready'
+    child.terminate()
+    assert child.wait(timeout=1)==-signal.SIGTERM
+finally:
+    if child.poll() is None:child.kill();child.wait()
+    child.stdout.close()
+print('graceful child termination')
+"""
+        code, stdout, _ = repair.run_probe(argv + ["--", sys.executable, "-B", "-c", program],
+            {"probeTimeoutMs": 3000, "cleanupTimeoutMs": 1000, "pollIntervalMs": 10})
+        self.assertEqual(code, 0)
+        self.assertIn("graceful child termination", stdout)
+
     def test_parent_death_setup_rejects_an_already_changed_parent(self):
         program = "import importlib.util;spec=importlib.util.spec_from_file_location('repair'," + repr(str(SCRIPT)) + ");module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);module.child_lifetime(0);print('unexpected continuation')"
         result = subprocess.run([sys.executable, "-c", program], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
